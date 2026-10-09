@@ -20,6 +20,23 @@ function withDevice(auth) {
 }
 
 /**
+ * 签到路径自己的 token 续期。**必须做，不能指望发请求那条路**：
+ * pickAccount 只在对话请求时刷新 token，而签到/额度接口直接拿账号里存的
+ * accessToken——token 每天过期，点「签到」时若已过期，上游会回
+ * "We're sorry, but we are not able to authenticate you"（不是 401 状态码，
+ * 就是这句业务文案），并被写进 lastError 挂在账号卡上（2026-10-09 实测）。
+ * 刷新失败不阻断签到——让它带着旧 token 试一次，错误如实上报。
+ */
+async function withFreshToken(auth) {
+  try {
+    if (!authStore.needsRefresh(auth)) return auth;
+    const r = await authStore.exchange(auth);
+    if (!r.ok) return auth;
+    return authStore.patch(auth.id, { ...r.patch, lastError: '' }) || { ...auth, ...r.patch };
+  } catch (e) { return auth; }
+}
+
+/**
  * 查签到状态：{ checkedIn, credits, extraCredits, enable }
  *
  * 实测返回体（2026-09-25）：
@@ -225,7 +242,8 @@ function computeGained(before, after, upstreamGained) {
  * （status 说没签、usage 已含奖励）还会出现「签到成功但余额没变」，
  * 被读成「显示的是旧积分」。快照失败不影响签到本身，拿不到就如实 null。
  */
-async function checkinAndSave(auth, authStore) {
+async function checkinAndSave(rawAuth, authStore) {
+  const auth = await withFreshToken(rawAuth);
   const st = await status(auth);
   if (!st.ok) return { ok: false, error: st.error, stage: 'status' };
   if (st.checkedIn) {
@@ -258,4 +276,4 @@ async function checkinAndSave(auth, authStore) {
   };
 }
 
-module.exports = { status, claim, usage, checkinAndSave, computeGained };
+module.exports = { status, claim, usage, checkinAndSave, computeGained, withFreshToken };
