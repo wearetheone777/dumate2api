@@ -65,9 +65,11 @@ const routes = [
     method: 'GET',
     path: '/credits',
     handler: async ({ res }) => {
-      const list = authStore.findUsable();
       const rows = [];
-      for (const a of list) {
+      for (const raw of authStore.findUsable()) {
+        // 额度/签到状态接口直接用账号里存的 accessToken——先续期一次，
+        // 否则 token 过期后本页恒报 "not able to authenticate"（与 /checkin 同根因）
+        const a = await checkin.withFreshToken(raw);
         const st = await checkin.status(a);
         const u = await checkin.usage(a);
         rows.push({
