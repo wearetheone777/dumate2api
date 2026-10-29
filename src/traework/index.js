@@ -134,9 +134,17 @@ async function runAttempt(bodyJson, auth, model, emit, hold) {
     } else if (evt.event === 'done' && evt.data && evt.data.finish_reason) {
       // 终止原因按 OpenAI 约定补一帧。翻译器靠它判 completed/length——
       // 不补的话 length 截断会被当成正常收尾，客户端无从察觉。
+      // 上游给出工具调用时 done 仍报 stop（见 chat.aggregate 内注释），
+      // 这里与 gate / aggregate 同口径纠正。done 是最后一个事件，
+      // events 里已收齐全部 output，扫一遍即可判定。
+      let fr = evt.data.finish_reason;
+      if (fr === 'stop' && events.some((x) => x.event === 'output'
+        && Array.isArray(x.data && x.data.tool_calls) && x.data.tool_calls.length)) {
+        fr = 'tool_calls';
+      }
       emit(JSON.stringify({
         id: 'traework', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model,
-        choices: [{ index: 0, delta: {}, finish_reason: evt.data.finish_reason }],
+        choices: [{ index: 0, delta: {}, finish_reason: fr }],
       }));
     }
   });

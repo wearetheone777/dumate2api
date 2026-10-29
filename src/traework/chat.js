@@ -417,10 +417,14 @@ function createTextGate(emit, model, hold) {
         return;
       }
       if (evt.event === 'done' && evt.data && evt.data.finish_reason) {
+        // 与 aggregate 同一纠正：流里出过工具调用时上游仍报 stop，照搬会把
+        // 「执行工具」的信号吞掉（判据见 aggregate 内注释）。
+        let fr = evt.data.finish_reason;
+        if (fr === 'stop' && toolCalls) fr = 'tool_calls';
         held.push(JSON.stringify({
           id: 'traework', object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000), model,
-          choices: [{ index: 0, delta: {}, finish_reason: evt.data.finish_reason }],
+          choices: [{ index: 0, delta: {}, finish_reason: fr }],
         }));
       }
     },
@@ -474,6 +478,14 @@ function aggregate(events, model) {
     }
     if (e.event === 'done' && d.finish_reason) finish = d.finish_reason;
   }
+
+  // 上游在给出工具调用的同时 done 帧仍报 `stop`（2026-10-29 实测抓包：
+  // tool_calls 增量正常到达，done 是 {"finish_reason":"stop"}）。OpenAI 生态
+  // 里 `finish_reason === 'tool_calls'` 是常见的执行判据，照搬会让工具被
+  // 当成正常收尾忽略——表现为「模型说要调工具，但什么都没发生」。Anthropic
+  // 翻译器两处（流式 sentToolUse / 非流式 openAIToAnthropic）已各自纠正过，
+  // 这里在源头归一，OpenAI 直通与非流式聚合一并受益。
+  if (calls.size && finish === 'stop') finish = 'tool_calls';
 
   const message = { role: 'assistant', content };
   if (reasoning) message.reasoning_content = reasoning;

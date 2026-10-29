@@ -76,7 +76,10 @@ const evDone = () => ({ event: 'done', data: { finish_reason: 'stop' } });
   ok(gate.result().toolCalls === 1, '统计到 1 个工具调用');
   gate.finish();
   ok(out.some((c) => c.usage), 'usage 帧在 finish() 后补发');
-  ok(out.some((c) => c.choices[0] && c.choices[0].finish_reason === 'stop'), 'finish_reason 帧在 finish() 后补发');
+  // 该场景带工具调用而上游 done 给 stop（2026-10-29 实测），gate 按新口径
+  // 纠正为 tool_calls（见 verify-traework-finish-reason.js）。这里断言的是
+  // 「补发确实发生」，纠正语义由专项脚本锁定。
+  ok(out.some((c) => c.choices[0] && c.choices[0].finish_reason === 'tool_calls'), 'finish_reason 帧在 finish() 后补发（有工具调用 → tool_calls）');
 }
 
 {
