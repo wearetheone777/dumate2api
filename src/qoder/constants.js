@@ -39,6 +39,10 @@ const ENDPOINTS = {
     PlanEndpoint: 'https://openapi.qoder.com.cn/api/v2/user/plan',
     QuotaEndpoint: 'https://openapi.qoder.com.cn/api/v2/quota/usage',
     CampaignsBase: 'https://openapi.qoder.com.cn/sash/api/v1/me/campaigns',
+    // 官方积分消耗（0.4.3 客户端新增接口，qoder2api-hub v1.7.5 实测 cn/intl 均 200）。
+    // 上游唯一给出「真实消耗口径」的地方——补 grants「只有领取额没有剩余额」的缺口。
+    CreditsSummaryEndpoint: 'https://openapi.qoder.com.cn/sash/api/v1/ai-conversations/credits-summary',
+    CreditsHeatmapEndpoint: 'https://openapi.qoder.com.cn/sash/api/v1/ai-conversations/credits-heatmap',
     ChatStreamURL: 'https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1',
     ModelListURL: 'https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1',
     JobTokenURL: 'https://gateway.qoder.com.cn/algo/api/v3/user/jobToken?Encode=1',
@@ -54,6 +58,8 @@ const ENDPOINTS = {
     PlanEndpoint: 'https://openapi.qoder.sh/api/v2/user/plan',
     QuotaEndpoint: 'https://openapi.qoder.sh/api/v2/quota/usage',
     CampaignsBase: 'https://openapi.qoder.sh/sash/api/v1/me/campaigns',
+    CreditsSummaryEndpoint: 'https://openapi.qoder.sh/sash/api/v1/ai-conversations/credits-summary',
+    CreditsHeatmapEndpoint: 'https://openapi.qoder.sh/sash/api/v1/ai-conversations/credits-heatmap',
     // 主力推理主机。官方 0.4.8 客户端 endpoint 缓存实测（qoder2api-hub 逆向）：
     // inference=api3、securityInference=api2；api1 是旧配置首位，常年直连超时。
     ChatStreamURL: 'https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1',

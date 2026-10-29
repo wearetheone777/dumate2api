@@ -507,6 +507,10 @@ async function runOnce(account, payload, onChunk, opts, meter) {
               return;
             }
             noteCredits(parsed);
+          // usage 缓存字段归一化（#112）：DeepSeek/Qwen 的缓存命中数字搬到
+          // 标准位 prompt_tokens_details.cached_tokens，改写发生在转发前——
+          // 原样转发的话按标准协议解析的客户端读到的缓存恒为 0
+          if (parsed.usage && chat.normalizeUsageCache(parsed.usage)) inner = JSON.stringify(parsed);
           }
           sent = true;
           delivered = true;

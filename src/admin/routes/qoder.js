@@ -179,6 +179,65 @@ const routes = [
     },
   },
   {
+    // 官方积分消耗（credits-summary + credits-heatmap，2026-10-30）。
+    // **真实消耗口径**：累计消耗 / 单日峰值 / 近 365 天逐日——上游唯一给出
+    // 「花了多少」的地方（逐笔 credits 只覆盖经网关的请求，官方口径含全部）。
+    // 按 token 缓存 5 分钟（session 层），?force=1 可强刷。
+    method: 'GET',
+    path: '/credits/usage',
+    handler: async ({ req, res }) => {
+      const force = /[?&]force=1/.test(req.url);
+      const list = authStore.list();
+      const proxyAgent = require('../../proxy-agent');
+      const rows = [];
+      const dailySum = new Map(); // date → 合计（多账号同日相加）
+      for (const a of list) {
+        const raw = authStore.get(a.id);
+        let agent = null;
+        try { agent = proxyAgent.getAgentFor(raw); } catch (e) {
+          rows.push({ id: a.id, nickname: a.nickname || a.uid || `账号 ${a.id}`, region: a.region, usage: null, error: `出站代理配置错误: ${e.message}` });
+          continue;
+        }
+        const u = await session.fetchCreditUsage(raw.accessToken, a.region, { agent, force });
+        rows.push({
+          id: a.id,
+          nickname: a.nickname || a.uid || `账号 ${a.id}`,
+          region: a.region,
+          usage: u.ok ? u : null,
+          error: u.ok ? '' : (u.error || '查询失败'),
+        });
+        // 逐日合计：只累计取到数的日子；取不到的账号不拖垮其余账号的合并
+        if (u.ok) {
+          for (const d of u.daily) {
+            if (!d.date || typeof d.value !== 'number') continue;
+            dailySum.set(d.date, Number((((dailySum.get(d.date) || 0) + d.value)).toFixed(4)));
+          }
+        }
+      }
+      const daily = [...dailySum.entries()]
+        .map(([date, value]) => ({ date, value }))
+        .sort((x, y) => (x.date < y.date ? -1 : 1));
+      const known = rows.filter((r) => r.usage);
+      return sendJSON(res, 200, {
+        count: rows.length,
+        rows,
+        daily,
+        summary: {
+          valid: known.length,
+          // 累计合计：只加取到的（null 不计）；全部取不到就是 null，不补 0
+          total: known.length
+            ? Number(known.reduce((s, r) => s + (r.usage.total || 0), 0).toFixed(4))
+            : null,
+          peak: known.length
+            ? Number(Math.max(...known.map((r) => r.usage.peak || 0)).toFixed(4))
+            : null,
+          windowDays: known.length ? Math.max(...known.map((r) => r.usage.daily.length)) : 0,
+        },
+        note: '官方口径的累计消耗（含不经网关的客户端用量）。逐笔 credits（/credits/records）只覆盖经网关的请求，两者不可相加。',
+      });
+    },
+  },
+  {
     // 手动签到：幂等，已领的自动跳过。返回**实际到账差值**（不是总额）。
     method: 'POST',
     path: '/checkin',

@@ -105,7 +105,12 @@
           <template v-else-if="record.channel === 'qoder'">
             <a-tag v-if="record.isFree" color="cyan" class="mr-1">免费档</a-tag>
             <a-tag v-if="record.capability === 'reasoning_model'" color="purple">推理</a-tag>
-            <span v-if="!record.isFree && record.capability !== 'reasoning_model'" class="text-xs text-slate-500">—</span>
+            <!-- 错峰优惠：系数与时段是上游原值（discount_factor 的乘性方向
+                 未实测，不解读成「x 折」）；无窗口期时不显示 -->
+            <a-tag v-if="record.offPeak && record.offPeak.window" color="orange" class="mr-1">
+              错峰 {{ record.offPeak.window }}{{ record.offPeak.discountFactor != null ? ` ×${record.offPeak.discountFactor}` : '' }}
+            </a-tag>
+            <span v-if="!record.isFree && record.capability !== 'reasoning_model' && !(record.offPeak && record.offPeak.window)" class="text-xs text-slate-500">—</span>
           </template>
           <span v-else class="text-xs text-slate-500">—</span>
         </template>

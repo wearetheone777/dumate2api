@@ -313,6 +313,66 @@ check('客户端没带 max_tokens 时的默认值也受上限约束', () => {
 });
 
 console.log('');
+console.log('== usage 缓存字段归一化（#112：DeepSeek/Qwen 缓存数字搬标准位）==');
+check('DeepSeek 形态：prompt_cache_hit_tokens → 标准位，原字段保留', () => {
+  const u = { prompt_tokens: 100, prompt_cache_hit_tokens: 80, completion_tokens: 5 };
+  assert.strictEqual(chat.normalizeUsageCache(u), true);
+  assert.strictEqual(u.prompt_tokens_details.cached_tokens, 80);
+  assert.strictEqual(u.prompt_cache_hit_tokens, 80, '原字段保留');
+});
+check('Qwen 形态：completion_tokens_details.cached_tokens → 标准位', () => {
+  const u = { prompt_tokens: 100, completion_tokens_details: { cached_tokens: 60 } };
+  assert.strictEqual(chat.normalizeUsageCache(u), true);
+  assert.strictEqual(u.prompt_tokens_details.cached_tokens, 60);
+  assert.strictEqual(u.completion_tokens_details.cached_tokens, 60, '原字段保留');
+});
+check('已有标准位时不覆盖（不编数字）', () => {
+  const u = { prompt_cache_hit_tokens: 80, prompt_tokens_details: { cached_tokens: 99 } };
+  assert.strictEqual(chat.normalizeUsageCache(u), false);
+  assert.strictEqual(u.prompt_tokens_details.cached_tokens, 99);
+});
+check('上游没给缓存时不凭空造字段', () => {
+  const u = { prompt_tokens: 100 };
+  assert.strictEqual(chat.normalizeUsageCache(u), false);
+  assert.strictEqual(u.prompt_tokens_details, undefined);
+  assert.strictEqual(chat.normalizeUsageCache(null), false);
+});
+check('aggregate 出口带归一化后的 usage', () => {
+  const agg = chat.aggregate([
+    '{"choices":[{"delta":{"content":"hi"}}]}',
+    '{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"credits":0.01,"prompt_cache_hit_tokens":7}}',
+  ], 'gfmodel');
+  assert.strictEqual(agg.usage.prompt_tokens_details.cached_tokens, 7);
+});
+
+console.log('');
+console.log('== 官方积分消耗解析（credits-summary / credits-heatmap）==');
+check('标准形状：summary 三字段 + heatmap 逐日', () => {
+  const r = session.parseCreditUsage(
+    { totalCredits: 12.3456, peakCredits: 3.2, peakDate: '2026-10-28', unit: 'credits' },
+    { items: [{ date: '2026-10-28', value: 3.2 }, { date: '2026-10-27', value: 1.1 }, { junk: 1 }] },
+  );
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.total, 12.3456);
+  assert.strictEqual(r.peak, 3.2);
+  assert.strictEqual(r.peakDate, '2026-10-28');
+  assert.strictEqual(r.daily.length, 2, '坏条目跳过');
+  assert.strictEqual(r.heatmapOk, true);
+});
+check('summary 字段缺失给 null（不补 0——0 会被读成没消耗）', () => {
+  const r = session.parseCreditUsage({}, null);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.total, null);
+  assert.strictEqual(r.peak, null);
+  assert.strictEqual(r.daily.length, 0);
+  assert.strictEqual(r.heatmapOk, false);
+});
+check('summary 不是对象 → ok:false', () => {
+  assert.strictEqual(session.parseCreditUsage(null, null).ok, false);
+  assert.strictEqual(session.parseCreditUsage('x', null).ok, false);
+});
+
+console.log('');
 if (failures) { console.log(`${failures} 项失败`); process.exit(1); }
 console.log('全部通过');
 process.exit(0);

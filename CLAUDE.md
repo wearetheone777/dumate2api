@@ -319,6 +319,35 @@ send() 下发 deadline）；`DUMATE_QODER_QUEUE_POLL=0` 整体关闭（回到纯
 throw** 两种形态——只有它们才走等待轮）。注意该套件前 4 节的三个 6 秒用例是
 10-29 快速轮询的既有节奏，不是排队等待。
 
+**P2 增强（2026-10-30 同日，数据与档位批次）**：
+
+1. **官方积分消耗接口**（`/sash/api/v1/ai-conversations/credits-summary` +
+   `credits-heatmap`，0.4.3 客户端新增，hub v1.7.5 实测 cn/intl 均 200）。
+   形状：summary = `{totalCredits, peakCredits, peakDate, unit}`；heatmap =
+   `{items:[{date,value}]}`。**上游唯一给出「真实消耗口径」的地方**——逐笔
+   credits 只覆盖经网关的请求，官方口径含全部客户端用量；与 grants（只有领取额）
+   互补但不可相加。实现：`session.fetchCreditUsage`（按 token 缓存 5 分钟，
+   全量聚合接口别跟着轮询打；解析抽成纯函数 `parseCreditUsage` 可离线测）+
+   管理端 `GET /api/admin/qoder/credits/usage`（逐账号 + 逐日合并，`?force=1`
+   强刷）。取不到的字段给 null 不补 0。真机实测：累计 3078.50 credits、峰值
+   776.44（10-29）、371 天逐日。
+2. **usage 缓存字段归一化**（对齐 hub #112）：上游按模型族把缓存命中放不同
+   字段（DeepSeek `prompt_cache_hit_tokens`、Qwen
+   `completion_tokens_details.cached_tokens`）——按标准协议解析的客户端读
+   `usage.prompt_tokens_details.cached_tokens` 恒为 0。`chat.normalizeUsageCache`
+   把数字搬进标准位、原字段保留（已适配上游形态的客户端不受影响），流式在
+   转发前改写 usage 帧、非流式在 aggregate 出口改写；上游没给缓存时不凭空造
+   字段，已有标准位时不覆盖。
+3. **错峰优惠透出**（model-info.js 的 `offPeak` 字段 + 界面橙色徽标）：上游
+   `promotion` 字段原样透出（discountFactor + 窗口）。**不解读成「x 折」**——
+   discount_factor 的乘性方向没实测过，编一个口径会被对账打脸。真机实测
+   qmodel_38max 带 `{discountFactor:0.4, window:"22:00-08:00"}`。
+
+**P2 明确不做的两项（别再翻出来做）**：上下文窗口按请求可调（hub 的默认是
+200K 档才需要「抬窗」，我们已经默认按最大档下发，覆盖只能往下调没有意义）；
+工具调用泄漏回读（hub 的场景是文本标记工具历史被模型照抄进正文——我们发的是
+结构化工具历史，且部署中无实测案例，不值得为它给热路径加跨帧缓冲门）。
+
 
 **`cosy.encode` 是同步的，它一慢就「假死」整个网关（2026-10-03 修，性能级）。**
 自定义 base64 编码在 `runOnce` 里**直接同步调用**，所以它的耗时会**阻塞事件循环**：

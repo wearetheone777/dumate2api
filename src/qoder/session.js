@@ -285,6 +285,58 @@ function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
+// ---- 官方积分消耗（credits-summary / credits-heatmap，2026-10-30）----
+// 上游唯一给出「真实消耗口径」的接口：累计消耗 + 单日峰值 + 近 365 天逐日。
+// 结果按 token 缓存 5 分钟——全量聚合接口，别跟着界面轮询打（hub 同值）。
+const CREDIT_USAGE_TTL_MS = 5 * 60 * 1000;
+const creditUsageCache = new Map(); // accessToken → { at, data }
+
+/**
+ * 解析 credits-summary + credits-heatmap 的响应体（单独成函数为了离线可测）。
+ * 字段形状实测自 qoder2api-hub v1.7.5：summary = {totalCredits, peakCredits,
+ * peakDate, unit}；heatmap = {items: [{date, value}]}。
+ * 取不到的字段给 null 不补 0——0 会被读成「没消耗」。
+ */
+function parseCreditUsage(sum, heat) {
+  if (!sum || typeof sum !== 'object') {
+    return { ok: false, error: '响应不是 JSON 对象', total: null, peak: null, peakDate: '', unit: '', daily: [], heatmapOk: false };
+  }
+  const daily = [];
+  const items = (heat && typeof heat === 'object' && Array.isArray(heat.items)) ? heat.items : [];
+  for (const it of items) {
+    // 没有 date 的条目对热力图无用，跳过（上游坏读/形状漂移时不画错）
+    if (!it || typeof it !== 'object' || !it.date) continue;
+    const v = Number(it.value);
+    daily.push({ date: String(it.date), value: Number.isFinite(v) ? v : 0 });
+  }
+  return {
+    ok: true,
+    total: typeof sum.totalCredits === 'number' ? sum.totalCredits : null,
+    peak: typeof sum.peakCredits === 'number' ? sum.peakCredits : null,
+    peakDate: String(sum.peakDate || ''),
+    unit: String(sum.unit || 'credits'),
+    daily,
+    heatmapOk: !!(heat && typeof heat === 'object'),
+  };
+}
+
+async function fetchCreditUsage(token, region, opts = {}) {
+  const ep = c.endpointsOf(region);
+  const hit = creditUsageCache.get(token);
+  if (!opts.force && hit && Date.now() - hit.at < CREDIT_USAGE_TTL_MS) return hit.data;
+  const headers = bearerHeaders(token, { 'cosy-clienttype': c.CHECKIN_CLIENT_TYPE });
+  const sum = await request(ep.CreditsSummaryEndpoint, { headers, agent: opts.agent || null });
+  if (sum.status !== 200 || !sum.data) {
+    // 失败给 null 不补 0——0 会被读成「没消耗」
+    return { ok: false, error: sum.error || `HTTP ${sum.status}`, total: null, peak: null, peakDate: '', unit: '', daily: [], heatmapOk: false };
+  }
+  // 热力图失败不拖垮摘要：逐日给空数组并标注 heatmapOk
+  const heat = await request(ep.CreditsHeatmapEndpoint, { headers, agent: opts.agent || null });
+  const out = parseCreditUsage(sum.data, heat.status === 200 ? heat.data : null);
+  creditUsageCache.set(token, { at: Date.now(), data: out });
+  return out;
+}
+
 /**
  * 签到：查活动列表 → 领取可领的。
  *
@@ -468,6 +520,6 @@ function cachedModels(account) {
 
 module.exports = {
   request, bearerHeaders, exchange, ensureAccount, fetchUserInfo, fetchPlan,
-  fetchQuota, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
+  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
   parseThinkingConfig,
 };

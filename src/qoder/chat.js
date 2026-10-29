@@ -568,6 +568,29 @@ function postStream(url, body, headers, onChunk, opts = {}) {
 }
 
 /** 非流式：聚合 SSE 成一个 chat.completion */
+/**
+ * usage 缓存字段归一化（2026-10-30，对齐 qoder2api-hub #112）。
+ *
+ * 上游按模型族把缓存命中放在不同字段：DeepSeek 用 `prompt_cache_hit_tokens`、
+ * Qwen 用 `completion_tokens_details.cached_tokens`——按 OpenAI 标准协议解析
+ * 的客户端读 `usage.prompt_tokens_details.cached_tokens` 恒为 0。把数字搬到
+ * 标准位，**原字段保留**（已适配上游形态的客户端不受影响）。上游完全没给
+ * 缓存时不凭空造字段。返回是否发生过改写（调用方据此决定要不要重新序列化）。
+ */
+function normalizeUsageCache(usage) {
+  if (!usage || typeof usage !== 'object') return false;
+  const hit = typeof usage.prompt_cache_hit_tokens === 'number'
+    ? usage.prompt_cache_hit_tokens
+    : (usage.completion_tokens_details && typeof usage.completion_tokens_details.cached_tokens === 'number'
+      ? usage.completion_tokens_details.cached_tokens
+      : null);
+  if (hit == null) return false;
+  if (usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object'
+    && typeof usage.prompt_tokens_details.cached_tokens === 'number') return false; // 已有标准位
+  usage.prompt_tokens_details = { ...(usage.prompt_tokens_details || {}), cached_tokens: hit };
+  return true;
+}
+
 function aggregate(payloads, model) {
   let content = '';
   let reasoning = '';
@@ -607,6 +630,7 @@ function aggregate(payloads, model) {
     message.tool_calls = [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
     if (!content) message.content = null;
   }
+  normalizeUsageCache(usage);
   return {
     id, object: 'chat.completion', created, model,
     choices: [{ index: 0, message, finish_reason: finish }],
@@ -669,5 +693,5 @@ function getQueueStatus(origin, headers, { modelKey, queueType, requestId, agent
 module.exports = {
   buildBody, resolveModelKey, unwrap, envelopeStatus, payloadError,
   post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
-  getQueueStatus, parseQueueStatus,
+  getQueueStatus, parseQueueStatus, normalizeUsageCache,
 };
