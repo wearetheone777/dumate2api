@@ -340,6 +340,28 @@ check('errtext：112/110/430 翻译成人话（含多层转义形态），普通
 });
 
 console.log('');
+console.log('== 3d. FEFO（最早到期优先）：pool 的 expiring 过滤（临期积分先烧掉）==');
+check('expiring 非空时候选被限制在集合内（无论游标位置）', () => {
+  const pool = createPool({ file: null });
+  for (let i = 0; i < 4; i++) {
+    assert.strictEqual(
+      pool.pick(['qoder:e1', 'qoder:e2'], { expiring: new Set(['qoder:e1']) }),
+      'qoder:e1',
+    );
+  }
+});
+check('临期号不健康（软冷却）时退回全量候选，不因 FEFO 卡死', () => {
+  const pool = createPool({ file: null });
+  pool.noteError('qoder:e1', { kind: 'soft', status: 429, message: 'x', retryAfterMs: 60000 });
+  assert.strictEqual(pool.pick(['qoder:e1', 'qoder:e2'], { expiring: new Set(['qoder:e1']) }), 'qoder:e2');
+});
+check('expiring 为空/null 时无感（普通选号）', () => {
+  const pool = createPool({ file: null });
+  assert.ok(pool.pick(['qoder:e1', 'qoder:e2'], { expiring: null }));
+  assert.ok(pool.pick(['qoder:e1', 'qoder:e2'], {}));
+});
+
+console.log('');
 console.log('== 4. 通道层：换号 + 下游拿到 429 ==');
 
 // 池单例已在 DUMATE_POOL_STATE 的临时文件上，不会碰真实 data/

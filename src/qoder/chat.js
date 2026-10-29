@@ -92,6 +92,55 @@ function resolveModelKey(name, models) {
   return bare;
 }
 
+// ---- 思考档位（2026-10-30，判据来自上游模型表 thinking_config 与 qoder2api-hub）----
+// 上游参数是 parameters.reasoning_effort；**收到不支持的档位时不报错、悄悄改用
+// 默认档**——所以归一化必须本地做，否则「high 在 Qwen3.8 系不合法」这类情况
+// 用户完全无感（档位静默丢失）。
+const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
+// 客户端写法别名：minimal 是 OpenAI 系的最低档叫法，off/disabled 是显式关闭
+const EFFORT_ALIASES = { minimal: 'low', off: 'none', disabled: 'none' };
+
+/**
+ * 解析并归一化思考档位。返回要下发的档位字符串，或 null（不下发该参数）。
+ *
+ * 输入写法（四个入口）：reasoning_effort（OpenAI）、reasoning.effort（Codex/
+ * Responses）、thinking.effort / thinking.level（Anthropic 系）。显式关闭
+ * （none / thinking.type=disabled，翻译层已剥）一律不下发——上游按模型默认
+ * 处理，比硬塞一个档位稳。
+ *
+ * 归一化：档位在模型表 thinking_config 的合法集合里 → 原样；不在 → 取 ORDER
+ * 序上距离最近的合法档，距离相同偏向模型默认档（与 hub 实测一致：
+ * qfmodel 的 high→medium、max→xhigh；dfmodel 的 xhigh→max）；模型表没带
+ * 档位集合（理论少见）→ 原样透传（上游自会回落默认档）。
+ */
+function resolveReasoningEffort(payload, modelMeta) {
+  const p = payload || {};
+  const raw = p.reasoning_effort != null ? p.reasoning_effort
+    : p.reasoning && p.reasoning.effort != null ? p.reasoning.effort
+      : p.thinking && p.thinking.effort != null ? p.thinking.effort
+        : p.thinking && p.thinking.level != null ? p.thinking.level
+          : null;
+  if (raw == null || raw === '') return null;
+  let e = String(raw).trim().toLowerCase();
+  e = EFFORT_ALIASES[e] || e;
+  if (e === 'none') return null;
+  const efforts = (modelMeta && modelMeta.reasoningEfforts) || [];
+  if (!efforts.length) return e;
+  if (efforts.includes(e)) return e;
+  const idx = (x) => { const i = EFFORT_ORDER.indexOf(x); return i === -1 ? 99 : i; };
+  const want = idx(e);
+  const def = (modelMeta && modelMeta.reasoningDefault) || '';
+  let best = efforts[0];
+  let bestDist = idx(best) === 99 ? Infinity : Math.abs(idx(best) - want);
+  for (const cand of efforts.slice(1)) {
+    const ci = idx(cand);
+    if (ci === 99) continue;
+    const d = Math.abs(ci - want);
+    if (d < bestDist || (d === bestDist && cand === def)) { best = cand; bestDist = d; }
+  }
+  return best;
+}
+
 /** 构造上游请求体（OpenAI 形状 → Qoder 形状） */
 function buildBody(modelKey, payload, opts = {}) {
   // 上下文档位：上游同一模型挂着 200K / 400K / 1M 三档（模型表的
@@ -116,6 +165,15 @@ function buildBody(modelKey, payload, opts = {}) {
     if (payload && payload[k] != null) parameters[k] = payload[k];
   }
   if (parameters.max_tokens == null) parameters.max_tokens = 32000;
+  // max_tokens 上游上限自学习（max-output.js）：第一次超限上游回 400 并被
+  // learn 记下，之后同一模型出站前在这里自动压到上限。
+  const cap = Number(opts.maxOutputTokens);
+  if (Number.isFinite(cap) && cap > 0 && parameters.max_tokens > cap) {
+    parameters.max_tokens = Math.floor(cap);
+  }
+  // 思考档位：解析 + 按模型合法档归一化（见 resolveReasoningEffort）
+  const effort = resolveReasoningEffort(payload, opts.modelMeta || null);
+  if (effort) parameters.reasoning_effort = effort;
 
   // 工具只留标准 OpenAI 形状（上游只认 `{type:"function", function:{...}}`）。
   // Codex 会带 namespace / web_search 等，带上会整轮失败。
@@ -553,5 +611,5 @@ function aggregate(payloads, model) {
 
 module.exports = {
   buildBody, resolveModelKey, unwrap, envelopeStatus, payloadError,
-  post, postStream, aggregate, withAgentDiscipline,
+  post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
 };

@@ -248,6 +248,41 @@ e2e 用例与 rr 游标位置无关——轮转两轮、A 起手轮才断言）+
 `node test/verify-qoder-channel.js`（新增候选链顺序、machineos/hostname 的 sse
 场景区分、UA 形态）。
 
+**P1 增强（2026-10-30 同日落地，四件）**：
+
+1. **思考档位透传 + 本地归一化**。上游参数是 `parameters.reasoning_effort`，
+   收到不支持的档位**不报错、悄悄回落默认档**——不归一化用户就无感地丢了档位。
+   合法档集合来自模型表原始行的 `thinking_config`（`enabled.efforts` +
+   `is_default`，session.parseThinkingConfig 解析）。四个入口写法都收：
+   `reasoning_effort`（OpenAI）、`reasoning.effort`（Codex）、`thinking.effort` /
+   `thinking.level`（Anthropic 系）；Claude Code 的 adaptive 形态强度在
+   `output_config.effort`，显式 `thinking.budget_tokens` 按区间映射
+   （≤1024 minimal / ≤4096 low / ≤16384 medium / ≤32768 high / 更大 max）。
+   归一规则：合法原样；非法取最近合法档（同距偏默认档——qfmodel 的
+   high→medium、max→xhigh 与 hub 实测一致）；`none`/disabled 不下发；
+   模型表没带档位集合时原样透传。**搭子是最小干预透传，reasoning_effort 会在
+   server.js 的 needsModelMap 分支被剥掉**——多余字段进百度云端行为未知。
+2. **max_tokens 上游上限自学习**（`qoder/max-output.js`）：模型表不带
+   maxOutputTokens，超限报错 `Range of max_tokens should be [1, N]` 就是 N 的
+   唯一来源。第一次撞上限如实报 400 并按（区域，模型）落盘
+   `data/qoder-max-output.json`（7 天 TTL，原子写），之后 buildBody 出站前
+   自动 clamp。`DUMATE_QODER_MAX_OUTPUT_FILE` 可改路径（测试用）。
+3. **FEFO 选号**：积分领取后 30 天作废而上游没有逐批余额接口，临期不用就废。
+   `qoder/index.js` 的 `fefoUidSet` 从 grants 账本取临期批次（默认 3 天窗口，
+   `DUMATE_QODER_FEFO_DAYS=0` 关），经 channel-pool 透传给 pool.pick 的
+   `expiring` 过滤——集合非空时候选**限制**在临期账号内；临期号不健康时池自动
+   退回全量候选。已知缺口如实存在：领取额≠剩余额，FEFO 可能把流量打向已花完
+   的号——代价只是一次快速失败 + 换号，比让积分作废划算。
+4. **流式 `: ping` 保活帧**（server.js 直连通道流式桥）：上游首字实测可长达
+   40~70 秒（高思考档位 + 长上下文），期间 Codex / Claude Code 或中间代理会
+   因空闲超时断连。每 5s 写一个 SSE 注释帧——三套翻译器与 OpenAI 直通都按
+   `data: ` 前缀过滤、天然忽略；首帧到达即停。OpenAI 分支的头必须推迟到真实
+   首帧（要保住回 4xx 的能力），所以头发出前不写 ping。
+
+离线验证（新增）：`node test/verify-qoder-max-output.js`（学习/TTL/钳制/落盘）、
+`node --test test/unit/effort-passthrough.test.js`（两个翻译层的 effort 映射）、
+verify-qoder-channel.js（档位归一化 9 项）、verify-qoder-throttle.js（FEFO 3 项）。
+
 
 **`cosy.encode` 是同步的，它一慢就「假死」整个网关（2026-10-03 修，性能级）。**
 自定义 base64 编码在 `runOnce` 里**直接同步调用**，所以它的耗时会**阻塞事件循环**：
@@ -917,6 +952,7 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `DUMATE_QODER_MACHINE_OS` | 按 Windows/其他取 `x86_64_win32` / `x86_64_linux` | `cosy-machineos` 头的值。`auto` 按当前系统与架构识别，也可直接指定 |
 | `DUMATE_QODER_OS_HEADERS` | 未设（发送） | 设 `0` 关闭 `cosy-machineos` / `cosy-machinehostname` 两个身份头（见上文 2026-10-30 段） |
 | `DUMATE_QODER_INTL_GATEWAY` | 未设（候选链） | 钉死国际版推理主机（替代 api3→api2→api1 候选链）。上游服务端「选举」导流端点时用它 |
+| `DUMATE_QODER_FEFO_DAYS` | `3` | FEFO 选号的临期窗口（天）：账号有 N 天内到期的积分批次时优先接流量。`0` 关闭 |
 | `DUMATE_DUMATE_SOURCE` | 未设（`web`） | 搭子凭证来源。未设 = **只用网页凭证**（桌面链路不参与，跳过启动那次约 3 秒的探测；池子不可用时路由层直接拒绝并说明原因，不静默退回桌面链路）。设 `auto`（别名 `desktop`）= 桌面优先、不可用时回落网页池。**无法识别的值按 `web` 处理并在启动日志告警** |
 | `DUMATE_WEB_FALLBACK` | 未设（开启） | 设 `0` 关闭「桌面凭证不可用时回落到网页池」（见上文回落机制）。关闭后桌面凭证失效即请求全失败 |
 | `DUMATE_POINTS_METER` | 未设（开启） | 设 `0` 关闭搭子的余额游标采集（`points-cursor.js`）。关闭后请求日志不再有逐条消耗 |

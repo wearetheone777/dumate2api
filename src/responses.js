@@ -151,6 +151,12 @@ function responsesToOpenAI(body, stream) {
   };
   if (body.temperature != null) req.temperature = body.temperature;
   if (body.top_p != null) req.top_p = body.top_p;
+  // Codex 的思考强度（Responses 请求顶层 reasoning.effort）。此前整体丢弃——
+  // 用户在 Codex 里调 model_reasoning_effort 完全无效且无感。直连通道（Qoder）
+  // 会按模型合法档归一化后下发；其他通道不认识这个键，自然忽略。
+  if (body.reasoning && body.reasoning.effort != null) {
+    req.reasoning_effort = String(body.reasoning.effort);
+  }
   if (tools) req.tools = tools;
 
   const choice = body.tool_choice;

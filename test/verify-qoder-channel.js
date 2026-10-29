@@ -235,6 +235,84 @@ check('User-Agent 是 undici（官方 CLI 形态），不再是 Go 指纹', () =
 });
 
 console.log('');
+console.log('== 思考档位归一化（2026-10-30，thinking_config 实测形状）==');
+const session = require('../src/qoder/session');
+// thinking_config 原文取自 hub 的 qoder_catalog_cn.json 快照（dfmodel/qfmodel）
+check('parseThinkingConfig：efforts 集合 + is_default 默认档 + disabled 开关', () => {
+  const df = session.parseThinkingConfig({
+    disabled: { description: 'Disable thinking' },
+    enabled: {
+      description: 'Enable thinking',
+      efforts: { high: {}, max: { description: 'x', is_default: true }, low: {} },
+      is_default: true,
+    },
+  });
+  assert.deepStrictEqual(df, { efforts: ['high', 'max', 'low'], default: 'max', canDisable: true });
+});
+check('parseThinkingConfig：缺失/坏形状给空值（按无档位表处理）', () => {
+  assert.deepStrictEqual(session.parseThinkingConfig(null), { efforts: [], default: '', canDisable: false });
+  assert.deepStrictEqual(session.parseThinkingConfig({}), { efforts: [], default: '', canDisable: false });
+  assert.deepStrictEqual(session.parseThinkingConfig({ enabled: { efforts: 'x' } }).efforts, []);
+});
+const QF = { key: 'qfmodel', reasoningEfforts: ['xhigh', 'low', 'medium'], reasoningDefault: 'medium' }; // Qwen3.8-Flash
+const DF = { key: 'dfmodel', reasoningEfforts: ['high', 'max', 'low'], reasoningDefault: 'max' };        // DeepSeek-Flash
+check('合法档位原样透传', () => {
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'high' }, DF), 'high');
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'xhigh' }, QF), 'xhigh');
+});
+check('无效档位归一到最近合法档（hub 实测：qfmodel high→medium、max→xhigh）', () => {
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'high' }, QF), 'medium');
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'max' }, QF), 'xhigh');
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'xhigh' }, DF), 'max');
+});
+check('距离相同偏向默认档（dfmodel medium→high 而非 low）', () => {
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'medium' }, DF), 'high');
+});
+check('四种入口写法都认（OpenAI / Codex / thinking.effort / thinking.level）', () => {
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning: { effort: 'low' } }, DF), 'low');
+  assert.strictEqual(chat.resolveReasoningEffort({ thinking: { effort: 'low' } }, DF), 'low');
+  assert.strictEqual(chat.resolveReasoningEffort({ thinking: { level: 'low' } }, DF), 'low');
+});
+check('minimal 别名 → low；显式 none → 不下发（null）', () => {
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'minimal' }, DF), 'low');
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'none' }, DF), null);
+  assert.strictEqual(chat.resolveReasoningEffort({ thinking: { type: 'disabled' }, reasoning_effort: 'high' }, DF), 'high',
+    'disabled 标志由翻译层剥（不发 effort 字段），这里只看档位');
+});
+check('无档位表的模型原样透传（上游自会回落默认档）', () => {
+  assert.strictEqual(chat.resolveReasoningEffort({ reasoning_effort: 'high' }, null), 'high');
+});
+check('buildBody 下发 parameters.reasoning_effort；none 不下发', () => {
+  const b1 = JSON.parse(chat.buildBody('dfmodel', {
+    messages: [{ role: 'user', content: 'hi' }], reasoning_effort: 'xhigh',
+  }, { modelMeta: DF }));
+  assert.strictEqual(b1.parameters.reasoning_effort, 'max');
+  const b2 = JSON.parse(chat.buildBody('dfmodel', {
+    messages: [{ role: 'user', content: 'hi' }], reasoning_effort: 'none',
+  }, { modelMeta: DF }));
+  assert.strictEqual(b2.parameters.reasoning_effort, undefined);
+});
+
+console.log('');
+console.log('== max_tokens 上限自学习钳制（buildBody 侧）==');
+check('超上限自动压到 maxOutputTokens', () => {
+  const b = JSON.parse(chat.buildBody('dfmodel', {
+    messages: [{ role: 'user', content: 'hi' }], max_tokens: 999999,
+  }, { maxOutputTokens: 131072 }));
+  assert.strictEqual(b.parameters.max_tokens, 131072);
+});
+check('未学到上限时不钳制', () => {
+  const b = JSON.parse(chat.buildBody('dfmodel', {
+    messages: [{ role: 'user', content: 'hi' }], max_tokens: 999999,
+  }, {}));
+  assert.strictEqual(b.parameters.max_tokens, 999999);
+});
+check('客户端没带 max_tokens 时的默认值也受上限约束', () => {
+  const b = JSON.parse(chat.buildBody('dfmodel', { messages: [{ role: 'user', content: 'hi' }] }, { maxOutputTokens: 16000 }));
+  assert.strictEqual(b.parameters.max_tokens, 16000);
+});
+
+console.log('');
 if (failures) { console.log(`${failures} 项失败`); process.exit(1); }
 console.log('全部通过');
 process.exit(0);

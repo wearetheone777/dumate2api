@@ -17,6 +17,8 @@ const constants = require('./constants');
 const { normalizeError } = require('../errtext');
 const { isThrottle, unescapeDeep } = require('../upstream-errors');
 const ledger = require('../checkin-ledger');
+const grants = require('./grants');
+const maxOutput = require('./max-output');
 // 选号接缝（集成阶段）：冷却/熔断/粘性/在途帽统一走池状态机。
 // 通道在池里的 uid 键位 = 'qoder:<id>'（channel-pool.js 统一裁决）。
 const channelPool = require('../channel-pool');
@@ -193,6 +195,28 @@ async function postWithFallback(candidates, fn, isDelivered) {
 }
 
 /**
+ * FEFO（最早到期优先）候选集：有临期积分批次的账号 uid 集合。
+ *
+ * 积分领取后 30 天作废、上游没有逐批余额接口（领取额≠剩余额，见 grants.js
+ * 头注释）——不用掉就白白过期。池的 expiring 过滤在集合非空时**把候选限制
+ * 在集合内**，所以这里只收「真有临期批次」的账号；`DUMATE_QODER_FEFO_DAYS`
+ *（默认 3 天）窗口外的批次不参与，`0` 整体关闭。查询失败返回 null（退回
+ * 普通选号），绝不因账本问题挡住请求。
+ */
+function fefoUidSet(usable) {
+  const days = Number(process.env.DUMATE_QODER_FEFO_DAYS ?? 3);
+  if (!(days > 0)) return null;
+  try {
+    const set = new Set();
+    for (const g of grants.expiring({ withinMs: days * 86400000 })) {
+      const acc = usable.find((a) => a.id === g.account_id);
+      if (acc) set.add(channelPool.uidOf(CHANNEL, acc.id));
+    }
+    return set.size ? set : null;
+  } catch (e) { return null; }
+}
+
+/**
  * 这个错误换账号还有救吗？
  *
  * 判据与千问同一思路：4xx（除 401/402/429/403-模型不可用）是请求本身的问题，
@@ -308,7 +332,13 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   }
   const modelMeta = cachedModels.find((m) => m.key === modelKey);
   const ctxMax = process.env.DUMATE_QODER_CONTEXT === 'default' ? null : (modelMeta && modelMeta.maxInputTokens);
-  const bodyJson = chat.buildBody(modelKey, payload, { maxInputTokens: ctxMax });
+  const bodyJson = chat.buildBody(modelKey, payload, {
+    maxInputTokens: ctxMax,
+    // 思考档位归一化要读模型的 thinking_config（见 chat.resolveReasoningEffort）
+    modelMeta,
+    // max_tokens 上限自学习（max-output.js）：撞过上限的模型出站前自动 clamp
+    maxOutputTokens: maxOutput.get(region, modelKey),
+  });
   // encode 进 worker（审计 P1-5b）：几 MB 请求的编码不再独占事件循环
   const encBody = await cosy.encodeAsync(Buffer.from(bodyJson));
 
@@ -487,6 +517,10 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   } catch (e) {
     // 网络错误没有 statusCode，标记一下让上层知道可以换号
     if (!e.statusCode) e.statusCode = 0;
+    // max_tokens 上限自学习：上游的超限报错是 N 的唯一来源，在这里记下
+    // （第一次如实报 400，之后 chat.buildBody 自动 clamp，不再踩第二次）
+    const mt = /Range of max_tokens should be \[1,\s*(\d+)\]/i.exec(String(e.message || ''));
+    if (mt) maxOutput.learn(region, modelKey, mt[1]);
     throw e;
   }
 }
@@ -569,7 +603,9 @@ async function send(payload, onChunk, opts = {}) {
   const sessionKey = channelPool.sessionKeyOf(payload, opts);
   const usable = authStore.findUsable();
   if (!usable.length) throw new Error('Qoder 没有可用账号，请先添加一个');
-  let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model });
+  // FEFO 候选集只算一次（账本是静态的，轮询内不会变）
+  const expiring = fefoUidSet(usable);
+  let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring });
   if (!sel) {
     // 入口被**排队软冷却**挡住时，等掉它再试——**不能秒失败**。
     //
@@ -584,7 +620,7 @@ async function send(payload, onChunk, opts = {}) {
     const av = channelPool.availability(CHANNEL, usable, { model });
     if (av.softOnly && av.nextInMs > 0 && av.nextInMs <= QUEUE_PATIENCE_MS) {
       await sleep(av.nextInMs);
-      sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model });
+      sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring });
     }
     if (!sel) throw noAccountError(usable, model);
   }
@@ -620,7 +656,7 @@ async function send(payload, onChunk, opts = {}) {
       errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled });
       if (e.sent) throw e; // 流式已吐帧，不能再换号
       if (!retryable(code, e.message, e.quotaKind)) throw e;
-      sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model });
+      sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring });
       if (!sel) {
         // 账号都轮过一遍了。
         //

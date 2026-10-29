@@ -274,6 +274,25 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
       shim.pipe(res);
     }
 
+    // 流式等待期的 SSE 保活帧（2026-10-30，对齐官方客户端形态——qoder2api-hub
+    // 逆向：官方在上游沉默期间按固定节奏发注释帧）。上游首字实测可长达
+    // 40~70 秒（高思考档位 + 长上下文），期间 Codex / Claude Code 或中间代理
+    // 会因空闲超时断连。每 5s 写一个 `: ping`——SSE 规范里冒号行是注释（合法
+    // no-op），三套翻译器与 OpenAI 直通都按 `data: ` 前缀过滤、天然忽略。
+    // OpenAI 分支的头必须推迟到真实首帧（上游错误在流里才暴露，要保住回
+    // 4xx 的能力），所以头发出前不写 ping。
+    let pingTimer = null;
+    if (wantStream) {
+      pingTimer = setInterval(() => {
+        if (shim.writableEnded || shim.destroyed || res.writableEnded || res.destroyed) {
+          clearInterval(pingTimer);
+          return;
+        }
+        if (!translated && !res.headersSent) return;
+        try { shim.write(': ping\n\n'); } catch (e) { clearInterval(pingTimer); }
+      }, 5000);
+    }
+
     (async () => {
       try {
         await provider.send(payload, (inner) => {
@@ -281,11 +300,14 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
             // 按 OpenAI 规范补发结束标记再关流。千问上游本身不发
             // `data: [DONE]`（它用 event:finish 收尾），但客户端按规范等这个
             // 标记；只靠流关闭会让部分客户端（如 Codex）认为响应未完成。
+            if (pingTimer) clearInterval(pingTimer);
             writeSSEHead && writeSSEHead();
             shim.write('data: [DONE]\n\n');
             shim.end();
             return;
           }
+          // 首帧到达，保活帧使命结束（间隔里的最后一帧是无害的 no-op）
+          if (pingTimer) clearInterval(pingTimer);
           // 首字时刻：直连通道的 first_token_ms 全靠这里标，
           // 不标则请求日志里千问的「首字延迟」永远是空
           markFirstToken(res);
@@ -311,6 +333,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
         if (kind === 'openai') done(reqlog.usageFromSSE(seen), 200);
       } catch (e) {
         // 顺序很关键：**先 unpipe 再 end**。
+        if (pingTimer) clearInterval(pingTimer);
         // shim 已经 pipe 到 res，若直接 shim.end()，pipe 会把 res 一并结束
         // （发成 200 空响应），等想回 4xx JSON 时头已发出、改不回来了。
         try { shim.unpipe(res); } catch (e2) { /* 未 pipe */ }
@@ -1165,6 +1188,8 @@ async function handleOpenAIResponses(req, res) {
   if (route.target.needsModelMap) {
     openaiReq.model = mapModel(route.model);
     req._mappedModel = openaiReq.model;
+    // 与 Anthropic 路径同口径：reasoning_effort 只给直连通道，搭子透传前剥掉
+    delete openaiReq.reasoning_effort;
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
@@ -1261,6 +1286,9 @@ async function handleAnthropicMessages(req, res) {
   if (route.target.needsModelMap) {
     openaiReq.model = mapModel(route.model);
     req._mappedModel = openaiReq.model;
+    // 思考强度是直连通道（Qoder）才下发的字段；搭子是「最小干预透传」，
+    // 多余字段原样进云端，行为未知——剥掉（翻译层加的，这里剥干净）。
+    delete openaiReq.reasoning_effort;
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
