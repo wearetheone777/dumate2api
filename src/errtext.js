@@ -81,6 +81,27 @@ const OWN_TIMEOUT = [
 const QUOTA_ERROR = /^qwenwork\s+402\b/i;
 
 /**
+ * Qoder 计费平台的业务码（信封原文实测，2026-10-30 对齐 qoder2api-hub #108）：
+ *   112 = 额度耗尽（message 带 pricingUrl）——不是故障，签到/充值后恢复
+ *   110 = 当日调用次数达上限（"Billing daily count exceeded"）——次日重置
+ *   114 = 试用账号使用受限
+ *   430 = 客户端/网关版本过低（上游版本门）
+ * 这些码 < 400，payloadError 不认（它只认 >= 400），所以要单独列。
+ * 信封会把内层 JSON 当字符串多层转义，匹配前先把反斜杠剥掉（与
+ * upstream-errors 的 unescapeDeep 同一思路：`\\+` 全删等价于归一化）。
+ */
+const QODER_QUOTA = [
+  [/qoder quota exhausted\(|"code"\s*:\s*"112"|"pricingUrl"/i,
+    'Qoder 额度已耗尽（可签到领积分或切换其他账号；签到积分每日 10:00 刷新）'],
+  [/qoder quota daily\(|"code"\s*:\s*"110"|Billing daily count exceeded/i,
+    'Qoder 当日调用次数已达上限（每日重置后自动恢复）'],
+  [/qoder quota version\(|"code"\s*:\s*"430"/,
+    'Qoder 网关签名版本过低，上游要求升级（可设 DUMATE_QODER_COSY_VERSION 覆盖）'],
+  [/qoder quota trial\(|"code"\s*:\s*"114"/,
+    'Qoder 试用账号使用受限（该账号部分模型/功能不可用）'],
+];
+
+/**
  * 翻译一条错误。匹配不到就**原样返回**（含空串）。
  *
  * @param {unknown} msg 原始错误串或 Error
@@ -101,6 +122,13 @@ function explainError(msg) {
   if (QUOTA_ERROR.test(s)) {
     const text = '额度已用完（该账号暂停使用，次日 00:00 重置后自动恢复）';
     return s.includes(text) ? s : `${text}（${s}）`;
+  }
+  // Qoder 额度类业务码：信封转义形态要先剥反斜杠再匹配；已带中文说明的
+  // （重翻场景）跳过，防止套娃双重括号。
+  const unescaped = s.replace(/\\+/g, '');
+  for (const [re, text] of QODER_QUOTA) {
+    if (s.includes(text)) continue;
+    if (re.test(unescaped)) return `${text}（${s}）`;
   }
   for (const [re, text] of NET_ERRORS) {
     if (s.includes(text)) continue;

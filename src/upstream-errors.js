@@ -301,6 +301,12 @@ function classifyCore(err) {
   const message = full.slice(0, 200);
   const base = { kind: null, status, message };
   if (err.model) base.model = String(err.model).slice(0, 100);
+  // 调用方显式钉时长（通用透传，不认识任何业务码）：通道私有码的处置策略
+  // 留在各自通道层（如 Qoder 额度类 112/110 的固定冷却），这里只负责把
+  // 「调用方比 classify 更懂该冷却多久」的结论带给池——applySoftCooldown
+  // 对显式时长只夹取不递增 soft_streak，正好是配额类想要的语义。
+  const pinned = Number(err.retryAfterMs);
+  if (Number.isFinite(pinned) && pinned > 0) base.retryAfterMs = pinned;
 
   if (status === 429) return { ...base, kind: 'soft' };
   // 限流先于 403/5xx 判：它本质是 429 语义（「稍后再来」），不是服务坏了。
@@ -355,4 +361,5 @@ module.exports = {
   payloadError, envelopeStatus, classify, isThrottle, throttleRetryMs, THROTTLE_TEXT,
   isDeterministic,
   QUEUE_TEXT, QUEUE_THROTTLE_COOLDOWN_MS,
+  unescapeDeep,
 };

@@ -135,7 +135,7 @@ p50=1.8s / p90=4.4s / p99=11.9s / 最大 35.1s（1029 条）——12 秒刚好�
   （`QUEUE_HANG_COOLDOWN_MS`），而不是软冷却默认的 5 分钟基数。否则两个账号
   会互相把对方挡在门外，用户看到的是「全部账号排队中（300 秒后可重试）」。
 - `send()` 在**账号都轮过一遍**且失败全是瞬时类（限流/网络）时，会等掉池给的
-  短冷却（`DUMATE_QODER_QUEUE_WAIT_MS`，默认 6000）、清空 `tried` 再轮询一次
+  短冷却（`DUMATE_QODER_QUEUE_STEP_MS`，默认 1500ms 间隔）、清空 `tried` 再轮询一次
   （`MAX_ATTEMPTS` 因此从 3 提到 4）。只换号不重试的话，按实测约 40% 的挂起率，
   两个账号各挂一次就必然失败。
 
@@ -211,6 +211,43 @@ p50=1.8s / p90=4.4s / p99=11.9s / 最大 35.1s（1029 条）——12 秒刚好�
 原来写的是真实 `data/pool-state.json`，429 那条把账号冷却 5 分钟后，后面所有用例都
 选不到账号（**该文件在修之前就已经是 11 项全红**）。现在它自带 `DUMATE_POOL_STATE`
 临时文件、每个用例前 `pool.revive()` 重置。
+
+**身份形态与额度类业务码对齐官方客户端（2026-10-30 修，源自 qoder2api-hub 的逆向结论）。**
+四件事，判据全部取自 [shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)
+（459★，Qoder 协议逆向的社区权威，带风控文档与实测夹具）：
+
+1. **global 推理主力换成 api3.qoder.sh**（`constants.js`）。官方 0.4.8 客户端的
+   endpoint 缓存是 inference=api3、securityInference=api2；api1 是旧配置首位，
+   **常年直连超时**——我们原来用的正是它。连接层失败（ECONNREFUSED/ECONNRESET
+   等，不含首字节超时）按官方候选顺序 api3→api2→api1 切换，且只在还没转发过
+   任何帧时切（转发过再切会让客户端收到两段拼接内容）。`DUMATE_QODER_INTL_GATEWAY`
+   可钉死单主机（上游支持服务端「选举」导流端点，被导流时用它）。
+2. **额度类业务码 112/110/430/114 单独处置**（`qoder/index.js` 的
+   `quotaKindOfText` / `quotaFrameError` / `poolInfoOf`）。这些码 **< 400**，
+   `payloadError`（只认 ≥400）不认——裸的 `{"code":"112"}` 信封帧此前会被当
+   正常数据转发，客户端拿到 200 + 空回答。处置对齐 hub #108：112（额度耗尽，
+   message 带 pricingUrl）/114（试用受限）冷却 30 分钟；110（当日次数上限，
+   `Billing daily count exceeded`）冷却到本地 0 点；**不禁用、不进熔断、不写
+   模型级冷却**（配额是账号级的），且**换号有用**（别的号可能还有额度）；
+   430（版本门）换号无用，快速失败 + 明确文案，账号不进冷却。识别层放
+   **通道本地**而不是 upstream-errors——105→401 的同一架构先例：共用层不认识
+   通道私有码。喂池走「429 + 显式 retryAfterMs」，classify 只做通用透传。
+3. **身份头对齐官方推理请求**（`cosy.js`）：推理与模型表带 `cosy-machineos`
+   （`{arch}_{platform}`，默认 x86_64_win32）；流式对话另带
+   `cosy-machinehostname`（`DESKTOP-` + md5("hostname:"+uid) 前 7 位，按账号
+   稳定派生、跨账号互异）。User-Agent 从 Go-http-client/2.0（Go 参考实现的
+   指纹）改为官方 CLI 形态的 `undici`。**签到链路千万不要加派生机器头**——
+   hub 实测发了假机器头会被活动平台整条过滤掉「每日领取」。
+4. **cosy-version 从 1.0.10（旧桌面端）升到 1.1.75（官方 CLI 当前值）**，
+   `DUMATE_QODER_COSY_VERSION` 可覆盖。上游对过低版本回 430，提前对齐省一次
+   被版本门拦住。cn 账号真机验证：1.1.75 + 新身份头请求正常出流。
+
+离线验证：`node test/verify-qoder-throttle.js`（新增 **3c 节** 16 项：112/110/430/114
+识别与处置、10605 不被额度判据误吃、池固定冷却不递增 soft_streak、errtext 翻译；
+e2e 用例与 rr 游标位置无关——轮转两轮、A 起手轮才断言）+
+`node test/verify-qoder-channel.js`（新增候选链顺序、machineos/hostname 的 sse
+场景区分、UA 形态）。
+
 
 **`cosy.encode` 是同步的，它一慢就「假死」整个网关（2026-10-03 修，性能级）。**
 自定义 base64 编码在 `runOnce` 里**直接同步调用**，所以它的耗时会**阻塞事件循环**：
@@ -871,9 +908,15 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `DUMATE_TRAEWORK_HOLD_CAP` | `600` | 正文缓冲门的阈值（字符）。超过就转直发，避免长回答被扣住等判定 |
 | `DUMATE_QODER_FIRST_BYTE_MS` | `60000` | Qoder 上游**首字节**超时（ms），挡「连响应头都不给」的挂起。`0` 关闭 |
 | `DUMATE_QODER_CONTENT_MS` | `12000` | Qoder 上游**无内容**超时（ms）：排队时上游先回一个空 ack 帧再沉默，首字节计时器会被它清掉，只有这个计时器能识别（见上文）。只在**还没转发过任何真实内容**时计时，有内容即撤销。两个账号串行，所以它是「用户感知最坏等待」的一半。`0` 关闭 |
-| `DUMATE_QODER_QUEUE_WAIT_MS` | `6000` | 账号都轮过一遍、且失败全是限流/网络时，最多愿意等多久再重试（ms）。要大于排队冷却（5s）才走得通。`0` = 不等待直接回 429 |
+| `DUMATE_QODER_QUEUE_PATIENCE_MS` | `6000` | 排队重试的**总预算**（ms）。实测推翻了「按上游时长耐心等」的旧结论：排队是请求级随机，等 30 秒也不保证放行，所以改为快速轮询几轮（信封本身 150~1000ms 就到）仍失败就如实回 429。`0` = 拿到限流立刻回 429 |
+| `DUMATE_QODER_QUEUE_STEP_MS` | `1500` | 排队轮询间隔（ms）。过长恰恰是用户感知的「慢」（原 3000ms × 5 轮 = 15 秒纯等待） |
 | `DUMATE_QODER_READ_IDLE_MS` | `120000` | Qoder 上游**读空闲**超时（ms），每块数据重置，挡「先响应后沉默」的限流排队（见上文）。**必须大于首字节超时**，否则两计时器抢跑。`0` 关闭 |
 | `DUMATE_THROTTLE_MAX_MS` | `600000` | 排队/限流冷却的**上限**（ms，千问与 Qoder 共用）。上游按自己的队列长度给 `waitTime`（实测 7015 秒），照单全收会把账号锁近两小时；封顶后最多等这么久再探一次 |
+| `DUMATE_QODER_COSY_VERSION` | `1.1.75` | Qoder 的 cosy 版本（进 payload 与请求头）。默认对齐官方 CLI；上游行为变化时可覆盖回退，不用改代码 |
+| `DUMATE_QODER_UA` | `undici` | Qoder 推理请求的 User-Agent（官方 CLI 由 undici 补默认值） |
+| `DUMATE_QODER_MACHINE_OS` | 按 Windows/其他取 `x86_64_win32` / `x86_64_linux` | `cosy-machineos` 头的值。`auto` 按当前系统与架构识别，也可直接指定 |
+| `DUMATE_QODER_OS_HEADERS` | 未设（发送） | 设 `0` 关闭 `cosy-machineos` / `cosy-machinehostname` 两个身份头（见上文 2026-10-30 段） |
+| `DUMATE_QODER_INTL_GATEWAY` | 未设（候选链） | 钉死国际版推理主机（替代 api3→api2→api1 候选链）。上游服务端「选举」导流端点时用它 |
 | `DUMATE_DUMATE_SOURCE` | 未设（`web`） | 搭子凭证来源。未设 = **只用网页凭证**（桌面链路不参与，跳过启动那次约 3 秒的探测；池子不可用时路由层直接拒绝并说明原因，不静默退回桌面链路）。设 `auto`（别名 `desktop`）= 桌面优先、不可用时回落网页池。**无法识别的值按 `web` 处理并在启动日志告警** |
 | `DUMATE_WEB_FALLBACK` | 未设（开启） | 设 `0` 关闭「桌面凭证不可用时回落到网页池」（见上文回落机制）。关闭后桌面凭证失效即请求全失败 |
 | `DUMATE_POINTS_METER` | 未设（开启） | 设 `0` 关闭搭子的余额游标采集（`points-cursor.js`）。关闭后请求日志不再有逐条消耗 |

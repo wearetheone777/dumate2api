@@ -173,6 +173,9 @@ check('两个区域都有端点', () => {
   assert.ok(constants.endpointsOf('cn').ChatStreamURL.includes('qoder.com.cn'));
   assert.ok(constants.endpointsOf('global').ChatStreamURL.includes('qoder.sh'));
 });
+check('global 推理主力是 api3（官方 0.4.8 候选首位；api1 是旧配置，常年超时）', () => {
+  assert.ok(constants.endpointsOf('global').ChatStreamURL.startsWith('https://api3.qoder.sh/'));
+});
 check('区域归一化', () => {
   assert.strictEqual(constants.normalizeRegion('cn'), 'cn');
   assert.strictEqual(constants.normalizeRegion('CN'), 'cn');
@@ -181,6 +184,54 @@ check('区域归一化', () => {
 });
 check('便宜模型表都是 0.1 档', () => {
   assert.deepStrictEqual(constants.CHEAP_MODELS, ['qfmodel', 'qmodel', 'q37fmodel', 'dfmodel', 'gfmodel']);
+});
+
+console.log('');
+console.log('== 推理主机候选链（2026-10-30 对齐官方客户端候选顺序）==');
+check('cn 单主机（国内版没有候选链）', () => {
+  assert.strictEqual(constants.chatStreamCandidates('cn').length, 1);
+  assert.ok(constants.chatStreamCandidates('cn')[0].includes('gateway.qoder.com.cn'));
+});
+check('global 按 api3→api2→api1 排列', () => {
+  const hosts = constants.chatStreamCandidates('global').map((u) => new URL(u).host);
+  assert.deepStrictEqual(hosts, ['api3.qoder.sh', 'api2.qoder.sh', 'api1.qoder.sh']);
+});
+check('候选链的 path 与签名 path 一致', () => {
+  for (const u of constants.chatStreamCandidates('global')) {
+    assert.ok(new URL(u).pathname.startsWith('/algo/api/v2/service/pro/sse/agent_chat_generation'));
+  }
+});
+
+console.log('');
+console.log('== 身份头（对齐官方客户端，qoder2api-hub #64 逆向）==');
+const cosy = require('../src/qoder/cosy');
+const SESS = cosy.newSession({
+  name: 'tester', aid: 'uid-h1', uid: 'uid-h1', yxUid: '',
+  organizationId: '', organizationName: '', userType: 'personal_standard',
+  securityOauthToken: 'at', refreshToken: 'rt',
+}, 'mid-h', 'mtok-h', '5');
+check('流式请求带 cosy-machineos（官方 {arch}_{platform} 形态）', () => {
+  const h = cosy.buildHeaders(SESS, '/api/v2/service/pro/sse/agent_chat_generation', '', 'text/event-stream', {}, { sse: true });
+  assert.ok(/^x86_64_(win32|linux|darwin)|^aarch64_/.test(h['cosy-machineos']), h['cosy-machineos']);
+});
+check('流式请求带 cosy-machinehostname，非流式（模型表）不带', () => {
+  const sse = cosy.buildHeaders(SESS, '/p', '', 'text/event-stream', {}, { sse: true });
+  const api = cosy.buildHeaders(SESS, '/p', '', 'application/json', {});
+  assert.ok(/^DESKTOP-[0-9A-F]{7}$/.test(sse['cosy-machinehostname']), sse['cosy-machinehostname']);
+  assert.strictEqual(api['cosy-machinehostname'], undefined);
+  // 模型表请求也带 machineos（官方对所有请求注入）
+  assert.ok(api['cosy-machineos']);
+});
+check('hostname 按账号稳定派生：同账号恒同、跨账号不同', () => {
+  const a1 = cosy.machineHostname('uid-a');
+  const a2 = cosy.machineHostname('uid-a');
+  const b1 = cosy.machineHostname('uid-b');
+  assert.strictEqual(a1, a2);
+  assert.notStrictEqual(a1, b1);
+});
+check('User-Agent 是 undici（官方 CLI 形态），不再是 Go 指纹', () => {
+  const h = cosy.buildHeaders(SESS, '/p', '', 'text/event-stream', {}, { sse: true });
+  assert.strictEqual(h['user-agent'], 'undici');
 });
 
 console.log('');

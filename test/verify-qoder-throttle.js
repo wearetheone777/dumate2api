@@ -245,6 +245,101 @@ check('账号健康、仅模型排队 → availability 报 softOnly（下游 429
 });
 
 console.log('');
+console.log('== 3c. 额度类业务码 112/110/430/114（2026-10-30 对齐 qoder2api-hub #108）==');
+// 信封原文取自 hub #108 的现场日志：HTTP 403 + {"code":"112","message":"{\"pricingUrl\":...}"}
+// 这些码 < 400，payloadError 不认，由 qoder/index.js 通道层识别。
+const qoderIndex = require('../src/qoder/index');
+const errtext = require('../src/errtext');
+const D112 = 'qoder 403: {"code":"112","message":"{\\"pricingUrl\\":\\"https://qoder.com.cn/pricing?client=qoder\\"}"}';
+const D110 = 'qoder 403: {"code":"110","message":"Billing daily count exceeded"}';
+const D430 = 'qoder 403: {"code":"430","message":"please upgrade client"}';
+check('112 认得出（信封转义形态，code 藏在 message 深处）', () => {
+  assert.strictEqual(qoderIndex.quotaKindOfText(D112), 'exhausted');
+});
+check('110 认得出（code 与文案两种锚都认）', () => {
+  assert.strictEqual(qoderIndex.quotaKindOfText(D110), 'daily');
+  assert.strictEqual(qoderIndex.quotaKindOfText('x {"code":"110"} y'), 'daily');
+});
+check('114 / 430 认得出', () => {
+  assert.strictEqual(qoderIndex.quotaKindOfText('{"code":"114","message":"trial limited"}'), 'trial');
+  assert.strictEqual(qoderIndex.quotaKindOfText(D430), 'version');
+});
+check('10605 排队不误判成额度', () => {
+  assert.strictEqual(qoderIndex.quotaKindOfText(THROTTLE_RESOURCE), '');
+  assert.strictEqual(qoderIndex.quotaKindOfText(THROTTLE_3LAYER), '');
+});
+check('普通 403 / 模型不可用不误判成额度', () => {
+  assert.strictEqual(qoderIndex.quotaKindOfText(MODEL_GONE), '');
+  assert.strictEqual(qoderIndex.quotaKindOfText('qoder 403: forbidden'), '');
+});
+check('额度帧逐帧识别：顶层 code 才算数（模型正文里讨论 112 不误伤）', () => {
+  const fe = qoderIndex.quotaFrameError({ code: '112', message: '{"pricingUrl":"x"}' });
+  assert.strictEqual(fe.code, 403);
+  assert.strictEqual(fe.quotaKind, 'exhausted');
+  assert.strictEqual(qoderIndex.quotaFrameError({ choices: [{ delta: { content: '{"code":"112"}' } }] }), null);
+  assert.strictEqual(qoderIndex.quotaFrameError({ code: '10605' }), null);
+});
+check('quotaFromBody 从 SSE 行 / 裸 JSON 里找额度帧', () => {
+  assert.ok(qoderIndex.quotaFromBody('data: {"code":"112","message":"x"}\n\n'));
+  assert.ok(qoderIndex.quotaFromBody('{"code":"110","message":"Billing daily count exceeded"}'));
+  assert.strictEqual(qoderIndex.quotaFromBody('data: {"choices":[{"delta":{"content":"{\\"code\\":\\"112\\"}"}}]}'), null);
+});
+check('112/110/114 可换号（别的账号可能还有额度）', () => {
+  assert.strictEqual(qoderIndex.retryable(403, D112), true);
+  assert.strictEqual(qoderIndex.retryable(403, D110), true);
+  assert.strictEqual(qoderIndex.retryable(403, '{"code":"114"}'), true);
+});
+check('430 版本门不换号（每个号都会 430，快速失败）', () => {
+  assert.strictEqual(qoderIndex.retryable(403, D430), false);
+});
+check('112 喂池 = 429 + 30 分钟固定冷却', () => {
+  const info = qoderIndex.poolInfoOf({ statusCode: 403, message: D112 }, 'gfmodel');
+  assert.strictEqual(info.status, 429);
+  assert.ok(Math.abs(info.retryAfterMs - 30 * 60 * 1000) < 1000, '实际 ' + info.retryAfterMs);
+});
+check('110 喂池 = 429 + 到下一个本地 0 点', () => {
+  const info = qoderIndex.poolInfoOf({ statusCode: 403, message: D110 }, 'gfmodel');
+  assert.strictEqual(info.status, 429);
+  assert.ok(info.retryAfterMs > 0 && info.retryAfterMs <= 24 * 3600 * 1000, '实际 ' + info.retryAfterMs);
+});
+check('430 喂池 = 400（请求/网关版本问题，不惩罚账号）', () => {
+  const info = qoderIndex.poolInfoOf({ statusCode: 403, message: D430 }, 'gfmodel');
+  assert.strictEqual(info.status, 400);
+});
+check('额度类经 classify 是 soft（不进熔断/不禁用），且 10605 判据不受影响', () => {
+  assert.strictEqual(classify(qoderIndex.poolInfoOf({ statusCode: 403, message: D112 }, 'gfmodel')).kind, 'soft');
+  assert.strictEqual(classify({ status: 403, message: D112 }).kind, 'breaker', '裸 403 + 112 不带钉时长时仍按旧路（调用方必须走 poolInfoOf）');
+});
+check('classify 透传调用方钉的 retryAfterMs（通用能力，不认识业务码）', () => {
+  const c = classify({ status: 429, message: 'quota', retryAfterMs: 1800000 });
+  assert.strictEqual(c.kind, 'soft');
+  assert.strictEqual(c.retryAfterMs, 1800000);
+});
+check('池：112 的 30 分钟冷却生效、soft_streak 不递增、不写模型级冷却', () => {
+  let now = 5_000_000;
+  const pool = createPool({ file: null, now: () => now });
+  pool.noteError('qoder:q1', classify(qoderIndex.poolInfoOf({ statusCode: 403, message: D112 }, 'gfmodel')));
+  const st = pool.status('qoder:q1');
+  assert.strictEqual(st.cool_kind, 'soft');
+  assert.ok(Math.abs(st.cool_remaining_s - 1800) <= 2, '实际 ' + st.cool_remaining_s + 's');
+  assert.strictEqual(st.soft_streak, 0, '显式时长不算「又超速一次」');
+  assert.strictEqual(st.model_cooldowns.length, 0, '配额是账号级的，不写模型冷却');
+  // 冷却中再失败不延长（防越堆越厚）
+  now += 60_000;
+  pool.noteError('qoder:q1', classify(qoderIndex.poolInfoOf({ statusCode: 403, message: D112 }, 'gfmodel')));
+  const st2 = pool.status('qoder:q1');
+  assert.ok(Math.abs(st2.cool_remaining_s - 1740) <= 2, '冷却中不得重置，实际 ' + st2.cool_remaining_s + 's');
+});
+check('errtext：112/110/430 翻译成人话（含多层转义形态），普通 403 不误翻', () => {
+  assert.ok(errtext.explainError(D112).includes('额度已耗尽'));
+  assert.ok(errtext.explainError(D110).includes('当日调用次数'));
+  assert.ok(errtext.explainError(D430).includes('版本过低'));
+  // 逐层转义：内层 code 被当字符串再包一层信封（\\\\"code\\\\":\\\\"112\\\\"）
+  assert.ok(errtext.explainError('qoder 403: {"code":"403","message":"{\\\\\\"code\\\\\\":\\\\\\"112\\\\\\",\\\\\\"message\\\\\\":\\\\\\"{\\\\\\\\\\\\\\"pricingUrl\\\\\\\\\\\\\\":1}\\\\\\"}"}').includes('额度已耗尽'));
+  assert.ok(!errtext.explainError(MODEL_GONE).includes('额度'), MODEL_GONE);
+});
+
+console.log('');
 console.log('== 4. 通道层：换号 + 下游拿到 429 ==');
 
 // 池单例已在 DUMATE_POOL_STATE 的临时文件上，不会碰真实 data/
@@ -285,6 +380,26 @@ chat.postStream = async (url, body, headers, onChunk) => {
   if (plan === 'readidle') {
     const err = new Error(READ_IDLE);
     err.statusCode = 0;
+    throw err;
+  }
+  if (plan === 'neterr') {
+    const err = new Error('getaddrinfo ENOTFOUND gateway.qoder.com.cn');
+    err.statusCode = 0;
+    throw err;
+  }
+  if (plan === 'quota112') {
+    const err = new Error(D112);
+    err.statusCode = 403;
+    throw err;
+  }
+  if (plan === 'quota112frame') {
+    // 200 + 流内 112 错误帧（payloadError 不认 <400 的码，走 quotaFrameError）
+    onChunk(JSON.stringify({ code: '112', message: '{"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"}' }));
+    return { status: 200, headers: {}, raw: '' };
+  }
+  if (plan === 'quota430') {
+    const err = new Error(D430);
+    err.statusCode = 403;
     throw err;
   }
   onChunk(JSON.stringify({ id: 'c1', choices: [{ index: 0, delta: { content: 'pong' }, finish_reason: null }] }));
@@ -332,8 +447,104 @@ function resetCase(plan) {
     require('../src/pool').pool.revive('qoder:902');
   });
 
+  await checkAsync('限流轮询中夹进网络错误 → 仍回 429（不退化成 502）', async () => {
+    // 实测 2026-10-28：5 次 403 排队 + 1 次 DNS 失败（ENOTFOUND），旧判据
+    // 只认限流，聚合状态码退化成 502——客户端当硬失败不再重试。
+    // 网络错误与排队同为瞬时类（retryable 对 code=0 也放行换号），聚合
+    // 口径应与轮询继续的 transientOnly 一致。
+    channelPool._stickyClear();
+    scripts = { ta: 'throttle', tb: 'neterr' };
+    let err = null;
+    try { await require('../src/qoder').send(payload, () => {}, { sessionKey: 'case-b2' }); }
+    catch (e) { err = e; }
+    assert.ok(err, '应该抛错');
+    assert.strictEqual(err.statusCode, 429, '实际 ' + err.statusCode + ' / ' + err.message);
+    assert.ok(err.throttled === true);
+    require('../src/pool').pool.revive('qoder:901');
+    require('../src/pool').pool.revive('qoder:902');
+  });
+
+  // rr 游标是池内单调的，用例不假设起手账号：轮转最多两轮（各自起手一次），
+  // A 起手的那轮做断言。B 起手的轮也顺带验证了「健康号直接成功」。
+  async function untilAFirst(name, runCase) {
+    let sawSwitch = false;
+    for (let i = 0; i < 2 && !sawSwitch; i++) {
+      channelPool._stickyClear();
+      require('../src/pool').pool.revive('qoder:901');
+      require('../src/pool').pool.revive('qoder:902');
+      const before = { ta: callsByToken.ta || 0, tb: callsByToken.tb || 0 };
+      await runCase(i, before, () => {
+        sawSwitch = true;
+      });
+    }
+    assert.ok(sawSwitch, `${name}：两轮轮转应有一次以 A 起手`);
+    require('../src/pool').pool.revive('qoder:901');
+    require('../src/pool').pool.revive('qoder:902');
+  }
+
+  await checkAsync('额度耗尽(112) → 换号成功，命中账号进 30 分钟账号级软冷却', async () => {
+    await untilAFirst('112 换号', async (i, before, hitA) => {
+      scripts = { ta: 'quota112', tb: 'ok' };
+      const chunks = [];
+      const r = await require('../src/qoder').send(payload, (c) => chunks.push(c), { sessionKey: `case-q1-${i}` });
+      assert.strictEqual(r.status, 200);
+      assert.ok(chunks.some((c) => c.includes('pong')), '应从健康账号拿到正文');
+      if ((callsByToken.ta || 0) - before.ta === 0) return; // B 起手：健康号直接成功，下一轮再验
+      hitA();
+      const stA = require('../src/pool').pool.status('qoder:901');
+      assert.strictEqual(stA.cool_kind, 'soft', '额度耗尽是账号级软冷却，实际 ' + stA.cool_kind);
+      assert.ok(stA.cool_remaining_s > 1700, '应接近 30 分钟，实际 ' + stA.cool_remaining_s + 's');
+      assert.strictEqual(stA.model_cooldowns.length, 0, '配额不写模型级冷却');
+      assert.strictEqual(stA.state, 'cooling', '不是 disabled');
+    });
+  });
+
+  await checkAsync('流内 112 错误帧（200 信封）→ 识别并换号，不再空回答', async () => {
+    await untilAFirst('112 帧', async (i, before, hitA) => {
+      scripts = { ta: 'quota112frame', tb: 'ok' };
+      const chunks = [];
+      const r = await require('../src/qoder').send(payload, (c) => chunks.push(c), { sessionKey: `case-q2-${i}` });
+      assert.strictEqual(r.status, 200);
+      assert.ok(chunks.some((c) => c.includes('pong')), '应从健康账号拿到正文');
+      if ((callsByToken.ta || 0) - before.ta === 0) return;
+      hitA();
+      const stA = require('../src/pool').pool.status('qoder:901');
+      assert.strictEqual(stA.cool_kind, 'soft');
+    });
+  });
+
+  await checkAsync('两账号都额度耗尽 → 下游拿 403（不伪装成 429），文案点明额度', async () => {
+    channelPool._stickyClear();
+    scripts = { ta: 'quota112', tb: 'quota112' };
+    let err = null;
+    try { await require('../src/qoder').send(payload, () => {}, { sessionKey: 'case-q3' }); }
+    catch (e) { err = e; }
+    assert.ok(err, '应该抛错');
+    assert.strictEqual(err.statusCode, 403, '额度耗尽不是瞬时故障，不该伪装成 429，实际 ' + err.statusCode);
+    assert.ok(errtext.explainError(err.message).includes('额度已耗尽'), err.message);
+    require('../src/pool').pool.revive('qoder:901');
+    require('../src/pool').pool.revive('qoder:902');
+  });
+
+  await checkAsync('版本门 430 → 快速失败不换号，账号不进冷却', async () => {
+    await untilAFirst('430 版本门', async (i, before, hitA) => {
+      scripts = { ta: 'quota430', tb: 'ok' };
+      let err = null;
+      try { await require('../src/qoder').send(payload, () => {}, { sessionKey: `case-q4-${i}` }); }
+      catch (e) { err = e; }
+      if (!err) return; // B 起手：健康号直接成功，下一轮再验
+      assert.ok(err.message.includes('430'), err.message);
+      hitA();
+      const stA = require('../src/pool').pool.status('qoder:901');
+      assert.strictEqual(stA.cool_kind, '', '430 是网关版本问题，不该罚账号');
+    });
+  });
+
   await checkAsync('两账号都在限流冷却里 → 立刻回 429 而不是 503', async () => {
     channelPool._stickyClear();
+    // 剧本显式声明：本用例等待冷却后真发请求（入口会把 5s 冷却等掉），
+    // 不能依赖前序用例残留的 scripts。
+    resetCase({ ta: 'throttle', tb: 'throttle' });
     const { pool } = require('../src/pool');
     const cls = classify({ status: 403, message: THROTTLE_RESOURCE });
     pool.noteError('qoder:901', cls);
@@ -350,14 +561,22 @@ function resetCase(plan) {
 
   await checkAsync('读空闲（排队挂起）也换号并成功', async () => {
     channelPool._stickyClear();
-    scripts = { ta: 'readidle', tb: 'ok' };
+    // **两个账号首调都必须失败**：pool.pick 是轮询游标，先选中谁由前面
+    // 用例消耗的次数决定（2026-10-30 教训：只给 ta 设失败剧本，游标停在
+    // 902 时 901 根本不会被调用，用例就变成了「直接成功」的空转）。
+    // 两账号 [readidle, ok] 保证「失败→换号→重试成功」路径必然发生，
+    // 且失败者（两个都会失败一次）进 soft 而非熔断。
+    resetCase({ ta: ['readidle', 'ok'], tb: ['readidle', 'ok'] });
     const r = await require('../src/qoder').send(payload, () => {}, { sessionKey: 'case-d' });
     assert.strictEqual(r.status, 200);
     const { pool } = require('../src/pool');
     const stA = pool.status('qoder:901');
+    const stB = pool.status('qoder:902');
     assert.strictEqual(stA.cool_kind, 'soft', 'read idle 应进软冷却');
+    assert.strictEqual(stB.cool_kind, 'soft', '两个账号都经历过一次 readidle 失败');
     assert.strictEqual(stA.breaker_fails, 0, 'read idle 不该累计熔断');
     pool.revive('qoder:901');
+    pool.revive('qoder:902');
   });
 
   await checkAsync('排队挂起后快速重试同一账号 → 成功（不在网关里干等冷却）', async () => {

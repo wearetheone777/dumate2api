@@ -15,7 +15,7 @@ const authStore = require('./auth');
 const session = require('./session');
 const constants = require('./constants');
 const { normalizeError } = require('../errtext');
-const { isThrottle } = require('../upstream-errors');
+const { isThrottle, unescapeDeep } = require('../upstream-errors');
 const ledger = require('../checkin-ledger');
 // 选号接缝（集成阶段）：冷却/熔断/粘性/在途帽统一走池状态机。
 // 通道在池里的 uid 键位 = 'qoder:<id>'（channel-pool.js 统一裁决）。
@@ -79,6 +79,119 @@ function poolStatusOf(code) {
   return n === 105 ? 401 : n;
 }
 
+// ---------------------------------------------------------------------------
+// Qoder 计费平台的业务码（< 400，payloadError 不认，必须通道层自己识别）。
+//
+// 信封原文（2026-10-30 对齐 qoder2api-hub #108 的现场日志）：
+//   112 额度耗尽    HTTP 403 + {"code":"112","message":"{\"pricingUrl\":...}"}
+//   110 每日次数上限 {"code":"110","message":"Billing daily count exceeded"}
+//   114 试用账号受限 / 430 客户端版本过低
+//
+// 处置（对齐 hub #108，四条不变量）：
+//   · 112/110/114 → soft 冷却 + **换号**（别的账号可能还有额度）：112/114 冷却
+//     30 分钟；110 冷却到本地 0 点（池会夹到软冷却封顶 2h，到期前每 2h 探一次）。
+//   · **不禁用账号、不进熔断**——配额问题不是凭证失效/未知故障。
+//   · 不写模型级冷却——配额是账号级的。
+//   · 430 → 换号无用（每个号都会 430），快速失败 + 明确文案，不惩罚账号。
+// ---------------------------------------------------------------------------
+
+/** 112/114 的固定冷却（30 分钟后探一次：期间可能签到到账/充值到账） */
+const QUOTA_COOLDOWN_MS = 30 * 60 * 1000;
+
+/** 冷却到下一个本地 0 点（每日次数上限的恢复窗口） */
+function msUntilMidnight(now) {
+  const d = now ? new Date(now) : new Date();
+  const target = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0);
+  return Math.max(60 * 1000, target.getTime() - d.getTime());
+}
+
+/** 从错误文本认额度类业务码。信封可能多层转义，先剥反斜杠归一化。 */
+function quotaKindOfText(text) {
+  const s = unescapeDeep(text);
+  if (/"code"\s*:\s*"112"|"pricingUrl"/i.test(s)) return 'exhausted';
+  if (/"code"\s*:\s*"110"|Billing daily count exceeded/i.test(s)) return 'daily';
+  if (/"code"\s*:\s*"114"/.test(s)) return 'trial';
+  if (/"code"\s*:\s*"430"/.test(s)) return 'version';
+  return '';
+}
+
+/**
+ * 逐帧识别额度类错误帧。**只看顶层 code 字段**，不匹配帧的字符串全文——
+ * 模型输出里讨论到 `{"code":"112"}` 时不能误伤正文。
+ * 返回 {code, message, quotaKind} 形状（与 payloadError 同形，code 用 403 语义）。
+ */
+function quotaFrameError(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const c = String(parsed.code != null ? parsed.code : '').trim();
+  if (!/^(112|110|114|430)$/.test(c)) return null;
+  const kind = c === '112' ? 'exhausted' : c === '110' ? 'daily' : c === '114' ? 'trial' : 'version';
+  const msg = String(parsed.message || '').trim();
+  return { code: 403, message: `qoder quota ${kind}(${c})${msg ? ': ' + msg.slice(0, 160) : ''}`, quotaKind: kind };
+}
+
+/** 从响应原文（SSE 行或裸 JSON）里找额度类错误帧。逐行解析、只看顶层 code。 */
+function quotaFromBody(raw) {
+  const text = String(raw || '');
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    const json = t.startsWith('data:') ? t.slice(5).trim() : t;
+    if (!json || json === '[DONE]') continue;
+    let o;
+    try { o = JSON.parse(json); } catch (e) { continue; }
+    const fe = quotaFrameError(o);
+    if (fe) return fe;
+  }
+  return null;
+}
+
+/**
+ * 喂池的错误形状。105→401 的旧映射保留；额度类改喂「429 + 显式时长」——
+ * classify 对显式 retryAfterMs 只透传（见 upstream-errors），applySoftCooldown
+ * 拿它做固定冷却且不递增 soft_streak。430 喂 400（不惩罚）。
+ */
+function poolInfoOf(e, model) {
+  const code = Number(e.statusCode) || 0;
+  const qk = e.quotaKind || quotaKindOfText(e.message);
+  if (qk === 'version') return { status: 400, message: e.message, model };
+  if (qk) {
+    return {
+      status: 429,
+      message: e.message,
+      model,
+      retryAfterMs: qk === 'daily' ? msUntilMidnight() : QUOTA_COOLDOWN_MS,
+    };
+  }
+  return { status: poolStatusOf(code), message: e.message, model };
+}
+
+// ---------------------------------------------------------------------------
+// 国际版推理主机候选链（constants.chatStreamCandidates：api3→api2→api1）。
+// 只有**连接建立阶段**的失败才切候选——「已连上但没数据」（首字节/读空闲
+// 超时）说明主机可达，换主机无意义，交回上层按限流/换号处置。
+// ---------------------------------------------------------------------------
+const CONN_PHASE = /^(ECONNREFUSED|ECONNRESET|ECONNABORTED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EPROTO)$/;
+function isConnPhaseError(e) {
+  return !!(e && typeof e.code === 'string' && CONN_PHASE.test(e.code));
+}
+function hostOf(url) {
+  try { return new URL(url).host; } catch (e) { return String(url); }
+}
+
+/** 依次尝试候选主机；连接层失败且（流式）还没转发过任何帧时切下一个 */
+async function postWithFallback(candidates, fn, isDelivered) {
+  let lastErr = null;
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      return await fn(candidates[i]);
+    } catch (e) {
+      lastErr = e;
+      if (i >= candidates.length - 1 || (isDelivered && isDelivered()) || !isConnPhaseError(e)) throw e;
+      console.warn(`[qoder] 推理端点 ${hostOf(candidates[i])} 连接失败（${e.code}），切换备用端点 ${hostOf(candidates[i + 1])}`);
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * 这个错误换账号还有救吗？
  *
@@ -94,9 +207,13 @@ function poolStatusOf(code) {
  * 旧判据只看 403 + 一组模型/权限文案，限流落到「不可换号」分支，
  * 于是第二个账号白放着、用户拿一个 403。
  */
-function retryable(code, message) {
+function retryable(code, message, quotaKind) {
   const n = Number(code);
   if (!Number.isFinite(n) || n === 0) return true; // 网络错误/超时：换号试一次
+  // 额度类业务码先于 403 文案判：112/110/114 换号有用（别的号可能还有额度）；
+  // 430 是版本门，换号无用——快速失败，客户端拿到明确文案。
+  const qk = quotaKind || quotaKindOfText(message);
+  if (qk) return qk !== 'version';
   if (n === 401 || n === 402 || n === 429) return true;
   if (n === 105) return true; // Login expired：凭证失效，换号有用
   if (isThrottle(message)) return true; // 上游排队/限流：换号可能落到没排队的那个
@@ -214,7 +331,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     // 模型 key 必须同时放请求头——实测只放 body 时上游仍走 auto
     'x-model-key': modelKey,
     'x-model-source': 'system',
-  });
+  }, { sse: true });
   // 出站代理（E 包接线）：账号 proxy 字段 > 全局 DUMATE_PROXY，无代理 null 直连
   const agent = proxyAgent.getAgentFor(account);
 
@@ -236,18 +353,20 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       // 数据帧——旧实现把它也算成「已吐帧」，于是 HTTP 429 / 200+纯错误体
       // 这类「一帧数据都没有」的情况被误判成已开始输出：错误被吞、换号被挡。
       let sent = false;
+      // 已转发过帧就不能再换候选主机（会输出两段拼接的内容）
+      let delivered = false;
       let doneSeen = false;
       // 识别到错误帧就立刻中止上游：Qoder 零额度时是**挂起**而不是报错，
       // 不主动断就要等 socket 空闲超时（600s），客户端早已超时。
       const ac = new AbortController();
-      const res = await chat.postStream(ep.ChatStreamURL, encBody, headers, (inner) => {
+      const onInner = (inner) => {
         if (firstErr) return;
         // 哨兵延后到状态检查之后再转发，避免「先发 200 + [DONE] 再抛错」
         if (inner === '[DONE]') { doneSeen = true; return; }
         let parsed = null;
         try { parsed = JSON.parse(inner); } catch (e) { /* 非 JSON 帧照原样转发 */ }
         if (parsed) {
-          const err = chat.payloadError(parsed);
+          const err = chat.payloadError(parsed) || quotaFrameError(parsed);
           if (err) {
             firstErr = err;
             try { ac.abort(); } catch (e) { /* 已结束 */ }
@@ -256,11 +375,18 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           noteCredits(parsed);
         }
         sent = true;
+        delivered = true;
         onChunk(inner);
-      }, { signal: ac.signal, agent });
+      };
+      const res = await postWithFallback(
+        constants.chatStreamCandidates(region),
+        (url) => chat.postStream(url, encBody, headers, onInner, { signal: ac.signal, agent }),
+        () => delivered,
+      );
       if (firstErr) {
         const err = new Error(`qoder ${firstErr.code}: ${firstErr.message}`);
         err.statusCode = firstErr.code;
+        if (firstErr.quotaKind) err.quotaKind = firstErr.quotaKind;
         err.sent = sent;
         throw err;
       }
@@ -274,6 +400,8 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           || 'upstream error';
         const err = new Error(`qoder ${res.status}: ${detail}`);
         err.statusCode = res.status;
+        const qk = quotaKindOfText(String(res.raw || ''));
+        if (qk) err.quotaKind = qk;
         err.sent = sent;
         throw err;
       }
@@ -281,6 +409,16 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       // 这种形状）。**判据是「一帧真实数据都没转发」**，不是「没收到
       // [DONE]」——后者恒为假（postStream 总会补一个）。
       if (!sent) {
+        // 额度类业务码（112/110/114/430）< 400，envelopeStatus/payloadError
+        // 都不认——它们才是「200 + 空回答」的另一半来源，单独兜一层。
+        const qf = quotaFromBody(res.raw);
+        if (qf) {
+          const err = new Error(`qoder ${qf.code}: ${qf.message}`);
+          err.statusCode = qf.code;
+          err.quotaKind = qf.quotaKind;
+          err.sent = false;
+          throw err;
+        }
         const es = chat.envelopeStatus(res.raw);
         if (es && es.code >= 400) {
           const err = new Error(`qoder ${es.code}: ${es.message}`);
@@ -294,7 +432,10 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       meter.settle(peakCredits);
       return res;
     }
-    const res = await chat.post(ep.ChatStreamURL, encBody, headers, { agent });
+    const res = await postWithFallback(
+      constants.chatStreamCandidates(region),
+      (url) => chat.post(url, encBody, headers, { agent }),
+    );
     // `post` 现在会在数据块里识别错误信封并当场断流（与 postStream 同一纪律）。
     // 命中的 `firstErr` 是**最准确**的那份（带上游 code 与内层 message），
     // 优先用它——排在 envelopeStatus 之前，否则会先被 raw 的空壳信封盖掉，
@@ -302,12 +443,24 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     if (res.firstErr) {
       const err = new Error(`qoder ${res.firstErr.code}: ${res.firstErr.message}`);
       err.statusCode = res.firstErr.code;
+      if (res.firstErr.quotaKind) err.quotaKind = res.firstErr.quotaKind;
       throw err;
     }
     const es = chat.envelopeStatus(res.raw);
     if (es && es.code >= 400) {
       const err = new Error(`qoder ${es.code}: ${es.message}`);
       err.statusCode = es.code;
+      const qk = quotaKindOfText(String(res.raw || ''));
+      if (qk) err.quotaKind = qk;
+      throw err;
+    }
+    // 额度类业务码 < 400，envelopeStatus 认不出——聚合前单独兜一层，
+    // 否则「零额度挂起结束后回 200 + 112 错误体」会聚合成空回答。
+    const qf = quotaFromBody(res.raw);
+    if (qf) {
+      const err = new Error(`qoder ${qf.code}: ${qf.message}`);
+      err.statusCode = qf.code;
+      err.quotaKind = qf.quotaKind;
       throw err;
     }
     // 与流式路径同理：非 SSE 的 HTTP 错误体也要认，否则会聚合成一个空回答
@@ -459,12 +612,14 @@ async function send(payload, onChunk, opts = {}) {
     } catch (e) {
       const code = Number(e.statusCode) || 0;
       const throttled = isThrottle(e.message);
-      // 失败喂池：105（Login expired）按 401 进防误杀计数，其余按 classify
-      channelPool.noteError(CHANNEL, account.id, { status: poolStatusOf(code), message: e.message, model });
+      // 失败喂池：105（Login expired）按 401 进防误杀计数；额度类业务码
+      // （112/110/114/430）按 poolInfoOf 的专门处置（固定冷却/不惩罚），
+      // 其余按 classify。
+      channelPool.noteError(CHANNEL, account.id, poolInfoOf(e, model));
       markFailure(account, e.message);
       errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled });
       if (e.sent) throw e; // 流式已吐帧，不能再换号
-      if (!retryable(code, e.message)) throw e;
+      if (!retryable(code, e.message, e.quotaKind)) throw e;
       sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model });
       if (!sel) {
         // 账号都轮过一遍了。
@@ -510,9 +665,12 @@ async function send(payload, onChunk, opts = {}) {
     return `${x.account}(${x.status}${m ? ': ' + m.slice(0, 120) : ''})`;
   };
   const err = new Error(`Qoder 所有账号均失败：${errors.map(brief).join('；')}`);
-  // 全部失败原因都是**限流**时回 429：客户端（Codex / Claude Code）对 429 会
-  // 自动退避重试，对 403/502 只会当硬失败。上游的条件本来就是「稍后再来」。
-  if (errors.length && errors.every((x) => x.throttled)) {
+  // 全部失败都是**瞬时类**（限流或网络错误）时回 429：客户端（Codex /
+  // Claude Code）对 429 会自动退避重试，对 502 只当硬失败。判据与上面
+  // transientOnly 同口径——实测 2026-10-28：5 次 403 排队后夹进 1 次 DNS
+  // 解析失败，只认限流的旧判据把本该 429 的响应降级成 502，客户端不再重试；
+  // 而网络抖动与排队同为「换一次也许就好」的瞬时类。
+  if (errors.length && errors.every((x) => x.throttled || x.status === '网络错误')) {
     err.statusCode = 429;
     err.throttled = true;
   } else {
@@ -663,4 +821,6 @@ module.exports = {
   warmupModels, status, send, listModels, listModelEntries, pickAccount, checkin, quota,
   chatCompletion: (p, opts) => send(p, undefined, opts),
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
+  // 额度类业务码的识别与处置（离线验证用：test/verify-qoder-throttle.js）
+  quotaKindOfText, quotaFrameError, quotaFromBody, retryable, poolInfoOf,
 };

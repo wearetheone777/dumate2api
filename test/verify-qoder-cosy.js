@@ -13,6 +13,7 @@
 // 测试向量来自 wangtufly/QCCG 的 internal/cosy 包（GPL-3.0，仅作参考基准，
 // 本仓库的实现是独立重写）。
 const cosy = require('../src/qoder/cosy');
+const constants = require('../src/qoder/constants');
 
 let failures = 0;
 function eq(label, got, want) {
@@ -60,7 +61,10 @@ console.log('== 结构 ==');
 const pb = cosy.buildPayloadB64('INFO_X');
 const pbObj = JSON.parse(Buffer.from(pb, 'base64').toString());
 eq('payload key 顺序', Object.keys(pbObj).join(','), 'cosyVersion,ideVersion,info,requestId,version');
-eq('payload cosyVersion', pbObj.cosyVersion, '1.0.10');
+// 版本断言跟随常量：这里验证的是「cosyVersion 透传进 payload」这个行为，
+// 不是钉死具体值（默认值 2026-10-30 从桌面端 1.0.10 对齐到官方 CLI 的 1.1.75，
+// 可被 DUMATE_QODER_COSY_VERSION 覆盖）。
+eq('payload cosyVersion', pbObj.cosyVersion, constants.COSY_VERSION);
 eq('payload ideVersion 为空', pbObj.ideVersion, '');
 eq('payload version', pbObj.version, 'v1');
 eq('bearer 形状', cosy.composeBearer('PB', 'SIG'), 'Bearer COSY.PB.SIG');
