@@ -16,7 +16,7 @@ const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
 const c = require('./constants');
 const cosy = require('./cosy');
-const { payloadError, envelopeStatus } = require('../upstream-errors');
+const { payloadError, envelopeStatus, throttleRetryMs } = require('../upstream-errors');
 
 const TIMEOUT_MS = 600000;
 
@@ -149,6 +149,11 @@ function buildBody(modelKey, payload, opts = {}) {
   // 显式传 opts.maxInputTokens 可以覆盖；DUMATE_QODER_CONTEXT=default 退回默认档。
   const maxInputTokens = Number(opts.maxInputTokens) > 0 ? Number(opts.maxInputTokens) : 200000;
   const requestId = crypto.randomUUID();
+  // request_set_id 是上游排队的槽位键（官方客户端被 10605 拒后带着**同一个
+  // requestSetId** 轮询 queue/status，放行后重发推理）。排队等待模式（见
+  // index.js）要求同一次 send() 的多次尝试共用它——每次换新值等于每次重新
+  // 排队，这正是 2026-10-29「等多久都不保证放行」结论的疑似真因。
+  const requestSetId = opts.requestSetId || requestId;
   const sessionId = (payload && payload.session_id) || crypto.randomUUID();
   const messages = (payload && payload.messages) || [];
   let system = '';
@@ -187,7 +192,7 @@ function buildBody(modelKey, payload, opts = {}) {
   const modelCfg = { key: modelKey, is_reasoning: false };
   return JSON.stringify({
     request_id: requestId,
-    request_set_id: requestId,
+    request_set_id: requestSetId,
     chat_record_id: requestId,
     session_id: sessionId,
     stream: true, // 上游只走 SSE；非流式由本文件聚合
@@ -609,7 +614,60 @@ function aggregate(payloads, model) {
   };
 }
 
+// ---- 官方排队轮询协议（2026-10-30，qoder2api-hub 文档 7.1 的逆向结论）----
+//
+// 官方客户端被 10605（isQueued:true）拒绝后**不结束请求**，而是带着同一个
+// requestSetId 轮询 GET /api/v2/service/ask/queue/status，每轮先睡
+// retryAfterSeconds；isQueued===false 才继续真正的推理请求，连续 3 次轮询
+// 失败才判致命，总等待默认 60 分钟。queue/status 的响应形状没有官方文档，
+// 这里按防御式解析：认得出的字段（isQueued / serviceAvailable /
+// retryAfterSeconds / waitTime / 10605）就用，认不出一律 unknown——
+// 调用方对 unknown 的处置是「退化为盲等重发」（hub 验证过的形态），
+// 端点不存在/鉴权不通都不会影响主流程。
+
+/** 排队状态解析。返回 { state: 'released'|'queued'|'unknown', retryAfterMs } */
+function parseQueueStatus(raw) {
+  const s = String(raw == null ? '' : raw).replace(/\\+"/g, '"').replace(/\\+/g, '');
+  if (/"isQueued"\s*:\s*false/i.test(s)) return { state: 'released', retryAfterMs: 0 };
+  if (/"isQueued"\s*:\s*true/i.test(s) || /10605/.test(s)) {
+    const ms = throttleRetryMs(s);
+    return { state: 'queued', retryAfterMs: Number.isFinite(ms) && ms > 0 ? ms : 0 };
+  }
+  return { state: 'unknown', retryAfterMs: 0 };
+}
+
+/**
+ * 查一次排队状态（best-effort）。永不 reject——网络错/非 200 都按 unknown 返回。
+ * @param {string} origin 推理请求实际用到的主机 origin（队列跟着主机走）
+ * @param {object} headers cosy.buildHeaders 的产物（body 传空串签名）
+ */
+function getQueueStatus(origin, headers, { modelKey, queueType, requestId, agent }) {
+  const path = `/algo/api/v2/service/ask/queue/status?requestSetId=${encodeURIComponent(requestId)}`
+    + `&modelKey=${encodeURIComponent(modelKey)}&queueType=${encodeURIComponent(queueType || 'p3')}`;
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(origin); } catch (e) { return resolve(null); }
+    const req = https.request({
+      hostname: u.hostname,
+      path,
+      method: 'GET',
+      headers: { ...headers, Host: u.hostname },
+      timeout: 8000,
+      ...(agent ? { agent } : {}),
+    }, (res) => {
+      let buf = '';
+      res.on('data', (c) => { if (buf.length < 65536) buf += c; });
+      res.on('end', () => resolve(res.statusCode === 200 ? parseQueueStatus(buf) : null));
+      res.on('error', () => resolve(null));
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
 module.exports = {
   buildBody, resolveModelKey, unwrap, envelopeStatus, payloadError,
   post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
+  getQueueStatus, parseQueueStatus,
 };

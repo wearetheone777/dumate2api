@@ -39,6 +39,9 @@ process.env.DUMATE_POOL_STATE = TMP_STATE;
 process.env.DUMATE_QODER_QUEUE_PATIENCE_MS = '6000';
 // 重试间隔取默认 1500ms 会拖慢用例；压到 100ms，语义不变（只是让轮询更快）。
 process.env.DUMATE_QODER_QUEUE_STEP_MS = '100';
+// 排队轮询（2026-10-30 官方协议）默认关闭——旧用例的剧本用 throw 模拟限流，
+// 不走信封路径，等待轮用不上；排队专区在文件尾部单独打开并注入短间隔。
+process.env.DUMATE_QODER_QUEUE_POLL = '0';
 // 选号顺序：本脚本多条例程按「先打 901、失败再换 902」断言，依赖**确定性**选号。
 // 生产默认已改为加权抽签 + 防撞号窗口（更快命中健康号，但顺序是随机的）。
 // 这里关回轮询——本脚本要验的是限流分类与冷却，不是选号分布；顺序随机化会让
@@ -389,8 +392,10 @@ credits.capture = () => {};                 // 不写真实积分账本
  *  剧本可以是数组，按该账号的第 N 次调用依次取（用于验证「重试同一账号」）。 */
 let scripts = {};
 let currentToken = '';
+let sentBodies = []; // 排队专区：捕获 postStream 收到的加密请求体
 let callsByToken = {};
 chat.postStream = async (url, body, headers, onChunk) => {
+  sentBodies.push(body); // 排队专区用：重发必须是**同一份**加密请求体
   const n = (callsByToken[currentToken] = (callsByToken[currentToken] || 0) + 1);
   let plan = scripts[currentToken] || 'ok';
   if (Array.isArray(plan)) plan = plan[n - 1] || plan[plan.length - 1] || 'ok';
@@ -422,6 +427,22 @@ chat.postStream = async (url, body, headers, onChunk) => {
   if (plan === 'quota430') {
     const err = new Error(D430);
     err.statusCode = 403;
+    throw err;
+  }
+  if (plan === 'queueenv') {
+    // 官方排队形态：**信封在流里**（不走 throw）——onInner 认出错误帧 →
+    // firstErr 置位 → attemptStream 正常返回 → 循环里触发排队等待。
+    onChunk(JSON.stringify({
+      code: '403',
+      message: '{"code":"10605","isQueued":true,"modelKey":"gfmodel","queueType":"p3","retryAfterSeconds":30,"serviceAvailable":false,"subCode":"RESOURCE_LIMIT","waitTime":30}',
+    }));
+    return { status: 200, headers: {}, raw: '' };
+  }
+  if (plan === 'queuesilent') {
+    // 静默形态：上游收了请求、回空 ack 后沉默，content deadline 掐断（throw）。
+    // 2026-10-30 实测这是当下最主要的排队形态。
+    const err = new Error('qoder upstream queued (no content in 6000ms)');
+    err.statusCode = 0;
     throw err;
   }
   onChunk(JSON.stringify({ id: 'c1', choices: [{ index: 0, delta: { content: 'pong' }, finish_reason: null }] }));
@@ -656,6 +677,112 @@ function resetCase(plan) {
     assert.strictEqual(classify({ status: 403, message: THROTTLE_RESOURCE }).deterministic, false);
     assert.strictEqual(classify(null).deterministic, false, 'null 输入不该抛错');
   });
+
+  // ==========================================================================
+  // 5. 排队轮询（2026-10-30 官方协议）：共享 request_set_id + 等待后重发
+  // ==========================================================================
+  console.log('');
+  console.log('== 5. 排队轮询（官方协议）：request_set_id 稳定 + queue/status 放行 ==');
+  // 打开排队轮询并注入短节奏（这些 env 是**调用时**现读的，中途翻转即生效）
+  process.env.DUMATE_QODER_QUEUE_POLL = '1';
+  process.env.DUMATE_QODER_QUEUE_POLL_BUDGET_MS = '1500';
+  process.env.DUMATE_QODER_QUEUE_POLL_INTERVAL_MS = '30';
+
+  const origBuildBody = chat.buildBody;
+  const bodySetIds = [];
+  chat.buildBody = (key, payload, o) => {
+    const s = origBuildBody(key, payload, o);
+    try { bodySetIds.push(JSON.parse(s).request_set_id); } catch (e) { /* 忽略 */ }
+    return s;
+  };
+  const origGetQueueStatus = chat.getQueueStatus;
+  let statusCalls = [];
+  let statusScript = () => null;
+  chat.getQueueStatus = async (origin, headers, params) => {
+    statusCalls.push({ origin, params });
+    return statusScript(origin, params);
+  };
+  // deterministic 段末尾把 ensureAccount 重置成了不跟踪 token 的版本，
+  // 剧本分发（scripts[currentToken]）会拿到陈旧 token——这里恢复跟踪。
+  session.ensureAccount = async (store, acc) => { currentToken = acc.accessToken; return acc; };
+  // 数组剧本按「该账号第 N 次调用」取值，而 callsByToken 是跨用例累计的——
+  // 不清零的话 plan[0] 永远取不到（旧计数直接落到数组末位的兜底上）。
+  callsByToken = {};
+
+  await checkAsync('排队信封 → 等 queue/status 放行 → 同一 request_set_id 重发成功', async () => {
+    channelPool._stickyClear();
+    require('../src/pool').pool.revive('qoder:901');
+    require('../src/pool').pool.revive('qoder:902');
+    scripts = { ta: ['queueenv', 'ok'], tb: ['queueenv', 'ok'] };
+    statusCalls = []; sentBodies = []; callsByToken = {};
+    statusScript = () => ({ state: 'released', retryAfterMs: 0 });
+    const chunks = [];
+    const t0 = Date.now();
+    const r = await require('../src/qoder').send(payload, (c) => chunks.push(c), { sessionKey: 'case-qp1' });
+    assert.strictEqual(r.status, 200);
+    assert.ok(chunks.some((c) => c.includes('pong')), '应拿到正文');
+    assert.ok(Date.now() - t0 < 4000, '应快速放行，实际 ' + (Date.now() - t0) + 'ms');
+    assert.ok(statusCalls.length >= 1, '应查询过 queue/status');
+    assert.strictEqual(statusCalls[0].params.requestId, bodySetIds[bodySetIds.length - 1], 'status 查询带的是请求自己的 request_set_id');
+    assert.strictEqual(statusCalls[0].params.modelKey, 'gfmodel');
+    assert.strictEqual(statusCalls[0].params.queueType, 'p3');
+    assert.ok(sentBodies.length >= 2, '应至少尝试两次，实际 ' + sentBodies.length);
+    assert.ok(sentBodies.every((b) => b === sentBodies[0]), '重发必须是同一份加密请求体（同一个 request_set_id，排队槽位钥匙）');
+  });
+
+  await checkAsync('status 明说还要排很久 → 早停（不烧满预算），下游 429', async () => {
+    channelPool._stickyClear();
+    require('../src/pool').pool.revive('qoder:901');
+    require('../src/pool').pool.revive('qoder:902');
+    scripts = { ta: 'queueenv', tb: 'queueenv' };
+    statusCalls = []; sentBodies = []; callsByToken = {};
+    statusScript = () => ({ state: 'queued', retryAfterMs: 600000 });
+    let err = null;
+    const t0 = Date.now();
+    try { await require('../src/qoder').send(payload, () => {}, { sessionKey: 'case-qp2' }); }
+    catch (e) { err = e; }
+    assert.ok(err, '应该抛错');
+    assert.strictEqual(err.statusCode, 429);
+    assert.ok(Date.now() - t0 < 7000, '应早停而不是烧满预算+patience，实际 ' + (Date.now() - t0) + 'ms');
+    require('../src/pool').pool.revive('qoder:901');
+    require('../src/pool').pool.revive('qoder:902');
+  });
+
+  await checkAsync('status 端点连续不可用 → 自动退化为盲等重发（主流程不受影响）', async () => {
+    channelPool._stickyClear();
+    require('../src/pool').pool.revive('qoder:901');
+    require('../src/pool').pool.revive('qoder:902');
+    scripts = { ta: ['queueenv', 'queueenv', 'ok'], tb: ['queueenv', 'queueenv', 'ok'] };
+    statusCalls = []; sentBodies = []; callsByToken = {};
+    statusScript = () => null; // 端点不可用（网络错/404/解析不出）
+    const chunks = [];
+    const r = await require('../src/qoder').send(payload, (c) => chunks.push(c), { sessionKey: 'case-qp3' });
+    assert.strictEqual(r.status, 200);
+    assert.ok(chunks.some((c) => c.includes('pong')), '盲等重发后应拿到正文');
+    assert.strictEqual(statusCalls.length, 2, '连续两次不可用后停止探测，实际 ' + statusCalls.length);
+  });
+
+  await checkAsync('静默形态（content deadline 掐断）→ 立即查状态放行 → 同一请求体重发成功', async () => {
+    channelPool._stickyClear();
+    require('../src/pool').pool.revive('qoder:901');
+    require('../src/pool').pool.revive('qoder:902');
+    scripts = { ta: ['queuesilent', 'ok'], tb: ['queuesilent', 'ok'] };
+    statusCalls = []; sentBodies = []; callsByToken = {};
+    statusScript = () => ({ state: 'released', retryAfterMs: 0 });
+    const chunks = [];
+    const t0 = Date.now();
+    const r = await require('../src/qoder').send(payload, (c) => chunks.push(c), { sessionKey: 'case-qp4' });
+    assert.strictEqual(r.status, 200);
+    assert.ok(chunks.some((c) => c.includes('pong')), '应拿到正文');
+    assert.ok(Date.now() - t0 < 3000, '静默形态跳过首睡应立即查状态，实际 ' + (Date.now() - t0) + 'ms');
+    assert.ok(statusCalls.length >= 1, '应查询过 queue/status');
+    assert.ok(sentBodies.length >= 2, '应至少尝试两次');
+    assert.ok(sentBodies.every((b) => b === sentBodies[0]), '静默重发也必须是同一份加密请求体');
+  });
+
+  chat.buildBody = origBuildBody;
+  chat.getQueueStatus = origGetQueueStatus;
+  process.env.DUMATE_QODER_QUEUE_POLL = '0';
 
   session.ensureAccount = async (store, acc) => acc;
 

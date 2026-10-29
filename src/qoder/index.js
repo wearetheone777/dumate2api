@@ -15,7 +15,7 @@ const authStore = require('./auth');
 const session = require('./session');
 const constants = require('./constants');
 const { normalizeError } = require('../errtext');
-const { isThrottle, unescapeDeep } = require('../upstream-errors');
+const { isThrottle, unescapeDeep, throttleRetryMs } = require('../upstream-errors');
 const ledger = require('../checkin-ledger');
 const grants = require('./grants');
 const maxOutput = require('./max-output');
@@ -194,6 +194,46 @@ async function postWithFallback(candidates, fn, isDelivered) {
   throw lastErr;
 }
 
+// ---------------------------------------------------------------------------
+// 排队等待（2026-10-30，官方客户端的轮询协议 + hub 验证过的盲等兜底）。
+//
+// 官方行为（hub 文档 7.1 逆向）：被 10605（isQueued:true）拒绝后**不结束请求**，
+// 带着同一个 requestSetId 轮询 queue/status，每轮先睡 retryAfterSeconds，
+// 放行才重发推理，总预算默认 60 分钟。此前我们每次重试都换新的
+// request_set_id——等于每次重新排队，这正是「等 30 秒也不保证放行」结论的
+// 疑似真因；所以排队模式下 request_set_id 在同一次 send() 内保持稳定
+// （buildBody 的 opts.requestSetId）。
+//
+// 配置**每次现读**：chat.js 曾把 env 读死在模块加载时（测试与调参都不便），
+// 这里不重复那个坑。
+// ---------------------------------------------------------------------------
+function queuePollDeadline() {
+  if (process.env.DUMATE_QODER_QUEUE_POLL === '0') return 0;
+  const budget = Math.max(0, parseInt(process.env.DUMATE_QODER_QUEUE_POLL_BUDGET_MS || '60000', 10) || 0);
+  return budget > 0 ? Date.now() + budget : 0;
+}
+
+function queuePollIntervalMs(retryAfterMs) {
+  const env = Number(process.env.DUMATE_QODER_QUEUE_POLL_INTERVAL_MS);
+  if (Number.isFinite(env) && env > 0) return env; // 测试注入
+  return Math.min(Math.max(retryAfterMs || 5000, 5000), 20000);
+}
+
+// 只认**信封型**排队（10605 / isQueued / RESOURCE_LIMIT / CALL_COUNT_LIMIT）。
+// 另有**静默形态**（上游收了请求、回空 ack 然后沉默 → chat.js 的 content
+// deadline / read idle 掐断）——2026-10-30 实测它才是当下最主要的排队形态，
+// 同样进等待轮（budget 天然封顶，不会比旧路径更糟：旧路径是掐断后直接失败）。
+const QUEUEABLE_TEXT = /10605|isQueued|RESOURCE_LIMIT|CALL_COUNT_LIMIT/i;
+function queueableThrottle(text) {
+  return QUEUEABLE_TEXT.test(unescapeDeep(String(text || '')));
+}
+const SILENCE_QUEUED_TEXT = /qoder upstream (queued|read idle|first-byte timeout)/;
+
+function queueTypeOf(message) {
+  const m = /"queueType"\s*:\s*"([^"]+)"/i.exec(unescapeDeep(String(message || '')));
+  return (m && m[1]) || 'p3';
+}
+
 /**
  * FEFO（最早到期优先）候选集：有临期积分批次的账号 uid 集合。
  *
@@ -338,6 +378,9 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     modelMeta,
     // max_tokens 上限自学习（max-output.js）：撞过上限的模型出站前自动 clamp
     maxOutputTokens: maxOutput.get(region, modelKey),
+    // 排队槽位键（官方轮询协议）：同一 send() 的多次尝试共用它——queue/status
+    // 查询与请求体必须带同一个值，否则查的是别的槽位
+    requestSetId: opts.requestSetId,
   });
   // encode 进 worker（审计 P1-5b）：几 MB 请求的编码不再独占事件循环
   const encBody = await cosy.encodeAsync(Buffer.from(bodyJson));
@@ -365,6 +408,61 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   // 出站代理（E 包接线）：账号 proxy 字段 > 全局 DUMATE_PROXY，无代理 null 直连
   const agent = proxyAgent.getAgentFor(account);
 
+  // ---- 排队等待（官方轮询协议）----
+  // 预算由 send() 按整次请求下发（opts.queueDeadline），所有账号共享；
+  // 0 = 关闭（拿到限流直接交回上层，行为与旧快速轮询一致）。
+  const queueDeadline = Number(opts.queueDeadline) > 0 ? Number(opts.queueDeadline) : 0;
+  // queue/status 用与推理相同的 COSY 会话签名（签名 body 传空串）；查询主机
+  // 用「本次尝试实际打到的那个」（队列跟着主机走）。连续两次不可用就停止
+  // 探测、退化为纯盲等重发（hub 验证过的形态），端点不存在不影响主流程。
+  const statusHeaders = queueDeadline > 0
+    ? cosy.buildHeaders(sess, '/api/v2/service/ask/queue/status', '', 'application/json')
+    : null;
+  let statusUsable = queueDeadline > 0;
+  let statusFailures = 0;
+  let queueWaitStart = 0;
+  /**
+   * 一轮排队等待：按上游给的 retryAfterSeconds 睡眠（夹在 [5s, 20s]，测试可
+   * 注入），然后 best-effort 查一次 queue/status。返回 'retry'（用同一份
+   * 加密请求体重发）或 'giveup'（预算耗尽 / 上游明说要排到预算之外——把
+   * 节流错误如实交回上层，429 语义不变）。
+   * 静默形态传 skipFirstSleep：掐断本身已经等过一轮沉默，立即查状态。
+   */
+  const queueWaitRound = async (message, origin, { skipFirstSleep = false } = {}) => {
+    if (!queueWaitStart) queueWaitStart = Date.now();
+    const remaining = queueDeadline - Date.now();
+    if (remaining <= 0) return 'giveup';
+    // 静默形态跳过首睡的前提是**真的会查状态**——statusUsable 关掉后无睡眠
+    // 的盲等会变成每 6s（content deadline）紧循环重撞上游
+    if (!skipFirstSleep || !statusUsable) {
+      const waitMs = queuePollIntervalMs(throttleRetryMs(message));
+      await sleep(Math.min(waitMs, remaining) + Math.floor(Math.random() * 250));
+      if (Date.now() >= queueDeadline) return 'giveup';
+    }
+    if (!statusUsable || !origin || !opts.requestSetId) return 'retry';
+    const st = await chat.getQueueStatus(origin, statusHeaders, {
+      modelKey,
+      queueType: queueTypeOf(message),
+      requestId: opts.requestSetId,
+      agent,
+    }).catch(() => null);
+    // 排队等待是分钟级行为，没有日志就没法排障（实测 2026-10-30：27s 失败的
+    // 请求看不到 status 返回了什么）。每轮一行，排队事件本身低频。
+    console.warn(`[qoder] 排队等待 status=${st ? st.state : 'unavailable'}`
+      + `${st && st.retryAfterMs > 0 ? `(retryAfter=${Math.round(st.retryAfterMs / 1000)}s)` : ''}`
+      + ` 已等 ${Math.round((Date.now() - queueWaitStart) / 1000)}s/${Math.round((queueDeadline - queueWaitStart) / 1000)}s`);
+    if (st == null) {
+      statusFailures += 1;
+      if (statusFailures >= 2) statusUsable = false;
+      return 'retry';
+    }
+    // 上游明说还要排多久、且远超剩余预算：早停，不烧满预算干等
+    if (st.state === 'queued' && st.retryAfterMs > 0 && Date.now() + st.retryAfterMs > queueDeadline) {
+      return 'giveup';
+    }
+    return 'retry'; // released → 立即重发；unknown → 盲等重发（hub 形态）
+  };
+
   const startedAt = Date.now();
   // 本条请求的 credits（上游 usage 直给）。流式路径逐帧扫、取最大值——
   // 上游会在多帧里重复带 usage，最后一帧才是整轮合计。
@@ -378,99 +476,160 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   };
   try {
     if (onChunk) {
-      let firstErr = null;
       // `sent` 只表示**真实数据帧**已转发给下游。`[DONE]` 是哨兵、不是上游
       // 数据帧——旧实现把它也算成「已吐帧」，于是 HTTP 429 / 200+纯错误体
       // 这类「一帧数据都没有」的情况被误判成已开始输出：错误被吞、换号被挡。
       let sent = false;
-      // 已转发过帧就不能再换候选主机（会输出两段拼接的内容）
+      let firstErr = null;
       let delivered = false;
       let doneSeen = false;
-      // 识别到错误帧就立刻中止上游：Qoder 零额度时是**挂起**而不是报错，
-      // 不主动断就要等 socket 空闲超时（600s），客户端早已超时。
-      const ac = new AbortController();
-      const onInner = (inner) => {
-        if (firstErr) return;
-        // 哨兵延后到状态检查之后再转发，避免「先发 200 + [DONE] 再抛错」
-        if (inner === '[DONE]') { doneSeen = true; return; }
-        let parsed = null;
-        try { parsed = JSON.parse(inner); } catch (e) { /* 非 JSON 帧照原样转发 */ }
-        if (parsed) {
-          const err = chat.payloadError(parsed) || quotaFrameError(parsed);
-          if (err) {
-            firstErr = err;
-            try { ac.abort(); } catch (e) { /* 已结束 */ }
-            return;
+      const candidates = constants.chatStreamCandidates(region);
+      // 排队状态查询打「本次尝试实际用的主机」——队列跟着主机走
+      let statusOrigin = '';
+      // 单次尝试封装：排队放行后用**同一份加密请求体**（同一个 request_set_id）
+      // 原样重发，四个状态标志随之复位
+      const attemptStream = () => {
+        firstErr = null; sent = false; delivered = false; doneSeen = false;
+        // 识别到错误帧就立刻中止上游：Qoder 零额度时是**挂起**而不是报错，
+        // 不主动断就要等 socket 空闲超时（600s），客户端早已超时。
+        const ac = new AbortController();
+        const onInner = (inner) => {
+          if (firstErr) return;
+          // 哨兵延后到状态检查之后再转发，避免「先发 200 + [DONE] 再抛错」
+          if (inner === '[DONE]') { doneSeen = true; return; }
+          let parsed = null;
+          try { parsed = JSON.parse(inner); } catch (e) { /* 非 JSON 帧照原样转发 */ }
+          if (parsed) {
+            const err = chat.payloadError(parsed) || quotaFrameError(parsed);
+            if (err) {
+              firstErr = err;
+              try { ac.abort(); } catch (e) { /* 已结束 */ }
+              return;
+            }
+            noteCredits(parsed);
           }
-          noteCredits(parsed);
-        }
-        sent = true;
-        delivered = true;
-        onChunk(inner);
+          sent = true;
+          delivered = true;
+          onChunk(inner);
+        };
+        return postWithFallback(candidates, (url) => {
+          statusOrigin = new URL(url).origin;
+          return chat.postStream(url, encBody, headers, onInner, { signal: ac.signal, agent });
+        }, () => delivered);
       };
-      const res = await postWithFallback(
-        constants.chatStreamCandidates(region),
-        (url) => chat.postStream(url, encBody, headers, onInner, { signal: ac.signal, agent }),
-        () => delivered,
-      );
-      if (firstErr) {
-        const err = new Error(`qoder ${firstErr.code}: ${firstErr.message}`);
-        err.statusCode = firstErr.code;
-        if (firstErr.quotaKind) err.quotaKind = firstErr.quotaKind;
-        err.sent = sent;
-        throw err;
-      }
-      // HTTP 层错误：上游 4xx/5xx 时 body 往往不是 SSE（没有 `data:` 行），
-      // 上面一帧都收不到，旧实现就当成功返回 → 客户端 200 + 空响应。
-      // 这里按状态码判，并从原始 body 里取上游的 message 如实报出。
-      if (res.status >= 400) {
-        const es = chat.envelopeStatus(res.raw);
-        const detail = (es && es.message)
-          || String(res.raw || '').replace(/\s+/g, ' ').trim().slice(0, 200)
-          || 'upstream error';
-        const err = new Error(`qoder ${res.status}: ${detail}`);
-        err.statusCode = res.status;
-        const qk = quotaKindOfText(String(res.raw || ''));
-        if (qk) err.quotaKind = qk;
-        err.sent = sent;
-        throw err;
-      }
-      // 200 但不是 SSE：上游偶尔用 200 回一个纯错误体（provider_error 就是
-      // 这种形状）。**判据是「一帧真实数据都没转发」**，不是「没收到
-      // [DONE]」——后者恒为假（postStream 总会补一个）。
-      if (!sent) {
-        // 额度类业务码（112/110/114/430）< 400，envelopeStatus/payloadError
-        // 都不认——它们才是「200 + 空回答」的另一半来源，单独兜一层。
-        const qf = quotaFromBody(res.raw);
-        if (qf) {
-          const err = new Error(`qoder ${qf.code}: ${qf.message}`);
-          err.statusCode = qf.code;
-          err.quotaKind = qf.quotaKind;
-          err.sent = false;
+      for (;;) {
+        // 尝试可能以**异常**结束（静默形态：content deadline / read idle 掐断
+        // 时 postStream reject）——不能让它在等待判定之前飞出循环
+        let res = null;
+        let attemptErr = null;
+        try { res = await attemptStream(); } catch (e) { attemptErr = e; }
+        // 排队等待判定，两种形态：
+        //   信封型：错误帧 / 错误体里带 10605 / isQueued 等（带 !sent 守卫——
+        //           吐过帧之后 raw 里有模型输出，正文讨论到 10605 不能当排队）；
+        //   静默型：上游收了请求、回空 ack 然后沉默，被我们自己的计时器掐断
+        //           （掐断即已等过一轮沉默，跳过首睡立即查状态）。
+        const silenceForm = attemptErr && SILENCE_QUEUED_TEXT.test(String(attemptErr.message || ''));
+        const throttledMsg = silenceForm ? ''
+          : firstErr
+            ? (queueableThrottle(firstErr.message) ? firstErr.message : '')
+            : (!sent && res && queueableThrottle(res.raw) ? String(res.raw || '') : '');
+        if ((silenceForm || throttledMsg) && !sent && Date.now() < queueDeadline) {
+          const verdict = await queueWaitRound(
+            throttledMsg || String(attemptErr.message || ''),
+            statusOrigin,
+            { skipFirstSleep: silenceForm },
+          );
+          if (verdict === 'retry') continue;
+          // giveup：预算耗尽 / 上游明说要排到预算之外——落到底下的 throw，
+          // 把节流错误如实交回上层（429 语义不变）。
+        }
+        if (attemptErr) { attemptErr.sent = sent; throw attemptErr; }
+        if (firstErr) {
+          const err = new Error(`qoder ${firstErr.code}: ${firstErr.message}`);
+          err.statusCode = firstErr.code;
+          if (firstErr.quotaKind) err.quotaKind = firstErr.quotaKind;
+          err.sent = sent;
           throw err;
         }
-        const es = chat.envelopeStatus(res.raw);
-        if (es && es.code >= 400) {
-          const err = new Error(`qoder ${es.code}: ${es.message}`);
-          err.statusCode = es.code;
-          err.sent = false;
+        // HTTP 层错误：上游 4xx/5xx 时 body 往往不是 SSE（没有 `data:` 行），
+        // 上面一帧都收不到，旧实现就当成功返回 → 客户端 200 + 空响应。
+        // 这里按状态码判，并从原始 body 里取上游的 message 如实报出。
+        if (res.status >= 400) {
+          const es = chat.envelopeStatus(res.raw);
+          const detail = (es && es.message)
+            || String(res.raw || '').replace(/\s+/g, ' ').trim().slice(0, 200)
+            || 'upstream error';
+          const err = new Error(`qoder ${res.status}: ${detail}`);
+          err.statusCode = res.status;
+          const qk = quotaKindOfText(String(res.raw || ''));
+          if (qk) err.quotaKind = qk;
+          err.sent = sent;
           throw err;
         }
+        // 200 但不是 SSE：上游偶尔用 200 回一个纯错误体（provider_error 就是
+        // 这种形状）。**判据是「一帧真实数据都没转发」**，不是「没收到
+        // [DONE]」——后者恒为假（postStream 总会补一个）。
+        if (!sent) {
+          // 额度类业务码（112/110/114/430）< 400，envelopeStatus/payloadError
+          // 都不认——它们才是「200 + 空回答」的另一半来源，单独兜一层。
+          const qf = quotaFromBody(res.raw);
+          if (qf) {
+            const err = new Error(`qoder ${qf.code}: ${qf.message}`);
+            err.statusCode = qf.code;
+            err.quotaKind = qf.quotaKind;
+            err.sent = false;
+            throw err;
+          }
+          const es = chat.envelopeStatus(res.raw);
+          if (es && es.code >= 400) {
+            const err = new Error(`qoder ${es.code}: ${es.message}`);
+            err.statusCode = es.code;
+            err.sent = false;
+            throw err;
+          }
+        }
+        // 正常收尾：哨兵在这里补发，保证「先有内容、再有结束标记」
+        if (doneSeen) onChunk('[DONE]');
+        meter.settle(peakCredits);
+        return res;
       }
-      // 正常收尾：哨兵在这里补发，保证「先有内容、再有结束标记」
-      if (doneSeen) onChunk('[DONE]');
-      meter.settle(peakCredits);
-      return res;
     }
-    const res = await postWithFallback(
-      constants.chatStreamCandidates(region),
-      (url) => chat.post(url, encBody, headers, { agent }),
-    );
-    // `post` 现在会在数据块里识别错误信封并当场断流（与 postStream 同一纪律）。
-    // 命中的 `firstErr` 是**最准确**的那份（带上游 code 与内层 message），
-    // 优先用它——排在 envelopeStatus 之前，否则会先被 raw 的空壳信封盖掉，
-    // 让 `retryAfterSeconds` / `modelKey` 这些限流判据丢掉。
-    if (res.firstErr) {
+    // 非流式：post 聚合后一次返回，排队等待在返回前发生（客户端本来就在等
+    // 完整结果，多等几秒不改变交互）。raw 只在 status>=400 时参与排队判定——
+    // 200 的 raw 可能含模型正文，正文讨论到 10605 不能当成排队。
+    let statusOrigin = '';
+    for (;;) {
+      let res = null;
+      let attemptErr = null;
+      try {
+        res = await postWithFallback(
+          constants.chatStreamCandidates(region),
+          (url) => {
+            statusOrigin = new URL(url).origin;
+            return chat.post(url, encBody, headers, { agent });
+          },
+        );
+      } catch (e) { attemptErr = e; }
+      const silenceForm = attemptErr && SILENCE_QUEUED_TEXT.test(String(attemptErr.message || ''));
+      const firstMsg = res && res.firstErr ? res.firstErr.message : '';
+      const throttledMsg = silenceForm ? ''
+        : firstMsg
+          ? (queueableThrottle(firstMsg) ? firstMsg : '')
+          : (res && res.status >= 400 && queueableThrottle(res.raw) ? String(res.raw || '') : '');
+      if ((silenceForm || throttledMsg) && Date.now() < queueDeadline) {
+        const verdict = await queueWaitRound(
+          throttledMsg || String((attemptErr && attemptErr.message) || ''),
+          statusOrigin,
+          { skipFirstSleep: silenceForm },
+        );
+        if (verdict === 'retry') continue;
+      }
+      if (attemptErr) throw attemptErr;
+      // `post` 现在会在数据块里识别错误信封并当场断流（与 postStream 同一纪律）。
+      // 命中的 `firstErr` 是**最准确**的那份（带上游 code 与内层 message），
+      // 优先用它——排在 envelopeStatus 之前，否则会先被 raw 的空壳信封盖掉，
+      // 让 `retryAfterSeconds` / `modelKey` 这些限流判据丢掉。
+      if (res.firstErr) {
       const err = new Error(`qoder ${res.firstErr.code}: ${res.firstErr.message}`);
       err.statusCode = res.firstErr.code;
       if (res.firstErr.quotaKind) err.quotaKind = res.firstErr.quotaKind;
@@ -514,6 +673,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     if (opts && opts.onAccount) { /* 非流式也报一次 */ }
     meter.settle(peakCredits);
     return out;
+    } // for(;;) 非流式排队重试
   } catch (e) {
     // 网络错误没有 statusCode，标记一下让上层知道可以换号
     if (!e.statusCode) e.statusCode = 0;
@@ -538,17 +698,16 @@ const MAX_ATTEMPTS = 4;
 /**
  * 排队重试的**总预算**（ms），含所有等待与请求本身。
  *
- * 实测 2026-10-29 推翻了早先「按时间窗口、等 ~52s 会放行」的结论：
- * 上游限流信封（403 + 10605 + `retryAfterSeconds:30`）**150~1000ms 就到达**，
- * 而照它给的 30 秒等下去**并不可靠**——同一账号连测，等 3s 三次里只成一次，
- * 等 10s / 30s 仍全部 `stillThrottled`。排队是**请求级随机**的，等多久都不保证。
+ * 2026-10-29 的结论（「等 30 秒也不保证放行，快速多试几次就交还客户端」）
+ * 建立在一个当时不知道的事实上：每次重试都换了新的 request_set_id——等于
+ * 每次重新排队。2026-10-30 引入官方轮询协议后（queuePollDeadline：共享
+ * request_set_id + 按 retryAfterSeconds 睡眠 + queue/status 放行信号），
+ * 等待有了真实的放行机制，两者并存：
+ *   · 排队等待模式开启（默认）：runOnce 内按官方协议等待，本预算只兜「账号
+ *     都轮过一遍后仍全是限流」的收尾场景；
+ *   · 关闭（DUMATE_QODER_QUEUE_POLL=0）：回到纯快速轮询。
  *
- * 所以这里不是「耐心等窗口」，而是「**快速多试几次就交还客户端**」：
- * 拿到限流信封本身只要几百毫秒，多轮询几次的成本很低；硬等 60 秒只会让
- * 用户对着转圈界面干瞪眼，最后仍然可能失败。
- *
- * 默认 6 秒：够覆盖 3~4 轮快速轮询，又不会让用户等过一个客户端超时。
- * `0` 关闭（拿到限流就立刻回 429）。
+ * 默认 6 秒。`0` 关闭（拿到限流就立刻回 429）。
  */
 const QUEUE_PATIENCE_MS = Math.max(0, parseInt(process.env.DUMATE_QODER_QUEUE_PATIENCE_MS || '6000', 10) || 0);
 
@@ -603,6 +762,14 @@ async function send(payload, onChunk, opts = {}) {
   const sessionKey = channelPool.sessionKeyOf(payload, opts);
   const usable = authStore.findUsable();
   if (!usable.length) throw new Error('Qoder 没有可用账号，请先添加一个');
+  // 排队等待预算 + 共享 request_set_id（官方轮询协议，2026-10-30）。
+  // 预算是**整次请求**的（所有账号共享）——runOnce 内的排队等待受它约束，
+  // 耗尽后 throttle 错误按旧路交回（换号/429）。request_set_id 在多次尝试间
+  // 保持稳定：上游按它记排队槽位，每次换新值等于每次重新排队（2026-10-29
+  // 「等多久都不保证放行」结论的疑似真因）。
+  const queueDeadline = queuePollDeadline();
+  const requestSetId = queueDeadline > 0 ? crypto.randomUUID() : '';
+  const runOpts = queueDeadline > 0 ? { ...opts, queueDeadline, requestSetId } : opts;
   // FEFO 候选集只算一次（账本是静态的，轮询内不会变）
   const expiring = fefoUidSet(usable);
   let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring });
@@ -636,7 +803,7 @@ async function send(payload, onChunk, opts = {}) {
     // 每个账号一份：换号重试时归因要记到**实际成功的那个**账号上
     const meter = makeMeter(account, { ...opts, model, startedAt });
     try {
-      const result = await runOnce(account, payload, onChunk, opts, meter);
+      const result = await runOnce(account, payload, onChunk, runOpts, meter);
       // 成功喂池：清熔断/软退避/防误杀计数
       channelPool.noteSuccess(CHANNEL, account.id);
       // 成功即清除上次的失败标记（与千问同一约定：一次瞬时失败不该永远挂着）

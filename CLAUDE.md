@@ -283,6 +283,42 @@ e2e 用例与 rr 游标位置无关——轮转两轮、A 起手轮才断言）+
 `node --test test/unit/effort-passthrough.test.js`（两个翻译层的 effort 映射）、
 verify-qoder-channel.js（档位归一化 9 项）、verify-qoder-throttle.js（FEFO 3 项）。
 
+**官方排队轮询协议（2026-10-30，P1 收官）**。hub 文档 7.1 的逆向结论：官方客户端被
+10605（`isQueued:true`）拒绝后**不结束请求**——带着**同一个 requestSetId** 轮询
+`GET /api/v2/service/ask/queue/status?requestSetId=…&modelKey=…&queueType=…`，
+每轮先睡 `retryAfterSeconds`，`isQueued===false` 才继续真正的推理，总预算默认 60
+分钟。这直接推翻了我们对 10-29「排队请求级随机、等多久都不保证放行」结论的归因：
+**每次重试都换新的 request_set_id，等于每次重新排队**。
+
+实现（`qoder/index.js` 的 `queueWaitRound` + `chat.getQueueStatus`）三件套：
+
+1. **request_set_id 在同一次 send() 内稳定**（`buildBody` 的 `opts.requestSetId`）——
+   这是排队槽位的钥匙。queue/status 与请求体必须带同一个值，否则查的是别的槽位
+   （P1 落地时曾漏传 buildBody，离线测试当场抓住——status 与 body 各带各的 UUID）。
+2. **两种排队形态都进等待轮**：信封型（错误帧/错误体带 10605/isQueued 等）按
+   上游给的 `retryAfterSeconds` 睡眠（夹在 [5s, 20s]）后重发；**静默型**（上游
+   收了请求、回空 ack 后沉默 → content deadline / read idle 掐断——2026-10-30
+   实测它才是当下最主要的排队形态）**跳过首睡立即查状态**（掐断本身已等过一轮
+   沉默）。重发用**同一份加密请求体**（同一个 request_set_id）。预算天然封顶，
+   静默形态不会比旧路径更糟（旧路径是掐断后直接失败）。
+3. **queue/status 是 best-effort 放行信号**：端点真实存在（2026-10-30 实测
+   cn 网关 200，形状 `{"isQueued":false,"modelKey":…,"queueCount":0,"waitTime":0,
+   "retryAfterSeconds":2,"serviceAvailable":true}`，我们的 COSY 签名头被接受）。
+   说 released → 立即重发；说还要排很久且超出预算 → 早停（不烧满预算干等）；
+   连续两次不可用 → 停止探测、退化为纯盲等重发（hub 网关自己验证过的形态——
+   它逆向了协议但实现里只做 sleep+reopen）。
+
+预算：`DUMATE_QODER_QUEUE_POLL_BUDGET_MS` 默认 60000（**整次请求**所有账号共享，
+send() 下发 deadline）；`DUMATE_QODER_QUEUE_POLL=0` 整体关闭（回到纯快速轮询）；
+`DUMATE_QODER_QUEUE_POLL_INTERVAL_MS` 仅供测试注入短间隔。等待期间流式客户端靠
+`: ping` 保活帧保持连接（与上一节的保活帧天然配合——ping 跑在 provider.send
+未返回的整个期间，覆盖排队等待）。
+
+离线验证：verify-qoder-throttle.js **第 5 节**（信封放行重发 + request_set_id 字节级
+判等、早停、端点不可用退盲等、静默形态立即查状态重发；剧本用**信封在流里 / 掐断
+throw** 两种形态——只有它们才走等待轮）。注意该套件前 4 节的三个 6 秒用例是
+10-29 快速轮询的既有节奏，不是排队等待。
+
 
 **`cosy.encode` 是同步的，它一慢就「假死」整个网关（2026-10-03 修，性能级）。**
 自定义 base64 编码在 `runOnce` 里**直接同步调用**，所以它的耗时会**阻塞事件循环**：
@@ -953,6 +989,9 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `DUMATE_QODER_OS_HEADERS` | 未设（发送） | 设 `0` 关闭 `cosy-machineos` / `cosy-machinehostname` 两个身份头（见上文 2026-10-30 段） |
 | `DUMATE_QODER_INTL_GATEWAY` | 未设（候选链） | 钉死国际版推理主机（替代 api3→api2→api1 候选链）。上游服务端「选举」导流端点时用它 |
 | `DUMATE_QODER_FEFO_DAYS` | `3` | FEFO 选号的临期窗口（天）：账号有 N 天内到期的积分批次时优先接流量。`0` 关闭 |
+| `DUMATE_QODER_QUEUE_POLL` | 未设（开启） | 设 `0` 关闭官方排队轮询协议（信封型限流按 `retryAfterSeconds` 睡眠后重发 + queue/status 放行信号），回到纯快速轮询（429 交还客户端） |
+| `DUMATE_QODER_QUEUE_POLL_BUDGET_MS` | `60000` | 排队等待的**整次请求**预算（ms，所有账号共享）。耗尽后 throttle 错误按旧路交回（429） |
+| `DUMATE_QODER_QUEUE_POLL_INTERVAL_MS` | 按 `retryAfterSeconds`（夹 [5s, 20s]） | 每轮排队等待的睡眠时长。仅供测试注入短间隔，生产别调小——上游明说的等待要尊重 |
 | `DUMATE_DUMATE_SOURCE` | 未设（`web`） | 搭子凭证来源。未设 = **只用网页凭证**（桌面链路不参与，跳过启动那次约 3 秒的探测；池子不可用时路由层直接拒绝并说明原因，不静默退回桌面链路）。设 `auto`（别名 `desktop`）= 桌面优先、不可用时回落网页池。**无法识别的值按 `web` 处理并在启动日志告警** |
 | `DUMATE_WEB_FALLBACK` | 未设（开启） | 设 `0` 关闭「桌面凭证不可用时回落到网页池」（见上文回落机制）。关闭后桌面凭证失效即请求全失败 |
 | `DUMATE_POINTS_METER` | 未设（开启） | 设 `0` 关闭搭子的余额游标采集（`points-cursor.js`）。关闭后请求日志不再有逐条消耗 |
