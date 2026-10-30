@@ -1,5 +1,5 @@
 快照指纹 sha256（stable/src 下 78 个 .js，按路径+内容计算）：
-9dee04a4d1998a07d2afccdbcc5bdb428d0b249da9315fc035c5ed53bb091bb8
+6a7226a4df23e905f1f734c775a354b8abc34dd4548601c23924ea7a1ba9fdf4
 
 指纹算法：
   对 stable/src 下所有 .js 文件，按相对路径排序（`/` 分隔），
@@ -7,47 +7,40 @@
   本次已用该算法实算，可复核（scripts/snapshot-closure.js 算闭包，
   指纹与逐字节比对由同目录脚本流程复现）。
 
-来源：main 分支「播报即收尾三通道共享化」提交（父提交 77168f4）。
-  本次是**增量同步**，不是全量补齐——上一版快照已与 77168f4 对齐，
-  基线干净，只有本次改动的 7 个文件需要覆盖。
+来源：main 分支「Qoder 排队重签 + 无内容阈值回宽」提交（父提交 674686d，
+  即 2026-10-30 的「播报即收尾三通道共享化」）。本次是**增量同步**：
+  只覆盖 2 个文件（qoder/chat.js、qoder/index.js），其余 76 个与上一版
+  指纹 9dee04a4… 完全一致。
 
-文件数：77 → 78（新增 1，无删除）。
-  新增：repair.js（「播报即收尾」共享模块：判定、追加修复指令、
-        OpenAI chunk 缓冲门；千问 / Qoder / TRAE 三通道共用）
-  覆盖：repair.js（新）、qoder/chat.js、qoder/index.js、
-        qwenwork/chat.js、qwenwork/index.js、traework/chat.js、
-        traework/index.js
+本次覆盖了什么（相对上一版快照 9dee04a4…，2026-10-31 两件）：
+  1. **排队重发必须每轮重签（reSign）**：上游按**签名字节**去重——请求体
+     复用没问题，但 headers 复用时第二次起一律回
+     `{"code":"103","message":"Duplicate request"}`。103 < 400，
+     payloadError 认不出，请求静默挂到内容超时才被掐断；且去重与时间无关
+     （实测同一份 headers 间隔 7 秒重发仍是 103）。修法：重发前重建
+     headers（新 requestId + 新 cosy-date），**不动 encBody**，排队槽位
+     不受影响。实测对照：复用 headers → 103 后沉默；每轮重签 → 正常拿到
+     10605/放行。代价实测小请求 0.1ms / 800KB 请求 18.8ms。
+  2. **queue/status 同机制**（statusHeaders 由常量改成函数）：复用签名时
+     第二次查询起全部 403/103，getQueueStatus 对非 200 返回 null，
+     statusFailures 两次就把它判成「端点不可用」——官方排队轮询协议整条
+     退化成盲等重发。实测每次重建则连续 3 次全部 200。
+  3. **无内容超时 12s/6s → 90s（DUMATE_QODER_CONTENT_MS 默认值）**：
+     按 1270 条成功请求复核，首字 > 6s 占 14.4%、> 30s 占 7.6%、max 63.9s；
+     大上下文（>50K）首字 > 6s 占 20.5%。旧的 6s 上线后 502 里有 36 条
+     first_token_ms 卡在 5006~5030——计时器自己造的。真排队时上游 200~680ms
+     内就回 10605 信封（走 payloadError 断流），根本轮不到这个计时器；
+     90s 盖住本地实测 max 63.9s 与 qoder2api-hub 记载的 71s 上限。
 
-本次覆盖了什么（相对上一版快照）：
-  1. 新增 src/repair.js：looksUnfinished / appendRepairNudge / createChunkGate /
-     envCaps + REPAIR_NUDGE 等常量。判据与文本与 TRAE 2026-10-05 的实测结论
-     逐字一致（只有「检测 + 一次性重试」打到 5/5，提示词修不动）。
-  2. 千问通道接入修复（qwenwork/index.js 的 runOnce 流式 + 非流式两条路径）：
-     带工具的请求启用缓冲门，正文「播报 + 下一步」时追加修复指令重试。
-     新增 chat.hasFunctionTools（与 buildBody 的过滤口径共用）与
-     buildBody 的 out.sessionId（修复轮钉住会话、request_id 每轮新生成）。
-  3. Qoder 通道接入修复（qoder/index.js）：因签名含 body，修复轮整套重签
-     （applyRound），request_set_id（排队槽位键）每轮换新、session_id 钉住；
-     流式路径拆出 sawUp（上游送来过真实数据）/ sent（已到达下游）两个标志，
-     排队守卫与换主机守卫用前者、err.sent 用后者，且 err.sent 计入缓冲门的
-     放行（reasoning 是直发的）。聚合错误的 quotaKind 现在透传到上层。
-  4. TRAE 收敛：REPAIR_NUDGE / HOLD_CAP / REPAIR_MAX / looksUnfinished 改走
-     src/repair.js，行为不变（verify-traework-repair.js 38 项全绿）。
-  5. 顺带带入上一提交里判据修正的部分：qoder/chat.js 的 buildBody
-     hasFunctionTools 导出；traework/index.js 的 onAccount 第二参数（账号 id）。
-
-验证记录（2026-10-30）：
+验证记录（2026-10-31）：
   · 闭包重算：node scripts/snapshot-closure.js → 78 个文件，无无法解析的 require
   · 逐字节比对：src 与 stable/src 闭包内 78 个文件内容零差异；stable 无多余文件
-  · 语法检查：stable/src 下 78 个文件 node --check 全部通过
+  · 语法检查：本次覆盖的 2 个文件 node --check 通过
   · 独立启动：DUMATE2API_PORT=19099 DUMATE_ADMIN_DATA=<repo>/data 启动成功，
-    /health 四通道全部 ready（dumate(source=web, fallback 可用) / qwenwork 2 账号
-    本地签名 / traework 2 账号 / qoder 2 账号 needsClient=false）
-  · 离线套件：test/unit/*.test.js 109 项全过；
-    verify-qwen-repair 36 项 / verify-qoder-repair 36 项 / verify-traework-repair 38 项；
-    其余通道脚本（channel / throttle / read-idle / error-surface / grants / cosy /
-    max-output / discipline / wallets-zero / daily-aggregate / stream-error /
-    toolshape / gained / 9074 / display-name / fallback-stream-pipe）全通过
+    /health 四通道全部 ready（dumate source=web / qwenwork 2 账号本地签名 /
+    traework 2 账号 / qoder 2 账号 needsClient=false）
+  · 离线回归：verify-qoder-throttle / read-idle / error-surface / channel /
+    repair 全部 exit=0
   · 未启动 9080（对外服务的启动是用户的决定，不属于发布流程）
 
 注意：9080 若当前在运行，它跑的仍是旧快照代码；要让新代码生效需重启 9080

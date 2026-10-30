@@ -402,6 +402,12 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   let activeSetId = '';
   let encBody = '';
   let headers = null;
+  const HEADER_EXTRA = {
+    'accept-encoding': 'identity',
+    // 模型 key 必须同时放请求头——实测只放 body 时上游仍走 auto
+    'x-model-key': modelKey,
+    'x-model-source': 'system',
+  };
   const applyRound = async (p, setId) => {
     activeSetId = setId || '';
     const bodyJson = chat.buildBody(modelKey, p, {
@@ -416,12 +422,30 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     });
     // encode 进 worker（审计 P1-5b）：几 MB 请求的编码不再独占事件循环
     encBody = await cosy.encodeAsync(Buffer.from(bodyJson));
-    headers = cosy.buildHeaders(sess, ep.ChatPathSig, encBody, 'text/event-stream', {
-      'accept-encoding': 'identity',
-      // 模型 key 必须同时放请求头——实测只放 body 时上游仍走 auto
-      'x-model-key': modelKey,
-      'x-model-source': 'system',
-    }, { sse: true });
+    headers = cosy.buildHeaders(sess, ep.ChatPathSig, encBody, 'text/event-stream', HEADER_EXTRA, { sse: true });
+  };
+  /**
+   * 只重签名、不动请求体（排队等待轮用）。
+   *
+   * **排队重发必须重签**（2026-10-31 实测，这是「Qoder 一直转圈」的主因之一）：
+   * 排队等待轮按官方协议用**同一份**加密请求体重发（同一个 request_set_id 是
+   * 排队槽位的钥匙），但早先连 `headers` 也一并复用——上游按签名字节去重，
+   * 第二次起一律回 `{"code":"103","message":"Duplicate request"}`。
+   *
+   * 两个致命后果叠加：103 < 400，`payloadError` 认不出（它不是错误信封），
+   * 请求于是**静默**挂到内容超时才被掐断；去重判据与时间间隔无关（实测同一份
+   * headers 间隔 7 秒重发仍是 103），所以只靠等待永远绕不开。
+   *
+   * 实测对照（同一 request_set_id 连发）：
+   *   · 复用 headers → `103 Duplicate request`，之后沉默
+   *   · 每轮重建 headers → 正常拿到 10605 / 放行，第 5 轮出内容
+   *
+   * 重签只影响 Authorization 里的 payloadB64（`requestId` 每次新生成）与
+   * cosy-date，**不动 encBody**，所以排队槽位不受影响。代价实测：小请求 0.1ms、
+   * 800KB 请求 18.8ms——相对一轮 5~20 秒的排队等待可以忽略。
+   */
+  const reSign = () => {
+    headers = cosy.buildHeaders(sess, ep.ChatPathSig, encBody, 'text/event-stream', HEADER_EXTRA, { sse: true });
   };
   await applyRound(payload, opts.requestSetId);
   // 出站代理（E 包接线）：账号 proxy 字段 > 全局 DUMATE_PROXY，无代理 null 直连
@@ -434,9 +458,16 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   // queue/status 用与推理相同的 COSY 会话签名（签名 body 传空串）；查询主机
   // 用「本次尝试实际打到的那个」（队列跟着主机走）。连续两次不可用就停止
   // 探测、退化为纯盲等重发（hub 验证过的形态），端点不存在不影响主流程。
-  const statusHeaders = queueDeadline > 0
+  //
+  // **签名必须每次重建，不能复用**（2026-10-31 实测）：与推理请求同一个去重
+  // 机制——同一份 headers 连发，第二次起一律 `403 {"code":"103","message":
+  // "Duplicate request"}`，而 `getQueueStatus` 对非 200 返回 null，于是
+  // `statusFailures` 两次就把它判成「端点不可用」，官方排队轮询协议**整条
+  // 退化成盲等重发**。实测同一份 headers 间隔 7 秒重发仍是 103（判据与时间
+  // 无关）；每次重建则连续 3 次全部 200。
+  const statusHeaders = () => (queueDeadline > 0
     ? cosy.buildHeaders(sess, '/api/v2/service/ask/queue/status', '', 'application/json')
-    : null;
+    : null);
   let statusUsable = queueDeadline > 0;
   let statusFailures = 0;
   let queueWaitStart = 0;
@@ -458,8 +489,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       await sleep(Math.min(waitMs, remaining) + Math.floor(Math.random() * 250));
       if (Date.now() >= queueDeadline) return 'giveup';
     }
+    // 盲等重发（没查状态也要重签名）——复用 headers 会被判 103 Duplicate
+    // request，等待再久也绕不开（见 reSign 的注释）。
+    reSign();
     if (!statusUsable || !origin || !activeSetId) return 'retry';
-    const st = await chat.getQueueStatus(origin, statusHeaders, {
+    const st = await chat.getQueueStatus(origin, statusHeaders(), {
       modelKey,
       queueType: queueTypeOf(message),
       requestId: activeSetId, // 当前修复轮自己的槽位键（首轮 = send() 下发的那份）
@@ -475,10 +509,13 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       if (statusFailures >= 2) statusUsable = false;
       return 'retry';
     }
-    // 上游明说还要排多久、且远超剩余预算：早停，不烧满预算干等
+    // 早停（不重试）：见上面的 'giveup' 分支
     if (st.state === 'queued' && st.retryAfterMs > 0 && Date.now() + st.retryAfterMs > queueDeadline) {
       return 'giveup';
     }
+    // 重发前必须重签名——复用 headers 会被上游判 103 Duplicate request，
+    // 请求随之静默挂到内容超时（见 reSign 的注释）。
+    reSign();
     return 'retry'; // released → 立即重发；unknown → 盲等重发（hub 形态）
   };
 

@@ -393,9 +393,12 @@ credits.capture = () => {};                 // 不写真实积分账本
 let scripts = {};
 let currentToken = '';
 let sentBodies = []; // 排队专区：捕获 postStream 收到的加密请求体
+let sentSigs = [];   // 排队专区：捕获每次实际发出的 Authorization（验证重签名）
 let callsByToken = {};
 chat.postStream = async (url, body, headers, onChunk) => {
   sentBodies.push(body); // 排队专区用：重发必须是**同一份**加密请求体
+  // 重签名不变量（2026-10-31）：请求体复用、Authorization 每轮换新
+  sentSigs.push(headers && headers.authorization ? headers.authorization : '');
   const n = (callsByToken[currentToken] = (callsByToken[currentToken] || 0) + 1);
   let plan = scripts[currentToken] || 'ok';
   if (Array.isArray(plan)) plan = plan[n - 1] || plan[plan.length - 1] || 'ok';
@@ -714,7 +717,7 @@ function resetCase(plan) {
     require('../src/pool').pool.revive('qoder:901');
     require('../src/pool').pool.revive('qoder:902');
     scripts = { ta: ['queueenv', 'ok'], tb: ['queueenv', 'ok'] };
-    statusCalls = []; sentBodies = []; callsByToken = {};
+    statusCalls = []; sentBodies = []; sentSigs = []; callsByToken = {};
     statusScript = () => ({ state: 'released', retryAfterMs: 0 });
     const chunks = [];
     const t0 = Date.now();
@@ -728,6 +731,9 @@ function resetCase(plan) {
     assert.strictEqual(statusCalls[0].params.queueType, 'p3');
     assert.ok(sentBodies.length >= 2, '应至少尝试两次，实际 ' + sentBodies.length);
     assert.ok(sentBodies.every((b) => b === sentBodies[0]), '重发必须是同一份加密请求体（同一个 request_set_id，排队槽位钥匙）');
+    assert.ok(sentSigs.length >= 2, '应至少两次尝试');
+    assert.ok(sentSigs.every((x) => x && x.startsWith('Bearer COSY.')), '每轮都必须带签名头');
+    assert.strictEqual(new Set(sentSigs).size, sentSigs.length, '每轮重发必须重新签名（复用会被上游判 103 Duplicate request）');
   });
 
   await checkAsync('status 明说还要排很久 → 早停（不烧满预算），下游 429', async () => {
@@ -735,7 +741,7 @@ function resetCase(plan) {
     require('../src/pool').pool.revive('qoder:901');
     require('../src/pool').pool.revive('qoder:902');
     scripts = { ta: 'queueenv', tb: 'queueenv' };
-    statusCalls = []; sentBodies = []; callsByToken = {};
+    statusCalls = []; sentBodies = []; sentSigs = []; callsByToken = {};
     statusScript = () => ({ state: 'queued', retryAfterMs: 600000 });
     let err = null;
     const t0 = Date.now();
@@ -753,7 +759,7 @@ function resetCase(plan) {
     require('../src/pool').pool.revive('qoder:901');
     require('../src/pool').pool.revive('qoder:902');
     scripts = { ta: ['queueenv', 'queueenv', 'ok'], tb: ['queueenv', 'queueenv', 'ok'] };
-    statusCalls = []; sentBodies = []; callsByToken = {};
+    statusCalls = []; sentBodies = []; sentSigs = []; callsByToken = {};
     statusScript = () => null; // 端点不可用（网络错/404/解析不出）
     const chunks = [];
     const r = await require('../src/qoder').send(payload, (c) => chunks.push(c), { sessionKey: 'case-qp3' });
@@ -767,7 +773,7 @@ function resetCase(plan) {
     require('../src/pool').pool.revive('qoder:901');
     require('../src/pool').pool.revive('qoder:902');
     scripts = { ta: ['queuesilent', 'ok'], tb: ['queuesilent', 'ok'] };
-    statusCalls = []; sentBodies = []; callsByToken = {};
+    statusCalls = []; sentBodies = []; sentSigs = []; callsByToken = {};
     statusScript = () => ({ state: 'released', retryAfterMs: 0 });
     const chunks = [];
     const t0 = Date.now();
@@ -778,6 +784,7 @@ function resetCase(plan) {
     assert.ok(statusCalls.length >= 1, '应查询过 queue/status');
     assert.ok(sentBodies.length >= 2, '应至少尝试两次');
     assert.ok(sentBodies.every((b) => b === sentBodies[0]), '静默重发也必须是同一份加密请求体');
+    assert.strictEqual(new Set(sentSigs).size, sentSigs.length, '静默形态重发同样必须重新签名');
   });
 
   chat.buildBody = origBuildBody;
