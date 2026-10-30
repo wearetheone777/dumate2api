@@ -32,6 +32,12 @@ export interface TraeworkAccount {
   lastErrorAt: number | null
   deviceId: string
   refreshTail: string
+  /** 9074 自愈：连续退避次数（成功签到即清零）；0 = 无退避史 */
+  checkin9074Count?: number
+  /** 9074 退避截止时刻。未过期且 > now 时账号处于「等重试」状态 */
+  checkin9074Until?: number | null
+  /** 设备派生代数。>0 说明发生过 9074 设备轮换（gen 0 = 原始派生） */
+  deviceGeneration?: number
   /**
    * 脱敏手机号。可能为空——TRAE 无官方手机号接口（GetUserInfo 已 401），
    * 仅当昵称形如「用户13800138000」时才能取到。

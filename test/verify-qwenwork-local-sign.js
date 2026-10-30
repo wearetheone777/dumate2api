@@ -147,7 +147,7 @@ check('qoder/cosy.js 与 src/cosy.js 共用同一份算法实现', () => {
   assert.strictEqual(qoderCosy.SERVER_PUBKEY_PEM, core.SERVER_PUBKEY_PEM, '公钥不是同一份');
 });
 
-check('两个通道的 cosyVersion 各自独立（千问 1.1.52 / Qoder 1.0.10）', () => {
+check('两个通道的 cosyVersion 各自独立（千问 1.1.52 / Qoder 1.1.75）', () => {
   const qoderPayload = JSON.parse(Buffer.from(
     qoderCosy.buildPayloadB64('dummy-info'), 'base64',
   ).toString('utf8'));
@@ -155,7 +155,7 @@ check('两个通道的 cosyVersion 各自独立（千问 1.1.52 / Qoder 1.0.10�
     built.headers.authorization.slice('Bearer COSY.'.length).split('.')[0], 'base64',
   ).toString('utf8'));
   assert.strictEqual(qwPayload.cosyVersion, '1.1.52', '千问的 cosyVersion 应为 1.1.52');
-  assert.strictEqual(qoderPayload.cosyVersion, '1.0.10', 'Qoder 的 cosyVersion 应为 1.0.10');
+  assert.strictEqual(qoderPayload.cosyVersion, '1.1.75', 'Qoder 的 cosyVersion 应为 1.1.75（5d6f271 对齐官方 CLI）');
 });
 
 // ---- 9. bridge 的开关与 status() 判定 ----

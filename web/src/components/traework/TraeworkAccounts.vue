@@ -321,16 +321,26 @@ function creditOf(id: number): TraeworkCreditRow | undefined {
 }
 
 function checkinColor(a: TraeworkAccount) {
+  // 9074 退避中是「等自动重试」，不是故障也不是可签到——单独一档橙色
+  if (backoffLeft(a) > 0) return 'orange'
   const c = creditOf(a.id)
   if (!c || c.checkedIn == null) return 'default'
   return c.checkedIn ? 'green' : 'orange'
 }
 function checkinText(a: TraeworkAccount) {
+  const left = backoffLeft(a)
+  if (left > 0) return `9074 退避 ${Math.ceil(left / 1000)}s`
   const c = creditOf(a.id)
   if (!c) return '刷新中'
   if (c.error) return '查询失败'
   if (c.checkedIn == null) return '—'
   return c.checkedIn ? '今日已签' : '未签到'
+}
+
+/** 9074 退避剩余毫秒。自愈闭环（claimWithRetry）记的账，到期由轮询自然重试 */
+function backoffLeft(a: TraeworkAccount) {
+  const until = a.checkin9074Until || 0
+  return until > Date.now() ? until - Date.now() : 0
 }
 
 function tokenExpired(a: TraeworkAccount) {

@@ -76,10 +76,14 @@ check('read idle → 上游排队挂起已主动断开，保留原串', () => {
 });
 
 // ---- 3. 不该动的情况 ----
-check('已经有信息量的错误保持原样（HTTP 502 / 402）', () => {
+check('已经有信息量的错误保持原样（HTTP 502）', () => {
   assert.strictEqual(explainError('HTTP 502'), 'HTTP 502');
+});
+// 402 在 da9b011 起带额度语义（冷却到次日 00:00），翻译时保留原串——
+// 此用例原本期望 402 原样，是那次提交漏同步的漂移（2026-10-30 批量回归补上）
+check('402 翻译成额度语义且保留原串（da9b011 行为）', () => {
   assert.strictEqual(explainError('qwenwork 402: Error in upstream response'),
-    'qwenwork 402: Error in upstream response');
+    '额度已用完（该账号暂停使用，次日 00:00 重置后自动恢复）（qwenwork 402: Error in upstream response）');
 });
 
 check('认不出的错误原样返回（不编解释）', () => {

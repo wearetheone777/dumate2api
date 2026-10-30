@@ -235,6 +235,7 @@
         </span>
       </template>
       <template #extra>
+        <a-button size="small" class="ghost-btn mr-2" :loading="billingChecking" @click="runBillingCheck">计费自检</a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="loadQd(true)">刷新</a-button>
       </template>
 
@@ -263,6 +264,27 @@
       </div>
 
       <a-alert v-if="qdError" type="warning" show-icon class="mt-3" :message="qdError" />
+
+      <!-- 计费自检结果：上游静默改路由的可见性（billed_rate vs 标称倍率）。
+           ratio≠1 不一定是改路由——错峰优惠与倍率元数据过期都是合法偏差 -->
+      <a-alert
+        v-if="billingResult"
+        :type="billingResult.ok ? (billingResult.ratio != null && Math.abs(billingResult.ratio - 1) > 0.05 ? 'warning' : 'success') : 'error'"
+        show-icon class="mt-3"
+      >
+        <template #message>
+          <template v-if="billingResult.ok">
+            计费自检 · {{ billingResult.model }}：标称 {{ billingResult.expected ?? '—' }}，
+            实测 {{ billingResult.billed ?? '—' }}，
+            比值 {{ billingResult.ratio ?? '—' }}
+            <span v-if="billingResult.account" class="text-slate-500">（{{ billingResult.account }}，{{ billingResult.elapsedMs }}ms）</span>
+          </template>
+          <template v-else>计费自检失败：{{ billingResult.error }}</template>
+        </template>
+        <template #description>
+          <span class="text-xs">{{ billingResult.note || '比值≈1 正常；≠1 不一定是改路由——错峰优惠与倍率元数据过期都会造成偏差，结合模型页标称值人工判读。' }}</span>
+        </template>
+      </a-alert>
 
       <!-- 模型信息表：倍率（可排序）/ 上下文 / 输出上限，字段带来源标记。
            与搭子、千问、TRAE 共用同一个组件——Qoder 原本是单独一份 a-table，
@@ -564,6 +586,33 @@ const isQd = computed(() => isQoder())
 const qdModels = ref<QoderModel[]>([])
 const qdError = ref('')
 const qdCredits = ref<QoderCreditRow[]>([])
+// 计费自检：对最低倍率模型发探针，比对实测倍率与标称（上游改路由的可见性）
+const billingChecking = ref(false)
+const billingResult = ref<Awaited<ReturnType<typeof qoderApi.billingCheck>>['data'] | null>(null)
+async function runBillingCheck() {
+  // 选一个最低倍率的模型（免费/0.1 档即可验证，不烧高倍率额度）
+  const ranked = [...qdModels.value]
+    .filter((m) => m.key)
+    .sort((a, b) => {
+      const ra = a.rate != null && a.rate > 0 ? a.rate : (a.rateOriginal ?? 99)
+      const rb = b.rate != null && b.rate > 0 ? b.rate : (b.rateOriginal ?? 99)
+      return ra - rb
+    })
+  const target = ranked[0]?.key
+  if (!target) {
+    billingResult.value = { ok: false, model: '', account: null, expected: null, billed: null, ratio: null, credits: null, error: '模型表未加载，先刷新' }
+    return
+  }
+  billingChecking.value = true
+  try {
+    const r = await qoderApi.billingCheck(target)
+    billingResult.value = r.data
+  } catch (e: any) {
+    billingResult.value = { ok: false, model: target, account: null, expected: null, billed: null, ratio: null, credits: null, error: e?.message || '请求失败' }
+  } finally {
+    billingChecking.value = false
+  }
+}
 // 通道元信息（账号数 / 当前账号 / token 到期）来自 /system/status 的 channels.qoder
 const qdStatus = computed(() => channelStore.infos['qoder'] || null)
 const qdCheapCount = computed(() => qdModels.value.filter((m) => m.cheap).length)

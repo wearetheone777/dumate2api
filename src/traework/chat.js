@@ -57,6 +57,15 @@ function buildBody(payload, model, meta) {
   if (Array.isArray(obj.messages)) {
     for (const m of obj.messages) {
       if (!m || typeof m !== 'object') continue;
+      // 图像只属于 user 消息（OpenAI/Anthropic 规范如此）。历史里的
+      // assistant/tool 图像 part 剥掉——上游对非 user 图像的行为未知，
+      // 不给它赌的机会。user 的 image_url part 原样透传（实测上游接受，
+      // 2026-10-30 真机：纯红色 PNG → 模型答「红色」）
+      if (m.role !== 'user' && Array.isArray(m.content)) {
+        const kept = m.content.filter((p) => !(p && typeof p === 'object'
+          && (p.type === 'image_url' || p.type === 'input_image')));
+        if (kept.length !== m.content.length) m.content = kept;
+      }
       if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
         const kept = [];
         for (const tc of m.tool_calls) {
@@ -431,8 +440,81 @@ function createTextGate(emit, model, hold) {
     /** 判定所需的中间状态 */
     result() { return { toolCalls, text, live, pending }; },
     /** 收尾：把还没下发的正文与暂扣的帧补发出去 */
-    finish() { flush(); for (const f of held) emit(f); },
+    finish() {
+      // DSML 流式兜底（2026-10-30）：整轮零工具调用、正文还没 flush（pending
+      // 仍在缓冲里）、且正文带 DSML 块——解析还原成 tool_calls 补发，正文发
+      // 剥离后的干净版（pending 置空阻止 flush 发原文）。已 flush（live）的
+      // 场景正文出去了收不回，维持现状（不劣化）；reasoning 早已直发不受影响。
+      if (!live && toolCalls === 0 && pending && /dsml/i.test(pending)) {
+        const parsed = parseDsmlToolCalls(pending);
+        if (parsed) {
+          pending = '';
+          emit(mkChunk({ content: parsed.clean }));
+          emit(mkChunk({
+            tool_calls: parsed.calls.map((cc, i) => ({
+              index: i,
+              id: `call_dsml_${Date.now().toString(36)}${i}`,
+              type: 'function',
+              function: { name: cc.name, arguments: cc.arguments },
+            })),
+          }));
+          held.push(JSON.stringify({
+            id: 'traework', object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000), model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+          }));
+        }
+      }
+      flush(); for (const f of held) emit(f);
+    },
   };
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek DSML 工具调用回退解析（2026-10-30，融合自 trae2api-hub trae_proxy.py）
+//
+// 现象：DeepSeek 系模型偶尔把工具调用以**文本标记**写进正文而不是走原生
+// tool_calls 增量——形状是 `<dsml:calls>` 包 `<dsml:invoke name="…">` 包
+// `<dsml:parameter name="…">`（标签名里 DSML 的位置与分隔符不固定，前缀
+// 任意）。客户端拿到的是一段 XML 文本，本轮工具调用不执行。
+//
+// 处置是**纯兜底**：只在「正文含 DSML 标记且本轮没有任何原生 tool_calls」
+// 时才解析——原生工具调用永远优先（真实调用带调用 id 与上游语义，文本
+// 解析只是尽力还原），有原生调用时正文里的 DSML 文本原样保留（那可能是
+// 模型在讨论格式而不是在调用）。流式路径不解析：正文可能已直发，收不回；
+// 非流式（aggregate，含 chatlab 试调台）在聚合出口做，正文全量在手。
+// ---------------------------------------------------------------------------
+
+/** `<…DSML…calls>…</…DSML…calls>` 块（DOTALL：块可跨行） */
+const DSML_CALLS_RE = /<[^>]*dsml[^>]*calls>([\s\S]*?)<\/[^>]*dsml[^>]*calls>/i;
+/** `<…DSML…invoke name="…">…</…DSML…invoke>`（g 必须：exec 循环推进靠它） */
+const DSML_INVOKE_RE = /<[^>]*dsml[^>]*invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/[^>]*invoke>/gi;
+/** `<…DSML…parameter name="…">…</…DSML…parameter>`（g 同上） */
+const DSML_PARAM_RE = /<[^>]*dsml[^>]*parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/[^>]*parameter>/gi;
+
+/**
+ * 从正文解析 DSML 工具调用块。
+ * @returns {{calls:Array<{name:string,arguments:string}>, clean:string}|null}
+ *          null = 没有 DSML 块或块里没有 invoke（正文原样保留）
+ */
+function parseDsmlToolCalls(text) {
+  const s = String(text || '');
+  if (!/dsml/i.test(s)) return null;
+  const m = DSML_CALLS_RE.exec(s);
+  if (!m) return null;
+  const calls = [];
+  let inv;
+  while ((inv = DSML_INVOKE_RE.exec(m[1])) !== null) {
+    const params = {};
+    let p;
+    while ((p = DSML_PARAM_RE.exec(inv[2])) !== null) {
+      params[p[1]] = p[2].trim();
+    }
+    calls.push({ name: inv[1], arguments: JSON.stringify(params) });
+  }
+  if (!calls.length) return null;
+  const clean = (s.slice(0, m.index).trim() + ' ' + s.slice(m.index + m[0].length).trim()).trim();
+  return { calls, clean };
 }
 
 /**
@@ -479,6 +561,22 @@ function aggregate(events, model) {
     if (e.event === 'done' && d.finish_reason) finish = d.finish_reason;
   }
 
+  // DSML 回退（见 parseDsmlToolCalls 注释）：零原生调用且正文带 DSML 块时
+  // 还原成结构化工具调用并从正文剥离；原生调用优先，不碰正文。
+  if (!calls.size && content) {
+    const parsed = parseDsmlToolCalls(content);
+    if (parsed) {
+      content = parsed.clean;
+      parsed.calls.forEach((c, i) => {
+        calls.set(i, {
+          id: `call_dsml_${Date.now().toString(36)}${i}`,
+          type: 'function',
+          function: { name: c.name, arguments: c.arguments },
+        });
+      });
+    }
+  }
+
   // 上游在给出工具调用的同时 done 帧仍报 `stop`（2026-10-29 实测抓包：
   // tool_calls 增量正常到达，done 是 {"finish_reason":"stop"}）。OpenAI 生态
   // 里 `finish_reason === 'tool_calls'` 是常见的执行判据，照搬会让工具被
@@ -515,4 +613,5 @@ function aggregate(events, model) {
 module.exports = {
   buildBody, postStream, readStream, toOpenAIChunk, deltaOf, aggregate, eventError, normalizeToolCall,
   createTextGate, looksUnfinished, withRepairNudge, REPAIR_NUDGE, REPAIR_MAX, HOLD_CAP,
+  parseDsmlToolCalls,
 };

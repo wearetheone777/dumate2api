@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const constants = require('./constants');
 const bridge = require('./bridge');
 const { payloadError, envelopeStatus } = require('../upstream-errors');
+const { contentText } = require('../images');
 
 const TIMEOUT_MS = 600000;
 
@@ -102,14 +103,16 @@ function buildBody(modelKey, payload) {
   let system = '';
   if (payload && typeof payload.system === 'string') system = payload.system;
   const sysMsg = messages.find((m) => m && m.role === 'system');
-  if (!system && sysMsg) system = String(sysMsg.content || '');
+  // content 可能是带 image_url 的 parts 数组（翻译层已保真）——String() 会变成
+  // "[object Object]"，必须走文本展开（图像换占位，COSY 的 text 槽只有纯文本）
+  if (!system && sysMsg) system = contentText(sysMsg.content, '[Image content - not supported by Qwen channel]');
   // **不要把 system 从 messages 里摘出去**：实测上游只认 messages 里的
   // system 角色，顶层的 `system` 字段它根本不读。摘出去会让系统提示词
   // 整体丢失——模型收不到任何指令，表现为「不按要求做事、随口答两句就停」。
   // 顶层字段仍然带上（兼容），但权威来源是 messages。
   const turns = messages;
   const lastUser = [...turns].reverse().find((m) => m && m.role === 'user');
-  const text = lastUser ? String(lastUser.content || '') : '';
+  const text = lastUser ? contentText(lastUser.content, '[Image content - not supported by Qwen channel]') : '';
 
   const parameters = {};
   for (const k of ['temperature', 'top_p', 'max_tokens', 'presence_penalty', 'frequency_penalty']) {

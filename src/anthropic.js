@@ -22,6 +22,7 @@
 // ============================================================================
 const { resolveMaxTokens } = require('./budget');
 const modelmap = require('./modelmap');
+const { toImageUrlPart } = require('./images');
 
 // 模型映射已抽到 modelmap.js（可经管理端编辑，落 data/model-map.json）。
 // 这里保留 MODEL_MAP 导出以兼容既有引用，值是默认表。
@@ -155,12 +156,24 @@ function anthropicToOpenAI(anthropicReq, opts = {}) {
     const texts = [];
     const toolUses = [];
     const toolResults = [];
+    const imageParts = [];
     for (const block of msg.content) {
       if (!block || typeof block !== 'object') continue;
       if (block.type === 'text') texts.push(block.text || '');
       else if (block.type === 'tool_use') toolUses.push(block);
       else if (block.type === 'tool_result') toolResults.push(block);
-      else if (block.type === 'image') texts.push('[Image content - not supported by DuMate backend]');
+      else if (block.type === 'image') {
+        // 直连通道保真：base64/URL source 统一转 OpenAI image_url part。
+        // TRAE llm_utils_chat 实测接受该形状（2026-10-30）；不支持的通道
+        // 由各自通道层降级（traework 校验模型能力，千问/Qoder 展开占位文本）。
+        const src = block.source || {};
+        const url = src.type === 'url' ? src.url
+          : src.type === 'base64' ? `data:${src.media_type || 'image/png'};base64,${src.data || ''}`
+            : '';
+        const part = toImageUrlPart(url);
+        if (part) imageParts.push(part);
+        else texts.push('[Image content - unsupported source]');
+      }
       // thinking 块不回传：那是模型自己的思考，上游不需要，回传反而干扰
     }
 
@@ -193,7 +206,16 @@ function anthropicToOpenAI(anthropicReq, opts = {}) {
       });
     }
     const text = texts.filter(Boolean).join('\n');
-    if (text) messages.push({ role: 'user', content: text });
+    if (imageParts.length) {
+      // 带图消息必须保形状：content 用 parts 数组（text + image_url），
+      // 压成字符串会把图像丢掉
+      const parts = [];
+      if (text) parts.push({ type: 'text', text });
+      parts.push(...imageParts);
+      messages.push({ role: 'user', content: parts });
+    } else if (text) {
+      messages.push({ role: 'user', content: text });
+    }
   }
 
   // 预算统一由 budget.js 判定：客户端值只作参考，reasoning 与正文共用预算，

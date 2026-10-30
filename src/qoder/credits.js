@@ -36,6 +36,31 @@ function append(entry) {
  *   ——0 会被读成「这次没花钱」，而真相是没测到。
  * @param {object} [opts] { reqId, model, ms, tokens }
  */
+/**
+ * 实测倍率：credits ÷ (tokens/1000)。
+ *
+ * 上游静默改路由的可见性（融合自 qoder2api-hub #113 的 billed_model 思路，
+ * 保守版）：Qoder 响应的 model 恒为 "auto"，请求的模型可能被服务端换掉。
+ * 直接比对「实测倍率 vs 模型表 price_factor」**不做自动判定**——错峰优惠
+ * （discountFactor）会合法改变倍率而我们不确定乘性方向（CLAUDE.md 明确
+ * 不解读），自动判会误报；把实测值记进账本，比对交给管理端人工探针。
+ *
+ * @param {number} credits 上游 usage 直给的消耗
+ * @param {object|null} usage 同帧的 usage（total_tokens 或 prompt+completion）
+ * @param {number|null} expectedRate 模型表的 price_factor
+ * @returns {number|null} 无 credits / 无 tokens / 无期望倍率时如实 null
+ */
+function computeBilledRate(credits, usage, expectedRate) {
+  if (typeof credits !== 'number' || !Number.isFinite(credits)) return null;
+  const u = usage && typeof usage === 'object' ? usage : {};
+  const tokens = Number(u.total_tokens)
+    || (Number(u.prompt_tokens) || 0) + (Number(u.completion_tokens) || 0);
+  if (!(tokens > 0)) return null;
+  const rate = Number(expectedRate);
+  if (!Number.isFinite(rate) || rate <= 0) return null;
+  return Math.round((credits / (tokens / 1000)) * 10000) / 10000;
+}
+
 function capture(account, credits, opts = {}) {
   // 只认真正的数值：字符串 "abc" 会被 Number() 转成 NaN 从而挡掉，
   // 但 "0.5" 会强转成功——调用方传错类型时宁可不记，也不要记一笔可疑的数
@@ -51,6 +76,8 @@ function capture(account, credits, opts = {}) {
     credits: Math.round(Number(credits) * 10000) / 10000,
     exact: true,
   };
+  // 实测倍率（computeBilledRate 的说明——上游改路由的可见性数据源）
+  if (opts.billedRate != null) entry.billed_rate = opts.billedRate;
   append(entry);
   return entry;
 }
@@ -149,5 +176,6 @@ function creditRecords(limit) {
 
 module.exports = {
   capture, readHistory, indexByReqId, attachCosts, todayUsage, creditRecords, since, dayKey,
+  computeBilledRate,
   FILE, filePath,
 };

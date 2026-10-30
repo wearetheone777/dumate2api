@@ -7,6 +7,7 @@ const chat = require('./chat');
 const authStore = require('./auth');
 const models = require('./models');
 const { normalizeError } = require('../errtext');
+const images = require('../images');
 // 选号接缝（集成阶段）：冷却/熔断/粘性/在途帽统一走池状态机。
 // 通道在池里的 uid 键位 = 'traework:<id>'（channel-pool.js 统一裁决）。
 const channelPool = require('../channel-pool');
@@ -161,13 +162,65 @@ function upstreamError(streamErr) {
 }
 
 /**
+ * 模型名前置校验（2026-10-30，错误码实测后的产物）。
+ *
+ * llm_utils_chat 对未知模型名回流内 4001「param is invalid」（HTTP 200）——
+ * 无信息量：客户端分不清是模型名错了还是别的参数坏了，还得白烧一次上游
+ * 请求才知道。模型表缓存就绪且名字**完全不在表中**（含条目名下的自定义
+ * 模型）时，网关直接 400 并列出可用模型；表没就绪或名字已知则放行，
+ * 让上游当唯一的真相源（在表但不可见的模型照样透传）。
+ */
+function assertModelKnown(payload, model) {
+  if (models.isKnownModel(model)) return;
+  const usable = models.cachedModelIds();
+  const err = new Error(
+    `模型 ${model} 不在 TRAE 模型表中。可用模型（部分）：${usable.slice(0, 8).join('、')}`
+    + `${usable.length > 8 ? ' 等' : ''}`,
+  );
+  err.statusCode = 400;
+  throw err;
+}
+
+/**
+ * 图像输入的模型能力校验（2026-10-30 图像支持落地）。
+ *
+ * llm_utils_chat 对「带图像 + 非多模态模型」的上游行为未实测——与其赌上游
+ * 报错或静默忽略（客户端以为发了图、模型却看不到），不如在网关侧明确拒绝。
+ * 校验只挡**确知不支持**的：模型表就绪且 multimodal=false 才拦；表没就绪
+ * （缓存空、拉取失败）放行——宁可不挡，也不能挡住能用的请求。
+ *
+ * 必须在选号之前：模型能力与账号无关，没必要为注定失败的请求占用池。
+ */
+async function assertImageSupport(payload, model) {
+  const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  const hasImage = msgs.some((m) => m && m.role === 'user' && images.hasImageContent(m.content));
+  if (!hasImage) return;
+  const meta = models.cachedMetaById(model);
+  if (!meta || meta.multimodal) return;
+  const mm = models.multimodalIds();
+  const err = new Error(
+    `模型 ${model} 不支持图像输入。可用多模态模型：${mm.slice(0, 6).join('、') || '（模型表暂不可用）'}`
+    + `${mm.length > 6 ? ' 等' : ''}`,
+  );
+  err.statusCode = 400;
+  throw err;
+}
+
+/**
  * 发对话请求。
  * @param {object} payload OpenAI 格式请求体
  * @param {function} [onChunk] 流式回调（收到解出来的 OpenAI 行）
  * @param {object} [opts] { reqId } 请求埋点的 id，用于把积分归因与日志精确配对
  */
 async function send(payload, onChunk, opts = {}) {
-  const model = payload && payload.model ? String(payload.model).replace(/^traework\//, '') : c.DEFAULT_MODEL;
+  let model = payload && payload.model ? String(payload.model).replace(/^traework\//, '') : c.DEFAULT_MODEL;
+  // model=auto 兜底：搭子路径有 mapModel 兜底（auto → model-text），直连通道
+  // 此前没有——`traework/auto` 会撞 assertModelKnown 的 400，客户端配 auto
+  // 直接不可用。映射到通道默认模型；不做 Trae2api-cn 的「按请求内容智能
+  // 路由」——隐性替换模型违背显式契约（计费倍率跟着变，用户不知情）。
+  if (model === 'auto' || !model) model = c.DEFAULT_MODEL;
+  assertModelKnown(payload, model);
+  await assertImageSupport(payload, model);
   // 选号经池状态机：冷却/熔断/禁用/暂停/在途满跳过 + 会话粘性。
   // traework 单账号时代不做故障转移；多账号后由池提供「跳过坏号」能力，
   // 换号重试仍交给上层（一次会话内修不动模型行为问题）。

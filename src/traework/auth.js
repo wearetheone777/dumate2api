@@ -315,13 +315,36 @@ function ensureDevice(a) {
   if (!uid) return a;
   const ok = a.deviceId && /^\d{15}$/.test(a.deviceId) && a.sessionId && a.marketUserId;
   if (ok) return a;
-  const d = require('./device').deriveDevice(uid);
+  const d = require('./device').deriveDevice(uid, a.deviceGeneration);
   return patch(a.id, {
     deviceId: d.deviceId,
     sessionId: d.sessionId,
     marketUserId: d.marketUserId,
     deviceDerivedFrom: uid,
   }) || { ...a, ...d };
+}
+
+/**
+ * 9074 自愈：换到下一代的派生设备（gen+1 重派生三件套并落盘）。
+ *
+ * 9074「当前参与用户太多」实测是**设备级**校验：同一 token 换一个新派生的
+ * id 就能签到成功（Trae2api-cn 的 rotate_checkin_device_id 同结论，它的
+ * device_generation 字段同方案）。只对「确实是派生出来的」设备轮换——
+ * deviceDerivedFrom 缺失说明 id 是手工填的，轮换它不是我们的决定。
+ * 返回 null 表示不可轮换（调用方按「没轮换过」继续走退避）。
+ */
+function rotateDevice(a) {
+  if (!a) return null;
+  const uid = a.deviceDerivedFrom || a.uid || jwtUid(a.accessToken) || '';
+  if (!uid || !a.deviceDerivedFrom) return null;
+  const g = (Number(a.deviceGeneration) || 0) + 1;
+  const d = require('./device').deriveDevice(uid, g);
+  return patch(a.id, {
+    deviceGeneration: g,
+    deviceId: d.deviceId,
+    sessionId: d.sessionId,
+    marketUserId: d.marketUserId,
+  }) || { ...a, ...d, deviceGeneration: g };
 }
 
 /** 取用户信息（登录后用一次，补 uid / 昵称）。
@@ -380,6 +403,6 @@ async function syncNickname(a) {
 
 module.exports = {
   FILE, filePath, dataDir, load, save, list, get, findUsable, upsert, remove, patch,
-  needsRefresh, exchange, jwtExp, jwtUid, fetchUserInfo, ensureDevice,
+  needsRefresh, exchange, jwtExp, jwtUid, fetchUserInfo, ensureDevice, rotateDevice,
   maskPhone, phoneFromNickname, genId, syncNickname,
 };

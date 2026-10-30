@@ -467,12 +467,16 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   // 本条请求的 credits（上游 usage 直给）。流式路径逐帧扫、取最大值——
   // 上游会在多帧里重复带 usage，最后一帧才是整轮合计。
   let peakCredits = null;
+  // 最后一帧的完整 usage（tokens 由此取——实测倍率 billedRate 的分母）
+  let lastUsage = null;
   // 参数两种形状都收：流式路径给的是整帧（看 j.usage.credits），
   // 非流式给的是聚合后的 usage 对象本身（看 u.credits）。
   const noteCredits = (o) => {
     const u = o && o.usage ? o.usage : o;
-    const v = u ? Number(u.credits) : NaN;
+    if (!u) return;
+    const v = Number(u.credits);
     if (Number.isFinite(v)) peakCredits = peakCredits == null ? v : Math.max(peakCredits, v);
+    if (u.total_tokens != null || u.prompt_tokens != null) lastUsage = u;
   };
   try {
     if (onChunk) {
@@ -594,7 +598,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
         }
         // 正常收尾：哨兵在这里补发，保证「先有内容、再有结束标记」
         if (doneSeen) onChunk('[DONE]');
-        meter.settle(peakCredits);
+        meter.settle(peakCredits, { usage: lastUsage, expectedRate: billingExpectedRate(modelMeta) });
         return res;
       }
     }
@@ -675,7 +679,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     const out = chat.aggregate(payloads, (modelMeta && modelMeta.name) || modelKey);
     if (out && out.usage) noteCredits(out.usage);
     if (opts && opts.onAccount) { /* 非流式也报一次 */ }
-    meter.settle(peakCredits);
+    meter.settle(peakCredits, { usage: lastUsage, expectedRate: billingExpectedRate(modelMeta) });
     return out;
     } // for(;;) 非流式排队重试
   } catch (e) {
@@ -743,14 +747,26 @@ const MAX_ATTEMPTS_QUEUE = Math.max(MAX_ATTEMPTS, Math.ceil(QUEUE_PATIENCE_MS / 
  * （`倍率 × tokens/1000`），所以不用做「相邻两条的差值」——每条独立可归因，
  * 首条也有值、并发也不会串账。传 null 表示没测到，如实留空不补 0。
  */
+/** 比对用的期望倍率：price_factor 为 0（错峰免费档）时按原价倍率比对——
+ *  实测错峰窗口内上游按 original_price_factor 计费（credits ≈ 原价 × tokens/1000），
+ *  只看 rate 会把整条通道的 billed_rate 都记成 null。 */
+function billingExpectedRate(modelMeta) {
+  if (!modelMeta) return null;
+  if (Number.isFinite(modelMeta.rate) && modelMeta.rate > 0) return modelMeta.rate;
+  if (Number.isFinite(modelMeta.rateOriginal) && modelMeta.rateOriginal > 0) return modelMeta.rateOriginal;
+  return null;
+}
+
 function makeMeter(account, opts) {
   return {
-    settle(credits) {
+    settle(credits, extra = {}) {
       try {
         require('./credits').capture(account, credits, {
           reqId: opts.reqId || '',
           model: opts.model || '',
           ms: opts.startedAt ? Date.now() - opts.startedAt : null,
+          // 实测倍率（上游改路由的可见性，见 credits.computeBilledRate）
+          billedRate: require('./credits').computeBilledRate(credits, extra.usage, extra.expectedRate),
         });
       } catch (e) { /* 记账失败绝不影响已发出的响应 */ }
     },

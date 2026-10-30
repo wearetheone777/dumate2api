@@ -238,6 +238,62 @@ const routes = [
     },
   },
   {
+    // 计费自检探针：按模型发一个小请求，把「上游实际计费倍率」与模型表
+    // 标称值并排返回——上游静默改路由的可见性（融合 qoder2api-hub #113 的
+    // /diag/model-billing，数据源是 billed_rate 账本）。**不做自动判定**：
+    // ratio ≠ 1 不一定是改路由——错峰优惠（discountFactor）与倍率元数据
+    // 过期都会造成合法偏差，判读交给看这条结果的人。
+    // 探针消耗真实积分：用免费/低倍率档（qfmodel/gfmodel）即可验证。
+    method: 'GET',
+    path: '/billing-check',
+    handler: async ({ req, res }) => {
+      const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || '')).replace(/^qoder\//, '').trim();
+      if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=qfmodel）' });
+      const credits = require('../../qoder/credits');
+      // 标称倍率从 model-info 的归一化行取（两种上游形状都已摊平）；
+      // 表不可用时 expected 如实 null——探针仍然跑，只报实测值
+      let expected = null;
+      try {
+        const rows = await require('../../model-info').qoderRows();
+        const hit = rows.find((m) => m.key === model);
+        if (hit) {
+          if (Number.isFinite(hit.rate) && hit.rate > 0) expected = hit.rate;
+          else if (Number.isFinite(hit.rateOriginal) && hit.rateOriginal > 0) expected = hit.rateOriginal;
+          else if (Number.isFinite(hit.rate)) expected = hit.rate;
+        }
+      } catch (e) { /* 表不可用按 null */ }
+      const reqId = `billcheck_${Date.now().toString(36)}`;
+      const startedAt = Date.now();
+      try {
+        await qoder.send({
+          model: `qoder/${model}`,
+          messages: [{ role: 'user', content: 'reply with exactly: pong' }],
+          max_tokens: 64,
+        }, null, { reqId });
+      } catch (e) {
+        return sendJSON(res, 200, {
+          ok: false, model, expected, error: e.message,
+          elapsedMs: Date.now() - startedAt,
+        });
+      }
+      // capture 是同步 append，send 正常返回时已落盘——按 reqId 读回
+      const row = credits.readHistory().reverse().find((r) => r.req_id === reqId) || null;
+      const billed = row ? (row.billed_rate ?? null) : null;
+      const ratio = billed != null && expected ? Number((billed / expected).toFixed(3)) : null;
+      return sendJSON(res, 200, {
+        ok: true,
+        model,
+        account: row ? row.account : null,
+        expected,
+        billed,
+        ratio,
+        credits: row ? row.credits : null,
+        elapsedMs: Date.now() - startedAt,
+        note: 'ratio≈1 正常；≠1 不一定是改路由——错峰优惠与倍率元数据过期都会造成偏差，结合模型页的标称值人工判读。',
+      });
+    },
+  },
+  {
     // 手动签到：幂等，已领的自动跳过。返回**实际到账差值**（不是总额）。
     method: 'POST',
     path: '/checkin',

@@ -19,6 +19,7 @@
 // 由 server.js 在 router.resolve 之后处理（见 responsesToOpenAI 的注释）。
 
 const { markFirstToken } = require('./reqlog');
+const { imagePartsFromContent } = require('./images');
 
 // ---------- 请求侧 ----------
 
@@ -30,10 +31,9 @@ function textFromContent(content) {
       if (typeof p === 'string') return p;
       if (!p || typeof p !== 'object') return '';
       if (typeof p.text === 'string') return p.text;
-      // input_text / output_text / 其它带 text 字段的块
-      if (p.type === 'input_image' || p.type === 'image_url') {
-        return '[Image content - not supported by DuMate backend]';
-      }
+      // input_image / image_url 由 imagePartsFromContent 提取成 image_url part，
+      // 这里跳过——文本里不再重复占位，否则模型会看到一句多余的「不支持」
+      if (p.type === 'input_image' || p.type === 'image_url') return '';
       return '';
     })
     .filter(Boolean)
@@ -93,9 +93,17 @@ function inputToMessages(body) {
         const role = item.role === 'assistant' ? 'assistant'
           : (item.role === 'system' || item.role === 'developer') ? 'system' : 'user';
         const text = textFromContent(item.content);
-        if (!text) break;
+        // 图像保真：Codex 会发 input_image（截图等）。直连通道（TRAE 实测）
+        // 认 OpenAI image_url part；纯文本压平会把图像丢掉。
+        const imgs = role === 'user' ? imagePartsFromContent(item.content) : [];
+        if (!text && !imgs.length) break;
         if (role === 'system') messages.push({ role: 'system', content: text });
-        else messages.push({ role, content: text });
+        else if (imgs.length) {
+          const parts = [];
+          if (text) parts.push({ type: 'text', text });
+          parts.push(...imgs);
+          messages.push({ role, content: parts });
+        } else messages.push({ role, content: text });
         break;
       }
       case 'function_call': {
@@ -110,6 +118,29 @@ function inputToMessages(body) {
       case 'function_call_output': {
         const id = item.call_id || item.id || '';
         // 先把已聚合的 tool_calls 落到一条 assistant 消息里
+        if (pendingCalls.size) {
+          messages.push({ role: 'assistant', content: null, tool_calls: [...pendingCalls.values()] });
+          pendingCalls.clear();
+        }
+        const out = typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '');
+        messages.push({ role: 'tool', tool_call_id: id, content: out });
+        break;
+      }
+      case 'custom_tool_call': {
+        // Codex 的自由格式工具（freeform，如 apply_patch）：input 是**纯文本**
+        // 而非 JSON arguments。旧实现落进 default 分支被静默丢弃——模型的
+        // 工具调用凭空消失，Codex 侧表现为「调了没反应」。包装成单字段
+        // 对象转标准 function 调用，输出侧 *_call_output 再解回来。
+        const id = item.call_id || item.id || ('call_' + Math.random().toString(36).slice(2, 10));
+        pendingCalls.set(id, {
+          id,
+          type: 'function',
+          function: { name: item.name || '', arguments: JSON.stringify({ input: item.input == null ? '' : String(item.input) }) },
+        });
+        break;
+      }
+      case 'custom_tool_call_output': {
+        const id = item.call_id || item.id || '';
         if (pendingCalls.size) {
           messages.push({ role: 'assistant', content: null, tool_calls: [...pendingCalls.values()] });
           pendingCalls.clear();
@@ -200,11 +231,36 @@ function truncatedArguments(args) {
 
 function usageFrom(openaiUsage) {
   const u = openaiUsage || {};
+  // 缓存命中不能丢：Qoder 通道的 normalizeUsageCache 已把上游按模型族散落的
+  // 字段（DeepSeek prompt_cache_hit_tokens / Qwen completion_tokens_details）
+  // 归一进标准位，但直接打标准 OpenAI usage 的通道（搭子回落等）也带
+  // prompt_tokens_details.cached_tokens——这里曾是**硬编码 0**，Codex 的
+  // /status 永远显示缓存 0。多形状回退对齐 buddy-switch 的
+  // build_responses_usage（2026-10-30 融合）。
+  const details = (u.prompt_tokens_details && typeof u.prompt_tokens_details === 'object')
+    ? u.prompt_tokens_details : {};
+  const pickNum = (...cands) => {
+    for (const v of cands) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return 0;
+  };
+  const cached = pickNum(
+    details.cached_tokens,
+    u.prompt_cache_hit_tokens,
+    u.cache_read_input_tokens,
+    u.cached_tokens,
+  );
+  const reasoning = pickNum(
+    u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens,
+    u.reasoning_tokens,
+  );
   return {
     input_tokens: u.prompt_tokens || 0,
-    input_tokens_details: { cached_tokens: 0 },
+    input_tokens_details: { cached_tokens: cached },
     output_tokens: u.completion_tokens || 0,
-    output_tokens_details: { reasoning_tokens: (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens) || 0 },
+    output_tokens_details: { reasoning_tokens: reasoning },
     total_tokens: u.total_tokens || 0,
   };
 }

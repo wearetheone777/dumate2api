@@ -177,6 +177,21 @@ export interface QoderLoginPoll {
 
 export const qoderApi = {
   status: () => client.get<QoderStatus>('/qoder/status'),
+  /** 计费自检探针：按模型发一个小请求，比对「实测倍率 vs 模型表标称」。
+   *  ratio≠1 不一定是改路由（错峰优惠/倍率元数据过期都是合法偏差）——判读看 note。 */
+  billingCheck: (model: string) =>
+    client.get<{
+      ok: boolean
+      model: string
+      account: string | null
+      expected: number | null
+      billed: number | null
+      ratio: number | null
+      credits: number | null
+      elapsedMs?: number
+      error?: string
+      note?: string
+    }>(`/qoder/billing-check?model=${encodeURIComponent(model)}`),
   dashboard: () => client.get<{
     accounts: QoderDashboardAccount[]
     summary: { total: number; enabled: number; refreshExpired: number; errored: number }

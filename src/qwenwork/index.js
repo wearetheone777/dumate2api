@@ -11,6 +11,7 @@
 //   - chatCompletion(payload)  → 聚合后的 chat.completion 对象（非流式）
 //   - chatCompletionStream(payload, onChunk) → 逐块回调 OpenAI chunk
 const chat = require('./chat');
+const { normalizeUsageCache } = require('../usage-norm');
 const bridge = require('./bridge');
 const authStore = require('./auth');
 const constants = require('./constants');
@@ -158,6 +159,13 @@ async function runOnce(account, payload, onChunk, opts) {
         if (parsed) {
           const err = chat.payloadError(parsed);
           if (err) { firstErr = err; return; }
+          // 缓存命中归一进标准位（usage-norm.js 头注释）：DeepSeek 系模型的
+          // prompt_cache_hit_tokens 原样透传会让按标准读的客户端恒见 0。
+          if (parsed.usage && normalizeUsageCache(parsed.usage)) {
+            sent = true;
+            onChunk(JSON.stringify(parsed));
+            return;
+          }
         }
         sent = true;
         onChunk(inner);

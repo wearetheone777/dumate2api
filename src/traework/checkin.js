@@ -86,6 +86,63 @@ async function status(auth) {
  */
 const CODE_RATE_LIMITED = 9074;
 
+// ---- 9074 自愈（2026-10-30，方案对齐 Trae2api-cn 的 device_generation）----
+//
+// 9074 实测是**设备级**校验而非账号级：同一 token 换一个新派生的设备 id 就能
+// 签到成功（我们 2026-09-25 修好 15 位派生格式后签到成功也证明格式对就行）。
+// 所以 claim 撞 9074 先「换一代设备 → 立即重试一次」；仍 9074 才进退避。
+// 退避是温和指数（60s × 2^min(count,3)，封顶 3600s）：9074 是上游容量信号
+// 不是对本账号的惩罚，当天内保持尝试比一小时封顶更有机会签上。
+
+const RETRY_BASE_MS = Number(process.env.DUMATE_TRAEWORK_9074_RETRY_SECONDS || 60) * 1000;
+const RETRY_MAX_MS = Number(process.env.DUMATE_TRAEWORK_9074_MAX_BACKOFF_SECONDS || 3600) * 1000;
+const RETRY_EXPONENT_CAP = 3;
+
+/** 退避时长：base × 2^min(count, cap)，夹在 [base, max]。纯函数可离线测 */
+function backoffMs(count) {
+  const base = Math.max(1, RETRY_BASE_MS);
+  const backoff = base * (2 ** Math.min(Math.max(0, Number(count) || 0), RETRY_EXPONENT_CAP));
+  return Math.max(base, Math.min(backoff, Math.max(base, RETRY_MAX_MS)));
+}
+
+/** 读账号当前的 9074 退避剩余毫秒（0 = 无退避） */
+function backoffRemaining(auth) {
+  const until = Number(auth && auth.checkin9074Until) || 0;
+  return until > Date.now() ? until - Date.now() : 0;
+}
+
+/**
+ * claim + 9074 自愈：撞 9074 先换一代设备立即重试一次，仍失败才记账退避。
+ * 成功路径清空退避记账。返回 { ...claim结果, rotated, backoffMs }。
+ */
+async function claimWithRetry(auth) {
+  let r = await claim(auth);
+  if (!r.rateLimited) {
+    if (r.ok && (auth.checkin9074Count || auth.checkin9074Until)) {
+      authStore.patch(auth.id, { checkin9074Count: 0, checkin9074Until: 0 });
+    }
+    return r;
+  }
+  const rotated = authStore.rotateDevice(auth);
+  if (rotated) {
+    const retry = await claim(rotated);
+    if (!retry.rateLimited) {
+      if (retry.ok) authStore.patch(rotated.id, { checkin9074Count: 0, checkin9074Until: 0 });
+      return { ...retry, rotated: true };
+    }
+    auth = rotated;
+    r = retry;
+  }
+  const count = (Number(auth.checkin9074Count) || 0) + 1;
+  const ms = backoffMs(count - 1);
+  authStore.patch(auth.id, {
+    checkin9074Count: count,
+    checkin9074Until: Date.now() + ms,
+    lastError: `9074 ${r.error || ''}（已换设备重试，${Math.round(ms / 1000)}s 后自动再试）`.trim(),
+  });
+  return { ...r, rotated: !!rotated, backoffMs: ms };
+}
+
 async function claim(auth) {
   let agent;
   try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
@@ -248,6 +305,10 @@ function computeGained(before, after, upstreamGained) {
 /**
  * 签到并回写账号（含额度刷新）。供 task-runner 调用。
  *
+ * opts.respectBackoff=true 时（定时任务路径），账号还处在上一次 9074 的退避
+ * 窗口内就跳过不打上游——退避的意义就是错峰，定时器反复提前打等于没退避；
+ * 手动触发（管理端点「签到」）不拦：用户明确要求就试一次。
+ *
  * **签到前后各取一次余额**，用差值算「本次实际到账多少」。
  * 上游 claim 只回 {code:0, message:"success"}，不告诉发放数额；status 的
  * credits 是「签到可得」的固定值，也不等于实际入账。只报总额时用户看到
@@ -255,8 +316,12 @@ function computeGained(before, after, upstreamGained) {
  * （status 说没签、usage 已含奖励）还会出现「签到成功但余额没变」，
  * 被读成「显示的是旧积分」。快照失败不影响签到本身，拿不到就如实 null。
  */
-async function checkinAndSave(rawAuth, authStore) {
+async function checkinAndSave(rawAuth, authStore, opts = {}) {
   const auth = await withFreshToken(rawAuth);
+  const bo = backoffRemaining(auth);
+  if (opts.respectBackoff && bo > 0) {
+    return { ok: false, backoffRemaining: bo, error: `9074 退避中（${Math.round(bo / 1000)}s 后自动重试）`, stage: 'backoff' };
+  }
   const st = await status(auth);
   if (!st.ok) return { ok: false, error: st.error, stage: 'status' };
   if (st.checkedIn) {
@@ -271,10 +336,10 @@ async function checkinAndSave(rawAuth, authStore) {
     return { ok: true, already: true, credits: u.ok ? u.remain : null };
   }
   const before = await usage(auth);
-  const cl = await claim(auth);
+  const cl = await claimWithRetry(auth);
   if (!cl.ok) {
-    authStore.patch(auth.id, { lastError: cl.error });
-    return { ok: false, error: cl.error, stage: 'claim' };
+    if (!cl.rateLimited) authStore.patch(auth.id, { lastError: cl.error });
+    return { ok: false, error: cl.error, stage: 'claim', rotated: cl.rotated, backoffMs: cl.backoffMs };
   }
   const u = await usage(auth);
   authStore.patch(auth.id, {
@@ -298,4 +363,4 @@ async function checkinAndSave(rawAuth, authStore) {
   };
 }
 
-module.exports = { status, claim, usage, checkinAndSave, computeGained, withFreshToken };
+module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining };

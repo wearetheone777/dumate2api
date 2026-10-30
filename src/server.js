@@ -4,6 +4,7 @@ const { discoverPort, verifyPort } = require('./discovery');
 const { mapModel, anthropicToOpenAI, openAIToAnthropic, mapFinishReason } = require('./anthropic');
 const { googleToOpenAI, openAIToGoogle, translateStreamToGoogle } = require('./google');
 const { responsesToOpenAI, openAIToResponse, translateStreamToResponses } = require('./responses');
+const images = require('./images');
 const { resolveMaxTokens, resolveQwenMaxTokens, resolveTraeworkMaxTokens, resolveQoderMaxTokens } = require('./budget');
 const webFallback = require('./fallback-web');
 
@@ -1190,6 +1191,9 @@ async function handleOpenAIResponses(req, res) {
     req._mappedModel = openaiReq.model;
     // 与 Anthropic 路径同口径：reasoning_effort 只给直连通道，搭子透传前剥掉
     delete openaiReq.reasoning_effort;
+    // 图像同理：翻译层（Google→OpenAI）现在保真透传 image_url part，
+    // 搭子上游不认识——压回占位文本（恢复保真前的行为）
+    images.flattenImageParts(openaiReq);
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
@@ -1289,6 +1293,8 @@ async function handleAnthropicMessages(req, res) {
     // 思考强度是直连通道（Qoder）才下发的字段；搭子是「最小干预透传」，
     // 多余字段原样进云端，行为未知——剥掉（翻译层加的，这里剥干净）。
     delete openaiReq.reasoning_effort;
+    // 图像同理（Responses→OpenAI 翻译层已保真透传 image_url part）
+    images.flattenImageParts(openaiReq);
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
@@ -1918,6 +1924,8 @@ async function start() {
   } else {
     log('· Qoder 通道已关闭（DUMATE_QODER_AUTOSTART=off）');
   }
+
+
 
   server.listen(PROXY_PORT, PROXY_HOST, () => {
     log(`✓ dumate2api listening on http://${PROXY_HOST}:${PROXY_PORT}`);

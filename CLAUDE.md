@@ -349,6 +349,50 @@ throw** 两种形态——只有它们才走等待轮）。注意该套件前 4 
 结构化工具历史，且部署中无实测案例，不值得为它给热路径加跨帧缓冲门）。
 
 
+**Qoder 的实测倍率账本（2026-10-30 落地，上游改路由的可见性）**。融合自
+qoder2api-hub #113 的 billed_model 思路（保守版）：Qoder 响应的 model 恒为
+"auto"，请求的模型可能被服务端静默换掉。每条积分账本现在带 `billed_rate`
+（`credits.js` 的 `computeBilledRate`：credits ÷ (tokens/1000)），与模型表的
+price_factor 人工比对——**不做自动 mismatch 判定**：错峰优惠
+（discountFactor）会合法改变倍率且乘性方向未实测（CLAUDE.md 明确不解读），
+自动判必误报。期望倍率取 `rate > 0 ? rate : rateOriginal`——**错峰窗口内
+（22:00-08:00）免费档的 price_factor 标 0 但实际按 original_price_factor
+计费**（实测 qfmodel：credits 0.136 / 91 tokens → billed_rate 1.4947，与
+标称的 0/0.1 严重不符——要么上游改路由要么倍率元数据过期，这正是要暴露的
+信号）。期望倍率缺失（两者都 ≤0）时如实 null 不编。离线验证：
+`node --test test/unit/qoder-billing-rate.test.js`（13 项）。管理端探针端点：
+`GET /api/admin/qoder/billing-check?model=qfmodel`（admin/routes/qoder.js）——按
+模型发一个小请求，从账本读回 billed_rate 与标称值并排返回（expected/billed/
+ratio），panel 会话鉴权后；ratio≠1 的判读口径写在响应 note 里（错峰优惠与
+倍率元数据过期都是合法偏差）。**模型页有「计费自检」按钮**（ModelsView.vue
+的 Qoder 卡 extra，对模型表里倍率最低的模型跑探针，结果按 ratio 偏离 ±5%
+着色成 success/warning）。
+
+**Codex 自由格式工具（custom_tool_call）与 model=auto 兜底（2026-10-30）**。
+Responses 入口此前把 `custom_tool_call` / `custom_tool_call_output` 落进 default
+分支**静默丢弃**——Codex 配了 freeform 工具（如 apply_patch）时调用了凭空消失。
+现在转成标准 function 调用（input 包装成 `{input}` 单字段对象），`*_call_output`
+再解回 tool 消息。`model=auto` 在直连通道的兜底：搭子有 mapModel 兜底、千问有
+别名表（auto→pro）、Qoder 上游原生 auto 档，**只有 TRAE 会撞 assertModelKnown
+的 400**——`traework/auto` 现在兜底到 DEFAULT_MODEL（glm-5.2，真机 200 验证）；
+不做 Trae2api-cn 的「按请求内容智能路由」（隐性替换模型违背显式契约，计费倍率
+跟着变）。`previous_response_id` 维持忽略（上游无状态，Codex 全量回传 input）。
+
+**千问通道的 usage 缓存归一（2026-10-30，qoder2api-hub #112 的另一半）**。
+Qoder 通道 P2 修过 usage 缓存字段归一，**千问的流式透传一直没修**——DeepSeek 系
+模型的 `prompt_cache_hit_tokens` 原样透传，按标准读的客户端恒见 0。归一化实现
+提升到共享模块 `src/usage-norm.js`（两个 COSY 通道 require 同一份，与
+upstream-errors.js 的收敛同一理由），千问在流式帧转发前改写（有改写才重新
+序列化，无缓存字段时帧原样——真机冒烟：上游自带标准位时不覆盖）。非流式
+aggregate 出口同修（chat.aggregate 的 usage 在返回前归一）。
+
+**千问的 `is_reasoning` 字段同样不可控（2026-10-30 实测定案，别再试）**。
+buildBody 的 modelConfig/model_config 两处 `is_reasoning` 硬编码 false——曾想
+按 Qoder P1 的思路做成档位开关，对照实测（qwen/pro 同一水壶谜题 × 2+2）：
+false 组 reasoning 2788/16336，true 组 **1482/1**（方向相反、噪声级）——上游
+忽略该字段或它不是推理开关语义。与搭子「调参数无效」、TRAE「档位字段被忽略」
+同款结论：**四条通道里只有 Qoder 的思考档位真实可控**。
+
 **`cosy.encode` 是同步的，它一慢就「假死」整个网关（2026-10-03 修，性能级）。**
 自定义 base64 编码在 `runOnce` 里**直接同步调用**，所以它的耗时会**阻塞事件循环**：
 期间 `/health` 不响应、其他通道的请求全部排队、进程 CPU 跑满却**不崩也不打日志**。
@@ -433,6 +477,94 @@ sanguo 项目的 `novel-creator` 技能把写作拆成分阶段门控（「起�
 
 判定这类问题时要**分清「网关行为」与「模型行为」**：把出问题的那次请求（从会话日志重建 input + instructions）经网关重放，如果稳定调工具（本次 5/5、多轮循环 6 轮 × 3 次全正常），说明是概率性的模型行为而不是网关丢帧——**不要为了一个复现不出来的现象去改翻译层**。本次排查还顺带确认：sanguo 会话上下文其实只有 1.3~2.5 万 token（网关日志里 25 万那条属于另一个会话），所以与长上下文无关。
 
+**TRAE 通道支持图像输入（2026-10-30 落地），且形状就是 OpenAI 标准的——不要发明新转换。**
+实测（真机对照）：`llm_utils_chat` 请求体的 user 消息 content 里直接放 OpenAI 标准
+`{type:'image_url', image_url:{url:'data:image/png;base64,…'}}`，上游接受（纯红色 PNG →
+deepseek-v4.1-flash 答「红色」）；而 Trae2api-cn 的「渲染层媒体块」形状
+`{type:'image_url', value:{mimeType,data}}` 会被 4001 拒——那是 raw（llm_raw_chat）链路的
+形状，**两条链路的图像协议不同**，照搬别人的会翻车。HTTP(S) 外链未实测（上游是否代拉外网
+未知），data URI 已实测可用。
+
+分层架构（`src/images.js` 是共享层）：
+
+- **翻译层保真**（`anthropic.js` 结构化分支 / `responses.js` 的 inputToMessages /
+  `google.js` 的 googleToOpenAI）：各家图像块统一转 OpenAI image_url part。
+  Anthropic 的 `source:{type:'base64'}` → data URI、`source:{type:'url'}` → 原样；
+  Responses 的 `input_image` 兼容字符串/对象/顶层 url 三种写法；Google 的
+  `inlineData` → data URI。此前占位文案「not supported by DuMate backend」是
+  搭子的能力边界被错套到所有通道。
+- **通道层消歧**：TRAE 直通 + **多模态校验**（`traework/index.js` 的
+  `assertImageSupport`，在**选号之前**——模型能力与账号无关，不占池）；模型表
+  `multimodal=false` 时回 400 并列出可用多模态模型（表没就绪则放行，宁可不挡）。
+  buildBody 剥掉非 user 消息的图像 part（上游对 assistant/tool 带图的行为未知）。
+  千问/Qoder 的 COSY 协议只有纯文本槽（`chat_context.text`），图像展开成占位文本
+  ——**必须走 `images.contentText`，不能 `String(content)`**：翻译层保真后 content
+  可能是数组，`String([{type:'text',…},{type:'image_url',…}])` 会得到
+  `"[object Object]"`，模型看到垃圾（千问 buildBody 的签名是
+  `buildBody(modelKey, payload)`，与 TRAE 相反，改的时候别搞混）。
+- **搭子压回**（`server.js` 两处 needsModelMap 分支的 `images.flattenImageParts`）：
+  Responses/Google 路径的翻译层是通道无关的，保真出的 image_url part 会在搭子
+  路径压回占位文本（恢复保真前的行为）。OpenAI 直通路径不经翻译层，客户端自己
+  发的图像不在此列（与改动前一致）。
+
+离线验证：`node --test test/unit/image-passthrough.test.js`（12 项：翻译层三个入口
+的保真、搭子降级、TRAE 透传与非 user 剥除、千问防 [object Object]、images.js 基元）。
+真机验证：Anthropic 入口带图打 `traework/deepseek-v4.1-flash` → 答「红色」；
+`traework/glm-5.3-flash`（非多模态）→ 400 + 多模态模型列表；Responses 入口
+`input_image` 同样通过；搭子 glm-5 带图 → 200 且模型如实说看不到图片。
+
+**TRAE 的 llm_utils_chat 链路不支持请求级思考档位——实测定案，别再试（2026-10-30）。**
+Qoder P1 的思考档位透传想同样接到 TRAE，实测（11 次真实请求，minimax-m3.1-flash，
+同一道水壶谜题、light × 3 vs extra_high × 3 对照）：请求体顶层的
+`reasoning_effort` 与 `reasoning_effort_level` 两个字段**上游都忽略**——light 组
+6891~10733 token、extra_high 组 5645~7847 token，区间完全重叠且均值方向相反，
+纯噪声。模型表条目确实带 `reasoning_effort_config`（`{support_thinking, options:
+["light","high","extra_high"], default_level}`，51 个模型里 32 个带、多数
+`support_thinking:false`），但档位是**服务端模型配置**（`config_name` 引用）的一部分，
+请求级覆写不生效——与 Trae2api-cn 端点表里 Solo/IDE 标注的「思考强度由模型
+CustomModel 声明决定」自洽。想提升推理深度只能靠提示词。**与千问通道「调参数无效」
+同款结论**（见下文「is_reasoning 是硬编码的 false」），Qoder 是四条通道里唯一支持
+请求级档位的。
+
+**TRAE（llm_utils_chat）的错误形态实测（2026-10-30）——错误码分类按实测过的做，别照抄 raw 链路的码表。**
+trae2api-hub 的码表（1001/4001/4015/4019/4023/3003）是 agent/v3 业务码体系，但
+**我们链路上实测只出现两种形态**：
+
+1. **模型名未知 → 流内 `event:error` + `{"code":4001,"message":"...param is invalid"}`**
+   （HTTP 200，aggregate 已正确抛 400）。4001 的文案无信息量——分不清模型名错了
+   还是别的参数坏了。所以做了**模型名前置校验**（`traework/index.js` 的
+   `assertModelKnown`）：模型表缓存就绪且名字**完全不在表中**（含条目名下的
+   `custom_models` 自定义模型，大小写不敏感）时直接 400 + 可用模型列表，不白烧
+   上游请求；表没就绪或名字已知一律放行（在表但不可见的模型照样透传，上游当
+   唯一真相源）。判定函数是 `models.isKnownModel`（`normalize` 现在保留
+   `customModelIds`——自定义模型名不是顶层 config_name，漏了它会把自定义模型
+   误判成「不在表中」）。
+2. **鉴权失效 → HTTP 401 直接拒绝**（**不是**流内事件）——`runAttempt` 的
+   `r.status >= 400` 分支已把 statusCode 透传，classify 归 session_dead（防误杀
+   连续计数），无需改动。
+
+4015/4019（风控）与 4008（额度，国际版）在我们的链路上**未实测出现**——前者
+大概率以 HTTP 状态码形态出现（同 401 路径，现有分类已覆盖），后者是 raw 链路
+的额度码；CN 额度耗尽在对话链路上报什么码**没有实测依据**，遇到时再补，
+不预编分类。离线验证：`node --test test/unit/trae-model-known.test.js`；
+真机：模型表就绪后打 `traework/no-such-model-xyz` 应立即 400 + 列表
+（不再等上游 4001）。
+
+**DSML 工具调用回退解析（2026-10-30 落地，`src/traework/chat.js` 的 `parseDsmlToolCalls`）**。
+DeepSeek 系模型偶尔把工具调用以**文本标记**写进正文（`<dsml:calls>` 包
+`<dsml:invoke name="…">` 包 `<dsml:parameter name="…">`，不走原生 tool_calls 增量），
+客户端拿到 XML 文本、本轮工具不执行。处置是**纯兜底**：只在「正文含 DSML 标记
+（大小写不敏感）且本轮零原生 tool_calls」时解析还原并从正文剥离；**原生调用永远
+优先**——有原生调用时正文里的 DSML 文本原样保留（那可能是模型在讨论格式）。
+标签名里 dsml 的位置与分隔符不固定（`dsml:` / `DSML_` 都认），大小写不敏感。
+解析出的调用走与原生相同的 finish 纠正（`stop` → `tool_calls`）。**流式路径**
+在正文缓冲门（createTextGate）的 finish 里做：整轮零工具调用、正文还在缓冲
+（未转直发）时解析并补发 tool_calls，正文发剥离后的干净版；**已转直发（live，
+>600 字）的场景正文出去了收不回，维持现状不劣化**。不要在 delta 层做——DSML
+块跨帧，逐帧解析必然切碎。离线验证：`node --test test/unit/trae-dsml.test.js`（8 项）。
+踩过的坑：`exec` 循环的正则**必须带 `g` 标志**（无 `g` 的 exec 永远返回第一个
+匹配，while 循环死循环挂死进程——单测超时就是这么暴露的）。
+
 **TRAE 的「播报即收尾」靠「检测 + 重试」修，提示词修不动**（2026-10-05，`src/traework/`）。
 现象：`Doubao-Seed-Evolving`（Codex `model_reasoning_effort=high`）在**带工具的**请求上
 有 20~67% 的概率只输出一条进度播报（`当前进度：8%｜已完成：…｜下一步：读取…`）就结束回合，
@@ -492,6 +624,27 @@ Codex 把「无工具调用」判定成任务完成退出——用户看到「�
 **TRAE 的签到是 HTTP 200 + body 里的 code**：被限流时返回
 `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`。只看状态码会把这次
 当成成功，界面显示「签到成功」而额度没变，用户无从察觉——必须读 `code`。
+
+**9074 有自愈闭环（2026-10-30，方案对齐 Trae2api-cn 的 device_generation）**：
+9074 实测是**设备级**校验而非账号级——同一 token 换一个新派生的设备 id 就能签到
+成功（这正是 2026-09-25 修好 15 位派生格式后签到恢复的原因，格式对就行）。所以
+`checkin.claimWithRetry` 撞 9074 先 `authStore.rotateDevice`（`deviceGeneration`+1
+重派生三件套并落盘）**立即重试一次**；仍 9074 才记退避：`60s × 2^min(count,3)`
+封顶 3600s（`DUMATE_TRAEWORK_9074_RETRY_SECONDS` / `_MAX_BACKOFF_SECONDS` 可调），
+温和指数的依据是「9074 是上游容量信号不是对本账号的惩罚，当天内保持尝试比
+一小时封顶更有机会签上」。记账在账号记录的 `checkin9074Count` / `checkin9074Until`
+（成功即清零），`checkinAndSave` 的 `respectBackoff: true`（定时任务路径）在退避
+窗口内跳过不打上游；**手动触发不拦**——用户明确要求就试一次。退避到期后由
+task-scheduler 下一轮（30 分钟粒度）自然重试，签到幂等且当天签上即可，不需要
+独立的秒级重试循环。三个边界：`rotateDevice` 只轮换「确实是派生的」设备
+（`deviceDerivedFrom` 缺失 = 手填的，轮换它不是我们的决定）；`deriveDevice` 的
+gen 0 种子与原算法**逐字节一致**（uid 原样），既有账号的设备 id 不漂移；
+task-scheduler 原来的「9074 就短路跳过剩余账号」已移除——设备级问题不传染，
+各账号独立处置。**管理端账号卡透出退避状态**（`TraeworkAccounts.vue` 的
+`checkinText`）：退避窗口内显示橙色「9074 退避 Ns」（语义是「等自动重试」，
+不是故障也不是可签到）；数据来自 `/status` 的 rows——`authStore.list()` 直出
+全部落盘字段，后端不用再加透出层。离线验证：`node test/verify-traework-9074.js`（25 项：代数派生、
+退避序列、轮换落盘、自愈闭环打桩、退避尊重与手动不拦）。
 
 **签到结果必须报「到账差值」，不能只报总额**（`checkin.js` 的 `computeGained`）。
 上游 `claim` 只回 `{code:0, message:"success"}`，**从不告诉发了多少**；`status` 的
