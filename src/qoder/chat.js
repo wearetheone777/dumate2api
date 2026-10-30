@@ -150,13 +150,13 @@ function buildBody(modelKey, payload, opts = {}) {
   // 可用输入，所以**默认请求该模型的最大档**（由 index.runOnce 从缓存查出）。
   // 显式传 opts.maxInputTokens 可以覆盖；DUMATE_QODER_CONTEXT=default 退回默认档。
   const maxInputTokens = Number(opts.maxInputTokens) > 0 ? Number(opts.maxInputTokens) : 200000;
+  // request_id 每轮都是**新的**（这次请求自己的标识，两轮各是一次真实上游
+  // 请求）；session_id 可由外部钉住：「播报即收尾」的修复轮要在同一个会话里
+  // 继续（追加了修复指令但 session_id 不变），上游才会把重试轮当成同一段
+  // 对话的下一句。
   const requestId = crypto.randomUUID();
-  // request_set_id 是上游排队的槽位键（官方客户端被 10605 拒后带着**同一个
-  // requestSetId** 轮询 queue/status，放行后重发推理）。排队等待模式（见
-  // index.js）要求同一次 send() 的多次尝试共用它——每次换新值等于每次重新
-  // 排队，这正是 2026-10-29「等多久都不保证放行」结论的疑似真因。
   const requestSetId = opts.requestSetId || requestId;
-  const sessionId = (payload && payload.session_id) || crypto.randomUUID();
+  const sessionId = (payload && payload.session_id) || opts.sessionId || crypto.randomUUID();
   const messages = (payload && payload.messages) || [];
   let system = '';
   if (payload && typeof payload.system === 'string') system = payload.system;
@@ -211,7 +211,24 @@ function buildBody(modelKey, payload, opts = {}) {
         chatPrompt: '',
       },
       chatPrompt: '',
-      imageUrls: null,
+      imageUrls: (() => {
+        // Qoder 上游图像形状实测（2026-10-30）：dataURL 字符串数组和裸 base64 数组
+        // 均返回 HTTP 200，{url} 和 {image_url:{url}} 返回 429（上游冷却或形状不认）。
+        // 定案使用 dataURL 字符串数组。注意：模型对图像的识别准确度由上游
+        // 决定，网关层面只负责透传。
+        const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+        const urls = [];
+        for (const m of msgs) {
+          if (!m || !Array.isArray(m.content)) continue;
+          for (const p2 of m.content) {
+            if (p2 && p2.type === 'image_url') {
+              const u = p2.image_url && p2.image_url.url;
+              if (u) urls.push(u);
+            }
+          }
+        }
+        return urls.length ? urls : null;
+      })(),
     },
     is_reply: true,
     is_retry: false,
@@ -630,6 +647,17 @@ function aggregate(payloads, model) {
   };
 }
 
+/**
+ * 最终保留在请求里的标准工具数量（与 buildBody 的过滤口径共用）。
+ *
+ * 「播报即收尾」修复只对带工具的请求启用——重建判定要用**同一个**过滤口径，
+ * 抽出来共用，改过滤规则时不会两边漂移。
+ */
+function hasFunctionTools(payload) {
+  const t = Array.isArray(payload && payload.tools) ? payload.tools : [];
+  return t.filter((x) => x && x.type === 'function' && x.function && x.function.name).length;
+}
+
 // ---- 官方排队轮询协议（2026-10-30，qoder2api-hub 文档 7.1 的逆向结论）----
 //
 // 官方客户端被 10605（isQueued:true）拒绝后**不结束请求**，而是带着同一个
@@ -683,7 +711,7 @@ function getQueueStatus(origin, headers, { modelKey, queueType, requestId, agent
 }
 
 module.exports = {
-  buildBody, resolveModelKey, unwrap, envelopeStatus, payloadError,
+  buildBody, hasFunctionTools, resolveModelKey, unwrap, envelopeStatus, payloadError,
   post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
   getQueueStatus, parseQueueStatus, normalizeUsageCache,
 };

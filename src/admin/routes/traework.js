@@ -237,6 +237,107 @@ const routes = [
     },
   },
   {
+    /**
+     * 计费自检探针：按模型发一个小请求，把「实测倍率」与模型表标称值并排
+     * 返回——上游静默改路由/倍率的可见性（对齐 Qoder 的同名端点
+     * /api/admin/qoder/billing-check）。
+     *
+     * 数据源与 Qoder 不同：Qoder 的 usage.credits 是上游直给的单请求扣费；
+     * TRAE 没有逐笔账单，只能读 usage_summary.consumed_amount 的前后差值。
+     * 所以这里快照所有可用账号的 consumed，发探针请求，再轮询差值。
+     * 探针消耗真实积分（低倍率模型一次约 0.2~1 credits），由人工触发。
+     */
+    method: 'GET',
+    path: '/billing-check',
+    handler: async ({ req, res }) => {
+      const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || ''))
+        .replace(/^traework\//, '').trim();
+      if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=glm-5.2）' });
+      const billing = require('../../traework/billing');
+
+      // 标称倍率：模型表可用的就取归一化行；取不到如实 null，探针仍然跑
+      let expected = null;
+      try {
+        const r = await models.fetchModels({});
+        const meta = (r.models || []).find((m) => m.id === model) || null;
+        expected = billing.expectedRate(meta);
+      } catch (e) { /* 表不可用按 null */ }
+
+      const usable = authStore.findUsable();
+      if (!usable.length) return sendJSON(res, 200, { ok: false, model, expected, error: '没有可用账号' });
+
+      // 快照所有可用账号：选号交给池，探针事先不知道会用哪个号。
+      // 取不到 consumed 的账号不进 map——后面按缺失跳过，不补 0。
+      const snapshot = async () => {
+        const consumed = new Map();
+        for (const raw of usable) {
+          const a = await checkin.withFreshToken(raw);
+          const u = await checkin.usage(a);
+          if (u.ok && u.consumed != null) consumed.set(String(a.id), u.consumed);
+        }
+        return consumed;
+      };
+
+      const before = await snapshot();
+      const reqId = `billcheck_${Date.now().toString(36)}`;
+      const startedAt = Date.now();
+      let servedId = null;
+      let servedName = '';
+      let tokens = null;
+      try {
+        const agg = await tw.send({
+          model: `traework/${model}`,
+          // 让输出足够长：consumed 只有两位小数，几百 token 的输出才能把
+          // 量化误差压到可判读的范围内（rate≈0.2 的模型一次约 0.1 积分）
+          messages: [{ role: 'user', content: '请从 1 数到 400，每个数字之间用一个空格分隔，只输出数字本身，不要输出任何其他文字。' }],
+          max_tokens: 4096,
+        }, null, {
+          reqId,
+          onAccount: (name, id) => { servedName = name || ''; if (id != null) servedId = id; },
+        });
+        const u = (agg && agg.usage) || null;
+        if (u) tokens = { input: u.prompt_tokens || 0, output: u.completion_tokens || 0, total: u.total_tokens || 0 };
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, model, expected, error: e.message, elapsedMs: Date.now() - startedAt });
+      }
+
+      // 结算延迟：consumed 不会在响应返回的瞬间更新。轮询到增量出现为止
+      // （4 次尝试共约 8 秒）；仍没有就如实报 null——不把「没测到」编成 0。
+      let last = null;
+      for (let i = 0; i < 4; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, [1500, 2500, 4000][i - 1]));
+        const after = await snapshot();
+        last = billing.attributeDelta(before, after, servedId);
+        if (last.delta != null && last.delta > 0) break;
+        // 别的账号先涨（并发流量）也停——再等只会把对方的消耗卷进来
+        if (last.charged.length) break;
+      }
+      const delta = last ? last.delta : null;
+      const billed = billing.billedRate(delta, tokens && tokens.total);
+      const ratio = billing.ratioOf(billed, expected);
+      return sendJSON(res, 200, {
+        ok: true,
+        model,
+        account: servedName || null,
+        accountId: servedId,
+        expected,
+        billed,
+        ratio,
+        delta,
+        tokens,
+        charged: last ? last.charged : [],
+        singleAccount: last ? last.singleAccount : false,
+        elapsedMs: Date.now() - startedAt,
+        warning: delta == null
+          ? '请求成功，但 8 秒内未观测到 consumed 增量（结算延迟或上游未计量）；可稍后在逐笔明细里复核'
+          : '',
+        note: '实测倍率 = consumed 增量 ÷ (total_tokens/1000)，与 Qoder 的 billed_rate 同口径；'
+          + '标称取模型表 consumption_rate（命中会员折扣取折后价）。偏差可能来自：结算延迟、'
+          + '同账号并发请求、consumed 两位小数量化，或上游静默改路由——结合模型页标称值人工判读。',
+      });
+    },
+  },
+  {
     // 手动签到：幂等，已签的自动跳过
     method: 'POST',
     path: '/checkin',

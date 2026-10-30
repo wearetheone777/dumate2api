@@ -117,7 +117,10 @@ async function runOnce(trigger) {
         const authStore = require('./traework/auth');
         const checkin = require('./traework/checkin');
         for (const a of authStore.findUsable()) {
-          const r = await checkin.checkinAndSave(a, authStore);
+          // respectBackoff：上轮 9074 的退避窗口内跳过（退避的意义就是错峰）。
+          // 退避到期后由这里下一轮自然重试——签到幂等且当天签上即可，
+          // 30 分钟粒度天然错峰，不需要独立的秒级重试循环。
+          const r = await checkin.checkinAndSave(a, authStore, { respectBackoff: true });
           results.push({
             name: `TRAE:${a.nickname || a.uid || a.id}`,
             ok: r.ok,
@@ -127,17 +130,10 @@ async function runOnce(trigger) {
             fail: r.ok ? 0 : 1,
             error: r.error || '',
           });
-          // 9074 若出现，说明设备指纹或活动侧校验仍有问题（不是限流——
-          // 2026-09-25 查清 9074 的真因是设备指纹不匹配，已修）。
-          // 保留这个短路：真出现时不必把每个账号都试一遍。
-          if (!r.ok && /9074/.test(String(r.error || ''))) {
-            results.push({
-              name: 'TRAE Work',
-              ok: false,
-              error: '9074：设备指纹或活动侧校验未通过，本轮剩余账号跳过',
-            });
-            break;
-          }
+          // 9074 已在 checkin.claimWithRetry 里自愈：撞到先换一代设备 id
+          // 立即重试，仍失败才记退避（设备级校验，不传染其他账号——
+          // 2026-10-30 对齐 Trae2api-cn 的 device_generation 方案）。
+          // 所以这里不再短路跳过剩余账号，各账号独立处置。
           await sleep(PER_ACCOUNT_DELAY_MS);
         }
       }

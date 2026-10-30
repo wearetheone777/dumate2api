@@ -17,6 +17,7 @@ const { oauthHeaders } = require('./headers');
 const { explainError } = require('../errtext');
 const filelock = require('../filelock');
 const fileperm = require('../fileperm');
+const jitter = require('../jitter');
 
 const FILE = 'traework-accounts.json';
 
@@ -150,17 +151,44 @@ function patch(id, fields) {
   });
 }
 
-/** token 是否在 skewMs 内过期 */
+/**
+ * 刷新错峰窗口：把「提前量」按账号稳定地摊开（默认 30 分钟），避免一批
+ * 同时到期的账号在同一秒集体打 token 端点。
+ *
+ * 为什么必须是**确定性**偏移而不是随机：随机偏移每次启动都变，等于每次
+ * 重启都换一批刷新时刻，上游看到的是「这个号的刷新时刻一直在跳」；确定性
+ * 偏移跨重启不变，上游看到的是「这个号一直是这个点刷」——后者才像人。
+ * 依据与实现见 src/jitter.js 的 staggerMs。
+ *
+ * 设 0 关闭（行为回退到"统一提前量"）。
+ */
+const REFRESH_STAGGER_MS = Number(process.env.DUMATE_TRAEWORK_REFRESH_STAGGER_MS ?? 30 * 60 * 1000);
+
+/**
+ * token 是否在 skewMs（含本账号的确定性错峰偏移）内过期。
+ *
+ * 错峰加在**提前量**上而不是"延迟刷新"：让不同账号在不同时刻进入刷新窗口，
+ * 而不是让它们一起到点、再排队错开——后者在窗口内仍是同一秒的请求尖峰。
+ */
 function needsRefresh(a, skewMs = 24 * 3600 * 1000) {
   if (!a || !a.expiresAt) return true;
-  return Date.now() + skewMs >= a.expiresAt;
+  const margin = skewMs + jitter.staggerMs(`traework:${a.id}`, REFRESH_STAGGER_MS);
+  return Date.now() + margin >= a.expiresAt;
 }
+
+// 刷新单飞表：同一账号并发的 ExchangeToken 只打一次上游。
+//
+// 为什么必须有：TRAE 的 refreshToken 是**轮换**的（文件头已写明）。两个并发
+// 请求各拿各的新串，后落盘的覆盖先落盘的，被覆盖的那一串从此失效——账号直接
+// 报废，且界面上看不出原因（只会表现为"偶尔 401"）。单飞让并发调用共享同
+// 一个结果与同一份落盘，轮换链才不会断。
+const refreshFlights = new Map();
 
 /**
  * 用 refreshToken 换新 token（refreshToken 会轮换）。
  * 成功后**由调用方**落盘（保持「读-改-写」在一次调用里，避免并发覆盖）。
  */
-async function exchange(a) {
+async function exchangeOnce(a) {
   if (!a || !a.refreshToken) return { ok: false, error: '缺少 refreshToken' };
   let agent = null;
   try { agent = require('../proxy-agent').getAgentFor(a); } catch (e) {
@@ -190,6 +218,23 @@ async function exchange(a) {
   else if (res.ExpiresAt) out.expiresAt = Number(res.ExpiresAt);
   if (res.RefreshExpireAt) out.refreshExpiresAt = Number(res.RefreshExpireAt);
   return { ok: true, patch: out };
+}
+
+/**
+ * 换票（带**单飞**）。同账号并发调用只打一次上游，共享同一个结果。
+ *
+ * 无 id 的临时记录（登录流程里还没落盘的）不走单飞——它没有稳定主键，
+ * 且只会出现一次。
+ */
+async function exchange(a) {
+  const id = a && a.id != null ? String(a.id) : '';
+  if (!id) return exchangeOnce(a);
+  const inflight = refreshFlights.get(id);
+  if (inflight) return inflight;
+  // finally 里清理：失败也要清，否则这个 id 的后续刷新会被永久卡在旧 Promise 上
+  const p = exchangeOnce(a).finally(() => { refreshFlights.delete(id); });
+  refreshFlights.set(id, p);
+  return p;
 }
 
 /**
@@ -270,13 +315,36 @@ function ensureDevice(a) {
   if (!uid) return a;
   const ok = a.deviceId && /^\d{15}$/.test(a.deviceId) && a.sessionId && a.marketUserId;
   if (ok) return a;
-  const d = require('./device').deriveDevice(uid);
+  const d = require('./device').deriveDevice(uid, a.deviceGeneration);
   return patch(a.id, {
     deviceId: d.deviceId,
     sessionId: d.sessionId,
     marketUserId: d.marketUserId,
     deviceDerivedFrom: uid,
   }) || { ...a, ...d };
+}
+
+/**
+ * 9074 自愈：换到下一代的派生设备（gen+1 重派生三件套并落盘）。
+ *
+ * 9074「当前参与用户太多」实测是**设备级**校验：同一 token 换一个新派生的
+ * id 就能签到成功（Trae2api-cn 的 rotate_checkin_device_id 同结论，它的
+ * device_generation 字段同方案）。只对「确实是派生出来的」设备轮换——
+ * deviceDerivedFrom 缺失说明 id 是手工填的，轮换它不是我们的决定。
+ * 返回 null 表示不可轮换（调用方按「没轮换过」继续走退避）。
+ */
+function rotateDevice(a) {
+  if (!a) return null;
+  const uid = a.deviceDerivedFrom || a.uid || jwtUid(a.accessToken) || '';
+  if (!uid || !a.deviceDerivedFrom) return null;
+  const g = (Number(a.deviceGeneration) || 0) + 1;
+  const d = require('./device').deriveDevice(uid, g);
+  return patch(a.id, {
+    deviceGeneration: g,
+    deviceId: d.deviceId,
+    sessionId: d.sessionId,
+    marketUserId: d.marketUserId,
+  }) || { ...a, ...d, deviceGeneration: g };
 }
 
 /** 取用户信息（登录后用一次，补 uid / 昵称）。
@@ -335,6 +403,6 @@ async function syncNickname(a) {
 
 module.exports = {
   FILE, filePath, dataDir, load, save, list, get, findUsable, upsert, remove, patch,
-  needsRefresh, exchange, jwtExp, jwtUid, fetchUserInfo, ensureDevice,
+  needsRefresh, exchange, jwtExp, jwtUid, fetchUserInfo, ensureDevice, rotateDevice,
   maskPhone, phoneFromNickname, genId, syncNickname,
 };

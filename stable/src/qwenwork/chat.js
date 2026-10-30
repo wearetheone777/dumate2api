@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const constants = require('./constants');
 const bridge = require('./bridge');
 const { payloadError, envelopeStatus } = require('../upstream-errors');
+const { contentText } = require('../images');
 
 const TIMEOUT_MS = 600000;
 
@@ -95,21 +96,38 @@ function withAgentDiscipline(system, hasTools) {
   return String(system || '') + AGENT_DISCIPLINE;
 }
 
-function buildBody(modelKey, payload) {
+/**
+ * 最终保留在请求里的标准工具数量（与 buildBody 的过滤口径共用）。
+ *
+ * 「播报即收尾」修复只对带工具的请求启用——重建判定要用**同一个**过滤口径，
+ * 抽出来共用，改过滤规则时不会两边漂移。
+ */
+function hasFunctionTools(payload) {
+  const t = Array.isArray(payload && payload.tools) ? payload.tools : [];
+  return t.filter((x) => x && x.type === 'function' && x.function && x.function.name).length;
+}
+
+function buildBody(modelKey, payload, out = {}) {
+  // request_id 每轮都是**新的**（它是这次请求的标识，两轮各是一次真实上游
+  // 请求——重复用同一个值可能被上游当成幂等重试而合并）；session_id 可由外部
+  // 钉住：「播报即收尾」的修复轮要在同一个会话里继续（追加了修复指令但
+  // session_id 不变），上游才会把重试轮当成同一段对话的下一句。
   const requestId = crypto.randomUUID();
-  const sessionId = (payload && payload.session_id) || crypto.randomUUID();
+  const sessionId = (payload && payload.session_id) || out.sessionId || crypto.randomUUID();
   const messages = (payload && payload.messages) || [];
   let system = '';
   if (payload && typeof payload.system === 'string') system = payload.system;
   const sysMsg = messages.find((m) => m && m.role === 'system');
-  if (!system && sysMsg) system = String(sysMsg.content || '');
+  // content 可能是带 image_url 的 parts 数组（翻译层已保真）——String() 会变成
+  // "[object Object]"，必须走文本展开（图像换占位，COSY 的 text 槽只有纯文本）
+  if (!system && sysMsg) system = contentText(sysMsg.content, '[Image content - not supported by Qwen channel]');
   // **不要把 system 从 messages 里摘出去**：实测上游只认 messages 里的
   // system 角色，顶层的 `system` 字段它根本不读。摘出去会让系统提示词
   // 整体丢失——模型收不到任何指令，表现为「不按要求做事、随口答两句就停」。
   // 顶层字段仍然带上（兼容），但权威来源是 messages。
   const turns = messages;
   const lastUser = [...turns].reverse().find((m) => m && m.role === 'user');
-  const text = lastUser ? String(lastUser.content || '') : '';
+  const text = lastUser ? contentText(lastUser.content, '[Image content - not supported by Qwen channel]') : '';
 
   const parameters = {};
   for (const k of ['temperature', 'top_p', 'max_tokens', 'presence_penalty', 'frequency_penalty']) {
@@ -369,6 +387,7 @@ function aggregate(payloads, model) {
 
 module.exports = {
   buildBody,
+  hasFunctionTools,
   resolveModelKey,
   ensureAccount,
   unwrap,

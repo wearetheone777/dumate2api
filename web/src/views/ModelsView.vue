@@ -21,6 +21,9 @@
         </span>
       </template>
       <template #extra>
+        <a-button size="small" class="ghost-btn mr-2" :loading="twBillingChecking" @click="runTwBillingCheck">
+          计费自检
+        </a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="loadTwModels(true)">
           刷新
         </a-button>
@@ -47,6 +50,33 @@
       </div>
 
       <a-alert v-if="twError" type="warning" show-icon class="mt-3" :message="twError" />
+
+      <!-- 计费自检结果：TRAE 没有逐笔账单，实测倍率来自 consumed 增量 ÷ tokens。
+           billed 为 null（没测到增量）比「比值偏离」更常见，单独标黄 -->
+      <a-alert
+        v-if="twBillingResult"
+        :type="twBillingResult.ok
+          ? (twBillingResult.billed == null || twBillingResult.ratio == null
+            ? 'warning'
+            : (Math.abs(twBillingResult.ratio - 1) > 0.05 ? 'warning' : 'success'))
+          : 'error'"
+        show-icon class="mt-3"
+      >
+        <template #message>
+          <template v-if="twBillingResult.ok">
+            计费自检 · {{ twBillingResult.model }}：标称 {{ twBillingResult.expected ?? '—' }}，
+            实测 {{ twBillingResult.billed ?? '—' }}，
+            比值 {{ twBillingResult.ratio ?? '—' }}
+            <span class="text-slate-500">
+              （{{ twBillingResult.account || '账号未知' }}，Δconsumed {{ twBillingResult.delta ?? '—' }}，tokens {{ twBillingResult.tokens?.total ?? '—' }}，{{ twBillingResult.elapsedMs }}ms）
+            </span>
+          </template>
+          <template v-else>计费自检失败：{{ twBillingResult.error }}</template>
+        </template>
+        <template #description>
+          <span class="text-xs">{{ twBillingResult.warning || twBillingResult.note || '' }}</span>
+        </template>
+      </a-alert>
 
       <!-- 模型信息表：倍率 / 折扣 / 上下文 / 输出上限，字段带来源标记。
            与搭子、千问共用同一个组件——三条通道的字段形状统一，
@@ -96,6 +126,9 @@
         <a-tag class="ml-2" color="cyan">只读</a-tag>
       </template>
       <template #extra>
+        <a-button size="small" class="ghost-btn mr-2" :loading="qwBillingChecking" @click="runQwBillingCheck">
+          计费自检
+        </a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="load">刷新</a-button>
       </template>
       <a-empty v-if="!qwModels.length" :description="qwError || '未取到模型列表'" />
@@ -123,6 +156,29 @@
             </div>
           </div>
         </div>
+
+        <!-- 计费自检结果：千问没有标称倍率，只有实测成本（三池余额差值）。
+             成本为 null（没测到）比数字本身更需要醒目 -->
+        <a-alert
+          v-if="qwBillingResult"
+          :type="qwBillingResult.ok ? (qwBillingResult.cost == null ? 'warning' : 'info') : 'error'"
+          show-icon class="mt-3"
+        >
+          <template #message>
+            <template v-if="qwBillingResult.ok">
+              计费自检 · {{ qwBillingResult.model }}：本次成本 {{ qwBillingResult.cost ?? '—' }} 积分，
+              每千 token {{ qwBillingResult.billed ?? '—' }}
+              <span class="text-slate-500">
+                （{{ qwBillingResult.account || '账号未知' }}，tokens {{ qwBillingResult.tokens?.total ?? '—' }}，
+                免费池 {{ qwBillingResult.pools?.free ?? '—' }} · 付费池 {{ qwBillingResult.pools?.paid ?? '—' }}，{{ qwBillingResult.elapsedMs }}ms）
+              </span>
+            </template>
+            <template v-else>计费自检失败：{{ qwBillingResult.error }}</template>
+          </template>
+          <template #description>
+            <span class="text-xs">{{ qwBillingResult.warning || qwBillingResult.note || '' }}</span>
+          </template>
+        </a-alert>
 
         <a-table
           size="small"
@@ -689,6 +745,42 @@ const twStatus = computed(() => channelStore.infos['traework'] || null)
 const twRows = ref<TraeworkCreditRow[]>([])
 const twUsage = ref<Array<{ model: string; ts: number }>>([])
 
+// 计费自检：对最便宜的对话模型发探针（消耗真实积分，故挑最低倍率档），
+// 比对实测倍率（consumed 增量 ÷ tokens/1000）与模型表标称值
+const twBillingChecking = ref(false)
+const twBillingResult = ref<Awaited<ReturnType<typeof traeworkApi.billingCheck>>['data'] | null>(null)
+async function runTwBillingCheck() {
+  const ranked = [...twModels.value]
+    .filter((m) => m.id && m.usage === 'chat_completion')
+    .sort((a, b) => {
+      const ra = a.rate != null && a.rate > 0 ? a.rate : 99
+      const rb = b.rate != null && b.rate > 0 ? b.rate : 99
+      return ra - rb
+    })
+  const target = ranked[0]?.id
+  if (!target) {
+    twBillingResult.value = {
+      ok: false, model: '', account: null, accountId: null, expected: null,
+      billed: null, ratio: null, delta: null, tokens: null, charged: [],
+      singleAccount: false, elapsedMs: 0, error: '模型表未加载或没有可对话模型，先刷新',
+    }
+    return
+  }
+  twBillingChecking.value = true
+  try {
+    const r = await traeworkApi.billingCheck(target)
+    twBillingResult.value = r.data
+  } catch (e: any) {
+    twBillingResult.value = {
+      ok: false, model: target, account: null, accountId: null, expected: null,
+      billed: null, ratio: null, delta: null, tokens: null, charged: [],
+      singleAccount: false, elapsedMs: 0, error: e?.message || '请求失败',
+    }
+  } finally {
+    twBillingChecking.value = false
+  }
+}
+
 // 搭子的通道元信息与积分。对齐 TRAE 模型页顶部的「通道信息行 + 额度卡」：
 // 那条通道把「模型花什么」与「还剩多少」放在同一页，搭子原来只有模型表。
 // 数据源与仪表盘/积分页相同（/system/status、/points/points、/usage/overview），
@@ -737,6 +829,36 @@ const qwError = ref('')
 const qw = ref<QwCredits | null>(null)
 // 千问通道元信息：账号、套餐、token 状态
 const qwStatus = ref<{ account: string; tier: string; planId: string; refreshExpired: boolean; tokenExpired: boolean } | null>(null)
+
+// 计费自检：千问没有标称倍率（模型表无 price_factor），探针只报实测成本
+// （三池余额差值 ÷ tokens）。默认用 flash——成本量级最小
+const qwBillingChecking = ref(false)
+const qwBillingResult = ref<Awaited<ReturnType<typeof qwenworkApi.billingCheck>>['data'] | null>(null)
+async function runQwBillingCheck() {
+  const ids = qwModels.value.map((m) => m.id)
+  const target = ids.includes('flash') ? 'flash' : (ids[0] || '')
+  if (!target) {
+    qwBillingResult.value = {
+      ok: false, model: '', account: null, accountId: null, expected: null,
+      billed: null, ratio: null, cost: null, pools: null, tokens: null,
+      charged: [], singleAccount: false, elapsedMs: 0, error: '模型表未加载，先刷新',
+    }
+    return
+  }
+  qwBillingChecking.value = true
+  try {
+    const r = await qwenworkApi.billingCheck(target)
+    qwBillingResult.value = r.data
+  } catch (e: any) {
+    qwBillingResult.value = {
+      ok: false, model: target, account: null, accountId: null, expected: null,
+      billed: null, ratio: null, cost: null, pools: null, tokens: null,
+      charged: [], singleAccount: false, elapsedMs: 0, error: e?.message || '请求失败',
+    }
+  } finally {
+    qwBillingChecking.value = false
+  }
+}
 const rows = ref<Row[]>([])
 const saving = ref(false)
 const probing = ref(false)

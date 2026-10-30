@@ -102,6 +102,10 @@ function pickCandidate(channel, candidates, opts = {}) {
         exclude: [...exclude, ...busy],
         model: opts.model,
         paid: opts.paid,
+        // FEFO（最早到期优先）：调用方算好的「有临期积分批次」uid 集合，
+        // 非空时池把候选限制在集合内（pool.pick 的 expiring 语义），把临期
+        // 额度先烧掉。集合为空/null 时无感。
+        expiring: opts.expiring,
       });
       if (uid == null) return null;
     }

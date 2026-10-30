@@ -242,7 +242,40 @@ export interface QwLoginPoll {
   error?: string
 }
 
+/** 计费自检探针的结果（/qwenwork/billing-check）。千问无标称倍率，只有实测成本 */
+export interface QwBillingCheck {
+  ok: boolean
+  model: string
+  account: string | null
+  accountId: number | string | null
+  /** 千问没有标称倍率可对标，恒为 null */
+  expected: null
+  /** 每千 token 实测成本（cost ÷ tokens/1000） */
+  billed: number | null
+  ratio: null
+  /** 本次请求的三池余额差值合计（credits） */
+  cost: number | null
+  pools: {
+    daily: number | null
+    monthly: number | null
+    longterm: number | null
+    free: number | null
+    paid: number | null
+    total: number | null
+  } | null
+  tokens: { input: number; output: number; total: number } | null
+  charged: Array<{ id: string; total: number }>
+  singleAccount: boolean
+  elapsedMs: number
+  warning?: string
+  error?: string
+  note?: string
+}
+
 export const qwenworkApi = {
+  /** 计费自检探针：发一个小请求，报实测成本（消耗真实额度，量级极小） */
+  billingCheck: (model: string) =>
+    client.get<QwBillingCheck>(`/qwenwork/billing-check?model=${encodeURIComponent(model)}`, { timeout: 120000 }),
   credits: () => client.get<QwCredits>('/qwenwork/credits'),
   daily: (days = 14) => client.get<{ days: number; rows: QwDailyRow[] }>(`/qwenwork/credits/daily?days=${days}`),
   models: () => client.get<{ models: QwModel[]; error: string }>('/qwenwork/models'),

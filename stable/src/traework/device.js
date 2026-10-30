@@ -44,10 +44,15 @@ function seededStream(seed, salt, nbytes) {
  * 从 uid 派生设备三件套。
  *
  * @param {string} uid 账号的 user id（TRAE 的 uid，如 3675042082466132）
+ * @param {number} [generation] 派生代数（0 = 原始算法）。9074 实测是
+ *   **设备级**而非账号级——同一 token 换一个新派生的 id 就能签到成功
+ *   （Trae2api-cn 同结论）。签到撞 9074 时代数 +1 重派生，gen 0 的种子
+ *   与原算法完全一致（uid 原样），保证既有账号的设备 id 不漂移。
  * @returns {{deviceId:string, sessionId:string, marketUserId:string}}
  */
-function deriveDevice(uid) {
-  const seed = String(uid || '');
+function deriveDevice(uid, generation = 0) {
+  const g = Number(generation) || 0;
+  const seed = g > 0 ? `${String(uid || '')}#${g}` : String(uid || '');
   if (!seed) throw new Error('deriveDevice 需要 uid（设备标识由它派生）');
 
   // 15 位数字：每字节取模 10 映射到 '0'..'9'

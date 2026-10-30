@@ -91,6 +91,16 @@ const DEFAULTS = {
   sessionDeadThreshold: 3,    // 401 类连续计数达阈才禁用（防误杀）
   inFlightMax: 4,             // 每账号在途并发帽（防单账号被打爆触发风控）
   creditFloor: 0,             // 积分保底线;0 = 关闭（余额数据源由 B 包接入）
+  // ── 选号（加权抽签，替代纯轮询）───────────────────────────────────────
+  // 'weighted' = 按额度/闲置加权随机抽签；'rr' = 回到轮询。
+  // 为什么不再取「额度最高的那个」：那是确定性的，最高分号会吃掉全部流量，
+  // 而乘性权重会让 credits=0 的号永久饿死（参考实现 pool.go:drawLocked 的
+  // 注释就是这两条）。所以额度只做**加性**加成，基线 1.0 保证每个候选都有机会。
+  pickMode: process.env.DUMATE_POOL_PICK_MODE === 'rr' ? 'rr' : 'weighted',
+  pickGapMs: Number(process.env.DUMATE_POOL_PICK_GAP_MS ?? 100), // 防撞号窗口;0 = 关闭
+  creditWeight: Number(process.env.DUMATE_POOL_CREDIT_WEIGHT ?? 10), // 额度加成上限倍数
+  idleBonusPerHour: Number(process.env.DUMATE_POOL_IDLE_BONUS_PER_HOUR ?? 1), // 每闲置 1 小时加多少权重
+  idleBonusMax: Number(process.env.DUMATE_POOL_IDLE_BONUS_MAX ?? 5), // 闲置加成封顶
 };
 
 function newEntry(id) {
@@ -122,6 +132,11 @@ function newEntry(id) {
     in_flight: 0,
     synced_at: 0,
     rev: 0,
+    // 运行态,不落盘:选号用。**pick_seq 必须是单调序号而不是墙钟**——
+    // 同毫秒内 last_pick_at 会相等,按它比较会退化成「恒取第一个」,
+    // 防撞号窗口的兜底就失效了（参考实现 pool.go:drawLocked 的 usedSeq）。
+    pick_seq: 0,
+    last_pick_at: 0,
   };
 }
 
@@ -150,6 +165,7 @@ function createPool(opts = {}) {
 
   const states = new Map(); // id → entry
   let cursor = 0;           // 轮询游标（进程内单调,重启归零无所谓）
+  let pickSeqCounter = 0;   // 选号单调序号（防撞号窗口的 LRU 判据,见 markPick）
   let dirty = false;
   let timer = null;
   let lastMtime = 0;
@@ -416,7 +432,7 @@ function createPool(opts = {}) {
       ? new Set([...optsPick.exclude].map(String))
       : null;
     const seen = new Set();
-    const ok = [];
+    let ok = [];
     for (const raw of candidates || []) {
       const id = String(raw);
       if (seen.has(id) || (exclude && exclude.has(id))) continue;
@@ -430,9 +446,102 @@ function createPool(opts = {}) {
       ok.push(id);
     }
     if (!ok.length) return null;
-    const id = ok[cursor % ok.length];
-    cursor = (cursor + 1) % 1e9;
+
+    // 快过期优先：调用方标出的「这份额度快作废了」的账号，窗口内只在它们之间抽。
+    // 为什么在选号层做：积分过期是真金白银的损失，而纯轮询/纯加权都会让某个号
+    // 的快过期额度一直不被用、最后作废。credits=0 的号不算候选（没额度可过期）。
+    const expiring = optsPick.expiring;
+    if (expiring && expiring.size) {
+      const soon = ok.filter((id) => expiring.has(id));
+      if (soon.length) ok = soon;
+    }
+
+    // 防撞号窗口：minPickGap 内已被选过的号本轮不再进抽签。
+    // 兜底必须比**单调序号**而不是墙钟——同毫秒内 last_pick_at 相等，
+    // 按它比较会退化成「恒取第一个」。
+    const gapRaw = Number(optsPick.pickGapMs) > 0 ? optsPick.pickGapMs : o.pickGapMs;
+    const gap = Number.isFinite(gapRaw) ? gapRaw : 0;
+    if (gap > 0) {
+      const fresh = ok.filter((id) => {
+        const e = states.get(id);
+        return !e || now - (e.last_pick_at || 0) >= gap;
+      });
+      if (fresh.length) ok = fresh;
+      else return markPick(oldestBySeq(ok), now);
+    }
+
+    if (o.pickMode === 'rr') {
+      const id = ok[cursor % ok.length];
+      cursor = (cursor + 1) % 1e9;
+      return markPick(id, now);
+    }
+    return markPick(weightedDraw(ok, now), now);
+  }
+
+  /** 记录本次选号（防撞号窗口与 LRU 兜底的数据源） */
+  function markPick(id, now) {
+    const e = ensure(id);
+    e.last_pick_at = now;
+    e.pick_seq = ++pickSeqCounter;
     return id;
+  }
+
+  function oldestBySeq(ids) {
+    let best = ids[0];
+    let bs = Infinity;
+    for (const id of ids) {
+      const e = states.get(id);
+      const s = (e && e.pick_seq) || 0;
+      if (s < bs) { bs = s; best = id; }
+    }
+    return best;
+  }
+
+  /** 候选里的最大余额，用作额度加成的分母（同一批候选内归一化） */
+  function maxCreditsOf(ids) {
+    let m = 0;
+    for (const id of ids) {
+      const e = states.get(id);
+      if (e && Number.isFinite(e.credits) && e.credits > m) m = e.credits;
+    }
+    return m;
+  }
+
+  /**
+   * 单个候选的权重。
+   * 基线 1.0 —— 这是关键：额度只做**加性**加成，不能做乘性。乘性权重下
+   * credits=0 的号权重恒为 0，永久饿死；加性下它至少有基线，仍会被选中。
+   */
+  function weightOf(e, now, maxCredits) {
+    const CW = Number.isFinite(o.creditWeight) ? o.creditWeight : 10;
+    const PER = Number.isFinite(o.idleBonusPerHour) ? o.idleBonusPerHour : 1;
+    const CAP = Number.isFinite(o.idleBonusMax) ? o.idleBonusMax : 5;
+    let w = 1.0;
+    if (!e) return w + CAP; // 无记录 = 全新账号，给满闲置加成优先启用
+    if (maxCredits > 0 && Number.isFinite(e.credits) && e.credits > 0) {
+      w += (e.credits / maxCredits) * CW;
+    }
+    if (e.last_used_at) {
+      const hours = Math.max(0, (now - e.last_used_at) / 3600000);
+      w += Math.min(hours * PER, CAP);
+    } else {
+      w += CAP; // 从没用过
+    }
+    return w;
+  }
+
+  function weightedDraw(ids, now) {
+    const mc = maxCreditsOf(ids);
+    const w = ids.map((id) => weightOf(states.get(id), now, mc));
+    let total = 0;
+    for (const x of w) total += x;
+    if (!(total > 0)) return ids[0]; // 理论上不可达（基线 1.0），防 NaN 兜底
+    let r = Math.random() * total;
+    for (let i = 0; i < ids.length; i++) {
+      r -= w[i];
+      if (r <= 0) return ids[i];
+    }
+    return ids[ids.length - 1];
   }
 
   // ---------------------------------------------------------------------------

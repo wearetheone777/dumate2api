@@ -207,10 +207,12 @@ async function qoderRows() {
       reasoning: m.isReasoning === true || m.is_reasoning === true,
       multimodal: m.multimodal === true || m.is_vl === true,
       isFree: m.isFree === true || m.is_free === true,
+      // 错峰优惠（上游 promotion，session.fetchModels 已归一化）
+      promotion: m.promotion && typeof m.promotion === 'object' ? m.promotion : null,
     }))
     : constants.FALLBACK_MODELS.map((k) => ({
       key: k, name: k, rate: null, rateOriginal: null, ctx: null,
-      reasoning: false, multimodal: false, isFree: false,
+      reasoning: false, multimodal: false, isFree: false, promotion: null,
     }));
   return items.map((m) => ({
     id: m.key,
@@ -242,10 +244,17 @@ async function qoderRows() {
     multimodal: !!m.multimodal,
     // 免费档：上游 is_free，与 TRAE 的会员折扣是两回事，界面分开标
     isFree: !!m.isFree,
+    // 错峰优惠：折扣系数与时段原样透出，不解读成「x 折」——discount_factor
+    // 的乘性方向没实测过，编一个口径会被对账打脸
+    offPeak: m.promotion && (m.promotion.windowStart || m.promotion.windowEnd) ? {
+      discountFactor: typeof m.promotion.discountFactor === 'number' ? m.promotion.discountFactor : null,
+      window: [m.promotion.windowStart, m.promotion.windowEnd].filter(Boolean).join('-'),
+    } : null,
     // 便宜档标记：0.1 倍率的适合调试（省额度）
     note: [
       Array.isArray(m.tiers) && m.tiers.length > 1 ? `可选 ${m.tiers.map(fmtCtx).join(' / ')}` : '',
       (typeof m.rate === 'number' && m.rate <= 0.1) ? '低倍率，适合开发调试' : '',
+      (m.offPeak && m.offPeak.window) ? `错峰 ${m.offPeak.window}${m.offPeak.discountFactor != null ? `（×${m.offPeak.discountFactor}）` : ''}` : '',
     ].filter(Boolean).join('；'),
   }));
 }

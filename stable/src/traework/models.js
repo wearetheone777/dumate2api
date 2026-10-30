@@ -54,6 +54,9 @@ const MEASURED_HARD_CONTEXT = {
   },
 };
 
+/** 输出上限实测（2026-10-30）：max_tokens=131072（budget.js 顶格值）真机 200
+ *  正常出流——TRAE 上游的输出预算接受 131072，与搭子同限，无需独立钳制。 */
+
 /** display_contact_config 是 JSON 字符串，解析失败当空对象 */
 function parseContact(raw) {
   try {
@@ -103,6 +106,10 @@ function normalize(m) {
     visible: !m.is_invisible_to_user,
     // 上游声明的用途，chat_completion 之外的多半不是给对话用的
     usage: m.usage || '',
+    // 该条目名下的自定义模型名（如 "gemini//gemini-3-flash-preview"）。
+    // 它们不是顶层 config_name，模型名前置校验要把它们也算「已知」，
+    // 否则用自定义模型的请求会被误判成「模型不在表中」
+    customModelIds: Array.isArray(m.custom_models) ? m.custom_models.map((x) => String(x)) : [],
   };
 }
 
@@ -174,6 +181,41 @@ function cachedModelIds() {
 }
 
 /**
+ * 同步取单个模型的元数据（多模态校验用）。缓存未预热时返回 null——
+ * 校验方对 null 放行（宁可不挡，也不能因为模型表没就绪挡住能用的请求）。
+ */
+function cachedMetaById(id) {
+  if (!cache.data || !Array.isArray(cache.data.models)) return null;
+  return cache.data.models.find((m) => m.id === id) || null;
+}
+
+/** 缓存里客户端可见的多模态模型 id 列表（给「不支持图像」的报错信息用） */
+function multimodalIds() {
+  if (!cache.data || !Array.isArray(cache.data.models)) return [];
+  return cache.data.models
+    .filter((m) => m.visible && m.multimodal && (m.usage === 'chat_completion' || !m.usage))
+    .map((m) => m.id);
+}
+
+/** 模型表缓存是否就绪（前置校验只在就绪时生效，没就绪一律放行） */
+function hasCache() {
+  return !!(cache.data && Array.isArray(cache.data.models) && cache.data.models.length);
+}
+
+/** 模型名是否已知：顶层 config_name 或任一条目名下的自定义模型。大小写不敏感 */
+function isKnownModel(id) {
+  if (!hasCache()) return true;
+  const want = String(id || '').trim().toLowerCase();
+  if (!want) return true;
+  for (const m of cache.data.models) {
+    if (String(m.id || '').toLowerCase() === want) return true;
+    if (Array.isArray(m.customModelIds)
+      && m.customModelIds.some((x) => String(x).toLowerCase() === want)) return true;
+  }
+  return false;
+}
+
+/**
  * 带元信息的模型条目（给 /v1/models 用）。
  *
  * 为什么需要：cc-switch 解析模型列表读 `name` / `contextWindow`
@@ -198,4 +240,4 @@ function cachedModelEntries() {
   return [{ id: c.DEFAULT_MODEL, name: c.DEFAULT_MODEL, contextWindow: null, maxContextWindow: null }];
 }
 
-module.exports = { fetchModels, listModelIds, cachedModelIds, cachedModelEntries, usableIds, normalize, CACHE_MS, MEASURED_HARD_CONTEXT };
+module.exports = { fetchModels, listModelIds, cachedModelIds, cachedModelEntries, cachedMetaById, multimodalIds, hasCache, isKnownModel, usableIds, normalize, CACHE_MS, MEASURED_HARD_CONTEXT };

@@ -1,114 +1,54 @@
-快照指纹 sha256（stable/src 下 73 个 .js，按路径+内容计算）：
-9abffb2e6d6830a38285b45e2e213e2cf3a102c7bebe69c9df55553b4ed0db2f
+快照指纹 sha256（stable/src 下 78 个 .js，按路径+内容计算）：
+9dee04a4d1998a07d2afccdbcc5bdb428d0b249da9315fc035c5ed53bb091bb8
 
 指纹算法：
   对 stable/src 下所有 .js 文件，按相对路径排序（`/` 分隔），
   拼接 [相对路径 + LF + 文件内容]，以 UTF-8 编码后取 sha256。
-  本次已用该算法实算，可复核。
+  本次已用该算法实算，可复核（scripts/snapshot-closure.js 算闭包，
+  指纹与逐字节比对由同目录脚本流程复现）。
 
-来源：main 分支提交 28bce72（docs: 2026-10-29 改动记录）
-  同步随本轮修复一并完成，单列 chore(stable) 提交。
+来源：main 分支「播报即收尾三通道共享化」提交（父提交 77168f4）。
+  本次是**增量同步**，不是全量补齐——上一版快照已与 77168f4 对齐，
+  基线干净，只有本次改动的 7 个文件需要覆盖。
 
-文件数：58 → 73（新增 15，无删除）。内容变更 34 个。
+文件数：77 → 78（新增 1，无删除）。
+  新增：repair.js（「播报即收尾」共享模块：判定、追加修复指令、
+        OpenAI chunk 缓冲门；千问 / Qoder / TRAE 三通道共用）
+  覆盖：repair.js（新）、qoder/chat.js、qoder/index.js、
+        qwenwork/chat.js、qwenwork/index.js、traework/chat.js、
+        traework/index.js
 
-**本次是全闭包补账，不只本轮修复。**上一版（95f1693，指纹 c440a72b…）只按
-`src/qoder/index.js` 的 31 文件子闭包做逐字节比对，没有按本文档要求的
-`src/server.js` 全闭包——于是 server.js / responses.js / web-pool.js /
-upstream-router.js 等文件自 41863ef（d625b40 同步）起**一直没再同步过**，
-累计 34 个文件带账。本次按文档算法从 src/server.js 重算全闭包，一次性补齐。
-教训：**闭包比对必须从 src/server.js 算起**，子闭包比对会静默漏掉主链路的
-演进（本轮就是被它骗过的——server.js 顶层新 require 的 ./boot / ./cors 都
-不在快照里，9080 会直接起不来）。
+本次覆盖了什么（相对上一版快照）：
+  1. 新增 src/repair.js：looksUnfinished / appendRepairNudge / createChunkGate /
+     envCaps + REPAIR_NUDGE 等常量。判据与文本与 TRAE 2026-10-05 的实测结论
+     逐字一致（只有「检测 + 一次性重试」打到 5/5，提示词修不动）。
+  2. 千问通道接入修复（qwenwork/index.js 的 runOnce 流式 + 非流式两条路径）：
+     带工具的请求启用缓冲门，正文「播报 + 下一步」时追加修复指令重试。
+     新增 chat.hasFunctionTools（与 buildBody 的过滤口径共用）与
+     buildBody 的 out.sessionId（修复轮钉住会话、request_id 每轮新生成）。
+  3. Qoder 通道接入修复（qoder/index.js）：因签名含 body，修复轮整套重签
+     （applyRound），request_set_id（排队槽位键）每轮换新、session_id 钉住；
+     流式路径拆出 sawUp（上游送来过真实数据）/ sent（已到达下游）两个标志，
+     排队守卫与换主机守卫用前者、err.sent 用后者，且 err.sent 计入缓冲门的
+     放行（reasoning 是直发的）。聚合错误的 quotaKind 现在透传到上层。
+  4. TRAE 收敛：REPAIR_NUDGE / HOLD_CAP / REPAIR_MAX / looksUnfinished 改走
+     src/repair.js，行为不变（verify-traework-repair.js 38 项全绿）。
+  5. 顺带带入上一提交里判据修正的部分：qoder/chat.js 的 buildBody
+     hasFunctionTools 导出；traework/index.js 的 onAccount 第二参数（账号 id）。
 
-新增 15 个。**前两个是 9080 能不能启动的问题**：server.js 现在顶层
-require ./boot 与 ./cors，快照里没有就直接 crash。
+验证记录（2026-10-30）：
+  · 闭包重算：node scripts/snapshot-closure.js → 78 个文件，无无法解析的 require
+  · 逐字节比对：src 与 stable/src 闭包内 78 个文件内容零差异；stable 无多余文件
+  · 语法检查：stable/src 下 78 个文件 node --check 全部通过
+  · 独立启动：DUMATE2API_PORT=19099 DUMATE_ADMIN_DATA=<repo>/data 启动成功，
+    /health 四通道全部 ready（dumate(source=web, fallback 可用) / qwenwork 2 账号
+    本地签名 / traework 2 账号 / qoder 2 账号 needsClient=false）
+  · 离线套件：test/unit/*.test.js 109 项全过；
+    verify-qwen-repair 36 项 / verify-qoder-repair 36 项 / verify-traework-repair 38 项；
+    其余通道脚本（channel / throttle / read-idle / error-surface / grants / cosy /
+    max-output / discipline / wallets-zero / daily-aggregate / stream-error /
+    toolshape / gained / 9074 / display-name / fallback-stream-pipe）全通过
+  · 未启动 9080（对外服务的启动是用户的决定，不属于发布流程）
 
-  boot.js —— 启动接线（livecfg→pool→出站代理→计量挂钩探活→keepalive 探测）
-             与 SIGINT/SIGTERM 优雅停止；server.js 顶层引用
-  cors.js —— CORS 预检（server.js 顶层引用，无依赖）
-  reqlog-hook.js —— 请求计量挂钩（boot 启动探活 + reqlog 懒加载；缺失则
-                     9080 的计量降级为 broken，埋点全断）
-  usage-agg.js —— 用量聚合分桶（boot 退出时 flushNow）
-  keepalive.js —— 保活适配层（boot 只探测不排程；**顶层** require
-                   admin/store 与 balance-hist，这两个因此一并进快照）
-  admin/store.js —— 原子 JSON/JSONL 持久化（keepalive 顶层依赖）
-  balance-hist.js —— 余额时间线（keepalive 顶层依赖）
-  admin/auth.js / admin/router.js / admin/routes/accounts.js —— keepalive 的
-                   签到适配器懒加载链（try/catch 包裹，缺失只降级不崩溃，
-                   按全闭包算法一并带上）
-  records.js / points-agg.js / task-runner.js / task-scheduler.js /
-  login-browser.js —— 同上（keepalive→admin/routes 链可达）
-
-内容更新 34 个，分两类：
-
-  本轮修复（2026-10-29）：
-    qoder/chat.js —— CONTENT_MS 12s→6s；post() 识别错误信封当场断流
-    qoder/index.js —— 重试预算 60s→6s、步长 3s→1.5s、排队冷却不采信上游
-                       retryAfterSeconds、入口等掉排队软冷却
-    upstream-errors.js —— QUEUE_TEXT=serviceAvailable:false（不能用
-                           isQueued:true，CALL_COUNT_LIMIT 也带它）、
-                           QUEUE_THROTTLE_COOLDOWN_MS=5s、unescapeDeep
-                           三层转义
-    qwenwork/auth.js —— 续期提前量 5 分钟→24 小时（账号报废根因：
-                         到期时刻没流量就永远错过续期，23 小时后 grant 作废）
-    channel-pool.js —— 402 硬冷却按通道额度重置时刻：千问 00:00、
-                        搭子仍 04:00（照 4 点冷却白丢 4 小时额度）
-    errtext.js —— 402 文案翻译（与 400 同文案只能按状态码认）
-    filelock.js / fileperm.js —— renameAtomic 原子写（杀软/ACL 的 EPERM
-                                  不再丢账号与配置）
-  累计欠账（自 41863ef 起，src 已演进而快照未跟）：
-    server.js / responses.js / anthropic.js / google.js / budget.js /
-    upstream-router.js / web-pool.js / fallback-web.js / dumate-web.js /
-    accounts.js / points-cursor.js / keys.js / livecfg.js / modelmap.js /
-    model-info.js / discovery.js / jsonl.js / reqlog.js / pool.js /
-    qwenwork/bridge / chat / cosy-sign / credentials / credits / index /
-    traework/auth / chat / checkin / credits / index /
-    qoder/credentials 等
-
-验证记录（2026-10-29，全部实测）：
-
-  - 闭包：从 src/server.js 出发递归解析 require('./x')，得 73 个文件；
-    快照原 58 个全部在闭包内（0 个多余）；无动态相对 require（已 grep 确认）
-  - 逐字节比对：同步后 73/73 全部一致（Buffer.equals）
-  - node --check：73 个文件全部通过
-  - 独立启动（临时端口 19099，DUMATE_ADMIN_DATA=<repo>/data，
-    DUMATE_AUTOSTART=off）：status=ok，四通道全部 ready
-    （dumate / qwenwork / traework / qoder），启动日志 0 处 Error；
-    /v1/models 返回 35 个模型（keys / modelmap / 模型表链路通）
-  - 指纹实算：FILES=73，SHA256=9abffb2e…
-  - **未启动 9080**：只同步文件，9080 保持停止状态
-
-启动方式（沿用）：
-  9080 必须按 start-stable.bat 启动（它设了 DUMATE_ADMIN_DATA=<repo>/data）。
-  若手工启动且不设该变量，reqlog.js 的 ROOT 会解析到 stable/data/——
-  那是个**空目录**，里面没有任何凭证，千问/TRAE/Qoder 通道将不可用，
-  且 9083 管理端读的是 <repo>/data、看不到 9080 的流量。
-
-上一版快照来源：
-  95f1693（chore(stable)：Qoder 账号池整套进快照 49→58），指纹 c440a72b…
-    该版把账号池 9 个依赖补进快照，「模型级冷却」自此在 9080 生效；
-    但闭包比对只覆盖了 src/qoder/index.js 的 31 文件子集，主链路欠账
-    于本版（28bce72）补齐。
-  84a4522（chore(stable)：同步到 977723d 的部分内容），仅 2 文件
-  977723d 的部分同步（2 文件），指纹 a49c6d16…
-    该版**没有账号池**，Qoder 通道仍是池接入前的实现，已于 95f1693 补齐。
-  60ad161（merge(dev)：签到详情按月/按年查看），指纹 7c931419…
-
-更早：
-  41863ef（merge(dev)：code review 修复——错误帧识别 / 上游中止 / 错误埋点），
-    指纹 8a4ce323…（**这是 server.js 上一次进快照的版本**，其后 34 文件欠账）
-  6007f0d（merge(dev)：Qoder 错误面 + 模型表预热），指纹 dc89567a…
-  132e744（merge(dev)：流式 usage 帧与首字耗时埋点补齐 + 默认网页凭证），
-    指纹 c7a3c059…
-  0927bfd —— 千问本地签名脱离客户端 + 搭子回落流式 pipe 修复 + 仪表盘降级容错，
-    指纹 d0223393…
-  49697a8 —— 回落流式 pipe 修复 + TRAE checkin 补漏，指纹 a23a9946…
-  0fe2167 feat: Anthropic 原生工具 + TRAE 播报修复 + Qoder 积分归因（2026-10-06），
-    指纹 609ba739…
-  ccf8e27 perf(qoder): cosy.encode 改 O(n)（2026-10-03），指纹 7225acd3…
-  225e597 chore(stable): 同步快照到 23a62d0（流式失败收尾修复）
-  578d8b0 → 9736b11（Qoder 通道接入），指纹 3662af33…
-
-关于历史指纹值的说明：本文件早先记过 f7e7a810… / 96a22d7c… / 8548df35…
-三个值均无法复现，与任何一致算法都不符（不是编码/换行问题）。
-自 2026-10-03 起，指纹一律按上面这个算法实算得出，可核对。
+注意：9080 若当前在运行，它跑的仍是旧快照代码；要让新代码生效需重启 9080
+（走 stable/start-stable.bat，它设了 DUMATE_ADMIN_DATA=%~dp0..\data）。

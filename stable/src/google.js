@@ -15,6 +15,7 @@
 const { resolveMaxTokens } = require('./budget');
 const modelmap = require('./modelmap');
 const { markFirstToken } = require('./reqlog');
+const images = require('./images');
 
 // 回落名由 modelmap 决定，不再在本模块另立一个常量——两处常量必然漂移
 const DEFAULT_MODEL = modelmap.DEFAULTS.fallback;
@@ -43,12 +44,27 @@ function partsToText(parts) {
     .map((p) => {
       if (typeof p === 'string') return p;
       if (p && typeof p.text === 'string') return p.text;
-      if (p && p.inlineData && p.inlineData.data) {
-        return '[Image content - not supported by DuMate backend]';
-      }
+      // inlineData 由 partsToImageParts 提取成 image_url part，这里跳过
+      if (p && (p.inlineData || p.inline_data)) return '';
       return '';
     })
     .join('\n');
+}
+
+// Google inlineData part → OpenAI image_url part（data URI）
+function partsToImageParts(parts) {
+  const out = [];
+  if (!Array.isArray(parts)) return out;
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue;
+    const d = p.inlineData || p.inline_data;
+    if (d && d.data) {
+      const mime = d.mimeType || d.mime_type || 'image/png';
+      const part = images.toImageUrlPart(`data:${mime};base64,${d.data}`);
+      if (part) out.push(part);
+    }
+  }
+  return out;
 }
 
 // Google request -> OpenAI chat request
@@ -100,7 +116,17 @@ function googleToOpenAI(googleReq) {
       messages.push(...toolResults);
     } else {
       const text = texts.join('\n');
-      if (text) messages.push({ role, content: text });
+      // 图像保真（Gemini inlineData → OpenAI image_url）：直连通道认该形状，
+      // 压成字符串会把图像丢掉
+      const imgs = role === 'user' ? partsToImageParts(parts) : [];
+      if (imgs.length) {
+        const msgParts = [];
+        if (text) msgParts.push({ type: 'text', text });
+        msgParts.push(...imgs);
+        messages.push({ role, content: msgParts });
+      } else if (text) {
+        messages.push({ role, content: text });
+      }
     }
   }
 

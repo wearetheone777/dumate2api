@@ -106,13 +106,78 @@ function callWebPool(body, opts = {}) {
 
   const onChunk = (chunk) => { settle(200); push(chunk); };
 
+  // 从云端网关的错误体（{"error":{...}} 形状）推状态码。它对部分请求级错误
+  // 回 HTTP 200（Prompt 超长实测就是），错误藏在 body 里——不在首个 chunk
+  // 到达时把状态码定下来，处理器会 writeHead(200)，客户端把错误当成功静默
+  // 收下（2026-10-30 实测 5MB 请求即触发）。
+  function statusFromBodyError(s) {
+    try {
+      const j = JSON.parse(s);
+      const type = j && j.error && j.error.type;
+      if (type === 'invalid_request_error') return 400;
+      if (type === 'authentication_error') return 401;
+      if (type === 'permission_error') return 403;
+      if (type === 'rate_limit_error') return 429;
+    } catch (e) { /* 形状不认识，按网关错处理 */ }
+    return 502;
+  }
+
+  // 首块嗅探：正常流式（SSE）首帧必以 data:/event: 开头；裸 `{` 开头的是
+  // 云端网关的错误体（HTTP 200 或 4xx 的 body 都会走到这里——callModelStream
+  // 只按 HTTP 状态码定 ok，body 无条件经 onChunk 推出）。错误体可能跨多个
+  // chunk，所以要攒到 JSON 能解析（或超限）再定状态码并放行。
+  // sniffing 标志跨 chunk 保持——后续块不再做形状判定，直接进缓冲。
+  let pushedAny = false;
+  let sniffing = false;
+  let sniff = '';
+  const SNIFF_CAP = 64 * 1024;
+  const releaseSniff = (code) => {
+    settle(code);
+    pushedAny = true;
+    sniffing = false;
+    push(sniff);
+    sniff = '';
+  };
+  const tryReleaseSniff = () => {
+    if (sniff.length > SNIFF_CAP) return releaseSniff(502);
+    try {
+      JSON.parse(sniff);
+      releaseSniff(statusFromBodyError(sniff));
+    } catch (e) { /* JSON 未完，继续攒 */ }
+  };
+  const onChunkSniff = (chunk) => {
+    if (sniffing) {
+      sniff += chunk;
+      return tryReleaseSniff();
+    }
+    if (pushedAny) {
+      settle(200);
+      push(chunk);
+      return;
+    }
+    const head = String(chunk).trimStart();
+    if (head.startsWith('data:') || head.startsWith('event:') || head.startsWith(':') || !head.startsWith('{')) {
+      settle(200);
+      pushedAny = true;
+      push(chunk);
+      return;
+    }
+    sniffing = true;
+    sniff = chunk;
+    tryReleaseSniff();
+  };
+
   const done = new Promise((resolve) => {
     const finish = (r) => resolve(r);
 
     const run = body.stream
-      ? pool.callStreamWithFailover('/chat/completions', 'POST', body, onChunk, {
+      ? pool.callStreamWithFailover('/chat/completions', 'POST', body, onChunkSniff, {
         timeout: 600000,
-        onStatus: (code) => { if (code >= 200 && code < 300) settle(200); },
+        // **不在 onStatus 里 settle(200)**：云端网关对部分错误回 HTTP 200 +
+        // body 内错误体，响应头先于 body 到达——在这里 settle 会把状态码
+        // 定格成 200，等首块嗅探发现错误体时已经改不了（处理器早已
+        // writeHead）。状态码统一由首块嗅探定：正常 SSE 首帧毫秒级到达，
+        // 代价只是 ready 晚解析一个首块的时间。
       })
       : pool.callWithFailover('/chat/completions', 'POST', body, { timeout: 600000 });
 
@@ -132,12 +197,25 @@ function callWebPool(body, opts = {}) {
       }
 
       if (!r.ok) {
-        // 失败：给出明确状态码，别让下游以为成功
+        // 失败：给出明确状态码，别让下游以为成功。
+        // 流已断而错误体 JSON 未完（残缺 body）时先兜底放行，别让它卡在
+        // 嗅探缓冲里丢失。
+        if (sniff) releaseSniff(502);
+        // **流式已推出过字节时不补错误体**：错误体多半已经过 onChunkSniff
+        // 推出（HTTP 4xx 的 body 也会流经 onChunk），再 push 就是两段 JSON
+        // 直接拼接——非法 JSON，客户端解析必炸（2026-10-30 实测 5MB 超长
+        // Prompt 请求返回 `{"error":...}{"error":...}` 即此因）。
         settle(r.status || 502);
         emitter.headers = { 'content-type': 'application/json' };
-        push(JSON.stringify({
-          error: { message: r.error || 'web fallback failed', type: 'api_error' },
-        }));
+        if (!body.stream || !pushedAny) {
+          // 非流式（或还没推过任何字节）：有上游错误体就**原样透传**——
+          // 里面的 message（如「Prompt 超长」）才是真实原因；包一层
+          // 'web fallback failed' 会把原因抹掉。
+          const upstreamErr = r.raw && r.json && r.json.error;
+          push(upstreamErr
+            ? r.raw
+            : JSON.stringify({ error: { message: r.error || 'web fallback failed', type: 'api_error' } }));
+        }
         end();
         return finish({ ok: false, status: emitter.statusCode, error: r.error, json: r.json });
       }
@@ -155,9 +233,13 @@ function callWebPool(body, opts = {}) {
       end();
       return finish({ ok: true, status: 200, account: r.account });
     }).catch((e) => {
+      if (sniff) releaseSniff(502);
       settle(502);
       emitter.headers = { 'content-type': 'application/json' };
-      push(JSON.stringify({ error: { message: e.message, type: 'api_error' } }));
+      // 已推过字节（半截流）再补错误体就是非法拼接，同 !r.ok 分支
+      if (!pushedAny) {
+        push(JSON.stringify({ error: { message: e.message, type: 'api_error' } }));
+      }
       end();
       finish({ ok: false, status: 502, error: e.message });
     });

@@ -16,7 +16,9 @@ const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
 const c = require('./constants');
 const cosy = require('./cosy');
-const { payloadError, envelopeStatus } = require('../upstream-errors');
+const { normalizeUsageCache } = require('../usage-norm');
+const { contentText } = require('../images');
+const { payloadError, envelopeStatus, throttleRetryMs } = require('../upstream-errors');
 
 const TIMEOUT_MS = 600000;
 
@@ -92,6 +94,55 @@ function resolveModelKey(name, models) {
   return bare;
 }
 
+// ---- 思考档位（2026-10-30，判据来自上游模型表 thinking_config 与 qoder2api-hub）----
+// 上游参数是 parameters.reasoning_effort；**收到不支持的档位时不报错、悄悄改用
+// 默认档**——所以归一化必须本地做，否则「high 在 Qwen3.8 系不合法」这类情况
+// 用户完全无感（档位静默丢失）。
+const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
+// 客户端写法别名：minimal 是 OpenAI 系的最低档叫法，off/disabled 是显式关闭
+const EFFORT_ALIASES = { minimal: 'low', off: 'none', disabled: 'none' };
+
+/**
+ * 解析并归一化思考档位。返回要下发的档位字符串，或 null（不下发该参数）。
+ *
+ * 输入写法（四个入口）：reasoning_effort（OpenAI）、reasoning.effort（Codex/
+ * Responses）、thinking.effort / thinking.level（Anthropic 系）。显式关闭
+ * （none / thinking.type=disabled，翻译层已剥）一律不下发——上游按模型默认
+ * 处理，比硬塞一个档位稳。
+ *
+ * 归一化：档位在模型表 thinking_config 的合法集合里 → 原样；不在 → 取 ORDER
+ * 序上距离最近的合法档，距离相同偏向模型默认档（与 hub 实测一致：
+ * qfmodel 的 high→medium、max→xhigh；dfmodel 的 xhigh→max）；模型表没带
+ * 档位集合（理论少见）→ 原样透传（上游自会回落默认档）。
+ */
+function resolveReasoningEffort(payload, modelMeta) {
+  const p = payload || {};
+  const raw = p.reasoning_effort != null ? p.reasoning_effort
+    : p.reasoning && p.reasoning.effort != null ? p.reasoning.effort
+      : p.thinking && p.thinking.effort != null ? p.thinking.effort
+        : p.thinking && p.thinking.level != null ? p.thinking.level
+          : null;
+  if (raw == null || raw === '') return null;
+  let e = String(raw).trim().toLowerCase();
+  e = EFFORT_ALIASES[e] || e;
+  if (e === 'none') return null;
+  const efforts = (modelMeta && modelMeta.reasoningEfforts) || [];
+  if (!efforts.length) return e;
+  if (efforts.includes(e)) return e;
+  const idx = (x) => { const i = EFFORT_ORDER.indexOf(x); return i === -1 ? 99 : i; };
+  const want = idx(e);
+  const def = (modelMeta && modelMeta.reasoningDefault) || '';
+  let best = efforts[0];
+  let bestDist = idx(best) === 99 ? Infinity : Math.abs(idx(best) - want);
+  for (const cand of efforts.slice(1)) {
+    const ci = idx(cand);
+    if (ci === 99) continue;
+    const d = Math.abs(ci - want);
+    if (d < bestDist || (d === bestDist && cand === def)) { best = cand; bestDist = d; }
+  }
+  return best;
+}
+
 /** 构造上游请求体（OpenAI 形状 → Qoder 形状） */
 function buildBody(modelKey, payload, opts = {}) {
   // 上下文档位：上游同一模型挂着 200K / 400K / 1M 三档（模型表的
@@ -99,23 +150,39 @@ function buildBody(modelKey, payload, opts = {}) {
   // 可用输入，所以**默认请求该模型的最大档**（由 index.runOnce 从缓存查出）。
   // 显式传 opts.maxInputTokens 可以覆盖；DUMATE_QODER_CONTEXT=default 退回默认档。
   const maxInputTokens = Number(opts.maxInputTokens) > 0 ? Number(opts.maxInputTokens) : 200000;
+  // request_id 每轮都是**新的**（这次请求自己的标识，两轮各是一次真实上游
+  // 请求）；session_id 可由外部钉住：「播报即收尾」的修复轮要在同一个会话里
+  // 继续（追加了修复指令但 session_id 不变），上游才会把重试轮当成同一段
+  // 对话的下一句。
   const requestId = crypto.randomUUID();
-  const sessionId = (payload && payload.session_id) || crypto.randomUUID();
+  const requestSetId = opts.requestSetId || requestId;
+  const sessionId = (payload && payload.session_id) || opts.sessionId || crypto.randomUUID();
   const messages = (payload && payload.messages) || [];
   let system = '';
   if (payload && typeof payload.system === 'string') system = payload.system;
   const sysMsg = messages.find((m) => m && m.role === 'system');
-  if (!system && sysMsg) system = String(sysMsg.content || '');
+  // content 可能是带 image_url 的 parts 数组（翻译层已保真）——String() 会变成
+  // "[object Object]"，必须走文本展开（图像换占位，COSY 的 text 槽只有纯文本）
+  if (!system && sysMsg) system = contentText(sysMsg.content, '[Image content - not supported by Qoder channel]');
   // system 留在 messages 里（与千问同一实测结论：上游只认 messages 里的 system 角色）
   const turns = messages;
   const lastUser = [...turns].reverse().find((m) => m && m.role === 'user');
-  const text = lastUser ? String(lastUser.content || '') : '';
+  const text = lastUser ? contentText(lastUser.content, '[Image content - not supported by Qoder channel]') : '';
 
   const parameters = {};
   for (const k of ['temperature', 'top_p', 'max_tokens', 'presence_penalty', 'frequency_penalty']) {
     if (payload && payload[k] != null) parameters[k] = payload[k];
   }
   if (parameters.max_tokens == null) parameters.max_tokens = 32000;
+  // max_tokens 上游上限自学习（max-output.js）：第一次超限上游回 400 并被
+  // learn 记下，之后同一模型出站前在这里自动压到上限。
+  const cap = Number(opts.maxOutputTokens);
+  if (Number.isFinite(cap) && cap > 0 && parameters.max_tokens > cap) {
+    parameters.max_tokens = Math.floor(cap);
+  }
+  // 思考档位：解析 + 按模型合法档归一化（见 resolveReasoningEffort）
+  const effort = resolveReasoningEffort(payload, opts.modelMeta || null);
+  if (effort) parameters.reasoning_effort = effort;
 
   // 工具只留标准 OpenAI 形状（上游只认 `{type:"function", function:{...}}`）。
   // Codex 会带 namespace / web_search 等，带上会整轮失败。
@@ -129,7 +196,7 @@ function buildBody(modelKey, payload, opts = {}) {
   const modelCfg = { key: modelKey, is_reasoning: false };
   return JSON.stringify({
     request_id: requestId,
-    request_set_id: requestId,
+    request_set_id: requestSetId,
     chat_record_id: requestId,
     session_id: sessionId,
     stream: true, // 上游只走 SSE；非流式由本文件聚合
@@ -144,7 +211,24 @@ function buildBody(modelKey, payload, opts = {}) {
         chatPrompt: '',
       },
       chatPrompt: '',
-      imageUrls: null,
+      imageUrls: (() => {
+        // Qoder 上游图像形状实测（2026-10-30）：dataURL 字符串数组和裸 base64 数组
+        // 均返回 HTTP 200，{url} 和 {image_url:{url}} 返回 429（上游冷却或形状不认）。
+        // 定案使用 dataURL 字符串数组。注意：模型对图像的识别准确度由上游
+        // 决定，网关层面只负责透传。
+        const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
+        const urls = [];
+        for (const m of msgs) {
+          if (!m || !Array.isArray(m.content)) continue;
+          for (const p2 of m.content) {
+            if (p2 && p2.type === 'image_url') {
+              const u = p2.image_url && p2.image_url.url;
+              if (u) urls.push(u);
+            }
+          }
+        }
+        return urls.length ? urls : null;
+      })(),
     },
     is_reply: true,
     is_retry: false,
@@ -505,6 +589,17 @@ function postStream(url, body, headers, onChunk, opts = {}) {
 }
 
 /** 非流式：聚合 SSE 成一个 chat.completion */
+/**
+ * usage 缓存字段归一化（2026-10-30，对齐 qoder2api-hub #112）。
+ *
+ * 上游按模型族把缓存命中放在不同字段：DeepSeek 用 `prompt_cache_hit_tokens`、
+ * Qwen 用 `completion_tokens_details.cached_tokens`——按 OpenAI 标准协议解析
+ * 的客户端读 `usage.prompt_tokens_details.cached_tokens` 恒为 0。把数字搬到
+ * 标准位，**原字段保留**（已适配上游形态的客户端不受影响）。上游完全没给
+ * 缓存时不凭空造字段。返回是否发生过改写（调用方据此决定要不要重新序列化）。
+ */
+// 归一化实现提升到 src/usage-norm.js（千问通道同缺口同修，见该文件头注释）。
+
 function aggregate(payloads, model) {
   let content = '';
   let reasoning = '';
@@ -544,6 +639,7 @@ function aggregate(payloads, model) {
     message.tool_calls = [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
     if (!content) message.content = null;
   }
+  normalizeUsageCache(usage);
   return {
     id, object: 'chat.completion', created, model,
     choices: [{ index: 0, message, finish_reason: finish }],
@@ -551,7 +647,71 @@ function aggregate(payloads, model) {
   };
 }
 
+/**
+ * 最终保留在请求里的标准工具数量（与 buildBody 的过滤口径共用）。
+ *
+ * 「播报即收尾」修复只对带工具的请求启用——重建判定要用**同一个**过滤口径，
+ * 抽出来共用，改过滤规则时不会两边漂移。
+ */
+function hasFunctionTools(payload) {
+  const t = Array.isArray(payload && payload.tools) ? payload.tools : [];
+  return t.filter((x) => x && x.type === 'function' && x.function && x.function.name).length;
+}
+
+// ---- 官方排队轮询协议（2026-10-30，qoder2api-hub 文档 7.1 的逆向结论）----
+//
+// 官方客户端被 10605（isQueued:true）拒绝后**不结束请求**，而是带着同一个
+// requestSetId 轮询 GET /api/v2/service/ask/queue/status，每轮先睡
+// retryAfterSeconds；isQueued===false 才继续真正的推理请求，连续 3 次轮询
+// 失败才判致命，总等待默认 60 分钟。queue/status 的响应形状没有官方文档，
+// 这里按防御式解析：认得出的字段（isQueued / serviceAvailable /
+// retryAfterSeconds / waitTime / 10605）就用，认不出一律 unknown——
+// 调用方对 unknown 的处置是「退化为盲等重发」（hub 验证过的形态），
+// 端点不存在/鉴权不通都不会影响主流程。
+
+/** 排队状态解析。返回 { state: 'released'|'queued'|'unknown', retryAfterMs } */
+function parseQueueStatus(raw) {
+  const s = String(raw == null ? '' : raw).replace(/\\+"/g, '"').replace(/\\+/g, '');
+  if (/"isQueued"\s*:\s*false/i.test(s)) return { state: 'released', retryAfterMs: 0 };
+  if (/"isQueued"\s*:\s*true/i.test(s) || /10605/.test(s)) {
+    const ms = throttleRetryMs(s);
+    return { state: 'queued', retryAfterMs: Number.isFinite(ms) && ms > 0 ? ms : 0 };
+  }
+  return { state: 'unknown', retryAfterMs: 0 };
+}
+
+/**
+ * 查一次排队状态（best-effort）。永不 reject——网络错/非 200 都按 unknown 返回。
+ * @param {string} origin 推理请求实际用到的主机 origin（队列跟着主机走）
+ * @param {object} headers cosy.buildHeaders 的产物（body 传空串签名）
+ */
+function getQueueStatus(origin, headers, { modelKey, queueType, requestId, agent }) {
+  const path = `/algo/api/v2/service/ask/queue/status?requestSetId=${encodeURIComponent(requestId)}`
+    + `&modelKey=${encodeURIComponent(modelKey)}&queueType=${encodeURIComponent(queueType || 'p3')}`;
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(origin); } catch (e) { return resolve(null); }
+    const req = https.request({
+      hostname: u.hostname,
+      path,
+      method: 'GET',
+      headers: { ...headers, Host: u.hostname },
+      timeout: 8000,
+      ...(agent ? { agent } : {}),
+    }, (res) => {
+      let buf = '';
+      res.on('data', (c) => { if (buf.length < 65536) buf += c; });
+      res.on('end', () => resolve(res.statusCode === 200 ? parseQueueStatus(buf) : null));
+      res.on('error', () => resolve(null));
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
 module.exports = {
-  buildBody, resolveModelKey, unwrap, envelopeStatus, payloadError,
-  post, postStream, aggregate, withAgentDiscipline,
+  buildBody, hasFunctionTools, resolveModelKey, unwrap, envelopeStatus, payloadError,
+  post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
+  getQueueStatus, parseQueueStatus, normalizeUsageCache,
 };

@@ -263,7 +263,34 @@ function throttleRetryMs(message) {
  *   scope==='model' 表示这条限流只针对**这个模型**（上游信封带 modelKey），
  *   池应做模型级冷却而不是账号级——否则一个模型排队会封掉整条通道。
  */
-function classify(err) {
+/**
+ * 「确定性错误」判据：重发**同一份字节**必然得到同一个失败。
+ *
+ * 与「瞬时错误」的二分决定了换号前该不该等：
+ *   - 限流/排队是瞬时的——同一份 body 再发一次可能就过了，值得原地重试或换号重试；
+ *   - 413 / 404 / 参数类 400 是确定性的——换到哪个账号都还是这份 body，
+ *     失败原因与账号无关。在这类错误上等掉 QUEUE_WAIT_MS 再换号是纯浪费
+ *     （用户白等 6 秒，最后还是同一个错）。
+ *
+ * 依据：Agent2API 的 provider_loop.rs 把 PAYLOAD_SIZE_REJECTION_STATUSES(413)
+ * 与 DETERMINISTIC_NOT_FOUND_STATUSES(404=模型不在该账号套餐) 单列，
+ * 「重发同一份字节必然得到同一个失败」的一律不原地重试。
+ */
+const DETERMINISTIC_STATUS = new Set([400, 404, 413, 415, 422]);
+const DETERMINISTIC_TEXT = /payload too large|request entity too large|content too (large|long)|模型不在|model\s*(is\s*)?not\s*(available|found|exist|supported)|not supported model|invalid model|unknown model|no such model|unsupported model|context[_ ]?(length|window).{0,20}(exceed|too|over)|maximum context|too long|请求体过大/i;
+
+/**
+ * @param {number} status HTTP 状态码
+ * @param {string} full 完整错误串（不截断——判据可能落在深处）
+ * @returns {boolean}
+ */
+function isDeterministic(status, full) {
+  if (DETERMINISTIC_STATUS.has(status)) return true;
+  // 403 只按文案判（403 更常见的是限流，那不是确定性错误）
+  return DETERMINISTIC_TEXT.test(unescapeDeep(String(full || '')));
+}
+
+function classifyCore(err) {
   if (err == null) return { kind: null, status: 0, message: '' };
   if (typeof err === 'string') err = { status: 0, message: err };
   else if (err instanceof Error) err = { status: 0, message: err.message };
@@ -274,6 +301,12 @@ function classify(err) {
   const message = full.slice(0, 200);
   const base = { kind: null, status, message };
   if (err.model) base.model = String(err.model).slice(0, 100);
+  // 调用方显式钉时长（通用透传，不认识任何业务码）：通道私有码的处置策略
+  // 留在各自通道层（如 Qoder 额度类 112/110 的固定冷却），这里只负责把
+  // 「调用方比 classify 更懂该冷却多久」的结论带给池——applySoftCooldown
+  // 对显式时长只夹取不递增 soft_streak，正好是配额类想要的语义。
+  const pinned = Number(err.retryAfterMs);
+  if (Number.isFinite(pinned) && pinned > 0) base.retryAfterMs = pinned;
 
   if (status === 429) return { ...base, kind: 'soft' };
   // 限流先于 403/5xx 判：它本质是 429 语义（「稍后再来」），不是服务坏了。
@@ -309,7 +342,24 @@ function classify(err) {
   return base;
 }
 
+/**
+ * classify 的外层：补 `deterministic` 标志。
+ *
+ * 单独一层是为了让判据拿到**完整**错误串——classifyCore 里的 message 是
+ * 截断到 200 字的展示串，而确定性判据可能落在更深处（与 isThrottle 用完整
+ * 串同一理由：截断后匹配会时灵时不灵）。
+ */
+function classify(err) {
+  const out = classifyCore(err);
+  const raw = typeof err === 'string' ? err
+    : (err && (err.message || err.error)) || '';
+  out.deterministic = isDeterministic(out.status, String(raw));
+  return out;
+}
+
 module.exports = {
   payloadError, envelopeStatus, classify, isThrottle, throttleRetryMs, THROTTLE_TEXT,
+  isDeterministic,
   QUEUE_TEXT, QUEUE_THROTTLE_COOLDOWN_MS,
+  unescapeDeep,
 };

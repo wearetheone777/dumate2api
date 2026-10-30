@@ -12,6 +12,10 @@
 const https = require('https');
 const c = require('./constants');
 const { soloHeaders } = require('./headers');
+// 「播报即收尾」的常量与判定收敛到共享模块（千问 / Qoder / TRAE 同一判据，
+// 见 src/repair.js 头注释——TRAE 2026-10-05 实测只有「检测 + 重试」可靠）。
+const repair = require('../repair');
+const REPAIR_CAPS = repair.envCaps('TRAEWORK'); // DUMATE_TRAEWORK_HOLD_CAP / _REPAIR_RETRY
 
 /**
  * 执行纪律——与 src/qwenwork/chat.js 同一份文本、同一个判定口径
@@ -320,28 +324,21 @@ function toOpenAIChunk(evt, model) {
 // 在这里结束。长正文（>600 字）按真回答处理，不重试。
 // ---------------------------------------------------------------------------
 
-/** 重试时追加的修复指令（实测 5/5 触发工具调用） */
-const REPAIR_NUDGE = [
-  '你上一条回复只输出了一条进度汇报，没有调用任何工具就结束了回合，这是不允许的。',
-  '必须立即调用工具继续执行任务：不要输出任何文字，只输出工具调用。',
-].join('\n');
+/** 重试时追加的修复指令（实测 5/5 触发工具调用；文本收敛在 src/repair.js） */
+const REPAIR_NUDGE = repair.REPAIR_NUDGE;
 
 /** 正文缓冲上限：超过就转直发（真·长回答不该被扣住等判定） */
-const HOLD_CAP = Number(process.env.DUMATE_TRAEWORK_HOLD_CAP || 600);
+const HOLD_CAP = REPAIR_CAPS.HOLD_CAP;
 
 /** 重试次数上限（0 关闭整个修复） */
-const REPAIR_MAX = Number(process.env.DUMATE_TRAEWORK_REPAIR_RETRY == null
-  ? 1 : process.env.DUMATE_TRAEWORK_REPAIR_RETRY);
+const REPAIR_MAX = REPAIR_CAPS.REPAIR_MAX;
 
 /**
  * 一轮「无工具调用」的回复，是不是「没干活就收工」。
  * @returns {boolean}
  */
 function looksUnfinished(text) {
-  const t = String(text || '').trim();
-  if (!t) return true;                    // 一个字都没吐，等价于没干活
-  if (t.length > HOLD_CAP) return false;  // 长文本按真回答处理
-  return /下一步|next\s+step/i.test(t);   // 模型自己声明还有下一步
+  return repair.looksUnfinished(text, HOLD_CAP);
 }
 
 /** 在请求体末尾追加修复指令（幂等：已经加过就不再加） */

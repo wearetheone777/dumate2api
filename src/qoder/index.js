@@ -19,6 +19,8 @@ const { isThrottle, unescapeDeep, throttleRetryMs } = require('../upstream-error
 const ledger = require('../checkin-ledger');
 const grants = require('./grants');
 const maxOutput = require('./max-output');
+// 「播报即收尾」（共享判定与缓冲门，见 src/repair.js）
+const repair = require('../repair');
 // 选号接缝（集成阶段）：冷却/熔断/粘性/在途帽统一走池状态机。
 // 通道在池里的 uid 键位 = 'qoder:<id>'（channel-pool.js 统一裁决）。
 const channelPool = require('../channel-pool');
@@ -372,18 +374,6 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   }
   const modelMeta = cachedModels.find((m) => m.key === modelKey);
   const ctxMax = process.env.DUMATE_QODER_CONTEXT === 'default' ? null : (modelMeta && modelMeta.maxInputTokens);
-  const bodyJson = chat.buildBody(modelKey, payload, {
-    maxInputTokens: ctxMax,
-    // 思考档位归一化要读模型的 thinking_config（见 chat.resolveReasoningEffort）
-    modelMeta,
-    // max_tokens 上限自学习（max-output.js）：撞过上限的模型出站前自动 clamp
-    maxOutputTokens: maxOutput.get(region, modelKey),
-    // 排队槽位键（官方轮询协议）：同一 send() 的多次尝试共用它——queue/status
-    // 查询与请求体必须带同一个值，否则查的是别的槽位
-    requestSetId: opts.requestSetId,
-  });
-  // encode 进 worker（审计 P1-5b）：几 MB 请求的编码不再独占事件循环
-  const encBody = await cosy.encodeAsync(Buffer.from(bodyJson));
 
   // COSY 会话与账号身份绑定：uid / device_token 都进签名。
   // machineId/Token/Type 每账号一份（登录时生成并持久化）。
@@ -399,12 +389,41 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     refreshToken: auth.refreshToken,
   }, auth.machineId || '', auth.machineToken || '', auth.machineType || '5');
 
-  const headers = cosy.buildHeaders(sess, ep.ChatPathSig, encBody, 'text/event-stream', {
-    'accept-encoding': 'identity',
-    // 模型 key 必须同时放请求头——实测只放 body 时上游仍走 auto
-    'x-model-key': modelKey,
-    'x-model-source': 'system',
-  }, { sse: true });
+  // 「播报即收尾」（共享判定见 src/repair.js）：带工具的请求启用缓冲门 + 修复重试。
+  const caps = repair.envCaps('QODER');
+  const repairable = chat.hasFunctionTools(payload) > 0 && caps.REPAIR_MAX > 0;
+  // request_id 每轮新生成（单次请求的标识，复用可能被上游当幂等重试合并）；
+  // session_id 钉住：修复轮是同一段对话的下一句。request_set_id（排队槽位键）
+  // 也不钉——修复轮换新槽位，queue/status 查询（queueWaitRound 里的
+  // activeSetId）跟着看新槽位。
+  const pinnedSession = (payload && payload.session_id) || crypto.randomUUID();
+  // 一个修复轮的重建：追加了消息后签名内容变了，body/编码/请求头必须整套重造
+  // （签名包含 body 内容）。签名已是纯本地调用，重签没有 wasm 时代的阻塞性代价。
+  let activeSetId = '';
+  let encBody = '';
+  let headers = null;
+  const applyRound = async (p, setId) => {
+    activeSetId = setId || '';
+    const bodyJson = chat.buildBody(modelKey, p, {
+      maxInputTokens: ctxMax,
+      // 思考档位归一化要读模型的 thinking_config（见 chat.resolveReasoningEffort）
+      modelMeta,
+      // max_tokens 上限自学习（max-output.js）：撞过上限的模型出站前自动 clamp
+      maxOutputTokens: maxOutput.get(region, modelKey),
+      sessionId: pinnedSession,
+      // 排队槽位键（官方轮询协议）：queue/status 与请求体必须带同一个值
+      requestSetId: activeSetId || undefined,
+    });
+    // encode 进 worker（审计 P1-5b）：几 MB 请求的编码不再独占事件循环
+    encBody = await cosy.encodeAsync(Buffer.from(bodyJson));
+    headers = cosy.buildHeaders(sess, ep.ChatPathSig, encBody, 'text/event-stream', {
+      'accept-encoding': 'identity',
+      // 模型 key 必须同时放请求头——实测只放 body 时上游仍走 auto
+      'x-model-key': modelKey,
+      'x-model-source': 'system',
+    }, { sse: true });
+  };
+  await applyRound(payload, opts.requestSetId);
   // 出站代理（E 包接线）：账号 proxy 字段 > 全局 DUMATE_PROXY，无代理 null 直连
   const agent = proxyAgent.getAgentFor(account);
 
@@ -439,11 +458,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       await sleep(Math.min(waitMs, remaining) + Math.floor(Math.random() * 250));
       if (Date.now() >= queueDeadline) return 'giveup';
     }
-    if (!statusUsable || !origin || !opts.requestSetId) return 'retry';
+    if (!statusUsable || !origin || !activeSetId) return 'retry';
     const st = await chat.getQueueStatus(origin, statusHeaders, {
       modelKey,
       queueType: queueTypeOf(message),
-      requestId: opts.requestSetId,
+      requestId: activeSetId, // 当前修复轮自己的槽位键（首轮 = send() 下发的那份）
       agent,
     }).catch(() => null);
     // 排队等待是分钟级行为，没有日志就没法排障（实测 2026-10-30：27s 失败的
@@ -480,27 +499,35 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   };
   try {
     if (onChunk) {
-      // `sent` 只表示**真实数据帧**已转发给下游。`[DONE]` 是哨兵、不是上游
-      // 数据帧——旧实现把它也算成「已吐帧」，于是 HTTP 429 / 200+纯错误体
-      // 这类「一帧数据都没有」的情况被误判成已开始输出：错误被吞、换号被挡。
+      // 两个「已吐帧」标志要分清：
+      //   sawUp —— 上游送来了真实数据帧（老 `sent` 的口径），错误/排队判定用
+      //            它：缓冲门扣住的帧也算「上游来过数据」；
+      //   sent  —— 帧已**到达下游**，err.sent 用它：缓冲里的帧没交出去，
+      //            此刻换号/重试都还来得及（错误被吞、换号不被挡）。
+      // `[DONE]` 是哨兵、不是上游数据帧——两把都不算，旧实现把它也算成
+      // 「已吐帧」会让「一帧数据都没有」的错误被误判成已开始输出。
+      let sawUp = false;
       let sent = false;
       let firstErr = null;
-      let delivered = false;
       let doneSeen = false;
+      let gate = null;
       const candidates = constants.chatStreamCandidates(region);
       // 排队状态查询打「本次尝试实际用的主机」——队列跟着主机走
       let statusOrigin = '';
+      const down = (inner) => { sent = true; onChunk(inner); };
       // 单次尝试封装：排队放行后用**同一份加密请求体**（同一个 request_set_id）
       // 原样重发，四个状态标志随之复位
       const attemptStream = () => {
-        firstErr = null; sent = false; delivered = false; doneSeen = false;
+        firstErr = null; sent = false; doneSeen = false; sawUp = false;
         // 识别到错误帧就立刻中止上游：Qoder 零额度时是**挂起**而不是报错，
         // 不主动断就要等 socket 空闲超时（600s），客户端早已超时。
         const ac = new AbortController();
+        const deliver = gate ? (inner) => gate.onInner(inner) : down;
         const onInner = (inner) => {
           if (firstErr) return;
-          // 哨兵延后到状态检查之后再转发，避免「先发 200 + [DONE] 再抛错」
-          if (inner === '[DONE]') { doneSeen = true; return; }
+          // 哨兵有门时交门暂扣（finish() 收尾补发，顺序在 usage/finish 之后），
+          // 无门维持「延后到状态检查之后再转发，避免先发 200 + [DONE] 再抛错」
+          if (inner === '[DONE]') { doneSeen = true; if (gate) deliver(inner); return; }
           let parsed = null;
           try { parsed = JSON.parse(inner); } catch (e) { /* 非 JSON 帧照原样转发 */ }
           if (parsed) {
@@ -516,23 +543,42 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           // 原样转发的话按标准协议解析的客户端读到的缓存恒为 0
           if (parsed.usage && chat.normalizeUsageCache(parsed.usage)) inner = JSON.stringify(parsed);
           }
-          sent = true;
-          delivered = true;
-          onChunk(inner);
+          // 只有**过了错误判定**的帧才算「上游真实数据」——排队信封（10605）
+          // 与额度错误帧必须留在 sawUp=false，否则排队等待轮的守卫失效。
+          sawUp = true;
+          deliver(inner);
         };
         return postWithFallback(candidates, (url) => {
           statusOrigin = new URL(url).origin;
           return chat.postStream(url, encBody, headers, onInner, { signal: ac.signal, agent });
-        }, () => delivered);
+          // 换主机的守卫用 **sawUp**（上游真的送来过数据）而不是「已到达下游」：
+          // 缓冲门把正文扣住时「到达下游」恒为 false，用它会让「已经收到正文、
+          // 连接随后断了」的请求去切备用主机，从而把两段内容拼在一起。
+          // 连接层失败本身发生在收数据之前，sawUp 的语义正合适。
+        }, () => sawUp);
       };
+      // 「播报即收尾」的修复轮状态：判定在排队轮的正常出口（见下方收尾段）
+      let repairAttempt = 0;
+      let curPayload = payload;
+      let nextRound = false;
       for (;;) {
+        // 排队等待轮（官方协议）的重试会重复进这个循环体——它没拿到任何真实
+        // 帧（sawUp=false），缓冲门是空的，重建无害；修复轮入口在此重建整轮
+        // 状态与下一份请求体（applyRound 的重签是纯本地调用）。
+        if (nextRound) {
+          await applyRound(curPayload, crypto.randomUUID());  // 修复轮换新槽位键
+          peakCredits = null;
+          lastUsage = null;       // 每轮独立结算（每轮都是一次真实上游请求）
+          nextRound = false;
+        }
+        gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP) : null;
         // 尝试可能以**异常**结束（静默形态：content deadline / read idle 掐断
         // 时 postStream reject）——不能让它在等待判定之前飞出循环
         let res = null;
         let attemptErr = null;
         try { res = await attemptStream(); } catch (e) { attemptErr = e; }
         // 排队等待判定，两种形态：
-        //   信封型：错误帧 / 错误体里带 10605 / isQueued 等（带 !sent 守卫——
+        //   信封型：错误帧 / 错误体里带 10605 / isQueued 等（带 !sawUp 守卫——
         //           吐过帧之后 raw 里有模型输出，正文讨论到 10605 不能当排队）；
         //   静默型：上游收了请求、回空 ack 然后沉默，被我们自己的计时器掐断
         //           （掐断即已等过一轮沉默，跳过首睡立即查状态）。
@@ -540,8 +586,8 @@ async function runOnce(account, payload, onChunk, opts, meter) {
         const throttledMsg = silenceForm ? ''
           : firstErr
             ? (queueableThrottle(firstErr.message) ? firstErr.message : '')
-            : (!sent && res && queueableThrottle(res.raw) ? String(res.raw || '') : '');
-        if ((silenceForm || throttledMsg) && !sent && Date.now() < queueDeadline) {
+            : (!sawUp && res && queueableThrottle(res.raw) ? String(res.raw || '') : '');
+        if ((silenceForm || throttledMsg) && !sawUp && Date.now() < queueDeadline) {
           const verdict = await queueWaitRound(
             throttledMsg || String(attemptErr.message || ''),
             statusOrigin,
@@ -551,12 +597,13 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           // giveup：预算耗尽 / 上游明说要排到预算之外——落到底下的 throw，
           // 把节流错误如实交回上层（429 语义不变）。
         }
-        if (attemptErr) { attemptErr.sent = sent; throw attemptErr; }
+        if (attemptErr) { attemptErr.sent = sent || (gate ? gate.result().emitted > 0 : false); throw attemptErr; }
         if (firstErr) {
           const err = new Error(`qoder ${firstErr.code}: ${firstErr.message}`);
           err.statusCode = firstErr.code;
           if (firstErr.quotaKind) err.quotaKind = firstErr.quotaKind;
-          err.sent = sent;
+          // 门的 emitted 也算：reasoning 是直发的，有一帧到下游就不能再换号
+          err.sent = sent || (gate ? gate.result().emitted > 0 : false);
           throw err;
         }
         // HTTP 层错误：上游 4xx/5xx 时 body 往往不是 SSE（没有 `data:` 行），
@@ -571,13 +618,13 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           err.statusCode = res.status;
           const qk = quotaKindOfText(String(res.raw || ''));
           if (qk) err.quotaKind = qk;
-          err.sent = sent;
+          err.sent = sent || (gate ? gate.result().emitted > 0 : false);
           throw err;
         }
         // 200 但不是 SSE：上游偶尔用 200 回一个纯错误体（provider_error 就是
-        // 这种形状）。**判据是「一帧真实数据都没转发」**，不是「没收到
+        // 这种形状）。**判据是「上游一帧真实数据都没来」**，不是「没收到
         // [DONE]」——后者恒为假（postStream 总会补一个）。
-        if (!sent) {
+        if (!sawUp) {
           // 额度类业务码（112/110/114/430）< 400，envelopeStatus/payloadError
           // 都不认——它们才是「200 + 空回答」的另一半来源，单独兜一层。
           const qf = quotaFromBody(res.raw);
@@ -596,15 +643,31 @@ async function runOnce(account, payload, onChunk, opts, meter) {
             throw err;
           }
         }
-        // 正常收尾：哨兵在这里补发，保证「先有内容、再有结束标记」
-        if (doneSeen) onChunk('[DONE]');
+        // 正常收尾：哨兵有门时交给了门（finish() 收尾补发，顺序正文→usage→
+        // finish→[DONE]），无门维持旧口径——「先有内容、再有结束标记」
+        if (!gate && doneSeen) onChunk('[DONE]');
         meter.settle(peakCredits, { usage: lastUsage, expectedRate: billingExpectedRate(modelMeta) });
-        return res;
+        // ----「播报即收尾」修复判定（与千问 / TRAE 同构）----
+        if (!gate) return res;
+        const g = gate.result();
+        if (g.live || g.toolCalls > 0) { gate.finish(); return res; }          // 正常或在干活
+        if (!repair.looksUnfinished(g.text, caps.HOLD_CAP)) { gate.finish(); return res; }
+        if (repairAttempt >= caps.REPAIR_MAX) { gate.finish(); return res; }  // 上限到，吐给它收尾
+        repairAttempt++;
+        curPayload = repair.appendRepairNudge(curPayload);
+        repair.logRepair('qoder', opts.reqId, repairAttempt, g.text);
+        // 不 finish：本轮缓冲整轮丢弃（含暂扣的 usage / finish_reason），
+        // 循环入口的 nextRound 重建门与请求体（applyRound 的重签是纯本地调用）
+        nextRound = true;
+        continue;
       }
     }
     // 非流式：post 聚合后一次返回，排队等待在返回前发生（客户端本来就在等
     // 完整结果，多等几秒不改变交互）。raw 只在 status>=400 时参与排队判定——
     // 200 的 raw 可能含模型正文，正文讨论到 10605 不能当成排队。
+    // 「播报即收尾」的修复轮：判定在聚合出口，重试重建请求体（与流式同构）。
+    let repairAttempt = 0;
+    let curPayload = payload;
     let statusOrigin = '';
     for (;;) {
       let res = null;
@@ -680,8 +743,20 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     if (out && out.usage) noteCredits(out.usage);
     if (opts && opts.onAccount) { /* 非流式也报一次 */ }
     meter.settle(peakCredits, { usage: lastUsage, expectedRate: billingExpectedRate(modelMeta) });
-    return out;
-    } // for(;;) 非流式排队重试
+    // ----「播报即收尾」修复判定（与流式同构；不带工具 / 上限到 → 原样返回）----
+    if (!repairable || repairAttempt >= caps.REPAIR_MAX) return out;
+    const omsg = (out.choices && out.choices[0] && out.choices[0].message) || {};
+    if (Array.isArray(omsg.tool_calls) && omsg.tool_calls.length) return out;
+    if (!repair.looksUnfinished(omsg.content, caps.HOLD_CAP)) return out;
+    repairAttempt++;
+    curPayload = repair.appendRepairNudge(curPayload);
+    repair.logRepair('qoder', opts.reqId, repairAttempt, omsg.content);
+    // 重试轮重建请求体（追加了消息，签名内容变了）：换新槽位键、重置每轮结算
+    await applyRound(curPayload, crypto.randomUUID());
+    peakCredits = null;
+    lastUsage = null;
+    continue;
+    } // for(;;) 非流式排队重试 + 修复轮
   } catch (e) {
     // 网络错误没有 statusCode，标记一下让上层知道可以换号
     if (!e.statusCode) e.statusCode = 0;
@@ -840,7 +915,7 @@ async function send(payload, onChunk, opts = {}) {
       // 其余按 classify。
       channelPool.noteError(CHANNEL, account.id, poolInfoOf(e, model));
       markFailure(account, e.message);
-      errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled });
+      errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled, quotaKind: e.quotaKind || '' });
       if (e.sent) throw e; // 流式已吐帧，不能再换号
       if (!retryable(code, e.message, e.quotaKind)) throw e;
       sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring });
@@ -888,6 +963,11 @@ async function send(payload, onChunk, opts = {}) {
     return `${x.account}(${x.status}${m ? ': ' + m.slice(0, 120) : ''})`;
   };
   const err = new Error(`Qoder 所有账号均失败：${errors.map(brief).join('；')}`);
+  // 额度类业务码的类别透传到聚合错误：换号全试过之后，「额度耗尽 / 每日次数 /
+  // 试用受限」之间的区别对上层（埋点、客户端提示）仍然有意义，而在
+  // `errors` 里被压成一段文案就再也取不回来了。
+  const lastQuotaKind = errors.length ? errors[errors.length - 1].quotaKind : '';
+  if (lastQuotaKind) err.quotaKind = lastQuotaKind;
   // 全部失败都是**瞬时类**（限流或网络错误）时回 429：客户端（Codex /
   // Claude Code）对 429 会自动退避重试，对 502 只当硬失败。判据与上面
   // transientOnly 同口径——实测 2026-10-28：5 次 403 排队后夹进 1 次 DNS

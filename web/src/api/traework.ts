@@ -207,6 +207,33 @@ export interface TraeworkCreditRecord {
   limit: number | null
 }
 
+/** 计费自检探针的结果（/traework/billing-check） */
+export interface TraeworkBillingCheck {
+  ok: boolean
+  model: string
+  /** 本次实际服务的账号名（send 的 onAccount 上报） */
+  account: string | null
+  accountId: number | null
+  /** 模型表标称倍率（consumption_rate；命中会员折扣取折后价）。取不到为 null */
+  expected: number | null
+  /** 实测倍率 = consumed 增量 ÷ (total_tokens/1000)，与 Qoder billed_rate 同口径 */
+  billed: number | null
+  /** billed / expected，三位小数。任一侧缺失为 null */
+  ratio: number | null
+  /** 本次 consumed 增量（credits）。未观测到增量为 null */
+  delta: number | null
+  tokens: { input: number; output: number; total: number } | null
+  /** 被扣费的账号列表（并发时可能不止一个） */
+  charged: Array<{ id: string; delta: number }>
+  /** 是否恰好一个账号被扣费（并发流量会破坏这个前提） */
+  singleAccount: boolean
+  elapsedMs: number
+  /** 非空 = 请求成功但没测到增量（结算延迟） */
+  warning?: string
+  error?: string
+  note?: string
+}
+
 export const traeworkApi = {
   status: () => client.get<TraeworkStatus>('/traework/status'),
   dashboard: () => client.get<TraeworkDashboard>('/traework/dashboard'),
@@ -240,6 +267,12 @@ export const traeworkApi = {
     expiringPoints: number
   }>('/traework/credits'),
   checkin: (id?: number) => client.post('/traework/checkin', id ? { id } : {}),
+  /**
+   * 计费自检探针：按模型发一个小请求（消耗真实积分），比对实测倍率与标称。
+   * 探针含「发请求 + 8 秒结算轮询」，用比默认 30s 更长的超时。
+   */
+  billingCheck: (model: string) =>
+    client.get<TraeworkBillingCheck>(`/traework/billing-check?model=${encodeURIComponent(model)}`, { timeout: 120000 }),
   loginUrl: () => client.post<{ ok: boolean; url: string; deviceId: string; machineId: string; hint: string }>('/traework/login/url'),
   loginCallback: (payload: { callback: string; deviceId: string; machineId: string }) =>
     client.post<{ ok: boolean; account?: TraeworkAccount; error?: string }>('/traework/login/callback', payload),

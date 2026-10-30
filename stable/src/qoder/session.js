@@ -8,6 +8,25 @@ const c = require('./constants');
 
 const TIMEOUT_MS = 20000;
 
+/**
+ * 解析模型行的 thinking_config（上游模型表原始字段，2026-10-30 确认形状）：
+ *   { disabled: {...}, enabled: { efforts: { high: {...}, max: {is_default:true}, low: {} }, is_default: true } }
+ * 返回 { efforts: ['high','max','low'], default: 'max', canDisable: true }；
+ * 字段缺失/形状不对时给空值，调用方按「无档位表」处理。
+ * 单独成函数是为了离线可测（test/verify-qoder-channel.js）。
+ */
+function parseThinkingConfig(tc) {
+  const out = { efforts: [], default: '', canDisable: false };
+  if (!tc || typeof tc !== 'object') return out;
+  const en = tc.enabled;
+  if (en && typeof en === 'object' && en.efforts && typeof en.efforts === 'object') {
+    out.efforts = Object.keys(en.efforts).filter(Boolean);
+    out.default = out.efforts.find((k) => en.efforts[k] && en.efforts[k].is_default === true) || '';
+  }
+  out.canDisable = !!(tc.disabled && typeof tc.disabled === 'object');
+  return out;
+}
+
 /** 发一个 JSON 请求，返回 { status, data, raw }。永不抛（网络错当 status=0）。
  *  opts.agent 出站代理（E 包接线）：凭证/配额请求与对话同出口，null = 直连。 */
 function request(url, { method = 'GET', headers = {}, body = null, timeout = TIMEOUT_MS, agent = null } = {}) {
@@ -136,6 +155,12 @@ async function fetchModels(account, { force = false } = {}) {
     isNew: m.is_new === true,
     isReasoning: m.is_reasoning === true,
     multimodal: m.is_vl === true,
+    // 思考档位（thinking_config）。上游对不支持的档位**不报错、悄悄回落默认
+    // 档**，所以归一化必须本地做——chat.resolveReasoningEffort 按这两个字段
+    // 把客户端写法收敛到合法档（见那里的注释）。
+    reasoningEfforts: parseThinkingConfig(m.thinking_config).efforts,
+    reasoningDefault: parseThinkingConfig(m.thinking_config).default,
+    reasoningCanDisable: parseThinkingConfig(m.thinking_config).canDisable,
     // 错峰优惠：22:00-08:00 打折
     promotion: (m.promotion && m.promotion.active) ? {
       discountFactor: m.promotion.discount_factor || null,
@@ -258,6 +283,58 @@ async function fetchQuota(token, region, opts = {}) {
 
 function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+// ---- 官方积分消耗（credits-summary / credits-heatmap，2026-10-30）----
+// 上游唯一给出「真实消耗口径」的接口：累计消耗 + 单日峰值 + 近 365 天逐日。
+// 结果按 token 缓存 5 分钟——全量聚合接口，别跟着界面轮询打（hub 同值）。
+const CREDIT_USAGE_TTL_MS = 5 * 60 * 1000;
+const creditUsageCache = new Map(); // accessToken → { at, data }
+
+/**
+ * 解析 credits-summary + credits-heatmap 的响应体（单独成函数为了离线可测）。
+ * 字段形状实测自 qoder2api-hub v1.7.5：summary = {totalCredits, peakCredits,
+ * peakDate, unit}；heatmap = {items: [{date, value}]}。
+ * 取不到的字段给 null 不补 0——0 会被读成「没消耗」。
+ */
+function parseCreditUsage(sum, heat) {
+  if (!sum || typeof sum !== 'object') {
+    return { ok: false, error: '响应不是 JSON 对象', total: null, peak: null, peakDate: '', unit: '', daily: [], heatmapOk: false };
+  }
+  const daily = [];
+  const items = (heat && typeof heat === 'object' && Array.isArray(heat.items)) ? heat.items : [];
+  for (const it of items) {
+    // 没有 date 的条目对热力图无用，跳过（上游坏读/形状漂移时不画错）
+    if (!it || typeof it !== 'object' || !it.date) continue;
+    const v = Number(it.value);
+    daily.push({ date: String(it.date), value: Number.isFinite(v) ? v : 0 });
+  }
+  return {
+    ok: true,
+    total: typeof sum.totalCredits === 'number' ? sum.totalCredits : null,
+    peak: typeof sum.peakCredits === 'number' ? sum.peakCredits : null,
+    peakDate: String(sum.peakDate || ''),
+    unit: String(sum.unit || 'credits'),
+    daily,
+    heatmapOk: !!(heat && typeof heat === 'object'),
+  };
+}
+
+async function fetchCreditUsage(token, region, opts = {}) {
+  const ep = c.endpointsOf(region);
+  const hit = creditUsageCache.get(token);
+  if (!opts.force && hit && Date.now() - hit.at < CREDIT_USAGE_TTL_MS) return hit.data;
+  const headers = bearerHeaders(token, { 'cosy-clienttype': c.CHECKIN_CLIENT_TYPE });
+  const sum = await request(ep.CreditsSummaryEndpoint, { headers, agent: opts.agent || null });
+  if (sum.status !== 200 || !sum.data) {
+    // 失败给 null 不补 0——0 会被读成「没消耗」
+    return { ok: false, error: sum.error || `HTTP ${sum.status}`, total: null, peak: null, peakDate: '', unit: '', daily: [], heatmapOk: false };
+  }
+  // 热力图失败不拖垮摘要：逐日给空数组并标注 heatmapOk
+  const heat = await request(ep.CreditsHeatmapEndpoint, { headers, agent: opts.agent || null });
+  const out = parseCreditUsage(sum.data, heat.status === 200 ? heat.data : null);
+  creditUsageCache.set(token, { at: Date.now(), data: out });
+  return out;
 }
 
 /**
@@ -443,5 +520,6 @@ function cachedModels(account) {
 
 module.exports = {
   request, bearerHeaders, exchange, ensureAccount, fetchUserInfo, fetchPlan,
-  fetchQuota, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
+  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
+  parseThinkingConfig,
 };

@@ -96,9 +96,24 @@ function withAgentDiscipline(system, hasTools) {
   return String(system || '') + AGENT_DISCIPLINE;
 }
 
-function buildBody(modelKey, payload) {
+/**
+ * 最终保留在请求里的标准工具数量（与 buildBody 的过滤口径共用）。
+ *
+ * 「播报即收尾」修复只对带工具的请求启用——重建判定要用**同一个**过滤口径，
+ * 抽出来共用，改过滤规则时不会两边漂移。
+ */
+function hasFunctionTools(payload) {
+  const t = Array.isArray(payload && payload.tools) ? payload.tools : [];
+  return t.filter((x) => x && x.type === 'function' && x.function && x.function.name).length;
+}
+
+function buildBody(modelKey, payload, out = {}) {
+  // request_id 每轮都是**新的**（它是这次请求的标识，两轮各是一次真实上游
+  // 请求——重复用同一个值可能被上游当成幂等重试而合并）；session_id 可由外部
+  // 钉住：「播报即收尾」的修复轮要在同一个会话里继续（追加了修复指令但
+  // session_id 不变），上游才会把重试轮当成同一段对话的下一句。
   const requestId = crypto.randomUUID();
-  const sessionId = (payload && payload.session_id) || crypto.randomUUID();
+  const sessionId = (payload && payload.session_id) || out.sessionId || crypto.randomUUID();
   const messages = (payload && payload.messages) || [];
   let system = '';
   if (payload && typeof payload.system === 'string') system = payload.system;
@@ -372,6 +387,7 @@ function aggregate(payloads, model) {
 
 module.exports = {
   buildBody,
+  hasFunctionTools,
   resolveModelKey,
   ensureAccount,
   unwrap,

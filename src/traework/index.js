@@ -246,7 +246,9 @@ async function send(payload, onChunk, opts = {}) {
 
   const accountName = auth.nickname || auth.uid || `账号 ${auth.id}`;
   if (opts.onAccount) {
-    try { opts.onAccount(accountName); } catch (e) { /* 上报失败不影响请求 */ }
+    // 第二个参数是账号 id：计费自检探针要按 id 回读该账号的 consumed 增量
+    // （名字可能重名）。既有调用方只取第一个参数，不受影响。
+    try { opts.onAccount(accountName, auth.id); } catch (e) { /* 上报失败不影响请求 */ }
   }
 
   try {

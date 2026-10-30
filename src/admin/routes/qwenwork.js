@@ -347,6 +347,99 @@ const routes = [
     },
   },
   {
+    /**
+     * 计费自检探针（千问版）：发一个小请求，报本次请求的三池余额差值。
+     * 对齐 TRAE/Qoder 的同名端点，但**千问上游没有标称倍率**（模型表无
+     * price_factor），所以没有 ratio——只回答「这一次实际扣了多少、折算
+     * 每千 token 多少」。探针消耗真实额度（flash 一次约 0.002~0.01 credits）。
+     */
+    method: 'GET',
+    path: '/billing-check',
+    handler: async ({ req, res }) => {
+      const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || ''))
+        .replace(/^qwen\//, '').trim();
+      if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=flash）' });
+      const billing = require('../../qwenwork/billing');
+      const qw = require('../../qwenwork');
+
+      const usable = authStore.findUsable();
+      if (!usable.length) return sendJSON(res, 200, { ok: false, model, error: NO_ACCOUNT });
+
+      // 三池快照。**force 读**：探针要看实时值，30s 缓存会把本次差值吞掉
+      const snapshot = async () => {
+        const m = new Map();
+        for (const raw of usable) {
+          const w = await credits.fetchWallets({ account: raw, force: true });
+          if (w.ok && w.daily != null) {
+            m.set(String(raw.id), { daily: w.daily, monthly: w.monthly, longterm: w.longterm });
+          }
+        }
+        return m;
+      };
+
+      const before = await snapshot();
+      if (!before.size) {
+        return sendJSON(res, 200, { ok: false, model, error: '三池余额全部读取失败（先到额度页确认账号可用）' });
+      }
+      const reqId = `billcheck_${Date.now().toString(36)}`;
+      const startedAt = Date.now();
+      let servedId = null;
+      let servedName = '';
+      let tokens = null;
+      try {
+        const agg = await qw.send({
+          model: `qwen/${model}`,
+          // 输出足够长才能让四位小数的余额差值远离量化误差（成本量级见 note）
+          messages: [{ role: 'user', content: '请从 1 数到 400，每个数字之间用一个空格分隔，只输出数字本身，不要输出任何其他文字。' }],
+          max_tokens: 4096,
+        }, undefined, {
+          reqId,
+          onAccount: (name, id) => { servedName = name || ''; if (id != null) servedId = id; },
+        });
+        const u = (agg && agg.usage) || null;
+        if (u) tokens = { input: u.prompt_tokens || 0, output: u.completion_tokens || 0, total: u.total_tokens || 0 };
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, model, error: e.message, elapsedMs: Date.now() - startedAt });
+      }
+
+      // 结算延迟：credits.capture 的实测余量是 1.5s；最多 3 轮（约 4 秒），
+      // 仍没有就如实报 null——不把「没测到」编成 0。
+      let last = null;
+      for (let i = 0; i < 3; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, [1500, 2500][i - 1]));
+        const after = await snapshot();
+        last = billing.attributeWalletDelta(before, after, servedId);
+        if (last.delta && last.delta.total > 0) break;
+        // 别的账号先减（并发流量）也停——再等只会把对方的消耗卷进来
+        if (last.charged.length) break;
+      }
+      const delta = last ? last.delta : null;
+      const billed = billing.perKTokens(delta && delta.total, tokens && tokens.total);
+      return sendJSON(res, 200, {
+        ok: true,
+        model,
+        account: servedName || null,
+        accountId: servedId,
+        // 千问没有标称倍率可言，如实 null；界面据此不做 ±5% 着色
+        expected: null,
+        billed,
+        ratio: null,
+        cost: delta ? delta.total : null,
+        pools: delta || null,
+        tokens,
+        charged: last ? last.charged.map((c) => ({ id: c.id, total: c.delta.total })) : [],
+        singleAccount: last ? last.singleAccount : false,
+        elapsedMs: Date.now() - startedAt,
+        warning: !delta || delta.total == null
+          ? '请求成功，但约 4 秒内未观测到三池余额减少（结算延迟，或本次未计费）'
+          : '',
+        note: '千问上游不提供标称倍率/单价（模型表无 price_factor），这里只报本次实测成本：'
+          + 'cost 取三池余额差值（与逐笔归因同口径），billed 是折算的每千 token 成本。'
+          + '实测量级 flash 约 0.002~0.01 credits / 千 token；余额 4 位小数，短请求的偏差主要来自精度。',
+      });
+    },
+  },
+  {
     // 账号列表。多账号：可增删、可停用、可指定主账号
     method: 'GET',
     path: '/accounts',

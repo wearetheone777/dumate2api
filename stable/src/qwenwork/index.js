@@ -11,12 +11,17 @@
 //   - chatCompletion(payload)  → 聚合后的 chat.completion 对象（非流式）
 //   - chatCompletionStream(payload, onChunk) → 逐块回调 OpenAI chunk
 const chat = require('./chat');
+const { normalizeUsageCache } = require('../usage-norm');
 const bridge = require('./bridge');
 const authStore = require('./auth');
 const constants = require('./constants');
 const wasmPath = require('./wasm-path');
 const credits = require('./credits');
 const { normalizeError } = require('../errtext');
+const { isThrottle } = require('../upstream-errors');
+// 「播报即收尾」（共享判定与缓冲门，见 src/repair.js）
+const repair = require('../repair');
+const crypto = require('crypto');
 // 选号接缝（集成阶段）：冷却/熔断/粘性/在途帽统一走池状态机。
 // 通道在池里的 uid 键位 = 'qwenwork:<id>'（channel-pool.js 统一裁决）。
 const channelPool = require('../channel-pool');
@@ -102,77 +107,150 @@ function markFailure(account, msg) {
 /**
  * 用指定账号跑一次请求（非流式 / 流式由 onChunk 决定）。
  *
+ * 带工具的请求启用「播报即收尾」修复（共享判定见 src/repair.js——判据、
+ * 缓冲门与 TRAE 通道同一套，实测只有「检测 + 一次性重试」可靠）：
+ *   - 非流式：聚合后判定，正文是「进度汇报 + 下一步」就追加修复指令重试；
+ *   - 流式：正文先过缓冲门（tool_calls 一到先冲刷、超过 HOLD_CAP 转直发），
+ *     判定要重试时上一轮的缓冲整轮丢弃，下游只收到重试轮的输出。
+ *
  * @returns {Promise<object>} 非流式返回 chat.completion；流式返回 { streamed:true }
  */
 async function runOnce(account, payload, onChunk, opts) {
   const auth = await chat.ensureAccount(authStore, account);
   const modelKey = chat.resolveModelKey(payload && payload.model);
-  const bodyJson = chat.buildBody(modelKey, payload);
   // 出站代理（E 包接线）：账号 proxy 字段 > 全局 DUMATE_PROXY，无代理 null 直连。
   // 千问账号记录暂无 proxy 字段（代理字段只在搭子 web 账号上），走全局默认。
   const agent = proxyAgent.getAgentFor(account);
-  // encode 进 worker（审计 P1-5b），签名构造不再独占事件循环
-  const built = await bridge.prepareInferAsync({
-    uid: auth.uid,
-    token: auth.accessToken,
-    bodyJson,
-    modelKey,
-    // machineId 与 token 配套：登录时生成并存在账号记录里，不能用全局那份
-    machineId: auth.machineId || '',
-  });
 
-  const startedAt = Date.now();
-  const wasConcurrent = inFlight > 0;
-  inFlight++;
-  const settle = () => {
-    inFlight = Math.max(0, inFlight - 1);
-    // reqId 由调用方（server.js）生成，与请求埋点同源：归因要等结算，
-    // 时间戳对不上，只有这个键能把两边精确配对
-    credits.capture({
-      account: auth,
-      model: modelKey,
-      startedAt,
-      reqId: opts.reqId,
-      concurrent: wasConcurrent,
-    }).catch(() => { /* 采集失败绝不影响已发出的响应 */ });
+  // 修复配置（每通道独立的环境变量，默认 600 字 / 1 次）
+  const caps = repair.envCaps('QWENWORK');
+  const repairable = chat.hasFunctionTools(payload) > 0 && caps.REPAIR_MAX > 0;
+  // 会话 id 钉住：修复轮是同一段对话的下一句（request_id 仍是每轮新生成——
+  // 它是单次请求的标识，复用可能被上游当幂等重试合并）
+  const pinnedSession = (payload && payload.session_id) || crypto.randomUUID();
+
+  /** 一个修复轮的构造与签名：追加了消息后签名内容必然变，每轮重建 */
+  const buildRound = async (p) => {
+    const bodyJson = chat.buildBody(modelKey, p, { sessionId: pinnedSession });
+    // encode 进 worker（审计 P1-5b），签名构造不再独占事件循环
+    return bridge.prepareInferAsync({
+      uid: auth.uid,
+      token: auth.accessToken,
+      bodyJson,
+      modelKey,
+      // machineId 与 token 配套：登录时生成并存在账号记录里，不能用全局那份
+      machineId: auth.machineId || '',
+    });
   };
 
-  try {
-    if (onChunk) {
+  /** 开一轮：在飞计数归位，返回本轮的结算器（幂等，恰好一次） */
+  const beginRound = () => {
+    const startedAt = Date.now();
+    const wasConcurrent = inFlight > 0;
+    inFlight++;
+    let settled = false;
+    return () => {
+      if (settled) return;
+      settled = true;
+      inFlight = Math.max(0, inFlight - 1);
+      // reqId 由调用方（server.js）生成，与请求埋点同源：归因要等结算，
+      // 时间戳对不上，只有这个键能把两边精确配对
+      credits.capture({
+        account: auth,
+        model: modelKey,
+        startedAt,
+        reqId: opts.reqId,
+        concurrent: wasConcurrent,
+      }).catch(() => { /* 采集失败绝不影响已发出的响应 */ });
+    };
+  };
+
+  if (onChunk) {
+    // ---- 流式：正文先过缓冲门，轮末再判定是否需要修复重试 ----
+    let attempt = 0;
+    let curPayload = payload;
+    let gate = null;
+    let res = null;
+    for (;;) {
+      const built = await buildRound(curPayload);
+      const settle = beginRound();
       let firstErr = null;
-      // sent 只表示**真实数据帧**已转发——发了就不能再换账号了。
-      // [DONE] 是哨兵、不是上游数据帧：把它也算成「已吐帧」会让
-      // 「一帧数据都没有」的错误场景被误判成已开始输出（错误被吞、换号被挡）。
+      // sent 只表示**真实数据帧已到达下游**（门放行才算——缓冲里的帧还没
+      // 交出去，此刻换号/重试都还来得及）。[DONE] 是哨兵、不是数据帧。
       let sent = false;
       let doneSeen = false;
-      const res = await chat.postStream(built.url, built.body, built.headers, (inner) => {
-        // 错误帧**不能**转给下游：一旦写进 SSE，客户端会把它当数据帧收下，
-        // 而 HTTP 头早已发出（恒 200），改不成 4xx 了。
-        // 所以先判错、判出错误就吞掉不转发，最后统一抛出去让上层回 4xx。
-        if (firstErr) return;
-        // 哨兵延后到状态检查之后再转发，避免「先发 200 + [DONE] 再抛错」
-        if (inner === '[DONE]') { doneSeen = true; return; }
-        let parsed = null;
-        try { parsed = JSON.parse(inner); } catch (e) { /* 非 JSON 帧照原样转发 */ }
-        if (parsed) {
-          const err = chat.payloadError(parsed);
-          if (err) { firstErr = err; return; }
-        }
-        sent = true;
-        onChunk(inner);
-      }, { agent });
-      settle();
+      const down = (inner) => { sent = true; onChunk(inner); };
+      // 每轮新开一扇门：重试轮要丢弃上一轮的缓冲（含暂扣的 usage/finish）
+      gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP) : null;
+      const deliver = gate ? (inner) => gate.onInner(inner) : down;
+      try {
+        res = await chat.postStream(built.url, built.body, built.headers, (inner) => {
+          // 错误帧**不能**转给下游：一旦写进 SSE，客户端会把它当数据帧收下，
+          // 而 HTTP 头早已发出（恒 200），改不成 4xx 了。
+          // 所以先判错、判出错误就吞掉不转发，最后统一抛出去让上层回 4xx。
+          if (firstErr) return;
+          // 哨兵延后到状态检查之后再转发，避免「先发 200 + [DONE] 再抛错」；
+          // 有门时交门暂扣（finish() 在收尾补发，顺序保证在 usage/finish 之后）
+          if (inner === '[DONE]') { doneSeen = true; if (gate) deliver(inner); return; }
+          let parsed = null;
+          try { parsed = JSON.parse(inner); } catch (e) { /* 非 JSON 帧照原样转发 */ }
+          if (parsed) {
+            const err = chat.payloadError(parsed);
+            if (err) { firstErr = err; return; }
+            // 缓存命中归一进标准位（usage-norm.js 头注释）：DeepSeek 系模型的
+            // prompt_cache_hit_tokens 原样透传会让按标准读的客户端恒见 0。
+            if (parsed.usage && normalizeUsageCache(parsed.usage)) {
+              inner = JSON.stringify(parsed);
+            }
+          }
+          deliver(inner);
+        }, { agent });
+      } catch (e) {
+        // postStream 自己抛的是网络错误，也要收尾，否则 inFlight 会一直涨。
+        // 同样要把「下游已收到输出」标出来：reasoning 是直发的，有一帧出去了
+        // 就不能再换号重来（客户端会看到两段内容）。
+        settle();
+        if (!e.statusCode) e.sent = sent || !!(gate && gate.result().emitted > 0);
+        throw e;
+      }
       if (firstErr) {
+        settle();
         const err = new Error(`qwenwork ${firstErr.code}: ${firstErr.message}`);
         err.statusCode = firstErr.code;
-        // 已经吐过真实数据帧的流不能再换账号重来——客户端收到了半截输出
-        err.sent = sent;
+        // 「客户端是否已经收到过输出」要把门的放行也算上：正文虽然被扣在缓冲里，
+        // reasoning_content 是**直发**的——只要有一帧到了下游，换号重试就会让
+        // 客户端看到两段内容。
+        err.sent = sent || !!(gate && gate.result().emitted > 0);
         throw err;
       }
-      if (doneSeen) onChunk('[DONE]');
-      return res;
+      settle();
+      if (!gate) {
+        // 无门（纯对话 / 修复关闭）：与旧路径一致，[DONE] 在此处补发
+        if (doneSeen) onChunk('[DONE]');
+        return res;
+      }
+      const g = gate.result();
+      // 已转直发（正文超长 / 出现过工具调用）→ 正常一轮，收尾
+      if (g.live || g.toolCalls > 0) break;
+      if (!repair.looksUnfinished(g.text, caps.HOLD_CAP)) break;
+      if (attempt >= caps.REPAIR_MAX) break;
+      attempt++;
+      curPayload = repair.appendRepairNudge(curPayload);
+      repair.logRepair('qwenwork', opts.reqId, attempt, g.text);
+      // 不 finish：本轮缓冲整轮丢弃（含暂扣的 usage / finish_reason），重开会新门
     }
-    const res = await chat.post(built.url, built.body, built.headers, { agent });
+    gate.finish();
+    return res;
+  }
+
+  // ---- 非流式：聚合后判定（chatlab / 聚合客户端同样能享受到修复）----
+  let attempt = 0;
+  let curPayload = payload;
+  for (;;) {
+    const built = await buildRound(curPayload);
+    const settle = beginRound();
+    const res = await chat.post(built.url, built.body, built.headers, { agent })
+      .catch((e) => { settle(); throw e; });
     const es = chat.envelopeStatus(res.raw);
     if (es && es.code >= 400) {
       settle();
@@ -188,11 +266,14 @@ async function runOnce(account, payload, onChunk, opts) {
       payloads.push(...chat.unwrap(raw));
     }
     settle();
-    return chat.aggregate(payloads, modelKey);
-  } catch (e) {
-    // post/postStream 自己抛的是网络错误，也要收尾，否则 inFlight 会一直涨
-    if (!e.statusCode) settle();
-    throw e;
+    const agg = chat.aggregate(payloads, modelKey);
+    const msg = (agg.choices && agg.choices[0] && agg.choices[0].message) || {};
+    const hasCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+    if (hasCalls || !repairable || attempt >= caps.REPAIR_MAX
+      || !repair.looksUnfinished(msg.content, caps.HOLD_CAP)) return agg;
+    attempt++;
+    curPayload = repair.appendRepairNudge(curPayload);
+    repair.logRepair('qwenwork', opts.reqId, attempt, msg.content);
   }
 }
 
@@ -242,7 +323,9 @@ async function send(payload, onChunk, opts = {}) {
     // 在别处猜（比如「池里的第一个」）在转移场景下必然记错。
     if (opts.onAccount) {
       const name = account.nickname || account.uid || `账号 ${account.id}`;
-      try { opts.onAccount(name); } catch (e) { /* 上报失败不影响请求 */ }
+      // 第二个参数是账号 id：计费自检探针要按 id 回读该账号的余额差值
+      // （名字可能重名）。既有调用方只取第一个参数，不受影响。
+      try { opts.onAccount(name, account.id); } catch (e) { /* 上报失败不影响请求 */ }
     }
 
     try {
@@ -263,7 +346,14 @@ async function send(payload, onChunk, opts = {}) {
       // 失败喂池：类别判定在 upstream-errors.classify，池动作按类别分发
       channelPool.noteError(CHANNEL, account.id, { status: code, message: e.message, model });
       markFailure(account, e.message);
-      errors.push({ account: account.nickname || account.uid || account.id, status: code || '-', error: e.message });
+      // 限流要单独标出来：千问的限流是 **HTTP 403 + 信封 10605**，只看状态码
+      // 会把它和「签名错/无权限」混为一谈（isThrottle 才是判据）。
+      errors.push({
+        account: account.nickname || account.uid || account.id,
+        status: code || '-',
+        error: e.message,
+        throttled: isThrottle(e.message),
+      });
       // 流式已经吐过帧，客户端收到了半截输出，再换号会输出两遍
       if (e.sent) throw e;
       if (!retryable(code, e.message)) throw e;
@@ -276,8 +366,30 @@ async function send(payload, onChunk, opts = {}) {
     }
   }
 
-  const err = new Error(`千问办公所有账号均失败：${errors.map((x) => `${x.account}(${x.status})`).join('；')}`);
-  err.statusCode = Number(errors[errors.length - 1].status) || 502;
+  const brief = (x) => `${x.account}(${x.status}${
+    String(x.error || '').trim() ? `: ${String(x.error).replace(/\s+/g, ' ').trim().slice(0, 120)}` : ''
+  })`;
+  const err = new Error(`千问办公所有账号均失败：${errors.map(brief).join('；')}`);
+  // 全部失败原因都是**限流**时回 429，与 Qoder 通道同口径。
+  //
+  // 为什么必须在这里翻译：千问上游的限流回的是 **HTTP 403 + 信封 code 10605**，
+  // 把 403 原样回给客户端，Codex / Claude Code 会当成硬失败（对 403 只报一次错、
+  // 不退避重试），用户看到的就是「点了没反应」——而上游的条件其实是「稍后再来」，
+  // 其信封里还带了自己的 retryAfterSeconds。429 才能让客户端自动退避重试。
+  if (errors.length && errors.every((x) => x.throttled)) {
+    err.statusCode = 429;
+    err.throttled = true;
+    // 带上最近一次限流的冷却时刻 → server.js 会翻译成 Retry-After 头，
+    // 客户端退避时长才能对齐上游节奏，而不是盲退避。
+    try {
+      const av = channelPool.availability(CHANNEL, usable, { model });
+      if (av && av.softOnly && av.nextInMs > 0) err.retryAfterMs = av.nextInMs;
+    } catch (e) { /* 取不到就不带头，429 语义本身仍然正确 */ }
+  } else {
+    // 状态码 0 = 网络层失败（连接被拒/中断/超时）。映射成 502 让客户端知道是
+    // 上游不可用，而不是把 0 原样回出去（0 会被某些客户端当成「无错误」）。
+    err.statusCode = Number(errors[errors.length - 1].status) || 502;
+  }
   throw err;
 }
 

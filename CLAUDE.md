@@ -368,6 +368,50 @@ ratio），panel 会话鉴权后；ratio≠1 的判读口径写在响应 note �
 的 Qoder 卡 extra，对模型表里倍率最低的模型跑探针，结果按 ratio 偏离 ±5%
 着色成 success/warning）。
 
+**TRAE 的计费自检探针（2026-10-30 落地，与 Qoder 同名端点对齐）**。
+`GET /api/admin/traework/billing-check?model=X`（admin/routes/traework.js）按模型
+发一个小请求（数 1~400，让输出够长以压过 consumed 两位小数的量化误差），
+比对「实测倍率 vs 模型表标称」。**数据源与 Qoder 不同**：Qoder 的
+`usage.credits` 是上游直给的单请求扣费；TRAE 没有逐笔账单，只能读
+`usage_summary.consumed_amount` 的前后差值——所以探针先快照**所有**可用账号的
+consumed（选号交给池，事先不知用哪个号），请求完成后轮询（4 次约 8 秒）直到
+增量出现；8 秒内没涨就如实报 `delta: null` + warning，**不把「没测到」编成 0**。
+服务账号 id 由 `send` 的 `onAccount(name, id)` 上报（本次给回调加了第二个参数，
+向后兼容），并发流量让多个账号同时涨时只取服务账号自己的增量。
+判定逻辑是纯函数 `src/traework/billing.js`：`expectedRate`（命中会员折扣取折后价，
+否则标称价；都缺失如实 null）、`billedRate`（Δconsumed ÷ tokens/1000，**推断
+口径**——依据是历史账本里 glm-5.2 的实测比值落在 0.69~0.75、与标称 0.78 同量级，
+不是上游文档）、`attributeDelta`（增量归属）。期望倍率从 `models.fetchModels`
+的归一化行取（admin 进程自己拉表，不依赖网关进程的快照）。前端在 TRAE 模型卡
+有「计费自检」按钮（挑 `usage=chat_completion` 里倍率最低的模型；`billed` 为
+null 或 ratio 缺失比偏差更常见，单独标黄）。**真机首批结果（2026-10-30）**：
+glm-5.2 ratio≈0.96（Δ1.79 / 2393 tokens，正常）；**DeepSeek-V4-Flash 两个账号
+都稳定在 ratio≈1.35**（Δ0.23 / ~850 tokens，标称 0.2 实测≈0.27）；
+**deepseek-v4.1-flash（按钮默认选中的 0.06 档）ratio≈2.6**（Δ0.15 / ~970 tokens，
+标称 0.06 实测≈0.15）——后两者要么是倍率元数据过期、要么是有未文档化的计费
+差异，正是这个探针要暴露的信号；判读永远结合标称值与多次结果，不做自动判定。
+（历史 `traework-credits.jsonl` 的差值受 60 秒采集节流影响会合并多条请求，
+不能用来反推单模型倍率——只有探针的前后快照是单请求的干净测量。）离线验证：
+`node --test test/unit/trae-billing.test.js`（11 项）。
+
+**千问的计费自检探针（2026-10-30 同日，与 TRAE 同形不同判据）**。
+`GET /api/admin/qwenwork/billing-check?model=flash`（admin/routes/qwenwork.js）——
+发一个小请求（数 1~400），**force 读**三池余额前后差值（30s 缓存会吞掉本次
+差值），归属口径与 `credits.capture` **逐字一致**（`free = max(0, Δdaily)`、
+`paid = max(0, Δmonthly+Δlongterm)`，longterm 负值坏读时不会算出负消耗）。
+**千问上游没有标称倍率/单价**（模型表无 price_factor），所以没有 ratio 可比——
+响应里 `expected`/`ratio` 恒 null，只有 `cost`（本次三池差值）、逐池 `pools`、
+`billed`（每千 token 成本）。判读靠历史量级：实测 flash 约 **0.002~0.01
+credits / 千 token**，余额 4 位小数，短请求偏差主要来自精度。结算轮询 3 轮
+（约 4 秒，依据是 `credits.capture` 的 1.5s 实测余量）；没测到如实 `cost: null`
++ warning，不编 0。纯函数在 `src/qwenwork/billing.js`；前端在千问模型卡有
+「计费自检」按钮（默认挑 `flash`），成本为 null 标黄、其余用 info（无标称值
+可做 ±5% 着色）。离线验证：`node --test test/unit/qwen-billing.test.js`
+（10 项，差值口径/负值坏读/归属）+ `test/unit/qwen-billing-probe.test.js`
+（3 项，路由编排打桩：归属、失败如实、没测到不编）。**真机验证受阻于额度**：
+落地时两个千问账号都是 402 硬冷却（到本地 0 点），恢复后跑一次
+`/billing-check` 即可完成首个真机样本。
+
 **Codex 自由格式工具（custom_tool_call）与 model=auto 兜底（2026-10-30）**。
 Responses 入口此前把 `custom_tool_call` / `custom_tool_call_output` 落进 default
 分支**静默丢弃**——Codex 配了 freeform 工具（如 apply_patch）时调用了凭空消失。
@@ -497,11 +541,15 @@ deepseek-v4.1-flash 答「红色」）；而 Trae2api-cn 的「渲染层媒体�
   `assertImageSupport`，在**选号之前**——模型能力与账号无关，不占池）；模型表
   `multimodal=false` 时回 400 并列出可用多模态模型（表没就绪则放行，宁可不挡）。
   buildBody 剥掉非 user 消息的图像 part（上游对 assistant/tool 带图的行为未知）。
-  千问/Qoder 的 COSY 协议只有纯文本槽（`chat_context.text`），图像展开成占位文本
+  千问的 COSY 协议只有纯文本槽（`chat_context.text`），图像展开成占位文本
   ——**必须走 `images.contentText`，不能 `String(content)`**：翻译层保真后 content
   可能是数组，`String([{type:'text',…},{type:'image_url',…}])` 会得到
   `"[object Object]"`，模型看到垃圾（千问 buildBody 的签名是
   `buildBody(modelKey, payload)`，与 TRAE 相反，改的时候别搞混）。
+  Qoder 的 COSY 协议**有 `imageUrls` 数组槽**，实测上游接受 dataURL 字符串数组
+  形状（HTTP 200，裸 base64 也可）；模型对图像的识别准确度由上游决定，
+  网关层面只负责透传。实测：纯红色 PNG 发过去，Qoder 返回 200 并尝试回答
+  颜色（回答不准属上游模型问题，非网关透传问题）。
 - **搭子压回**（`server.js` 两处 needsModelMap 分支的 `images.flattenImageParts`）：
   Responses/Google 路径的翻译层是通道无关的，保真出的 image_url part 会在搭子
   路径压回占位文本（恢复保真前的行为）。OpenAI 直通路径不经翻译层，客户端自己
@@ -565,6 +613,51 @@ DeepSeek 系模型偶尔把工具调用以**文本标记**写进正文（`<dsml:
 踩过的坑：`exec` 循环的正则**必须带 `g` 标志**（无 `g` 的 exec 永远返回第一个
 匹配，while 循环死循环挂死进程——单测超时就是这么暴露的）。
 
+**「播报即收尾」现在是三通道共用一条修法（2026-10-30，收敛到 `src/repair.js`）**。
+TRAE 2026-10-05 的实测结论（见下一条）推广到千问与 Qoder：两家同样会「只播报进度
+不调工具就收尾」，同一份判定与缓冲门在三条直连通道上语义一致，只差上游帧形状
+（TRAE 是 `event:output`，两条 COSY 通道是标准 OpenAI chunk）。
+
+- **判定**（`looksUnfinished`）：`无工具调用 + 正文 < HOLD_CAP + 命中「下一步/next step」`
+  （空正文也算）。**不要放宽成「只要没有工具调用就重试」**——真·收尾也会被逼着
+  再调一次工具，变成永不结束。
+- **重试**：请求末尾追加一条 user 消息（`appendRepairNudge`，文本 `REPAIR_NUDGE`
+  与 TRAE 逐字一致），上限 `REPAIR_MAX`（默认 1）。
+- **两条 COSY 通道的 id 语义不同**：`request_id` **每轮新生成**（单次请求的标识，
+  复用可能被上游当幂等重试合并）；`session_id` **跨轮钉住**（修复轮是同一段对话
+  的下一句）；Qoder 的 `request_set_id`（排队槽位键）**也不钉**——修复轮是新的一次
+  排队，`queue/status` 跟着看新槽位（`activeSetId`）。
+- **缓冲门**（`createChunkGate`，标准 OpenAI chunk 版）：`reasoning_content` 直发、
+  正文先扣住、`tool_calls` 一到先冲刷正文再直发、`usage`/`finish_reason`/`[DONE]`
+  暂扣到轮末。重试轮**不调 `finish()`**，上一轮的缓冲整轮丢弃（下游只收到重试轮）。
+- **`err.sent` 的口径要算上门的放行**：正文虽被扣住，但 **reasoning 是直发的**——
+  `sent || gate.result().emitted > 0`。漏了这一半，一次「已吐出思考内容后上游报错」
+  会被当成没开始输出而换号重试，客户端看到两段内容。
+- **流式与上游错误/排队的交互**（Qoder）：`sawUp`（上游送来过真实数据）与 `sent`
+  （到达下游）必须分开——排队守卫与换主机守卫用前者，`err.sent` 用后者。排队信封
+  与额度错误帧**留在 `sawUp=false`**，否则排队等待轮的 `!sawUp` 守卫直接失效
+  （这是收敛时踩到的真 bug：`sawUp` 一度写在错误判定之前）。
+
+配置按通道独立：`DUMATE_TRAEWORK_*` / `DUMATE_QWENWORK_*` / `DUMATE_QODER_*` 的
+`HOLD_CAP` 与 `REPAIR_RETRY`（见环境变量表）。离线验证：`node --test
+test/unit/repair-gate.test.js`（共享模块 11 项）+ `node test/verify-qwen-repair.js`
+（36 项）+ `node test/verify-qoder-repair.js`（36 项）+ 原有的
+`node test/verify-traework-repair.js`（38 项）。三者都打桩 `chat.postStream` /
+`chat.post`，不需要账号与网络；**池状态必须隔离**（脚本自带 `DUMATE_POOL_STATE`
+临时文件，且失败用例之间要 `pool.revive()`——402/500 会让账号进冷却）。
+
+**真机首批结果（2026-10-30）**：
+- **Qoder（qfmodel）**：正常请求经门后行为不变（3.2s / 39 帧 / 正文完整 / `finish=stop`）；
+  强制模型只播报进度时**修复轮确实触发**（日志 `[qoder] 播报即收尾：第 1 次重试`，
+  被丢弃正文含「下一步：等待你的下一条任务指令」）。但重试轮撞上上游排队
+  （`no content in 6000ms`），没拿到最终工具调用——**修复轮是一次真实的新请求，
+  会重新排队**，这是排队的已知代价，不是修复引入的缺陷（重试换成新
+  `request_set_id`，见上文）。
+- **千问**：落地时两个账号都是 402 硬冷却（池 `cool_remaining_s≈7041`，
+  到本地 0 点），真机跑不了；编排逻辑由 `verify-qwen-repair.js` 的 36 项打桩锁住，
+  恢复额度后跑一次带工具的真实 Codex 会话即可补齐样本。
+- **TRAE（glm-5.2）**：收敛共享常量后回归正常（2.3s / 15 帧 / 正文完整 / `finish=stop`）。
+
 **TRAE 的「播报即收尾」靠「检测 + 重试」修，提示词修不动**（2026-10-05，`src/traework/`）。
 现象：`Doubao-Seed-Evolving`（Codex `model_reasoning_effort=high`）在**带工具的**请求上
 有 20~67% 的概率只输出一条进度播报（`当前进度：8%｜已完成：…｜下一步：读取…`）就结束回合，
@@ -587,13 +680,15 @@ Codex 把「无工具调用」判定成任务完成退出——用户看到「�
 **结论：只有重试可靠**，`tool_choice` 上游并不真的强制。所以 `send()` 里做的是
 **检测 + 一次性重试**（`DUMATE_TRAEWORK_REPAIR_RETRY`，默认 1；`0` 关闭）：
 
-- **正文缓冲门**（`chat.createTextGate`）：`reasoning_content` 直发；`content` 先扣住；
+- **正文缓冲门**（`chat.createTextGate`，TRAE 版；两条 COSY 通道用共享的
+  `repair.createChunkGate`）：`reasoning_content` 直发；`content` 先扣住；
   `tool_calls` 一到就先冲刷正文再直发；`token_usage` / `finish_reason` 暂扣到整轮结束。
   **正文总在工具调用之前、只有几十字，所以缓冲几乎不增加首字延迟**——不要改成「全量缓冲」，
   那会把每一轮的流式效果全丢掉。超过 `DUMATE_TRAEWORK_HOLD_CAP`（默认 600 字）转直发，
   避免长回答被扣住。
-- **判据是「模型自己说还有下一步」**（`chat.looksUnfinished`）：无工具调用 + 正文 < 600 字 +
-  命中 `下一步|next step`（空正文也算）。既然模型声明了下一步，回合就不该在这里结束。
+- **判据是「模型自己说还有下一步」**（`chat.looksUnfinished` → `repair.looksUnfinished`）：
+  无工具调用 + 正文 < 600 字 + 命中 `下一步|next step`（空正文也算）。既然模型声明了
+  下一步，回合就不该在这里结束。
   **不要放宽成「只要没有工具调用就重试」**——那样真·收尾也会被逼着再调一次工具，会变成永不结束。
 - **重试 = 原请求体末尾追加一条 user 消息**（`chat.withRepairNudge`，幂等）；重试轮若仍没调工具，
   就把它的正文吐给下游收尾，不再重试。
@@ -923,11 +1018,23 @@ DUMATE2API_PORT=9082 node src/server.js
 另有两个同样离线的千问专项验证（都不需要起服务）：
 `node test/verify-qwen-discipline.js`（执行纪律的注入条件与幂等）、
 `node test/verify-truncated-toolcall.js`（工具参数截断判定 + 纯工具调用轮次不误报 incomplete）。
+以及 `node --test test/unit/qwen-billing.test.js`（计费自检纯函数：三池差值口径、
+负值坏读、每千 token 成本、消耗归属）与 `test/unit/qwen-billing-probe.test.js`
+（探针路由编排打桩）。
 
 另有两个 TRAE 专项离线验证（都不需要起服务）：
 `node test/verify-traework-gained.js`（签到到账差值计算，含 0/负数/快照缺失三种边界）、
 `node test/verify-traework-repair.js`（「播报即收尾」修复：判据、幂等、正文缓冲门语义、
 端到端「首轮只播报→重试带工具调用」；打桩 postStream/readStream，不需要账号与网络）。
+以及 `node --test test/unit/trae-billing.test.js`（计费自检的纯函数：期望倍率选择、
+实测倍率换算、消耗增量归属）。
+
+**「播报即收尾」的三通道验证**（都离线、都打桩 `chat.postStream`/`chat.post`）：
+`node --test test/unit/repair-gate.test.js`（共享模块：判据、配置、追加修复指令、
+标准 OpenAI chunk 缓冲门 11 项）、`node test/verify-qwen-repair.js`（36 项）、
+`node test/verify-qoder-repair.js`（36 项）。三者都自带 `DUMATE_POOL_STATE` 临时文件，
+但**用例之间仍要 `pool.revive()`**——驱动 402/500 的用例会把账号打进冷却，
+后面的用例会先撞「没有可用账号」而测不到目标路径。
 
 另一个搭子专项离线验证（不需要起服务）：
 `node test/verify-display-name.js`（账号显示名解析：占位名识别、优先级、空值边界）。
@@ -1157,8 +1264,10 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `DUMATE_TRAEWORK_AUTOSTART` | `auto` | `auto`=启用 TRAE 通道 / `off`=关闭（与 `DUMATE_QWENWORK_AUTOSTART` 同形） |
 | `DUMATE_TRAEWORK_MIN_MAX_TOKENS` | `16384` | TRAE 输出预算下限（三通道各一套，不要互相套用） |
 | `DUMATE_TRAEWORK_MODELS_CACHE_MS` | `300000` | TRAE 模型表缓存时长（5 分钟）。模型表只在登录/刷新时变，不必每次打上游 |
-| `DUMATE_TRAEWORK_REPAIR_RETRY` | `1` | 「播报即收尾」的重试次数上限。`0` 关闭整个修复（见上文 TRAE 段落） |
+| `DUMATE_TRAEWORK_REPAIR_RETRY` | `1` | 「播报即收尾」的重试次数上限。`0` 关闭整个修复（见上文三通道共用的修复段落） |
 | `DUMATE_TRAEWORK_HOLD_CAP` | `600` | 正文缓冲门的阈值（字符）。超过就转直发，避免长回答被扣住等判定 |
+| `DUMATE_QWENWORK_REPAIR_RETRY` / `DUMATE_QODER_REPAIR_RETRY` | `1` | 同上，千问与 Qoder 各一套（`src/repair.js` 的 `envCaps`）。互不影响 |
+| `DUMATE_QWENWORK_HOLD_CAP` / `DUMATE_QODER_HOLD_CAP` | `600` | 同上，千问与 Qoder 各一套 |
 | `DUMATE_QODER_FIRST_BYTE_MS` | `60000` | Qoder 上游**首字节**超时（ms），挡「连响应头都不给」的挂起。`0` 关闭 |
 | `DUMATE_QODER_CONTENT_MS` | `12000` | Qoder 上游**无内容**超时（ms）：排队时上游先回一个空 ack 帧再沉默，首字节计时器会被它清掉，只有这个计时器能识别（见上文）。只在**还没转发过任何真实内容**时计时，有内容即撤销。两个账号串行，所以它是「用户感知最坏等待」的一半。`0` 关闭 |
 | `DUMATE_QODER_QUEUE_PATIENCE_MS` | `6000` | 排队重试的**总预算**（ms）。实测推翻了「按上游时长耐心等」的旧结论：排队是请求级随机，等 30 秒也不保证放行，所以改为快速轮询几轮（信封本身 150~1000ms 就到）仍失败就如实回 429。`0` = 拿到限流立刻回 429 |
@@ -1249,8 +1358,8 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `admin/router.js` | `/api/admin/*` 路由分发。**路径匹配锚定整串**，所以 `/models/map` 不会误吞 `/models/map/reset`；注册时 `path: ''` 与前缀拼成 `/api/admin/web-accounts`，`mount` 做了去尾斜杠 |
 | `admin/store.js` | JSON / JSONL 原子持久化（先写 `.tmp` 再 `rename`）。管理端的配置写盘都走它 |
 | `admin/iputil.js` | 客户端来源 IP。管理端只监听 127.0.0.1，所以直接取 TCP 对端；**没有 TRUST_PROXY 判定**——挂反代前必须先补，否则限流/锁定会按代理 IP 统计 |
-| `admin/routes/traework.js` | TRAE Work 通道的管理接口：`/status` 通道健康+账号列表（mode=multi，可增删）、`/models` 模型表（只读）、`/credits` 各账号额度与签到状态、`/checkin` 手动签到（幂等）、**`/login/url` + `/login/callback` 两步 OAuth 登录**、`DELETE/PATCH /accounts/:id` |
-| `admin/routes/qwenwork.js` | 千问办公通道的管理接口：`/status` 通道健康、`/credits` 三个池、`/credits/daily` 按天聚合、`/credits/records` 逐笔明细、`/models` 模型表、**`/account` 登录态详情（只读）**、**`/accounts` 账号（`mode='single'` 表示单账号直连，不可增删）** |
+| `admin/routes/traework.js` | TRAE Work 通道的管理接口：`/status` 通道健康+账号列表（mode=multi，可增删）、`/models` 模型表（只读）、`/credits` 各账号额度与签到状态、`/checkin` 手动签到（幂等）、`/billing-check` 计费自检探针、**`/login/url` + `/login/callback` 两步 OAuth 登录**、`DELETE/PATCH /accounts/:id` |
+| `admin/routes/qwenwork.js` | 千问办公通道的管理接口：`/status` 通道健康、`/credits` 三个池、`/credits/daily` 按天聚合、`/credits/records` 逐笔明细、`/billing-check` 计费自检探针、`/models` 模型表、**`/account` 登录态详情（只读）**、**`/accounts` 账号（`mode='single'` 表示单账号直连，不可增删）** |
 | `admin/routes/accounts.js` | 搭子网页账号的管理接口（签到/抽奖/积分/记录）。**回填与显示名的逻辑都在这里**（`backfillNickname` / `backfillAll`），属于管理端、不进快照 |
 | `admin/routes/*.js` | 其余管理 API，按 `mount()` 挂载到 `/api/admin/<前缀>` |
 
