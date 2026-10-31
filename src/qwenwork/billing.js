@@ -1,10 +1,10 @@
 // src/qwenwork/billing.js - 千问计费自检的纯函数
 //
-// 与 TRAE 的 billing.js 定位相同（探针端点在 admin/routes/qwenwork.js），
-// 但判定方式不同：**千问上游不提供标称倍率/单价**（模型表没有 price_factor），
-// 所以没有「标称 vs 实测」的比值——探针只能回答「这一次请求实际扣了多少、
-// 折算到每千 token 是多少」。判读靠历史量级（实测 flash 约 0.002~0.01
-// credits / 千 token）。
+// 与 TRAE 的 billing.js 定位相同（探针端点在 admin/routes/qwenwork.js）。
+// 差别：千问模型表**有 price_factor（相对倍率，2026-10-31 起解析）**，但它与
+// 三池 credits 不是同一单位（实测 flash 的每千 token 成本约 0.002~0.01
+// credits，而标称倍率是 0.1），所以本探针**不算 ratio**，只报实测成本；
+// 倍率只在模型页展示，判读靠历史量级。
 
 function num(v) {
   return v == null ? null : (Number.isFinite(Number(v)) ? Number(v) : null);

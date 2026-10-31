@@ -395,8 +395,60 @@ async function send(payload, onChunk, opts = {}) {
   throw err;
 }
 
-/** 模型列表：优先问服务端，失败回落静态表。用选中账号的凭证 */
-async function listModels() {
+// ---- 模型表与元数据（2026-10-31 起解析完整字段）----
+//
+// 上游 `/api/v2/model/list` 的条目除了 key 还带：
+//   price_factor / original_price_factor   标称倍率（相对值）
+//   context_config                          200K / 400K / 1M 档位
+//   is_vl                                   是否多模态
+// 旧实现只取 key，倍率/上下文/多模态全丢——模型页只能显示「千问无倍率」，
+// 而那是**解析没做**，不是上游没给。
+//
+// 结果缓存 60 秒：模型页会先后调 /models 与 /models/info，不缓存就是两次网络。
+
+const MODELS_TTL_MS = 60000;
+let modelsCache = { at: 0, entries: [], keys: [] };
+
+function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 归一化一条上游模型行（纯函数，便于离线验证） */
+function normalizeModelRow(m) {
+  if (!m || typeof m !== 'object') return null;
+  const key = m.key || m.model_key || m.name;
+  if (!key) return null;
+  const tiers = [];
+  const cfg = m.context_config && typeof m.context_config === 'object' ? m.context_config : null;
+  if (cfg) {
+    for (const x of Object.values(cfg)) {
+      const n = numOrNull(x && (x.token_count ?? x.tokens));
+      if (n && n > 0) tiers.push(n);
+    }
+  }
+  tiers.sort((a, b) => a - b);
+  const ctxMax = tiers.length ? tiers[tiers.length - 1] : numOrNull(m.max_input_tokens);
+  return {
+    key: String(key),
+    name: String(m.display_name || m.displayName || m.name || key),
+    rate: numOrNull(m.price_factor),
+    rateOriginal: numOrNull(m.original_price_factor),
+    contextWindow: ctxMax,
+    contextTiers: tiers,
+    multimodal: m.is_vl === true,
+    enabled: m.enable !== false,
+  };
+}
+
+/** 解析模型表响应（纯函数）。同时认 qwork 与 list 两种外壳。 */
+function parseModelsResponse(j) {
+  const list = (j && (Array.isArray(j.qwork) ? j.qwork : Array.isArray(j.list) ? j.list : null)) || [];
+  return list.map(normalizeModelRow).filter((x) => x && x.enabled);
+}
+
+async function fetchModelList(force = false) {
+  if (!force && modelsCache.entries.length && Date.now() - modelsCache.at < MODELS_TTL_MS) return modelsCache;
   try {
     const account = await chat.ensureAccount(authStore, pickAccount());
     // **签名必须覆盖模型表自己的路径**（2026-10-31 实测）：签名串里带 pathSig，
@@ -428,21 +480,37 @@ async function listModels() {
       req.end();
     });
     if (res.status === 200) {
-      const j = JSON.parse(res.raw);
-      const keys = ((j && j.qwork) || []).filter((m) => m && m.enable !== false).map((m) => m.key);
-      if (keys.length) {
-        // 成功拉到就告诉 model-info：界面据此把上下文等字段标成「上游下发」，
-        // 而不是回落静态表（两者可信度不同）
-        try { require('../model-info').setQwenKeys(keys); } catch (e) { /* 不影响返回 */ }
-        return keys;
+      const entries = parseModelsResponse(JSON.parse(res.raw));
+      if (entries.length) {
+        modelsCache = { at: Date.now(), entries, keys: entries.map((e) => e.key) };
+        // 成功拉到就告诉 model-info：界面据此把倍率/上下文标成「上游下发」
+        try { require('../model-info').setQwenModels(entries); } catch (e) { /* 不影响返回 */ }
+        return modelsCache;
       }
     }
   } catch (e) { /* 拿不到就用兜底，不阻断 */ }
-  return constants.FALLBACK_MODELS.slice();
+  return modelsCache.entries.length ? modelsCache : { at: 0, entries: [], keys: [] };
+}
+
+/** 模型 key 列表：优先问服务端，失败回落静态表 */
+async function listModels(force = false) {
+  const r = await fetchModelList(force);
+  return r.keys.length ? r.keys : constants.FALLBACK_MODELS.slice();
+}
+
+/** 带元数据的模型表（倍率/上下文/多模态）。接口不可用时给静态条目 */
+async function listModelEntries(force = false) {
+  const r = await fetchModelList(force);
+  if (r.entries.length) return r.entries;
+  return constants.FALLBACK_MODELS.map((key) => ({
+    key, name: key, rate: null, rateOriginal: null,
+    contextWindow: null, contextTiers: [], multimodal: false, enabled: true,
+  }));
 }
 
 module.exports = {
-  warmup, status, send, listModels, pickAccount,
+  warmup, status, send, listModels, listModelEntries, pickAccount,
+  normalizeModelRow, parseModelsResponse,
   chatCompletion: (p, opts) => send(p, undefined, opts),
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
 };

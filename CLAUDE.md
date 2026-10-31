@@ -491,9 +491,15 @@ glm-5.2 ratio≈0.96（Δ1.79 / 2393 tokens，正常）；**DeepSeek-V4-Flash �
 发一个小请求（数 1~400），**force 读**三池余额前后差值（30s 缓存会吞掉本次
 差值），归属口径与 `credits.capture` **逐字一致**（`free = max(0, Δdaily)`、
 `paid = max(0, Δmonthly+Δlongterm)`，longterm 负值坏读时不会算出负消耗）。
-**千问上游没有标称倍率/单价**（模型表无 price_factor），所以没有 ratio 可比——
-响应里 `expected`/`ratio` 恒 null，只有 `cost`（本次三池差值）、逐池 `pools`、
-`billed`（每千 token 成本）。判读靠历史量级：实测 flash 约 **0.002~0.01
+**2026-10-31 修正：上游模型表确实带 `price_factor`**（真机复核：`flash=0.1`、
+`pro=1`、`qwen3.8-max-preview=1.8`，另有 `context_config` 的 200K/400K/1M 三档
+与 `is_vl`）。此前「千问无标称倍率」的结论是**解析没做**，不是上游没给。倍率
+与上下文现在在模型页展示（`src/qwenwork/index.js` 的 `normalizeModelRow` /
+`listModelEntries` → `model-info.qwenworkRows(entries)`）。
+但**探针仍不算 ratio**：`price_factor` 是相对倍率，与三池 credits 不是同一单位
+（实测 flash 每千 token 成本约 0.002~0.01 credits，而标称倍率是 0.1），直接相除
+会得到没有意义的数。所以响应里 `expected`/`ratio` 恒 null，只有 `cost`（本次
+三池差值）、逐池 `pools`、`billed`（每千 token 成本）。判读靠历史量级：实测 flash 约 **0.002~0.01
 credits / 千 token**，余额 4 位小数，短请求偏差主要来自精度。结算轮询 3 轮
 （约 4 秒，依据是 `credits.capture` 的 1.5s 实测余量）；没测到如实 `cost: null`
 + warning，不编 0。纯函数在 `src/qwenwork/billing.js`；前端在千问模型卡有

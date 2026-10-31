@@ -420,7 +420,9 @@ const routes = [
         model,
         account: servedName || null,
         accountId: servedId,
-        // 千问没有标称倍率可言，如实 null；界面据此不做 ±5% 着色
+        // 千问的 price_factor 是**相对倍率**（上游模型表），与三池 credits
+        // 不是同一单位——直接算 ratio 会得到 0.02 这种没有意义的数。
+        // 所以这里如实 null，倍率只在模型页展示，判读靠历史量级。
         expected: null,
         billed,
         ratio: null,
@@ -433,7 +435,8 @@ const routes = [
         warning: !delta || delta.total == null
           ? '请求成功，但约 4 秒内未观测到三池余额减少（结算延迟，或本次未计费）'
           : '',
-        note: '千问上游不提供标称倍率/单价（模型表无 price_factor），这里只报本次实测成本：'
+        note: '千问上游模型表有 price_factor（相对倍率，2026-10-31 起解析并在模型页展示），'
+          + '但它与三池 credits 不是同一单位，所以这里不算 ratio；只报本次实测成本：'
           + 'cost 取三池余额差值（与逐笔归因同口径），billed 是折算的每千 token 成本。'
           + '实测量级 flash 约 0.002~0.01 credits / 千 token；余额 4 位小数，短请求的偏差主要来自精度。',
       });

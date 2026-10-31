@@ -231,8 +231,8 @@ wss://qwenwork.cn/api/chat-ws
 |---|---|---|
 | 9 | 媒体层：生图 + TTS（视频后置） | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
 | 10 | JSON mode（走千帆原生端点） | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
-| 11 | 千问附件上传 | 千问 |
-| 12 | 千问模型元数据复核与接入 | 千问 |
+| 11 | 千问附件上传 | 千问 | ⚠️ 证据不足，暂缓（见 §10） |
+| 12 | 千问模型元数据复核与接入 | 千问 | ✅ 已完成 2026-10-31（见 §10） |
 | 13 | TRAE `ide_user_pay_status` + 错误码补全 + 请求体韧性 | TRAE |
 | 14 | Qoder 前缀缓存亲和 + 历史字节稳定 | Qoder |
 | 15 | 统一错误码字典 | 全部 |
@@ -511,6 +511,52 @@ Responses   /v1/responses → status=completed，out「收到」
 
 **约束**：不钳预算（透传语义）；模型名必须写千帆原生名；`/v1/models` 只列
 实测可用的那一个（上游没有模型列表接口）。
+
+### 2026-10-31 · P1-12 千问模型元数据（真机复核并接入）
+
+| 文件 | 内容 |
+|---|---|
+| `src/qwenwork/index.js` | `normalizeModelRow` / `parseModelsResponse` 纯函数；模型表缓存 60s；新增 `listModelEntries()` |
+| `src/model-info.js` | `setQwenModels` + `qwenModelsCache`；`qwenworkRows(entries)` 带上游倍率/上下文/多模态；新增 `qwenRows()` 自己拉表（跨进程缓存不可见） |
+| `src/server.js` | `/v1/models` 的千问条目带 `contextWindow` / `multimodal` |
+| `src/admin/routes/models.js` | 模型页带 `rate` / `contextWindow` / `multimodal` |
+| `src/admin/routes/qwenwork.js` | 计费自检 note 说明「有倍率但单位不同，不算 ratio」 |
+| `test/unit/qwen-models-meta.test.js` | 6 项 |
+
+**真机复核（2026-10-31，用户登录后）**：
+
+```text
+flash                rate=0.1   context=[200000, 400000, 1000000]  is_vl=true
+pro                  rate=1     context=[200000, 400000, 1000000]  is_vl=true
+qwen3.8-max-preview  rate=1.8   context=[200000, 400000, 1000000]  is_vl=true
+```
+
+所以此前「千问上游没有 price_factor」的结论是**解析没做**，不是上游没给。
+`original_price_factor` 三个模型都回 0——那是「没有原价信息」，不是「打 0 折」，
+展示时按 null 处理。
+
+### 2026-10-31 · P1-11 千问附件上传：调研后判定暂缓（未写代码）
+
+**结论：现有证据不支持在 HTTP 链路上做这件事，先不做。**
+
+1. 抓了 qwenwork.cn 的 Web bundle（`/app/assets/index-*.js`，3.8MB）并全量搜索：
+   **没有 `chat_context` / `imageUrls` 字样**——Web 端不走我们网关用的
+   `agent_chat_generation` HTTP 接口，而是走 **ACP WebSocket**
+   (`wss://qwenwork.cn/api/chat-ws`)。bundle 里能找到的是 ACP 的
+   `barnId / filePath / mimeType / parentToolCallId` 这类**消息附件描述**。
+2. bundle 里确实有 `/api/barn/v1/files/*`、`/api/barn/v1/directories/*`、
+   `/api/barn/v1/drive/usage`、`/api/barn/v1/search`，以及
+   `GET /api/barn/v1/files/{path}?mode=preview|download` 返回 `presigned_url`。
+   但**这是网盘式的文件存储 API**，不是「把文件挂到一轮对话上」的协议；
+   更早调研里描述的 `POST /api/barn/v1/upload {chunk_size} → chunks → 完成`
+   在当前 bundle 里**找不到对应实现**。
+3. 我们的 HTTP 链路是桌面客户端那套（`chat_context.text` + `imageUrls` 槽），
+   而桌面客户端本机未安装（2026-10-14 已卸载），没有第二份证据能告诉我们
+   「附件」在这个 body 里长什么样。
+
+**所以「能上传」不等于「模型能读到」**：上传只是文件进了网盘，还需要一个
+对话侧的引用字段。这一步没有证据，按项目纪律不猜（不预编协议）。
+要推进只有两条路：接入 ACP 通道（P2-17），或恢复桌面客户端后抓一次真实附件请求。
 
 ---
 

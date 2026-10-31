@@ -73,10 +73,17 @@ async function channelView(cfg) {
   }];
   try {
     const qw = require('../../qwenwork');
-    const keys = await qw.listModels();
+    const entries = await qw.listModelEntries();
     out.push({
       id: 'qwenwork', label: '千问办公', editable: false, prefix: 'qwen/',
-      models: keys.map((k) => ({ id: k, name: QW_NAMES[k] || k, prefixed: `qwen/${k}` })),
+      models: entries.map((e) => ({
+        id: e.key,
+        name: e.name || QW_NAMES[e.key] || e.key,
+        prefixed: `qwen/${e.key}`,
+        ...(Number.isFinite(e.rate) ? { rate: e.rate } : {}),
+        ...(e.contextWindow ? { contextWindow: e.contextWindow } : {}),
+        ...(e.multimodal ? { multimodal: true } : {}),
+      })),
     });
   } catch (e) {
     out.push({ id: 'qwenwork', label: '千问办公', editable: false, prefix: 'qwen/', models: [], error: e.message });

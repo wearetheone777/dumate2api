@@ -772,9 +772,18 @@ async function handleOpenAIModels(req, res) {
   if ((process.env.DUMATE_QWENWORK_AUTOSTART || 'auto') !== 'off') {
     try {
       const qw = require('./qwenwork');
-      const models = await qw.listModels();
-      for (const m of router.exposedFor('qwenwork', models)) {
-        data.push({ id: m, object: 'model', created, owned_by: 'qwenwork', name: m.slice('qwen/'.length) });
+      // 用带元数据的条目：倍率/上下文/多模态都是上游下发的（2026-10-31 起解析）
+      const entries = await qw.listModelEntries();
+      for (const e of entries) {
+        data.push({
+          id: `qwen/${e.key}`,
+          object: 'model',
+          created,
+          owned_by: 'qwenwork',
+          name: e.name || e.key,
+          ...(e.contextWindow ? { contextWindow: e.contextWindow, maxContextWindow: e.contextWindow } : {}),
+          ...(e.multimodal ? { multimodal: true } : {}),
+        });
       }
     } catch (e) { /* 通道不可用，不列 */ }
   }

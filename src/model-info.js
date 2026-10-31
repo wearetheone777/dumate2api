@@ -89,45 +89,68 @@ function dumateRows() {
 }
 
 /** 千问的行。倍率本地拿不到（计费在 qwenwork.cn 的积分池里），如实 null */
-function qwenworkRows() {
+function qwenworkRows(entries) {
   const constants = require('./qwenwork/constants');
-  let keys = constants.FALLBACK_MODELS.slice();
-  let source = 'config';
-  // listModels 内部会先试接口、失败回落静态表，这里只看结果
-  const cached = qwenworkCachedKeys();
-  if (cached && cached.length) { keys = cached; source = 'upstream'; }
   const budget = require('./budget');
-  return keys.map((k) => {
-    const meta = QW_META[k] || {};
+  let list = Array.isArray(entries) && entries.length ? entries : qwenworkCachedEntries();
+  const source = list ? 'upstream' : 'config';
+  if (!list) {
+    list = constants.FALLBACK_MODELS.map((k) => ({
+      key: k, name: '', rate: null, rateOriginal: null,
+      contextWindow: null, contextTiers: [], multimodal: false,
+    }));
+  }
+  return list.map((e) => {
+    const meta = QW_META[e.key] || {};
+    const ctx = Number.isFinite(e.contextWindow) && e.contextWindow > 0 ? e.contextWindow : null;
     return {
-      id: k,
-      name: meta.name || k,
-      prefixed: `qwen/${k}`,
+      id: e.key,
+      name: e.name || meta.name || e.key,
+      prefixed: `qwen/${e.key}`,
       channel: 'qwenwork',
       native: true,
-      target: k,
-      rate: null,
-      rateSource: null,
-      contextWindow: meta.context ? meta.context.max : null,
+      target: e.key,
+      // 上游模型表的 price_factor（相对值）。拿不到如实 null——不编单价
+      rate: Number.isFinite(e.rate) ? e.rate : null,
+      // 实测 original_price_factor 对千问恒为 0（不是「打 0 折」，是没有原价信息）。
+      // 0 原价与正价并列显示会误导，按「无」处理。
+      rateOriginal: Number.isFinite(e.rateOriginal) && e.rateOriginal > 0 ? e.rateOriginal : null,
+      rateSource: Number.isFinite(e.rate) ? 'upstream' : null,
+      contextWindow: ctx != null ? ctx : (meta.context ? meta.context.max : null),
       contextWindowMin: meta.context ? meta.context.min : null,
-      contextSource: meta.context ? 'measured' : null,
-      contextNote: meta.context ? meta.context.note : '',
+      contextSource: ctx != null ? 'upstream' : (meta.context ? 'measured' : null),
+      contextNote: ctx != null
+        ? '上游模型表 context_config'
+        : (meta.context ? meta.context.note : ''),
       maxTokens: budget.resolveQwenMaxTokens(0),
       maxTokensSource: 'config',
       capability: 'chat_model',
-      multimodal: false,
+      multimodal: e.multimodal === true,
       note: source === 'upstream' ? '' : '模型列表接口 403，当前为静态表（pro / flash）',
     };
   });
 }
 
-// 千问模型表的缓存快照由 index.js 在成功拉取后写入
-let qwenKeysCache = null;
-function setQwenKeys(keys) {
-  qwenKeysCache = Array.isArray(keys) && keys.length ? keys.slice() : null;
+// 千问模型表的缓存快照（上游下发，带倍率/上下文/多模态）。
+// 由 qwenwork/index.js 拉取成功后写入。
+let qwenModelsCache = null;
+
+function setQwenModels(entries) {
+  qwenModelsCache = Array.isArray(entries) && entries.length ? entries.slice() : null;
 }
-function qwenworkCachedKeys() {
-  return qwenKeysCache;
+
+/** 兼容旧调用：只给 key 列表时按「无元数据」的快照处理 */
+function setQwenKeys(keys) {
+  setQwenModels(Array.isArray(keys) && keys.length
+    ? keys.map((k) => ({
+      key: k, name: k, rate: null, rateOriginal: null,
+      contextWindow: null, contextTiers: [], multimodal: false,
+    }))
+    : null);
+}
+
+function qwenworkCachedEntries() {
+  return qwenModelsCache;
 }
 
 // Qoder 模型表的缓存快照（上游下发，带倍率）。由 qoder/index.js 写入。
@@ -306,15 +329,33 @@ async function traeworkRows({ visibleOnly = false, force = false } = {}) {
 async function allRows({ force = false } = {}) {
   const tw = await traeworkRows({ force });
   return {
-    rows: [...dumateRows(), ...qwenworkRows(), ...tw.rows, ...(await qoderRows())],
+    rows: [...dumateRows(), ...(await qwenRows()), ...tw.rows, ...(await qoderRows())],
     errors: { traework: tw.error || '' },
   };
+}
+
+/**
+ * 千问的行：**自己拉一次模型表**（与 Qoder/TRAE 同理）。
+ * 缓存是模块级的，而 /models/info 跑在管理端进程、拉表发生在网关进程时
+ * 那份缓存根本看不到——只读缓存会让倍率/上下文在界面上永远是空的。
+ */
+async function qwenRows() {
+  try {
+    const qw = require('./qwenwork');
+    const entries = await qw.listModelEntries();
+    return qwenworkRows(entries);
+  } catch (e) {
+    return qwenworkRows();
+  }
 }
 
 /** 某条通道的行 */
 async function rowsFor(channel, opts = {}) {
   if (channel === 'dumate') return { rows: dumateRows(), error: '' };
-  if (channel === 'qwenwork') return { rows: qwenworkRows(), error: '' };
+  if (channel === 'qwenwork') {
+    const rows = await qwenRows();
+    return { rows, error: '' };
+  }
   if (channel === 'qoder') return { rows: await qoderRows(), error: '' };
   if (channel === 'traework') {
     const r = await traeworkRows(opts);
@@ -324,6 +365,7 @@ async function rowsFor(channel, opts = {}) {
 }
 
 module.exports = {
-  SRC, allRows, rowsFor, dumateRows, qwenworkRows, traeworkRows, qoderRows,
-  setQwenKeys, setQoderModels, DUMATE_NOTE, DUMATE_CONTEXT, QW_CONTEXT, CHANNELS: channels.CHANNELS,
+  SRC, allRows, rowsFor, dumateRows, qwenworkRows, qwenRows, traeworkRows, qoderRows,
+  setQwenKeys, setQwenModels, qwenworkCachedEntries, setQoderModels,
+  DUMATE_NOTE, DUMATE_CONTEXT, QW_CONTEXT, CHANNELS: channels.CHANNELS,
 };
