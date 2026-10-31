@@ -15,7 +15,9 @@ test('mapModel：upstream_models 里的真名直接透传（无需别名条目�
 
 test('mapModel：别名表仍生效（auto-l* 简写），未知名仍兜底 fallback', () => {
   assert.equal(mm.mapModel('auto-l1'), 'dm-auto-model/text.L1');
-  assert.equal(mm.mapModel('glm-5.2'), mm.load().fallback, '不在表内的近名仍兜底（防上游 404）');
+  // glm-5.2 已注册为别名（→ glm-5）；真正未知的名字仍兜底（防上游 404）
+  assert.equal(mm.mapModel('glm-5.2'), 'glm-5');
+  assert.equal(mm.mapModel('no-such-model-xyz'), mm.load().fallback);
   assert.equal(mm.mapModel(''), mm.load().fallback);
   assert.equal(mm.mapModel(undefined), mm.load().fallback);
 });

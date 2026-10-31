@@ -897,7 +897,7 @@ async function runQwBillingCheck() {
 /** 搭子计费自检：数数小请求 + 网页余额前后差（chatlab 同一份 costOf 实现）。
  *  默认打 model-text（上游默认档）；没有标称倍率可比，只报实测。 */
 async function runDmBillingCheck() {
-  const target = 'model-text'
+  const target = 'deepseek-v4.1-flash-low-latency'
   dmBillingChecking.value = true
   try {
     const r = await client.get<DmBillingResult>(`/dumate/billing-check?model=${target}`, { timeout: 180000 })

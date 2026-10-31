@@ -753,13 +753,13 @@ async function handleOpenAIModels(req, res) {
     id,
     object: 'model',
     created,
-    // 区分「上游直接认识」与「靠别名转换」——后者换名字也能用，
-    // 但前者才是上游真实模型，界面与客户端据此判断
-    owned_by: upstream.has(id) ? 'dumate' : 'dumate-proxy',
-    // 可读名来自 modelmap.displayName：上游没有模型列表接口，这几个名字是
-    // **本地标注**（`model-text` → 文本模型），不是百度下发的元信息。
-    // 别名（claude-* / gpt-*）没有标注，原样返回。
-    // 带上 name 是为了与其它通道形状一致——cc-switch 读 `name` 显示模型名。
+    // 分组按「映射后是否落到上游真名」判：暴露列表现在是**真实后端名**
+    // （deepseek-v4.1-flash-low-latency 等，经别名映射到上游槽位），客户端
+    // （cc-switch 按 owned_by 分组）看到的组名仍是 dumate；只有兜底型的
+    // 名字才算 dumate-proxy。
+    owned_by: upstream.has(modelmap.mapModel(id)) ? 'dumate' : 'dumate-proxy',
+    // 可读名来自 modelmap.displayName：真实后端名的条目 name===id；
+    // 带上 name 是为了与其它通道形状一致。
     name: modelmap.displayName(id),
   }));
 
