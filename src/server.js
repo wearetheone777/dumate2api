@@ -43,12 +43,17 @@ const boot = require('./boot');
 const PROXY_PORT = parseInt(process.env.DUMATE2API_PORT || '9080', 10);
 const PROXY_HOST = process.env.DUMATE2API_HOST || '127.0.0.1';
 // 审计修复（P0-1）：DUMATE2API_KEY 此前定义后从未被使用——管理员设了这个
-// 变量也不会有任何强制，是个配置陷阱。现在它与登记 key 体系并联：
-//   - DUMATE_REQUIRE_KEY=1          → 校验管理端登记的 key（原开关，语义不变）
-//   - 设置了 DUMATE2API_KEY（非空）  → 同样强制鉴权，命中该 env 密钥（或任一
-//     登记 key）才放行。两个开关任意一个打开即启用鉴权。
+// 变量也不会有任何强制，是个配置陷阱。现在它与登记 key 体系并联：命中该
+// env 密钥（或任一登记 key）才放行。
+//
+// **鉴权强制（2026-11-01 用户要求）**：「不鉴权」形态已删除——模型端点一律
+// 要求 API key，没有 key 的调用一律 401，想用必须先在管理端创建 key。
+// DUMATE_REQUIRE_KEY 因此成为死变量：设 0/1 都不再改变行为（显式设 0 时
+// 启动日志告警，避免管理员误以为关掉了）。
 const ENV_API_KEY = String(process.env.DUMATE2API_KEY || '').trim();
-const REQUIRE_KEY = process.env.DUMATE_REQUIRE_KEY === '1' || !!ENV_API_KEY;
+if (process.env.DUMATE_REQUIRE_KEY === '0') {
+  console.warn('[dumate2api] DUMATE_REQUIRE_KEY=0 无效：鉴权已强制，无法通过环境变量关闭');
+}
 
 let upstreamPort = null;
 let upstreamManaged = false;
@@ -1954,10 +1959,9 @@ const server = http.createServer(async (req, res) => {
         status: 'ok',
         upstream_port: upstreamPort,
         upstream_managed: upstreamManaged,
-        // 网关进程自己的鉴权开关（REQUIRE_KEY 含 DUMATE2API_KEY 的语义）。
-        // 管理端进程读不到网关的环境变量——它此前用 process.env 判断，
-        // 两个进程环境不同导致页面恒显示「鉴权关闭」。读这里才是实况。
-        require_key: REQUIRE_KEY,
+        // 鉴权强制开启（2026-11-01），恒 true。保留字段是为了管理端探测
+        // 逻辑不变（它读不到网关进程的环境变量，只能读这里）。
+        require_key: true,
         // 通道状态：搭子是主链路，千问是可选。分开报，便于一眼看出
         // 「qwen/ 请求会在哪一步失败」。千问是进程内直连，没有端口，
         // 所以报的是 wasm 版本与登录态而不是 port。
@@ -2015,11 +2019,10 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // ==================== API Key 鉴权 ====================
-    // 触发条件（满足其一）：DUMATE_REQUIRE_KEY=1，或设置了 DUMATE2API_KEY。
-    // 环境变量密钥此前是死变量（定义后从未校验），现已接线：命中登记 key
-    // 或 env 密钥任一即放行。鉴权在路由分发之前统一做，避免新增端点漏挂。
-    if (REQUIRE_KEY && url !== '/health' && url !== '/ping') {
+    // ==================== API Key 鉴权（强制，2026-11-01）====================
+    // 「不鉴权」形态已删除：模型端点一律要求 key（/health /ping 豁免，探活
+    // 需要）。鉴权在路由分发之前统一做，避免新增端点漏挂。
+    if (url !== '/health' && url !== '/ping') {
       const token = keysvc.tokenFromHeaders(req.headers);
       let key = keysvc.resolve(token);
       // env 密钥兜底：与登记 key 体系并联，常时比较（keys.tokenMatches）
@@ -2300,19 +2303,16 @@ async function start() {
     log(`✓ dumate2api listening on http://${PROXY_HOST}:${PROXY_PORT}`);
     // 同步代码卡住时打日志，把「静默假死」变成可排查的痕迹（见函数注释）
     startLagMonitor();
-    // 鉴权态势（P0-1）：env 密钥 / 登记 key 开关任一打开即有鉴权；
-    // 都没开且监听非回环地址时显式告警（不拒启，保持兼容）。
-    if (REQUIRE_KEY) {
-      log(ENV_API_KEY
-        ? '✓ 已启用鉴权：模型端点要求 Bearer / x-api-key（DUMATE2API_KEY 或管理端登记 key）'
-        : '✓ 已启用鉴权：模型端点要求管理端登记的 API key（DUMATE_REQUIRE_KEY=1）');
-    } else {
-      const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
-      if (!LOOPBACK.has(String(PROXY_HOST).toLowerCase())) {
-        log(`⚠ 安全警告：未启用任何 API key 鉴权（未设 DUMATE2API_KEY / DUMATE_REQUIRE_KEY=1），且监听 ${PROXY_HOST} 非回环地址——局域网内任何设备都能直接消耗上游账号与积分。`);
-        log('  最小修复：设 DUMATE2API_KEY=<密钥> 后，客户端请求头带 Bearer <密钥>。');
+    // 鉴权态势（2026-11-01 起强制）：没有「不鉴权」形态。原「未开鉴权且
+    // 监听非回环」的安全警告随之失去存在场景——现在任何监听地址都要求 key。
+    log(ENV_API_KEY
+      ? '✓ 鉴权强制开启：模型端点要求 Bearer / x-api-key（管理端登记 key 或 DUMATE2API_KEY）'
+      : '✓ 鉴权强制开启：模型端点要求管理端登记的 API key（DUMATE_REQUIRE_KEY 已废除，无需设置）');
+    try {
+      if (!keysvc.list().length) {
+        log('⚠ 当前没有任何登记 key：所有模型请求都会 401。到管理端「API Key」页创建一把再使用。');
       }
-    }
+    } catch (e) { /* keys.json 读不到不影响启动 */ }
     if (!cors.allowlistSize()) {
       log('· CORS 默认关闭（浏览器跨域请求将在 preflight 被拒）；如需放行请设 DUMATE_CORS_ORIGINS=http://localhost:xxxx（逗号分隔，支持 *.example.com）');
     }
@@ -2324,8 +2324,8 @@ async function start() {
     log('  Health:    http://127.0.0.1:' + PROXY_PORT + '/health');
     log('');
     log('cc-switch configuration:');
-    log('  Claude Code: Base URL = http://127.0.0.1:' + PROXY_PORT + (REQUIRE_KEY ? ', API Key = <你的 DUMATE2API_KEY 或登记 key>' : ', API Key = nokey'));
-    log('  Codex:       Base URL = http://127.0.0.1:' + PROXY_PORT + '/v1' + (REQUIRE_KEY ? ', API Key = <你的 DUMATE2API_KEY 或登记 key>' : ', API Key = nokey'));
+    log('  Claude Code: Base URL = http://127.0.0.1:' + PROXY_PORT + ', API Key = <管理端登记的 key 或 DUMATE2API_KEY>');
+    log('  Codex:       Base URL = http://127.0.0.1:' + PROXY_PORT + '/v1, API Key = <管理端登记的 key 或 DUMATE2API_KEY>');
   });
 }
 

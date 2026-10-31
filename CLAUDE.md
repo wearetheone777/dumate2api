@@ -1624,7 +1624,7 @@ discovery；鉴权固定 `Bearer nokey`。排障第一入口是
 
 **模型名兜底是唯一可行的容错，也是最容易静默吞模型的闸。** 上游接受的模型名远不止三个（`dm-auto-model/text.L0/L1/L2` 三档已登记，见下文「搭子的真实模型」节），但 `mapModel` 查不到一律回落 `fallback`（默认 `model-text`）——**任何新模型名必须显式登记进 `data/model-map.json` 的 `aliases`，否则被静默兜底且响应 200 无从察觉**。改 `fallback` 会影响全部未知模型名。注意它与 router 的 `unknown_channel` 是两道不同的闸：router 拦「带斜杠的未知前缀」，mapModel 兜「无前缀/已认领前缀的未知名字」。
 
-**`DUMATE2API_KEY` 是死变量。** `src/server.js` 顶部把它读进 `API_KEY`，但代码里从未参与任何校验（可以 grep `API_KEY` 确认只有那一处赋值）。真正的鉴权开关是 `DUMATE_REQUIRE_KEY=1` + `data/keys.json`。（README 已加说明标注它是历史遗留。）
+**`DUMATE2API_KEY` 与 `DUMATE_REQUIRE_KEY` 的现状（2026-11-01）**：`DUMATE2API_KEY` 已接线（命中 env 密钥或任一登记 key 即放行）；`DUMATE_REQUIRE_KEY` 则**因鉴权强制而废除**——「不鉴权」形态已删除，模型端点一律要求 key，设 0/1 都不改变行为（显式设 0 时启动日志告警）。`stable/` 旧快照仍认 `DUMATE_REQUIRE_KEY=1`，所以启动脚本里的设置保留（对新主分支代码无害）。
 
 **`model_allowlist` 只在配了白名单时才读请求体。** 网关鉴权段先判断 `key.model_allowlist` 非空才预读 body 取 `model`——否则给默认路径凭空加一次完整读取。结果存 `req._rawBody`，`readBody` 直接复用，**流只能读一次，重复读会拿到空串**。Google 路径的模型名在 URL 里，走正则从路径提取。
 
@@ -1669,7 +1669,7 @@ per-key 限流（低价值场景）。
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `DUMATE2API_PORT` / `DUMATE2API_HOST` | `9080` / `127.0.0.1` | 网关监听 |
-| `DUMATE_REQUIRE_KEY` | 未设（关闭） | 设为 `1` 才对模型端点校验 `data/keys.json` |
+| `DUMATE_REQUIRE_KEY` | 已废除 | **鉴权已强制**（2026-11-01），无 key 的模型请求一律 401；设 `0` 不再改变行为，仅启动日志告警。旧快照 `stable/` 仍认 `=1` |
 | `DUMATE_ADMIN_PORT` / `DUMATE_ADMIN_HOST` | `9081` / `127.0.0.1` | 管理端监听 |
 | `DUMATE_ADMIN_DATA` | `<repo>/data` | 覆盖数据目录（管理端与网关必须一致） |
 | `DUMATE_MIN_MAX_TOKENS` / `DUMATE_MAX_MAX_TOKENS` | `65536` / `131072` | 输出预算钳制区间（`0` 关闭下限策略） |
@@ -1745,7 +1745,7 @@ per-key 限流（低价值场景）。
 |---|---|
 | `keys.json` | API key，**存 sha256（校验用）+ plain 明文**（2026-11-01 起管理端可随时查看复制；旧策略「明文仅创建时返回一次」已废，启用前创建的旧 key 明文无法回填，界面标「明文未存」） |
 | `model-map.json` | `aliases` / `upstream_models` / `exposed` / `fallback` |
-| `admin-users.json` | 管理员口令（scrypt，N=2^18）与 `session_version` |
+| `admin-users.json` | 管理端账户表（多账户，2026-11-01 起）：`{ username: {username, role: admin/viewer, hash(scrypt N=2^18), session_version} }` |
 | `admin.secret` | 会话签名密钥，与用户表分开存 |
 | `admin-audit.jsonl` | 管理操作审计 |
 | `requests.jsonl` | 网关埋点，超 32MB 轮转一次留 `.1` |
@@ -1818,7 +1818,7 @@ traework 的区域约束落在**账号池选择**（`accountsForRegion`，send �
 模型名不编码区域，约束只能落在这里；qoder 的 intl 映射到 global 术语，
 traework intl → 明确「未接入」503）。无 model 字段的工具端点按路径归通道
 （搜索/语音润色/文件上传=千问、媒体=搭子），否则区域 key 可绕过判定。
-**区域约束只在 `DUMATE_REQUIRE_KEY=1` 时生效**（不开开关 key 完全不校验）。
+**区域约束随鉴权强制生效**（2026-11-01 起鉴权恒开，不存在未校验形态）
 预留六把 key：dumate / qwenwork / qoder-cn / qoder-intl / traework-cn /
 traework-intl（明文已交付；traework-intl 是真预留——国际链路未接入，
 用时明确报错）。搭子与千问**没有国际版**（纯国内产品）。

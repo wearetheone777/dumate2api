@@ -1,4 +1,5 @@
-// src/admin/routes/auth.js - 登录 / 登出 / 当前用户 / 踢会话
+// src/admin/routes/auth.js - 登录 / 登出 / 当前用户 / 多账户管理 / 踢会话
+const crypto = require('crypto');
 const auth = require('../auth');
 const { clientIP } = require('../iputil');
 const { sendJSON } = require('../router');
@@ -100,6 +101,122 @@ const routes = [
       return sendJSON(res, 200, { ok: true });
     },
   },
+
+  // ==================== 多账户管理（2026-11-01）====================
+  // admin-users.json 本来就是 { username: {username, role, hash, ...} } 的
+  // 多账户结构（bootstrap 只生成了 admin 一个），这里补上管理接口。
+  // 写操作的 admin-only 由 router 层统一强制（非 GET 一律 admin）。
+
+  {
+    method: 'GET',
+    path: '/auth/users',
+    handler: ({ res, user }) => {
+      // 账户管理是 admin 的页面：viewer 没有需要看用户列表的场景
+      // （写操作已被 router 层挡掉，这里把读也挡掉，界面不半开）
+      if (user.role !== 'admin') return sendJSON(res, 403, { error: 'admin_only' });
+      const data = auth.users() || {};
+      const users = Object.values(data)
+        .map((u) => ({ username: u.username, role: u.role, created_at: u.created_at }))
+        .sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+      return sendJSON(res, 200, { users, me: user.username });
+    },
+  },
+  {
+    method: 'POST',
+    path: '/auth/users',
+    handler: ({ res, body, user }) => {
+      const username = String((body && body.username) || '').trim();
+      const password = String((body && body.password) || '');
+      const role = String((body && body.role) || 'viewer');
+      const problem = userFieldsProblem(username, password, role);
+      if (problem) return sendJSON(res, 400, { error: problem });
+
+      const data = auth.users() || {};
+      if (data[username]) return sendJSON(res, 400, { error: `用户 ${username} 已存在` });
+      data[username] = {
+        username,
+        role,
+        hash: auth.makeHash(password),
+        created_at: Date.now(),
+        session_version: 0,
+      };
+      auth.saveUsers(data);
+      auth.audit(user.username, 'user_create', username, `role=${role}`);
+      return sendJSON(res, 200, { username, role });
+    },
+  },
+  {
+    method: 'PATCH',
+    path: '/auth/users/:username',
+    handler: ({ res, body, user, params }) => {
+      const target = params[0];
+      const data = auth.users() || {};
+      if (!data[target]) return sendJSON(res, 404, { error: '用户不存在' });
+
+      const patch = body || {};
+      const password = patch.password !== undefined ? String(patch.password) : undefined;
+      const role = patch.role !== undefined ? String(patch.role) : undefined;
+      if (password !== undefined && password.length < 8) {
+        return sendJSON(res, 400, { error: '密码至少 8 位' });
+      }
+      if (role !== undefined && !['admin', 'viewer'].includes(role)) {
+        return sendJSON(res, 400, { error: 'role 只能是 admin / viewer' });
+      }
+      // 最后一个 admin 不能被降级成 viewer——包括**自己降自己**（自降后
+      // currentUser 读实况角色，会话立刻失去写权限，系统失去管理能力且
+      // 无法自救）。先创建另一个 admin 再降级。
+      if (role === 'viewer' && data[target].role === 'admin') {
+        const admins = Object.values(data).filter((u) => u.role === 'admin');
+        if (admins.length <= 1) {
+          return sendJSON(res, 400, { error: '不能降级最后一个管理员：先创建另一个 admin' });
+        }
+      }
+      if (role !== undefined) data[target].role = role;
+      if (password !== undefined) {
+        data[target].hash = auth.makeHash(password);
+        // 改密即踢会话：旧 token 带着旧 session_version，立刻失效
+        data[target].session_version = (data[target].session_version || 0) + 1;
+      }
+      auth.saveUsers(data);
+      auth.audit(user.username, 'user_update', target,
+        `${role !== undefined ? `role=${role} ` : ''}${password !== undefined ? 'password=**' : ''}`.trim());
+      return sendJSON(res, 200, { username: target, role: data[target].role });
+    },
+  },
+  {
+    method: 'DELETE',
+    path: '/auth/users/:username',
+    handler: ({ res, user, params }) => {
+      const target = params[0];
+      if (target === user.username) {
+        return sendJSON(res, 400, { error: '不能删除当前登录的账户' });
+      }
+      const data = auth.users() || {};
+      if (!data[target]) return sendJSON(res, 404, { error: '用户不存在' });
+      // 最后一个 admin 不能删：删掉后系统失去管理能力且无法自救
+      if (data[target].role === 'admin') {
+        const admins = Object.values(data).filter((u) => u.role === 'admin');
+        if (admins.length <= 1) {
+          return sendJSON(res, 400, { error: '不能删除最后一个管理员' });
+        }
+      }
+      delete data[target];
+      auth.saveUsers(data);
+      auth.audit(user.username, 'user_delete', target);
+      return sendJSON(res, 200, { ok: true });
+    },
+  },
 ];
 
-module.exports = { routes, setSessionCookie, clearSessionCookie };
+// ---- 多账户的字段校验（纯函数，便于离线测试）----
+const USERNAME_RE = /^[a-zA-Z0-9_-]{2,32}$/;
+function userFieldsProblem(username, password, role) {
+  if (!USERNAME_RE.test(username)) {
+    return '用户名须为 2-32 位字母/数字/下划线/连字符';
+  }
+  if (String(password || '').length < 8) return '密码至少 8 位';
+  if (!['admin', 'viewer'].includes(role)) return 'role 只能是 admin / viewer';
+  return null;
+}
+
+module.exports = { routes, setSessionCookie, clearSessionCookie, userFieldsProblem };

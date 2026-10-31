@@ -11,17 +11,18 @@
           网关鉴权已开启：所有模型请求必须带已登记的 API key
         </span>
         <span v-else-if="data?.require_key === false">
-          网关鉴权当前<span class="font-medium">关闭</span>：任何来源无需 key 即可调用
+          网关鉴权当前<span class="font-medium">关闭</span>：运行的还是旧版网关（新版已强制鉴权）
         </span>
         <span v-else>网关不在线，鉴权状态未知</span>
       </template>
       <template #description>
         <span v-if="data?.require_key">
-          状态探测自网关进程（/health 的 require_key），关闭鉴权需要重启网关并去掉该环境变量。
+          状态探测自网关进程（/health 的 require_key）。鉴权已强制开启、无法关闭；
+          没有登记 key 时所有模型请求都会 401。
         </span>
         <span v-else-if="data?.require_key === false">
           本页的 key 与白名单已生效保存，但只有开启鉴权后才会被校验。
-          开启方式：停止网关后用环境变量 <code>DUMATE_REQUIRE_KEY=1</code> 重启。
+          升级网关到最新版后鉴权自动强制开启。
         </span>
         <span v-else>网关进程未启动或不可达，启动后刷新本页。</span>
       </template>
@@ -35,7 +36,7 @@
           <a-tag v-if="isQw" color="cyan" class="ml-2">千问办公</a-tag>
           <a-tag v-else-if="isTw" color="purple" class="ml-2">TRAE Work</a-tag>
         </div>
-        <a-space>
+        <a-space v-if="isAdmin">
           <a-button size="small" @click="ccDlg?.openDialog()">配置到 cc-switch</a-button>
           <a-button type="primary" size="small" @click="openCreate">新建 Key</a-button>
         </a-space>
@@ -66,8 +67,11 @@
             <div class="text-xs text-slate-400 font-mono">
               {{ record.prefix }}…
               <a v-if="record.plain" class="ml-1" @click="openView(record)">查看</a>
-              <a-tooltip v-else title="明文未存：此 key 创建于明文记录启用前，无法回填，需要查看请重建">
+              <a-tooltip v-else-if="isAdmin" title="明文未存：此 key 创建于明文记录启用前，无法回填，需要查看请重建">
                 <span class="ml-1 text-slate-500 cursor-default">明文未存</span>
+              </a-tooltip>
+              <a-tooltip v-else title="完整 key 只有管理员能查看">
+                <span class="ml-1 text-slate-500 cursor-default">仅管理员可见</span>
               </a-tooltip>
             </div>
           </template>
@@ -120,13 +124,14 @@
           </template>
           <template v-else-if="column.key === 'action'">
             <a-space>
-              <a-button type="link" size="small" @click="openEdit(record)">编辑</a-button>
+              <a-button v-if="isAdmin" type="link" size="small" @click="openEdit(record)">编辑</a-button>
               <a-switch
+                v-if="isAdmin"
                 size="small"
                 :checked="record.enabled"
                 @change="(v: boolean) => toggle(record, v)"
               />
-              <a-popconfirm title="删除后无法恢复，使用该 key 的客户端会立即失败" @confirm="remove(record)">
+              <a-popconfirm v-if="isAdmin" title="删除后无法恢复，使用该 key 的客户端会立即失败" @confirm="remove(record)">
                 <a-button type="link" size="small" danger>删除</a-button>
               </a-popconfirm>
             </a-space>
@@ -136,7 +141,7 @@
 
       <!-- 空态交给表格自带的 "No data"：再叠一个 a-empty 会并排出现两个空提示 -->
       <div v-if="!data?.keys.length" class="hint-text mt-2">
-        还没有 API Key。点右上角「新建 Key」签发第一把。
+        还没有 API Key。{{ isAdmin ? '点右上角「新建 Key」签发第一把。' : '请联系管理员创建。' }}
       </div>
     </a-card>
 
@@ -243,6 +248,7 @@ import { App as AntApp } from 'ant-design-vue'
 import dayjs, { type Dayjs } from 'dayjs'
 import client from '@/api/client'
 import { channelStore, isTraework, isQwenwork, isQoder, channelLabel } from '@/stores/channel'
+import { isAdmin } from '@/stores/auth'
 import type { ApiKey, KeysData } from '@/api/keys'
 
 const data = ref<KeysData | null>(null)

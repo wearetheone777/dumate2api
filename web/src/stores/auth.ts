@@ -1,4 +1,4 @@
-import { reactive } from 'vue'
+import { computed, reactive } from 'vue'
 import client from '@/api/client'
 
 export interface User {
@@ -27,3 +27,8 @@ export const auth = reactive({
     this.user = null
   },
 })
+
+// viewer 是只读角色：非 GET 的管理操作服务端一律 403，前端据此隐藏
+// 写按钮（服务端过滤才是权威，这里只是别让用户点到必然失败的按钮）。
+// 独立导出而不是挂在 auth 上——reactive 字面量内自引用会让 TS 推导失败。
+export const isAdmin = computed(() => auth.user?.role === 'admin')

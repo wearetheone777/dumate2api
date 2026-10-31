@@ -1,5 +1,5 @@
 // src/admin/router.js - /api/admin/* 路由分发（对应参考 main.py 的 include_router）
-const { currentUser } = require('./auth');
+const { currentUser, audit } = require('./auth');
 
 const routes = [];
 
@@ -92,6 +92,15 @@ async function handle(req, res, pathname) {
   if (!hit.route.public) {
     const user = currentUser(req);
     if (!user) return unauthorized(res);
+    // 角色强制（2026-11-01 多账户）：viewer 是只读角色——**所有**非 GET 的
+    // 管理操作一律 admin，集中在这里判定而不是让几十条路由各自记得判。
+    // 一刀切的依据：管理端没有「viewer 也该能写」的场景（签到/改配置/发
+    // 消息全部消耗资源或改状态）；具体路由需要放开时在 route 上加
+    // `write: true` 白名单即可。
+    if (req.method !== 'GET' && user.role !== 'admin' && !hit.route.write) {
+      audit(user.username, 'forbidden_write', pathname, `role=${user.role}`);
+      return sendJSON(res, 403, { error: 'admin_only' });
+    }
     req.user = user;
   }
 

@@ -96,14 +96,19 @@ const routes = [
   {
     method: 'GET',
     path: '',
-    handler: async ({ res, req }) => {
+    handler: async ({ res, req, user }) => {
       const usage = usageByKey(30);
+      // plain 是敏感信息（2026-11-01 多账户）：只给 admin。viewer 的会话
+      // 虽然能看 key 列表（名称/前缀/用量），但完整明文一律置 null——
+      // 过滤必须落在服务端，前端藏按钮挡不住直接 curl。
+      const isAdmin = !!user && user.role === 'admin';
       // 通道过滤：管理端切到千问时只列与千问相关的 key
       // （channel 为 qwenwork，或未限定通道的通用 key）
       const chRaw = decodeURIComponent((req.url.match(/[?&]channel=([^&]*)/) || [])[1] || '');
       const ch = normalize(chRaw);
       let list = keysvc.list().map((k) => ({
         ...k,
+        plain: isAdmin ? (k.plain || null) : null,
         usage: usage[k.id] || { requests: 0, total_tokens: 0, failed: 0, last_at: 0, channels: {} },
       }));
       if (ch) list = list.filter((k) => !k.channel || k.channel === ch);
