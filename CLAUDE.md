@@ -738,6 +738,17 @@ CustomModel 声明决定」自洽。想提升推理深度只能靠提示词。**
 同款结论**（见下文「is_reasoning 是硬编码的 false」），Qoder 是四条通道里唯一支持
 请求级档位的。
 
+**TRAE Remote 链路已通（2026-11-01，P2-16 最小版，默认关）。**
+`DUMATE_TRAEWORK_REMOTE=1` 时 **auto 档纯文本请求**走 remote
+（`trae-api-cn.mchost.guru/api/remote/v1`），带 tools 与显式模型名继续走
+utils_chat（工具矩阵与 manual 策略未实现，边界刻意收窄）。三条实测铁律：
+① 事件流终结判据是 `event:done`，**没有 `data:[DONE]` 哨兵**；② `plan_item`
+的 thought/reasoning_content 是**累积快照**不是增量，翻译层要快照/增量双判
+（判错=复读机）；③ 逐轮账单在这条链路上**真实可查**——拿创建会话返回的
+`message_id` 查 `get_session_usage` 返回真实 `amount_float`，P0-7 保留的
+`parseSessionUsage` 由此激活，计费自检自动切精确口径。实现见
+`src/traework/remote.js`，单测 `test/unit/trae-remote.test.js`。
+
 **TRAE（llm_utils_chat）的错误形态实测（2026-10-30）——错误码分类按实测过的做，别照抄 raw 链路的码表。**
 trae2api-hub 的码表（1001/4001/4015/4019/4023/3003）是 agent/v3 业务码体系，但
 **我们链路上实测只出现两种形态**：
@@ -1347,6 +1358,7 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `POST /v1/search/web` | 千问联网搜索（`src/qwenwork/search.js`）：`{query, allowed_domains?, blocked_domains?}` → `{items:[{title,link,snippet,publishedTime,hostname}]}`。**通道专属**，不占用 `/v1/images/*`（那是搭子的生图） |
 | `POST /v1/search/images` | 千问图搜：`{query, count 1~10}` → `{items:[{imageUrl,...}]}` |
 | `POST /v1/files/upload` | 千问 barn 附件上传：`{name, content_base64, mime_type?}` → `{path, file_uuid, reference_note?}`。file_uuid 由 ACP 会话下发，当前 HTTP 链路拿不到时如实 null |
+| `POST /v1/voice/polish` | 千问语音润色（`{text}` → `{text}`）：把 ASR 转写润色成可直接发送的话。**真机 401（端点疑似按账号/灰度开放）**，协议取证自解包（纯 Bearer、`<transcription>` 包裹、响应十个文本候选位），上游开放即用 |
 | `POST /v1/responses` 或 `/responses` | 全量翻译（Responses ↔ Chat），Codex CLI 0.155+ 只认 `wire_api="responses"` |
 | `POST /v1/messages` 或 `/messages` 或 `/api/v1/messages` | 全量翻译 Anthropic ↔ OpenAI |
 | `POST .../count_tokens` | `字符数/4` 估算（`String.length`，汉字与 ASCII 同等计 1），仅供客户端算上下文预算 |
@@ -1446,16 +1458,20 @@ Responses / Anthropic / Google）都能用，流式/非流式/工具调用全部
 
 **工具类网关 `/gateway/v2/tools/dumate/*` 用同一份凭证**（2026-10-31 实测）：生图 `image_generate_v3/async`（提交 POST + 查询 GET `?task_id=`）、TTS
 `t2a_v2/sync`、视频 `video_generate/async`、BOS 上传
-`appbuilder.baidu.com/v2/tools/bos/upload`。**生图与 TTS 已暴露成网关端点**
-（`src/media.js` + `POST /v1/images/generations` / `POST /v1/audio/speech`）：
+`appbuilder.baidu.com/v2/tools/bos/upload`。**生图 / TTS / 视频已暴露成网关端点**
+（`src/media.js` + `POST /v1/images/generations` / `POST /v1/audio/speech` / `POST /v1/videos/generations`）：
 
 - 凭证复用 `web-pool`（同一套选号/冷却/熔断），不要另建 token 缓存。
 - 生图是**异步任务**：提交拿 `task_id` → 同路径 GET 轮询到 `imageUrls`。
   默认 `dumate-image2.2`（v3 端点），另有 2.1 / 1.2 / 0.1 三套端点。
 - TTS 走 minimax `t2a_v2/sync`，`output_format=url` 拿链接后**下载成字节**
   再回给客户端（OpenAI 的 speech 语义是二进制，不是链接）。
-- 视频生成仍未接入（分镜/首尾帧/对白链路长），排期见
-  `docs/FUSION-BACKLOG-2026-10-31.md`。
+- 视频生成已接入文生视频最小版（2026-11-01）：`POST /v1/videos/generations`，
+  模型 `dumate-video2.9`/`3.0`，实测提交到出片 ~20s。请求形状经**探测循环**定案
+  （`model_parameters` 必填、`prompt` 顶层与内层双写——哪处被上游消费未实测，
+  同值无害）；终态判据 `task_status:"succeed"` + `task_result.videos[].url`。
+  轮询超时回 504 + taskId（任务在上游继续）。分镜/首尾帧/对白
+  （`video_elements/async`）未做，见 `docs/FUSION-BACKLOG-2026-10-31.md` §13。
 
 **搭子的只读查询接口在 `www.dumate.cn`，不是模型网关**（2026-10-31 实测定案，
 `src/dumate-web-api.js` + `src/admin/routes/dumate.js`）。清单里记的
@@ -1695,9 +1711,13 @@ per-key 限流（低价值场景）。
 | `DUMATE_DESENSITIZE` | 未设（关闭） | 设 `1` 开启系统提示词合规词零宽空格脱敏（词表 `data/desensitize-words.txt`，见 prompt-guard.js） |
 | `DUMATE_TOOL_OUTPUT_CAP` | 未设（关闭） | 历史 role:'tool' 输出超过此字符数截断并标注原始长度（0/未设关闭） |
 | `DUMATE_TRAEWORK_CONNECT_TIMEOUT_MS` | `10000` | TRAE 基址候选轮转的连接超时（tnc.js 候选链；黑洞主机不占满 600s） |
+| `DUMATE_TRAEWORK_REMOTE` | 未设（关闭） | 设 `1` 开启 TRAE Remote 链路（auto 档纯文本；见「TRAE Remote 链路已通」节）。utils_chat 仍是默认主力 |
+| `DUMATE_TRAEWORK_REMOTE_CONNECT_MS` / `_FIRST_EVENT_MS` | `15000` / `120000` | Remote 建会话连接超时 / 首模型事件超时（排队与心跳帧不算模型活动） |
 | `DUMATE_DUMATE_CAPS_FILE` | 未设 | 搭子按模型 max_tokens 上限学习表的落盘路径覆盖（测试用） |
 | `DUMATE_MEDIA_POLL_TIMEOUT_MS` | `120000` | 生图异步任务的轮询总超时（ms），超时回 504 |
 | `DUMATE_MEDIA_POLL_INTERVAL_MS` | `1500` | 生图轮询间隔（ms） |
+| `DUMATE_MEDIA_VIDEO_POLL_TIMEOUT_MS` | `900000` | 视频生成轮询总超时（ms）——视频是分钟级任务，与生图的 120s 分开。超时回 504 + taskId，任务在上游继续 |
+| `DUMATE_MEDIA_VIDEO_POLL_INTERVAL_MS` | `10000` | 视频轮询间隔（ms） |
 | `DUMATE_QWENWORK_COSY_VERSION` | `1.1.71` | 千问的 cosy 版本（进 payload 与请求头，2026-10-31 对齐官方 1.4.0）。上游做版本门时可覆盖回退 |
 | `DUMATE_QWENWORK_IDE_VERSION` / `_RELEASE_VERSION` / `_BUILD` | `1.4.0` / `1.4.0-26102705` / `26102705` | 千问客户端身份（进 `X-QwenWork-*` 头）。release 与 build **必须成对改**（build 由 release 派生） |
 | `DUMATE_QWENWORK_OS_HEADERS` | 未设（发送） | 设 `0` 关闭 `X-QwenWork-*` 六个身份头（排障对照用） |

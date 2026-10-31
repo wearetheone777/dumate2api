@@ -343,7 +343,105 @@ check('errtext：112/110/430 翻译成人话（含多层转义形态），普通
 });
 
 console.log('');
-console.log('== 3d. FEFO（最早到期优先）：pool 的 expiring 过滤（临期积分先烧掉）==');
+console.log('== 3d. 客户端渲染错误码与审核拒绝（2026-11-01，对齐 qoder2api-hub 风控 §7.4）==');
+// 词表与语义的证据边界：
+//   审核拒绝 = hub 源码实测（DataInspectionFailed 家族，确定性拒绝）；
+//   100401/100403 = hub §7.4 明确语义「鉴权/权限拒绝」；
+//   103 = 本项目实测「Duplicate request」（签名字节判重）；
+//   115-119/122/80411/80412/100400 = hub 只列码值、无公开语义——只验
+//   「fail loudly + 不惩罚 + 不换号」，不验证任何编造的含义。
+const AUDIT_MSG = 'qoder 500: {"code":"InternalError.Algo.DataInspectionFailed","message":"Input text data may contain inappropriate content."}';
+check('审核拒绝：classify 认出（kind null 不惩罚 + policy 标志），5xx 包裹也不进 breaker', () => {
+  const c = classify({ status: 500, message: AUDIT_MSG });
+  assert.strictEqual(c.kind, null);
+  assert.strictEqual(c.policy, true);
+  assert.strictEqual(c.deterministic, true);
+  // HTTP 200 帧内形态（payloadError 认成 500 的串）同样认出
+  assert.strictEqual(classify({ status: 0, message: 'qoder 500: InternalError.Algo.DataInspectionFailed: Input text data may contain inappropriate content.' }).policy, true);
+});
+check('审核拒绝：不换号（同一份 body 换哪个号都拒）', () => {
+  assert.strictEqual(qoderIndex.retryable(500, AUDIT_MSG), false);
+  assert.strictEqual(qoderIndex.retryable(0, 'ContentFilter: sensitive'), false);
+});
+check('审核拒绝：喂池 400（不熔断、不冷却账号）', () => {
+  const pool = createPool({ file: null });
+  pool.noteError('qoder:a1', classify(qoderIndex.poolInfoOf({ statusCode: 500, message: AUDIT_MSG }, 'gfmodel')));
+  const st = pool.status('qoder:a1');
+  assert.strictEqual(st.cool_kind, '', '不得进任何冷却');
+  assert.strictEqual(st.breaker_fails, 0, '不得计熔断');
+});
+check('100401/100403 映射到既有 401/403 处置（hub §7.4：鉴权/权限拒绝）', () => {
+  const f401 = qoderIndex.frameThrown({ code: 100401, message: 'token rejected' });
+  assert.strictEqual(f401.code, 401);
+  assert.ok(f401.message.includes('100401'), '原始码要保留在 message 里');
+  const f403 = qoderIndex.frameThrown({ code: '100403', message: 'org restricted' });
+  assert.strictEqual(f403.code, 403);
+  assert.ok(/无权限/.test(f403.message), '403 的 message 带「无权限」锚让 retryable 认出可换号');
+  assert.strictEqual(qoderIndex.retryable(403, f403.message), true);
+  // 喂池：100401 → session_dead 防误杀计数；100403 走 403 既有分支
+  const c401 = classify(qoderIndex.poolInfoOf({ statusCode: 401, message: f401.message }, 'gfmodel'));
+  assert.strictEqual(c401.kind, 'session_dead');
+});
+check('无语义渲染码（115/80411/100400）：fail loudly + 400 + 不惩罚 + 不换号', () => {
+  // <400：payloadError 认不出（旧代码整帧静默转发 → 200 + 空回答）
+  const f115 = qoderIndex.frameThrown({ code: '115', message: 'limit' });
+  assert.strictEqual(f115.code, 400);
+  assert.strictEqual(f115.opaqueCode, '115');
+  assert.ok(f115.message.includes('115'));
+  // ≥400：payloadError 认得出 code，但 statusCode 80411 非法（writeHead 会炸）
+  const f80411 = qoderIndex.frameThrown({ code: 80411, message: 'risk' });
+  assert.strictEqual(f80411.code, 400);
+  assert.strictEqual(f80411.opaqueCode, '80411');
+  for (const f of [f115, f80411]) {
+    assert.strictEqual(qoderIndex.retryable(400, f.message), false, '官方对渲染码是弹错误不重试');
+    const c = classify(qoderIndex.poolInfoOf({ statusCode: 400, message: f.message }, 'gfmodel'));
+    assert.strictEqual(c.kind, null, '语义未知宁可少惩罚');
+  }
+  // 120/121 不在 hub 清单里：不得识别（也不得误伤普通数字）
+  assert.strictEqual(qoderIndex.frameThrown({ code: '120', message: 'x' }).opaqueCode, undefined);
+});
+check('103 判重：429 + 可换号 + 5 秒短冷却（请求级问题不罚账号）', () => {
+  const f = qoderIndex.frameThrown({ code: '103', message: 'Duplicate request' });
+  assert.strictEqual(f.code, 429);
+  assert.strictEqual(f.dupRequest, true);
+  assert.strictEqual(qoderIndex.retryable(429, f.message), true);
+  const info = qoderIndex.poolInfoOf({ statusCode: 429, message: f.message, dupRequest: true }, 'gfmodel');
+  assert.strictEqual(info.status, 429);
+  assert.ok(info.retryAfterMs > 0 && info.retryAfterMs <= 10000, '短冷却，实际 ' + info.retryAfterMs);
+  const c = classify(info);
+  assert.strictEqual(c.kind, 'soft');
+  assert.strictEqual(c.retryAfterMs, info.retryAfterMs, '钉时长透传');
+});
+check('statusCode 钳制：80411/100401 压回合法 HTTP 范围（writeHead 不再炸）', () => {
+  assert.strictEqual(qoderIndex.httpStatusOf(80411), 400);
+  assert.strictEqual(qoderIndex.httpStatusOf(100401), 400);
+  assert.strictEqual(qoderIndex.httpStatusOf(406), 406, '合法码原样');
+  assert.strictEqual(qoderIndex.httpStatusOf(403), 403);
+  assert.strictEqual(qoderIndex.httpStatusOf(112), 112, '<400 的合法数字原样（额度帧在 frameThrown 里映射）');
+  const e = qoderIndex.thrownFrameErr({ code: 80411, message: 'risk' });
+  assert.strictEqual(e.statusCode, 400);
+  const e2 = qoderIndex.thrownFrameErr({ code: 100403, message: 'x' });
+  assert.strictEqual(e2.statusCode, 403, '鉴权映射先于钳制');
+});
+check('errtext：审核拒绝翻成人话（含转义形态），重翻不套娃', () => {
+  const t = errtext.explainError(AUDIT_MSG);
+  assert.ok(t.includes('内容安全审核'), t);
+  assert.ok(t.includes('换账号无效'), t);
+  // 信封多层转义形态（\\+ 全剥后匹配）
+  assert.ok(errtext.explainError('qoder 500: {\\\\"code\\\\":\\\\"InternalError.Algo.DataInspectionFailed\\\\"}').includes('内容安全审核'));
+  // 重翻不套娃
+  assert.strictEqual(errtext.explainError(t), t);
+  // 普通错误不误翻
+  assert.ok(!errtext.explainError('ECONNRESET').includes('内容安全审核'));
+});
+check('10605 限流与普通 403/5xx 不被审核词表误吃', () => {
+  assert.strictEqual(qoderIndex.retryable(403, THROTTLE_RESOURCE), true);
+  assert.strictEqual(classify({ status: 403, message: THROTTLE_RESOURCE }).kind, 'soft');
+  assert.strictEqual(classify({ status: 403, message: MODEL_GONE }).kind, 'model');
+});
+
+console.log('');
+console.log('== 3e. FEFO（最早到期优先）：pool 的 expiring 过滤（临期积分先烧掉）==');
 check('expiring 非空时候选被限制在集合内（无论游标位置）', () => {
   const pool = createPool({ file: null });
   for (let i = 0; i < 4; i++) {

@@ -28,6 +28,10 @@ const EP_CHAT = '/api/agent/v3/llm_utils_chat';
 const EP_MODELS = '/api/ide/v1/get_detail_param';
 const EP_EXCHANGE = '/cloudide/api/v3/trae/oauth/ExchangeToken';
 const EP_USER_INFO = '/cloudide/api/v3/trae/GetUserInfo';
+// 登录态 + 设备绑定查询（2026-11-01，bluechonk/trae-credential-reverse-engineering
+// 端点清单实测）：回 IsLogin / BoundDeviceID / DeviceBindStatus / ExpiredAt 等。
+// 9074 的诊断入口——不用打对话/签到就能看到上游认为本账号绑的是哪台设备。
+const EP_CHECK_LOGIN = '/cloudide/api/v3/trae/CheckLogin';
 const EP_CHECKIN_STATUS = '/trae/api/v2/ug/checkin_credits/status';
 const EP_CHECKIN_CLAIM = '/trae/api/v2/ug/checkin_credits/claim';
 const EP_ENT_USAGE = '/trae/api/v2/pay/ide_user_ent_usage';
@@ -50,6 +54,25 @@ const EP_PAY_STATUS = '/trae/api/v2/pay/ide_user_pay_status';
 // reply_to_message_id / user_message_id。这是 TRAE 唯一能拿到「单请求扣了多少」
 // 的接口——consumed 前后差值只是推断口径。
 const EP_SESSION_USAGE = '/api/v1/commercial/get_session_usage';
+// ---- Remote 链路（2026-11-01，Trae2api-cn 的 web remote 客户端同款）----
+// BASE 与 utils_chat 同一台网关主机（mchost.guru），路径不同。国际版 remote
+// 基址未实测（hub 只证实 raw 链路的 core-normal.traeapi.us），不预编。
+// 事件流是标准 SSE（event:/data: 行 + [DONE] 哨兵），与 utils_chat 的
+// event:output/done 自定义块不同。
+const REMOTE_BASE_CN = 'https://trae-api-cn.mchost.guru/api/remote/v1';
+const REMOTE_ORIGIN = 'https://solo.trae.cn';
+const REMOTE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
+// ---- 活动领取（2026-11-01，traework2api-panel 实测：5 个真号 × 两个 host 交叉验证）----
+// 三条链路 + 一张清单，全部在国内 ug 网关（国际域没有 ug 接口）：
+//   · info 是活动清单（activity_id / type / Enabled / 起止时间只在这里有）；
+//   · type==103 的裂变奖励**必须带 activity_id 单独领**（传 activity_type 一律 4001）；
+//   · 其余活动走 action：它是唯一回 work_extra（granted/grantable/prize_text）的接口；
+//   · grant_work_benefit 是兜底总入口（服务端按账号可领清单自行发放），覆盖
+//     action 不认的那几类——新人/发消息（send_message_reward）/学生认证/桌面下载。
+const EP_ACTIVITY_INFO = '/trae/api/v2/ug/activity/info';
+const EP_ACTIVITY_ACTION = '/trae/api/v2/ug/activity/action';
+const EP_FISSION_GRANT = '/trae/api/v2/ug/work_fission/grant';
+const EP_GRANT_BENEFIT = '/trae/api/v2/pay/grant_work_benefit';
 
 // ---- 客户端标识 ----
 // 这些值随客户端版本变化。升级 TRAE 后若接口报错，优先核对这几个。
@@ -137,8 +160,10 @@ function request(host, path, { method = 'POST', body = null, headers = {}, timeo
 
 module.exports = {
   AGENT_HOST, AGENT_HOST_INTL, UG_HOST, OAUTH_HOST, CONSOLE_HOST,
-  EP_CHAT, EP_MODELS, EP_EXCHANGE, EP_USER_INFO,
+  EP_CHAT, EP_MODELS, EP_EXCHANGE, EP_USER_INFO, EP_CHECK_LOGIN,
   EP_CHECKIN_STATUS, EP_CHECKIN_CLAIM, EP_ENT_USAGE, EP_SESSION_USAGE, EP_PAY_STATUS,
+  EP_ACTIVITY_INFO, EP_ACTIVITY_ACTION, EP_FISSION_GRANT, EP_GRANT_BENEFIT,
+  REMOTE_BASE_CN, REMOTE_ORIGIN, REMOTE_UA,
   CLIENT_ID, APP_ID, IDE_VERSION, IDE_VERSION_CODE,
   DEVICE_BRAND, OS_VERSION, FUNCTION, DEFAULT_MODEL,
   USER_AGENT, UA_VSCODE, MARKET_CLIENT_ID, APP_VERSION,

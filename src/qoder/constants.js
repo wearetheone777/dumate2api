@@ -35,6 +35,11 @@ const ENDPOINTS = {
     DeviceLoginBase: 'https://qoder.com.cn/device/selectAccounts',
     PollEndpoint: 'https://openapi.qoder.com.cn/api/v1/deviceToken/poll',
     RefreshEndpoint: 'https://openapi.qoder.com.cn/api/v1/deviceToken/refresh',
+    // jobToken 族（2026-11-01，qoder2api-hub：PAT 导入与 jrt- 刷新走这套）。
+    // PAT（pt-，网页版「设置 → Personal Access Token」签发，长期）在
+    // SSO 强制组织下是唯一登录路——设备授权流程会被组织拦。
+    JobExchangeEndpoint: 'https://openapi.qoder.com.cn/api/v1/jobToken/exchange',
+    JobRefreshEndpoint: 'https://openapi.qoder.com.cn/api/v1/jobToken/refresh',
     UserinfoBase: 'https://openapi.qoder.com.cn/api/v1/userinfo',
     PlanEndpoint: 'https://openapi.qoder.com.cn/api/v2/user/plan',
     QuotaEndpoint: 'https://openapi.qoder.com.cn/api/v2/quota/usage',
@@ -59,6 +64,8 @@ const ENDPOINTS = {
     DeviceLoginBase: 'https://qoder.com/device/selectAccounts',
     PollEndpoint: 'https://openapi.qoder.sh/api/v1/deviceToken/poll',
     RefreshEndpoint: 'https://openapi.qoder.sh/api/v1/deviceToken/refresh',
+    JobExchangeEndpoint: 'https://openapi.qoder.sh/api/v1/jobToken/exchange',
+    JobRefreshEndpoint: 'https://openapi.qoder.sh/api/v1/jobToken/refresh',
     UserinfoBase: 'https://openapi.qoder.sh/api/v1/userinfo',
     PlanEndpoint: 'https://openapi.qoder.sh/api/v2/user/plan',
     QuotaEndpoint: 'https://openapi.qoder.sh/api/v2/quota/usage',

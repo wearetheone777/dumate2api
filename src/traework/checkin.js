@@ -397,6 +397,171 @@ function parsePayStatus(d) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// 活动/权益领取（2026-11-01，traework2api-panel 实测结论，清单 P2「活动/邀请积分」）。
+//
+// 与签到的关系：签到领的是 checkin_credits（固定 150）；这里是 commercial
+// 活动——send_message_reward（type 105，实测 500 积分）、新人/学生认证/裂变等。
+// payStatus 的 activities 只给**资格**（eligible/grantable），真正的 activity_id
+// 与有效期只在 activity/info 清单里。
+//
+// 两条纪律（panel 的 ClaimActivities 同款，照抄不猜）：
+//   · 9069/9090/9070 是「现在领不到」而不是错误——记成错误会让调度器每天报警；
+//   · notes 只写「哪条、什么结论」，不写积分数字——响应体里没有可信的到账
+//     额度（与签到不同，这里连 gained 字段都没有）。到账与否用 usage 前后
+//     差值看总量。
+// ---------------------------------------------------------------------------
+
+/** 「现在领不到」的业务码：不是失败，下一轮自然再试 */
+const GRANT_PENDING_CODES = new Set([9069, 9090, 9070]);
+
+/**
+ * 纯函数：activity/info 清单体 → 待领列表。
+ * 过滤掉未启用与不在有效期内的（start/end 为 0 = 不限，panel 同口径）。
+ */
+function parseActivityList(d, nowMs) {
+  const now = Number(nowMs) || Date.now();
+  const list = (d && Array.isArray(d.commercial_activities)) ? d.commercial_activities : [];
+  const out = [];
+  for (const a of list) {
+    if (!a || typeof a !== 'object') continue;
+    const id = String(a.activity_id || '');
+    if (!id) continue;
+    const enabled = typeof a.Enabled === 'boolean' ? a.Enabled : a.enabled === true;
+    if (!enabled) continue;
+    const start = Number(a.start_time_ms) || 0;
+    const end = Number(a.end_time_ms) || 0;
+    if ((start && now < start) || (end && now > end)) continue;
+    const type = Number(a.activity_type) || 0;
+    out.push({ activityId: id, activityType: type, kind: ACTIVITY_KINDS[type] || null });
+  }
+  return out;
+}
+
+/** ug 族 POST 的统一小包装：HTTP 非 200 或 body 不带 code 时如实报错 */
+async function ugPost(auth, ep, body) {
+  let agent;
+  try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
+  const r = await c.request(c.UG_HOST, ep, {
+    method: 'POST', body, headers: ugHeaders(withDevice(auth)), agent,
+  });
+  if (r.status !== 200) {
+    return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+  }
+  const d = (r.data && (r.data.data || r.data)) || {};
+  // code 缺省按 0（成功）——与签到 claim 的判法同口径
+  const code = Number(d.code ?? 0) || 0;
+  return { ok: true, code, message: String(d.message || ''), workExtra: d.work_extra || null, raw: d };
+}
+
+/**
+ * 领取单条活动的结论归一（纯函数，便于离线验证）。
+ * 返回 { state: 'claimed'|'granted'|'pending'|'error'|'noop', prizeText?, error? }
+ *   claimed = 本次领到；granted = 已领过（granted=true + grantable=false，panel 实测）；
+ *   pending = 现在领不到（不报警）；noop = 受理了但没有 work_extra 可报（学生认证实测如此）；
+ *   error   = 真失败。
+ */
+function claimVerdict(code, message, workExtra) {
+  if (code === 0) {
+    // 空对象（{}）与缺失等价：没有 granted/grantable 键就没有可报的结论
+    const we = workExtra && typeof workExtra === 'object'
+      && (workExtra.granted != null || workExtra.grantable != null) ? workExtra : null;
+    if (!we) return { state: 'noop' };
+    if (we.granted === true) {
+      return { state: we.grantable === false ? 'granted' : 'claimed', prizeText: String(we.prize_text || '') || null };
+    }
+    // granted=false：受理但没发（可能 grantable=false 上游没给 granted 的变体）
+    return { state: we.grantable === false ? 'granted' : 'pending' };
+  }
+  if (GRANT_PENDING_CODES.has(code)) return { state: 'pending', error: `code=${code} ${message}`.trim() };
+  return { state: 'error', error: `code=${code} ${message}`.trim() };
+}
+
+/**
+ * 领取当前可领的活动 + 权益（三条链路，panel 同构）。
+ * 返回 { ok, notes: [{activityId, kind, state, prizeText?, error?}], benefit, error? }。
+ * 领不到不是失败（pending 不进 error）；网络/HTTP 层错误单独记但不中断其余链路。
+ */
+async function claimActivities(rawAuth) {
+  const auth = await withFreshToken(rawAuth);
+  const notes = [];
+  let hardError = null;
+  // 清单：拿 activity_id / type / 有效期。失败时其余链路没有入参，直接返回
+  const listR = await ugPost(auth, c.EP_ACTIVITY_INFO, { req_source: 1 });
+  if (!listR.ok) return { ok: false, notes, error: `活动清单: ${listR.error}` };
+  const acts = parseActivityList(listR.raw);
+  for (const act of acts) {
+    // 103 裂变必须带 activity_id 单独领；其余走 action（panel 实测，见 constants 注释）
+    const ep = act.activityType === 103 ? c.EP_FISSION_GRANT : c.EP_ACTIVITY_ACTION;
+    const r = await ugPost(auth, ep, { activity_id: act.activityId, req_source: 1 });
+    if (!r.ok) {
+      notes.push({ ...act, state: 'error', error: r.error });
+      continue;
+    }
+    const v = claimVerdict(r.code, r.message, r.workExtra);
+    notes.push({ ...act, ...v });
+    if (v.state === 'error' && !hardError) hardError = `${act.activityId}: ${v.error}`;
+  }
+  // 兜底总入口：action 不认的那几类（send_message_reward 实测落在这里）
+  const deviceId = (withDevice(auth) || {}).deviceId || '';
+  const b = await ugPost(auth, c.EP_GRANT_BENEFIT, { trae_client: 'Lite', device_id: deviceId });
+  let benefit;
+  if (!b.ok) {
+    benefit = { state: 'error', error: b.error };
+  } else {
+    const v = claimVerdict(b.code, b.message, b.workExtra);
+    // benefit 没有 activity 维度，prize_text 同样透出
+    benefit = { ...v };
+    if (v.state === 'error') hardError = hardError || `权益: ${v.error}`;
+  }
+  return { ok: !hardError, notes, benefit, error: hardError || '' };
+}
+
+/**
+ * 领活动并回写账号（供管理端手动触发与定时任务调用）。
+ *
+ * 前后各取一次余额算总差值（与签到 computeGained 同口径）：活动领取的响应
+ * 不带发放数额，差值是「这次到底到账没有」的唯一可见依据。差值为 0 也如实
+ * 返回——可能是领到的都是「已领过」，也可能是延迟入账，不在这一层粉饰。
+ * 快照失败不影响领取本身（gained 如实 null）。
+ */
+async function claimActivitiesAndSave(rawAuth, authStore, opts = {}) {
+  const auth = await withFreshToken(rawAuth);
+  const before = await usage(auth);
+  const r = await claimActivities(auth);
+  const after = r.ok ? await usage(auth) : null;
+  const creditsBefore = before.ok ? before.remain : null;
+  const credits = after && after.ok ? after.remain : null;
+  const gained = (r.ok && credits != null && creditsBefore != null)
+    ? computeGained(creditsBefore, credits, null)
+    : null;
+  const claimed = r.notes.filter((n) => n.state === 'claimed' || n.state === 'granted');
+  if (r.ok) {
+    const fields = { lastError: '' };
+    if (credits != null) fields.credits = credits;
+    authStore.patch(auth.id, fields);
+    // 只有确实有结论（领到/已领）才记账，全是 pending 的不刷流水
+    if (claimed.length || r.benefit.state === 'claimed' || r.benefit.state === 'granted') {
+      ledger.append({
+        channel: 'traework', account_id: auth.id, account: auth.nickname || auth.uid || '',
+        at: Date.now(), credits: gained, source: 'activity',
+        detail: claimed.map((n) => n.activityId).join(','),
+      });
+    }
+  } else {
+    authStore.patch(auth.id, { lastError: `活动领取失败: ${r.error}` });
+  }
+  return {
+    ok: r.ok,
+    error: r.error || '',
+    notes: r.notes,
+    benefit: r.benefit,
+    creditsBefore,
+    credits,
+    gained,
+  };
+}
+
 /**
  * 算「本次签到实际到账多少」。
  *
@@ -479,4 +644,4 @@ async function checkinAndSave(rawAuth, authStore, opts = {}) {
   };
 }
 
-module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining, parsePacks, payStatus, parsePayStatus, ACTIVITY_KINDS };
+module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining, parsePacks, payStatus, parsePayStatus, ACTIVITY_KINDS, claimActivities, claimActivitiesAndSave, parseActivityList, claimVerdict, GRANT_PENDING_CODES };

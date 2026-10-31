@@ -524,6 +524,22 @@ const routes = [
     },
   },
   {
+    // 导入 PAT（pt- 个人访问令牌）。SSO 强制组织下设备授权会被拦，
+    // PAT 是组织账号的唯一登录路。按 uid upsert：给存量账号补 PAT 走同一条路。
+    method: 'POST',
+    path: '/pat-import',
+    handler: async ({ res, body }) => {
+      const pat = body && body.pat;
+      const region = (body && body.region) || 'cn';
+      if (!pat) return sendJSON(res, 400, { ok: false, error: '缺少 pat' });
+      const r = await session.importPat(pat, region);
+      if (!r.ok) return sendJSON(res, 200, { ok: false, error: r.error });
+      const saved = authStore.upsert(r.account);
+      try { require('../auth').audit('admin', 'qoder_pat_import', String(saved.id), `region=${region} uid=${r.account.uid}`); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: true, account: authStore.list().find((a) => a.id === saved.id) });
+    },
+  },
+  {
     method: 'POST',
     path: '/login/cancel',
     handler: async ({ res, body }) => {

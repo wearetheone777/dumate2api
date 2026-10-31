@@ -198,6 +198,45 @@ function resetPool() {
   check('onModel 上报实际 key', () => assert.strictEqual(gotModel, 'gfmodel', String(gotModel)));
 
   console.log('');
+  resetPool();
+  console.log('== 无语义渲染码与审核拒绝（2026-11-01，对齐 hub 风控 §7.4）==');
+  // 115 < 400：payloadError 认不出，旧代码整帧静默转发 → 200 + 空回答
+  chat.postStream = async (url, body, headers, onChunk) => {
+    onChunk(JSON.stringify({ code: '115', message: 'upstream limit' }));
+    onChunk('[DONE]');
+    return { status: 200, headers: {}, raw: '' };
+  };
+  r = await collect((cb) => qoder.send(PAYLOAD, cb, {}));
+  check('无语义渲染码 115 必须 reject（不静默转发）', () => assert.ok(r.error, '应抛出错误，实际成功返回'));
+  check('115 的 statusCode 压回 400（80411/100401 同理，writeHead 不炸）', () => {
+    assert.strictEqual(r.error.statusCode, 400, String(r.error && r.error.statusCode));
+    assert.ok(r.error.opaqueCode === '115', String(r.error && r.error.opaqueCode));
+  });
+  check('115 不换号（官方对渲染码是弹错误不重试）', () => {
+    // 单账号场景下看 errors 即可；直接验 retryable 语义
+    assert.strictEqual(qoder.retryable(400, r.error.message), false);
+  });
+
+  resetPool();
+  // 审核拒绝：HTTP 500 包着的 DataInspectionFailed —— 旧代码会 5xx 换号 + 熔断
+  chat.postStream = async (url, body, headers, onChunk) => {
+    onChunk(JSON.stringify({
+      code: 'InternalError.Algo.DataInspectionFailed',
+      message: 'Input text data may contain inappropriate content.',
+    }));
+    onChunk('[DONE]');
+    return { status: 200, headers: {}, raw: '' };
+  };
+  r = await collect((cb) => qoder.send(PAYLOAD, cb, {}));
+  check('审核拒绝帧必须 reject 且带人话', () => {
+    assert.ok(r.error, '应抛出错误，实际成功返回');
+    assert.ok(r.error.policy === true, '应有 policy 标志');
+  });
+  check('审核拒绝不换号', () => {
+    assert.strictEqual(qoder.retryable(500, r.error.message), false);
+  });
+
+  console.log('');
   try { pool.close(); } catch (e) { /* 忽略 */ }
   try { fs.unlinkSync(TMP_STATE); } catch (e) { /* 不存在 */ }
   if (failures) { console.log(`${failures} 项失败`); process.exit(1); }

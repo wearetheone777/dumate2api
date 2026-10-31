@@ -25,6 +25,14 @@ const IMAGE_ENDPOINTS = {
 const DEFAULT_IMAGE_MODEL = 'dumate-image2.2';
 const TTS_PATH = '/v2/tools/dumate/t2a_v2/sync';
 const DEFAULT_TTS_MODEL = 'dumate-tts';
+// 视频生成（2026-11-01 真机探测定案）。上游是千帆 AigcVideoTask 的代理，
+// 必填字段靠 400 错误体逐轮吐出：model_parameters 必填、prompt 必填。
+const VIDEO_PATH = '/v2/tools/dumate/video_generate/async';
+const DEFAULT_VIDEO_MODEL = 'dumate-video2.9';
+// 视频生成比生图慢一个量级（实测提交后分钟级 processing），轮询预算单独给。
+// DUMATE_MEDIA_POLL_* 是生图/TTS 共用的，不要混用。
+const VIDEO_POLL_TIMEOUT_MS = Math.max(30000, Number(process.env.DUMATE_MEDIA_VIDEO_POLL_TIMEOUT_MS) || 900000);
+const VIDEO_POLL_INTERVAL_MS = Math.max(1000, Number(process.env.DUMATE_MEDIA_VIDEO_POLL_INTERVAL_MS) || 10000);
 
 const POLL_TIMEOUT_MS = Math.max(5000, Number(process.env.DUMATE_MEDIA_POLL_TIMEOUT_MS) || 120000);
 const POLL_INTERVAL_MS = Math.max(500, Number(process.env.DUMATE_MEDIA_POLL_INTERVAL_MS) || 1500);
@@ -146,6 +154,14 @@ async function withAccount(fn) {
   return { ok: false, ...lastErr };
 }
 
+function normalizeVideoModel(name) {
+  const raw = String(name || '').trim().replace(/^dumate\//, '');
+  // 只认实测存在过的两个模型名（其他名字上游是否可用无证据，不放开）
+  if (raw === 'dumate-video2.9' || raw === 'dumate-video3.0') return raw;
+  const hit = ['dumate-video2.9', 'dumate-video3.0'].find((k) => k.toLowerCase() === raw.toLowerCase());
+  return hit || DEFAULT_VIDEO_MODEL;
+}
+
 function normalizeImageModel(name) {
   const raw = String(name || '').trim().replace(/^dumate\//, '');
   if (IMAGE_ENDPOINTS[raw]) return raw;
@@ -201,6 +217,104 @@ function buildTtsPayload(o = {}) {
       subtitle_enable: false,
       output_format: 'url',
     },
+  };
+}
+
+/**
+ * 构造视频生成请求（纯函数，形状 2026-11-01 真机探测定案）。
+ *
+ * 必填字段是**探测循环**从上游 400 错误体逐轮拿到的（不是猜的）：
+ *   R1 `{query, model}`            → 「字段 'model_parameters' 是必填的」
+ *   R2 `+ model_parameters:{}`     → 「字段 'prompt' 是必填的」
+ *   R3 `+ prompt（两处都带）`       → 200 + task_id
+ * prompt 在顶层与 model_parameters 里**都带**——哪一处被上游真正消费未实测，
+ * 两处同值无害；query 按生图同款保留（对齐工具族形状）。
+ * 可选参数（时长/分辨率/首尾帧）没有探测证据，**不放开**——开了就是赌。
+ *
+ * 返回 `{ model, path, payload }` 或 `{ error }`。
+ */
+function buildVideoPayload(o = {}) {
+  const prompt = String(o.prompt || '').trim();
+  if (!prompt) return { error: 'prompt 不能为空' };
+  const model = normalizeVideoModel(o.model);
+  const payload = {
+    query: prompt,
+    prompt,
+    model,
+    model_parameters: { prompt },
+  };
+  return { model, path: VIDEO_PATH, payload };
+}
+
+/**
+ * 文生视频（异步提交 + 轮询）。视频是分钟级任务，轮询预算独立于生图
+ * （DUMATE_MEDIA_VIDEO_POLL_TIMEOUT_MS，默认 15 分钟）。
+ *
+ * 返回 `{ ok, model, created, data:[{url}], taskId }`。任务在轮询超时后仍会
+ * 继续生成（上游异步），此时如实报 504 + taskId——调用方可以直接拿 taskId
+ * 去轮询，不算钱白花。
+ */
+async function generateVideo(o = {}) {
+  const built = buildVideoPayload(o);
+  if (built.error) return { ok: false, status: 400, error: built.error };
+  const { model, path, payload } = built;
+
+  const r = await withAccount(async (token) => {
+    const sub = await requestJson(token, 'POST', path, payload, 60000);
+    if (sub.status !== 200 || !sub.json) {
+      return { ok: false, status: sub.status || 502, error: textError(sub) };
+    }
+    if (sub.json.code != null && String(sub.json.code) !== '0' && sub.json.code !== 0) {
+      return { ok: false, status: 400, error: sub.json.message || `upstream code ${sub.json.code}` };
+    }
+    const taskId = sub.json.data && sub.json.data.task_id;
+    if (!taskId) return { ok: false, status: 502, error: '上游未返回 task_id' };
+    return pollVideo(token, path, taskId);
+  });
+
+  if (!r.ok) return r;
+  const urls = r.videoUrls || [];
+  if (!urls.length) return { ok: false, status: 502, error: '上游返回成功但没有视频地址' };
+  return { ok: true, model, created: Math.floor(Date.now() / 1000), data: urls.map((url) => ({ url })), taskId: r.taskId };
+}
+
+/**
+ * 视频任务轮询。成功/失败字段是实测过的（task_status: processing → 终态），
+ * 视频地址的字段名以终态响应为准——探测任务完成前先认 videoUrls /
+ * video_urls / data.videoUrls 三个候选位，终态响应到手后在单测里钉死。
+ */
+async function pollVideo(token, path, taskId) {
+  const deadline = Date.now() + VIDEO_POLL_TIMEOUT_MS;
+  let last = null;
+  while (Date.now() < deadline) {
+    const q = await requestJson(token, 'GET', path + '?task_id=' + encodeURIComponent(taskId), null, 30000);
+    if (q.status === 200 && q.json) {
+      last = q.json;
+      const d = q.json.data || q.json;
+      const st = String(d.task_status || q.json.task_status || q.json.status || '').toLowerCase();
+      // 终态形状（2026-11-01 真机实测）：task_status:"succeed" +
+      // task_result.videos[].url。注意是 succeed 不是 success；url 可能每次
+      // 轮询重新签发（BOS 签名 URL），任取一个可用。
+      const result = d.task_result || {};
+      const rawUrls = Array.isArray(result.videos) ? result.videos
+        : (Array.isArray(d.videoUrls) ? d.videoUrls : []);
+      const urls = rawUrls
+        .map((v) => (typeof v === 'string' ? v : String((v && (v.url || v.video_url)) || '')))
+        .filter(Boolean);
+      if (urls.length) return { ok: true, videoUrls: urls, taskId };
+      if (st === 'succeed') {
+        return { ok: false, status: 502, error: '上游任务成功但没有返回视频地址', taskId };
+      }
+      if (/fail|error|reject/.test(st)) {
+        return { ok: false, status: 400, error: `视频生成失败: ${d.task_status_msg || q.json.message || st}`, taskId };
+      }
+    }
+    await sleep(VIDEO_POLL_INTERVAL_MS);
+  }
+  return {
+    ok: false, status: 504,
+    error: `视频生成超时（${Math.round(VIDEO_POLL_TIMEOUT_MS / 1000)}s，任务仍在上游继续）${last ? `，最后状态: ${JSON.stringify(last).slice(0, 160)}` : ''}`,
+    taskId,
   };
 }
 
@@ -317,7 +431,8 @@ function textError(r) {
 }
 
 module.exports = {
-  generateImage, synthesizeSpeech,
-  buildImagePayload, buildTtsPayload, normalizeImageModel,
-  IMAGE_ENDPOINTS, DEFAULT_IMAGE_MODEL, DEFAULT_TTS_MODEL, VOICE_MAP, AUDIO_TYPES,
+  generateImage, synthesizeSpeech, generateVideo,
+  buildImagePayload, buildTtsPayload, buildVideoPayload, normalizeImageModel, normalizeVideoModel,
+  IMAGE_ENDPOINTS, DEFAULT_IMAGE_MODEL, DEFAULT_TTS_MODEL, DEFAULT_VIDEO_MODEL, VOICE_MAP, AUDIO_TYPES,
+  VIDEO_PATH, VIDEO_POLL_TIMEOUT_MS,
 };

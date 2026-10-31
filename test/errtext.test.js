@@ -64,6 +64,23 @@ test('完全陌生的错误原样返回', () => {
   assert.equal(explainError('weird custom failure'), 'weird custom failure');
 });
 
+test('内容审核拒绝翻成人话（2026-11-01，DataInspectionFailed 家族）', () => {
+  const m1 = 'qoder 500: {"code":"InternalError.Algo.DataInspectionFailed","message":"Input text data may contain inappropriate content."}';
+  const t1 = explainError(m1);
+  assert.ok(t1.startsWith('上游内容安全审核未通过'), t1);
+  assert.ok(t1.includes('换账号无效'), t1);
+  assert.ok(t1.includes('DataInspectionFailed'), '原串要保留');
+  // 多层转义形态
+  assert.ok(explainError('x {\\"code\\":\\"DataInspectionFailed\\"} y').includes('内容安全审核'));
+  // ContentFilter / content_policy_rejected 家族
+  assert.ok(explainError('ContentFilter blocked').includes('内容安全审核'));
+  assert.ok(explainError('content_policy_rejected').includes('内容安全审核'));
+  // 重翻不套娃
+  assert.equal(explainError(t1), t1);
+  // 普通错误不误翻
+  assert.ok(!explainError('ECONNRESET').includes('内容安全审核'));
+});
+
 test('normalizeError：翻译一致且截断 200 字', () => {
   assert.equal(normalizeError('aborted'), '上游连接中断（aborted）');
   const long = 'x'.repeat(500);

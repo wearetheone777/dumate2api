@@ -71,3 +71,23 @@ test('TTS：不支持的格式报错', () => {
 test('TTS：空 input 报错', () => {
   assert.ok(media.buildTtsPayload({ input: '' }).error);
 });
+
+// ---- 视频生成（2026-11-01，形状经探测循环从上游 400 错误体逐轮定案）----
+test('buildVideoPayload：探测定案的最小形状（model_parameters 必填 + prompt 两处都带）', () => {
+  const r = media.buildVideoPayload({ prompt: '一只猫' });
+  assert.equal(r.model, 'dumate-video2.9');
+  assert.equal(r.path, '/v2/tools/dumate/video_generate/async');
+  assert.equal(r.payload.prompt, '一只猫');
+  assert.equal(r.payload.query, '一只猫');
+  assert.deepEqual(r.payload.model_parameters, { prompt: '一只猫' });
+  // 无证据的可选参数不放开（时长/分辨率/首尾帧没有探测证据）
+  assert.equal(r.payload.duration, undefined);
+  assert.equal(r.payload.resolution, undefined);
+});
+
+test('buildVideoPayload：空 prompt 拒绝；模型归一只认实测过的两个', () => {
+  assert.equal(media.buildVideoPayload({}).error, 'prompt 不能为空');
+  assert.equal(media.normalizeVideoModel('dumate-video3.0'), 'dumate-video3.0');
+  assert.equal(media.normalizeVideoModel('dumate-video9.9'), 'dumate-video2.9', '未实测的模型名回落默认，不透传赌运气');
+  assert.equal(media.normalizeVideoModel(undefined), 'dumate-video2.9');
+});

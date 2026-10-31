@@ -15,10 +15,11 @@ const authStore = require('./auth');
 const session = require('./session');
 const constants = require('./constants');
 const { normalizeError } = require('../errtext');
-const { isThrottle, unescapeDeep, throttleRetryMs } = require('../upstream-errors');
+const { isThrottle, unescapeDeep, throttleRetryMs, isContentPolicy } = require('../upstream-errors');
 const ledger = require('../checkin-ledger');
 const grants = require('./grants');
 const maxOutput = require('./max-output');
+const clock = require('./clock');
 // 「播报即收尾」（共享判定与缓冲门，见 src/repair.js）
 const repair = require('../repair');
 // 选号接缝（集成阶段）：冷却/熔断/粘性/在途帽统一走池状态机。
@@ -50,6 +51,15 @@ async function warmupModels() {
     if (r && r.ok && r.models && r.models.length) last = r;
     else if (!last.ok) last = r || last;
   }
+  // 时钟偏差自检（hub issue #64）：启动时测一次，超阈值打 WARN——时钟漂移的
+  // 401 与凭证失效形态一致，不在这里看得见就只能靠换凭证瞎试
+  for (const region of new Set(accounts.map((a) => a.region))) {
+    clock.measureSkew(region).then((skew) => {
+      if (clock.shouldWarn(skew)) {
+        console.warn(`[qoder] 机器时间偏差 ${skew > 0 ? '+' : ''}${Math.round(skew)}s（超过 ${clock.WARN_THRESHOLD_S}s 时 COSY 签名会 401，先校时再排查凭证）`);
+      }
+    }).catch(() => { /* 测不出就不报 */ });
+  }
   return last;
 }
 
@@ -60,6 +70,8 @@ function status() {
     // 这条通道没有 wasm 依赖，如实标注（千问的 status 有 wasm 字段）
     needsClient: false,
     accounts: usable.length,
+    // 时钟偏差（缓存直读，status 是同步路径不发请求；null = 还没测过/已过期）
+    clock: { cn: clock.cachedSkewOf('cn'), global: clock.cachedSkewOf('global') },
     error: usable.length ? '' : '尚未添加 Qoder 账号（需先登录一次）',
   };
 }
@@ -81,6 +93,125 @@ function pickAccount() {
 function poolStatusOf(code) {
   const n = Number(code) || 0;
   return n === 105 ? 401 : n;
+}
+
+// ---------------------------------------------------------------------------
+// 客户端渲染错误码的识别（2026-11-01，对齐 qoder2api-hub 风控文档 §7.4）。
+//
+// hub 逆向官方客户端得到的**已渲染错误码清单**：
+//   103/105/110/112/114/115/116/117/118/119/122/406/430/10605/80411/80412/
+//   100400/100401/100403
+// 其中 105/110/112/114/430/10605 已有专门处置（额度/排队/版本门，见上下文）。
+// 剩下的按证据分级处理——**只认清单内的码，120/121 不在清单里，不猜**：
+//
+//   · 100401/100403 → hub 明确语义「鉴权/权限拒绝」，映射到既有 HTTP 401/403
+//     复用既有处置（session_dead 防误杀计数 / 403+无权限文案换号）。
+//   · 103 → 本项目实测语义「Duplicate request」（按签名字节去重，2026-10-31
+//     重签修复的同一机制）。重签后正常路径不再出现；再出现说明有重试竞态，
+//     新签名重试即解，可换号，短冷却（请求级问题不罚账号）。
+//   · 406 → 标准 HTTP 语义（payloadError 本来就认，状态码合法，retryable(406)
+//     = false、池不惩罚）——现状已正确，不动。
+//   · 115/116/117/118/119/122/80411/80412/100400 → **无公开语义**（hub 只列
+//     码值，i18n 里也没有映射）。不编含义，只做两件有据的事：
+//       1. 帧识别 fail loudly——这些码 <400 时 payloadError 不认，整帧会被当
+//          正常数据静默转发（「200 + 空回答」失败模式，与 112 同源）；
+//       2. 处置保守：不惩罚账号（语义未知宁可少惩罚）、不换号（官方客户端
+//          对渲染码的行为是弹错误对话框而非重试）。
+//
+// 另有一个**与分类无关但更基础**的修复：业务码会原样进 e.statusCode，而
+// res.writeHead 要求 100-599——上游回 80411/100401 时旧代码直接抛
+// ERR_HTTP_INVALID_STATUS_CODE。httpStatusOf 把超范围的码压回 400。
+// ---------------------------------------------------------------------------
+
+/** 鉴权/权限业务码 → 既有 HTTP 语义（hub §7.4 明确语义） */
+const AUTH_BIZ_MAP = { 100401: 401, 100403: 403 };
+/** <400 的已渲染码（payloadError 认不出，会静默转发）。103 单独判重 */
+const OPAQUE_SUB400 = /^(103|115|116|117|118|119|122)$/;
+/** ≥400 的无语义码（payloadError 认得出 code，但 statusCode 非法且不该进 5xx 分支） */
+const OPAQUE_OVER400 = /^(80411|80412|100400)$/;
+
+/** 业务码 → 合法 HTTP 状态码。超范围（如 80411/100401）一律压 400：语义未知按保守处置 */
+function httpStatusOf(code) {
+  const n = Number(code) || 0;
+  if (n >= 100 && n <= 599) return n;
+  return 400;
+}
+
+/**
+ * 把帧识别的原始结果（payloadError / quotaFrameError 的返回）归一成
+ * 可抛出的形状：鉴权码映射、无语义码转 400 + opaqueCode 标志、判重转
+ * 429 + dupRequest 标志、审核拒绝打 policy 标志。其余形状原样透传
+ * （quotaKind 等字段保留）。
+ */
+function frameThrown(fe) {
+  if (!fe) return fe;
+  const c = String(fe.code != null ? fe.code : '').trim();
+  if (AUTH_BIZ_MAP[c]) {
+    const mapped = AUTH_BIZ_MAP[c];
+    // 403 的 message 带「无权限」锚：retryable(403) 按文案认出可换号
+    const why = mapped === 403 ? '无权限访问' : '鉴权失败';
+    return {
+      code: mapped,
+      message: `qoder auth biz(${c}): ${why}${fe.message ? ': ' + fe.message : ''}`,
+    };
+  }
+  if (c === '103') {
+    return {
+      code: 429,
+      message: `qoder dup(103): ${fe.message || 'Duplicate request'}（请求签名判重，重试即解）`,
+      dupRequest: true,
+    };
+  }
+  if (OPAQUE_SUB400.test(c) || OPAQUE_OVER400.test(c)) {
+    return {
+      code: 400,
+      message: `qoder biz(${c}): ${fe.message || '上游业务错误'}`,
+      opaqueCode: c,
+    };
+  }
+  if (isContentPolicy(fe.message)) return { ...fe, policy: true };
+  return fe;
+}
+
+/**
+ * 顶层帧的**无语义渲染码**识别（<400，payloadError/quotaFrameError 都认不出
+ * 的那批）。只看顶层 code 字段，不匹配帧的字符串全文——模型正文里讨论到
+ * `{"code":"115"}` 不能误伤（与 quotaFrameError 同一纪律）。
+ * 返回原始 {code, message}，映射交给 frameThrown。
+ */
+function bizFrameError(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const c = String(parsed.code != null ? parsed.code : '').trim();
+  if (!OPAQUE_SUB400.test(c)) return null;
+  return { code: c, message: String(parsed.message || '').trim() };
+}
+
+/** bizFrameError 的响应原文版（SSE 行或裸 JSON，逐行解析、只看顶层 code） */
+function bizFromBody(raw) {
+  const text = String(raw || '');
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    const json = t.startsWith('data:') ? t.slice(5).trim() : t;
+    if (!json || json === '[DONE]') continue;
+    let o;
+    try { o = JSON.parse(json); } catch (e) { continue; }
+    const be = bizFrameError(o);
+    if (be) return be;
+  }
+  return null;
+}
+
+/** frameThrown 的结果 → 抛出的 Error：statusCode 钳制 + 全部标志透传 */
+function thrownFrameErr(fe, sent) {
+  const t = frameThrown(fe);
+  const err = new Error(`qoder ${t.code}: ${t.message}`);
+  err.statusCode = httpStatusOf(t.code);
+  if (t.quotaKind) err.quotaKind = t.quotaKind;
+  if (t.policy) err.policy = true;
+  if (t.dupRequest) err.dupRequest = true;
+  if (t.opaqueCode) err.opaqueCode = t.opaqueCode;
+  if (sent !== undefined) err.sent = sent;
+  return err;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,10 +279,16 @@ function quotaFromBody(raw) {
   return null;
 }
 
+/** 判重的短冷却（与排队挂起同量级：请求级问题，不是账号坏了） */
+const DUP_COOLDOWN_MS = 5000;
+
 /**
  * 喂池的错误形状。105→401 的旧映射保留；额度类改喂「429 + 显式时长」——
  * classify 对显式 retryAfterMs 只透传（见 upstream-errors），applySoftCooldown
  * 拿它做固定冷却且不递增 soft_streak。430 喂 400（不惩罚）。
+ *
+ * 2026-11-01 增三支：审核拒绝/无语义码 → 400（不惩罚账号——前者拒绝的是
+ * 内容不是账号，后者语义未知宁可少惩罚）；判重 → 429 + 5 秒短冷却。
  */
 function poolInfoOf(e, model) {
   const code = Number(e.statusCode) || 0;
@@ -165,6 +302,9 @@ function poolInfoOf(e, model) {
       retryAfterMs: qk === 'daily' ? msUntilMidnight() : QUOTA_COOLDOWN_MS,
     };
   }
+  if (e.policy || isContentPolicy(e.message)) return { status: 400, message: e.message, model };
+  if (e.dupRequest) return { status: 429, message: e.message, model, retryAfterMs: DUP_COOLDOWN_MS };
+  if (e.opaqueCode) return { status: 400, message: e.message, model };
   return { status: poolStatusOf(code), message: e.message, model };
 }
 
@@ -274,6 +414,11 @@ function fefoUidSet(usable) {
  * 于是第二个账号白放着、用户拿一个 403。
  */
 function retryable(code, message, quotaKind) {
+  // 内容审核拒绝先于一切状态码判（含 n===0 的网络分支——带审核串的「未知
+  // 状态错误」也是上游拒绝）：拒绝的是这批内容，换哪个号发同一份 body 都会
+  // 被拒（hub：确定性拒绝，重试无效）。判据在完整 message 上，因为上游常把
+  // 它包在 HTTP 500 / 200 帧里，数字 code 认不出。
+  if (isContentPolicy(message)) return false;
   const n = Number(code);
   if (!Number.isFinite(n) || n === 0) return true; // 网络错误/超时：换号试一次
   // 额度类业务码先于 403 文案判：112/110/114 换号有用（别的号可能还有额度）；
@@ -581,7 +726,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           let parsed = null;
           try { parsed = JSON.parse(inner); } catch (e) { /* 非 JSON 帧照原样转发 */ }
           if (parsed) {
-            const err = chat.payloadError(parsed) || quotaFrameError(parsed);
+            const err = frameThrown(chat.payloadError(parsed) || quotaFrameError(parsed) || bizFrameError(parsed));
             if (err) {
               firstErr = err;
               try { ac.abort(); } catch (e) { /* 已结束 */ }
@@ -659,9 +804,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
         }
         if (attemptErr) { attemptErr.sent = sent || (gate ? gate.result().emitted > 0 : false); throw attemptErr; }
         if (firstErr) {
-          const err = new Error(`qoder ${firstErr.code}: ${firstErr.message}`);
-          err.statusCode = firstErr.code;
-          if (firstErr.quotaKind) err.quotaKind = firstErr.quotaKind;
+          const err = thrownFrameErr(firstErr);
           // 门的 emitted 也算：reasoning 是直发的，有一帧到下游就不能再换号
           err.sent = sent || (gate ? gate.result().emitted > 0 : false);
           throw err;
@@ -678,6 +821,8 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           err.statusCode = res.status;
           const qk = quotaKindOfText(String(res.raw || ''));
           if (qk) err.quotaKind = qk;
+          // 审核拒绝常包在 HTTP 500 里（正文 discussion 也可能触发它），从 raw 认
+          if (isContentPolicy(String(res.raw || ''))) err.policy = true;
           err.sent = sent || (gate ? gate.result().emitted > 0 : false);
           throw err;
         }
@@ -688,19 +833,15 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           // 额度类业务码（112/110/114/430）< 400，envelopeStatus/payloadError
           // 都不认——它们才是「200 + 空回答」的另一半来源，单独兜一层。
           const qf = quotaFromBody(res.raw);
-          if (qf) {
-            const err = new Error(`qoder ${qf.code}: ${qf.message}`);
-            err.statusCode = qf.code;
-            err.quotaKind = qf.quotaKind;
-            err.sent = false;
-            throw err;
-          }
+          if (qf) throw thrownFrameErr(qf, false);
+          // 无语义渲染码（115/103…）同样 <400：额度层没认出的在这里兜
+          const bf = bizFromBody(res.raw);
+          if (bf) throw thrownFrameErr(bf, false);
           const es = chat.envelopeStatus(res.raw);
           if (es && es.code >= 400) {
-            const err = new Error(`qoder ${es.code}: ${es.message}`);
-            err.statusCode = es.code;
-            err.sent = false;
-            throw err;
+            // envelopeStatus 的 code 可能是业务码（100401/80411…）：frameThrown
+            // 负责映射/转 400，thrownFrameErr 负责把 statusCode 压回合法范围
+            throw thrownFrameErr(es, false);
           }
         }
         // 正常收尾：哨兵有门时交给了门（finish() 收尾补发，顺序正文→usage→
@@ -761,15 +902,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       // 优先用它——排在 envelopeStatus 之前，否则会先被 raw 的空壳信封盖掉，
       // 让 `retryAfterSeconds` / `modelKey` 这些限流判据丢掉。
       if (res.firstErr) {
-      const err = new Error(`qoder ${res.firstErr.code}: ${res.firstErr.message}`);
-      err.statusCode = res.firstErr.code;
-      if (res.firstErr.quotaKind) err.quotaKind = res.firstErr.quotaKind;
-      throw err;
+      throw thrownFrameErr(res.firstErr);
     }
     const es = chat.envelopeStatus(res.raw);
     if (es && es.code >= 400) {
-      const err = new Error(`qoder ${es.code}: ${es.message}`);
-      err.statusCode = es.code;
+      const err = thrownFrameErr(es);
       const qk = quotaKindOfText(String(res.raw || ''));
       if (qk) err.quotaKind = qk;
       throw err;
@@ -777,16 +914,16 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     // 额度类业务码 < 400，envelopeStatus 认不出——聚合前单独兜一层，
     // 否则「零额度挂起结束后回 200 + 112 错误体」会聚合成空回答。
     const qf = quotaFromBody(res.raw);
-    if (qf) {
-      const err = new Error(`qoder ${qf.code}: ${qf.message}`);
-      err.statusCode = qf.code;
-      err.quotaKind = qf.quotaKind;
-      throw err;
-    }
+    if (qf) throw thrownFrameErr(qf);
+    // 无语义渲染码（115/103…）同样 <400：额度层没认出的在这里兜
+    const bf = bizFromBody(res.raw);
+    if (bf) throw thrownFrameErr(bf);
     // 与流式路径同理：非 SSE 的 HTTP 错误体也要认，否则会聚合成一个空回答
     if (res.status >= 400) {
-      const err = new Error(`qoder ${res.status}: ${String(res.raw || '').replace(/\s+/g, ' ').trim().slice(0, 200) || 'upstream error'}`);
+      const detail = String(res.raw || '').replace(/\s+/g, ' ').trim().slice(0, 200) || 'upstream error';
+      const err = new Error(`qoder ${res.status}: ${detail}`);
       err.statusCode = res.status;
+      if (isContentPolicy(String(res.raw || ''))) err.policy = true;
       throw err;
     }
     const payloads = [];
@@ -984,7 +1121,12 @@ async function send(payload, onChunk, opts = {}) {
       // （112/110/114/430）按 poolInfoOf 的专门处置（固定冷却/不惩罚），
       // 其余按 classify。
       channelPool.noteError(CHANNEL, account.id, poolInfoOf(e, model));
-      markFailure(account, e.message);
+      // 401/105 的偏差标注（hub issue #64）：时钟漂移的 401 与凭证失效形态
+      // 一致。有新鲜缓存且超阈值才加话（测不出就不加），并顺手刷新一次测量。
+      const isAuthErr = code === 401 || code === 105 || /login expired/i.test(String(e.message || ''));
+      const clockHint = isAuthErr ? clock.annotate401(account.region) : '';
+      if (isAuthErr) clock.measureSkew(account.region).catch(() => { /* 排障信息，失败不管 */ });
+      markFailure(account, `${e.message}${clockHint}`);
       errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled, quotaKind: e.quotaKind || '' });
       if (e.sent) throw e; // 流式已吐帧，不能再换号
       if (!retryable(code, e.message, e.quotaKind)) throw e;
@@ -1196,4 +1338,6 @@ module.exports = {
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
   // 额度类业务码的识别与处置（离线验证用：test/verify-qoder-throttle.js）
   quotaKindOfText, quotaFrameError, quotaFromBody, retryable, poolInfoOf,
+  // 客户端渲染错误码（2026-11-01）：鉴权映射 / 无语义码 / statusCode 钳制
+  httpStatusOf, frameThrown, thrownFrameErr, bizFrameError, bizFromBody,
 };

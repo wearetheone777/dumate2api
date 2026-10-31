@@ -102,6 +102,17 @@ const QODER_QUOTA = [
 ];
 
 /**
+ * 内容审核拒绝（2026-11-01，判据同 upstream-errors 的 CONTENT_POLICY_TEXT，
+ * 词表取自 qoder2api-hub 实测：InternalError.Algo.DataInspectionFailed 家族）。
+ * 放在最前判——比网络错误更具体，且这类错误不该被翻译成「上游故障」：
+ * 换账号、重试都无效，用户要看到的是「调整输入」这个动作。
+ */
+const CONTENT_POLICY = [
+  [/DataInspectionFailed|inappropriate content|input text data may contain|ContentFilter|SensitiveContent|content_policy_rejected/i,
+    '上游内容安全审核未通过：输入可能含敏感内容，调整措辞后重试（换账号无效）'],
+];
+
+/**
  * 翻译一条错误。匹配不到就**原样返回**（含空串）。
  *
  * @param {unknown} msg 原始错误串或 Error
@@ -115,6 +126,10 @@ function explainError(msg) {
   // 读取侧会对已翻译过的存量值再翻一次：已带这段中文说明的就跳过——
   // 无锚的子串匹配（RESOURCE_LIMIT / read idle / upstream timeout）不跳的话，
   // 重翻会命中翻译结果里保留的原串，套娃成双重括号。
+  for (const [re, text] of CONTENT_POLICY) {
+    if (s.includes(text)) continue;
+    if (re.test(s)) return `${text}（${s}）`;
+  }
   for (const [re, text] of OWN_TIMEOUT) {
     if (s.includes(text)) continue;
     if (re.test(s)) return `${text}（${s}）`;

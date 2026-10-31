@@ -130,6 +130,20 @@ async function runOnce(trigger) {
             fail: r.ok ? 0 : 1,
             error: r.error || '',
           });
+          // 签到之后顺手领一遍活动/权益（send_message_reward 等商业活动）。
+          // 领取本身幂等（已领的上游回 granted、领不到的回 9069/9090/9070
+          // 且不算失败），失败只进 results 不中断本轮其余账号。
+          try {
+            const ar = await checkin.claimActivitiesAndSave(a, authStore);
+            const got = (ar.notes || []).filter((n) => n.state === 'claimed').length;
+            if (got || (ar.benefit && ar.benefit.state === 'claimed')) {
+              results.push({
+                name: `TRAE:活动:${a.nickname || a.uid || a.id}`,
+                ok: ar.ok, done: got, already: 0, fail: ar.ok ? 0 : 1,
+                error: ar.error || '',
+              });
+            }
+          } catch (e2) { /* 活动领取失败不影响签到结果 */ }
           // 9074 已在 checkin.claimWithRetry 里自愈：撞到先换一代设备 id
           // 立即重试，仍失败才记退避（设备级校验，不传染其他账号——
           // 2026-10-30 对齐 Trae2api-cn 的 device_generation 方案）。

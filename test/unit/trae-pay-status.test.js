@@ -127,3 +127,34 @@ test('buildBody 保留合法 tool 调用链（不误删）', () => {
   assert.equal(meta.dropped.orphanTool, 0);
   assert.equal(meta.dropped.emptyAssistant, 0);
 });
+
+// ---- CheckLogin 解析（2026-11-01，bluechonk 端点清单 + 真机实测定案）----
+const { parseCheckLogin } = require('../../src/traework/auth');
+
+test('parseCheckLogin：BOUND 形态全字段解析', () => {
+  const r = parseCheckLogin({
+    IsLogin: true, BoundDeviceID: 'e4kyx6q4p00r72', DeviceBindStatus: 'BOUND',
+    ExpiredAt: 1808320085008, Region: 'CN', Host: 'https://api.trae.com.cn',
+  }, '684948195320048');
+  assert.equal(r.isLogin, true);
+  assert.equal(r.boundDeviceId, 'e4kyx6q4p00r72');
+  assert.equal(r.deviceBindStatus, 'BOUND');
+  assert.equal(r.expiredAt, 1808320085008);
+  assert.equal(r.region, 'CN');
+  // 命名空间不同（12 位混合字符 vs 15 位纯数字）：不比对，如实 null
+  assert.equal(r.deviceMatch, null);
+});
+
+test('parseCheckLogin：空骨架（鉴权头没被认）如实透出 false', () => {
+  const r = parseCheckLogin({ IsLogin: false, BoundDeviceID: '', DeviceBindStatus: null, ExpiredAt: 0 }, 'x');
+  assert.equal(r.isLogin, false);
+  assert.equal(r.boundDeviceId, null);
+  assert.equal(r.deviceBindStatus, null);
+  assert.equal(r.deviceMatch, null);
+});
+
+test('parseCheckLogin：两边都是纯数字时才比对', () => {
+  assert.equal(parseCheckLogin({ IsLogin: true, BoundDeviceID: '684948195320048' }, '684948195320048').deviceMatch, true);
+  assert.equal(parseCheckLogin({ IsLogin: true, BoundDeviceID: '684948195320048' }, '579369755843387').deviceMatch, false);
+  assert.equal(parseCheckLogin({ IsLogin: true, BoundDeviceID: 'abc123' }, '684948195320048').deviceMatch, null);
+});

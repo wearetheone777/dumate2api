@@ -252,7 +252,19 @@ async function send(payload, onChunk, opts = {}) {
   }
 
   try {
-    const result = await runConversation(auth, payload, onChunk, opts, model);
+    // Remote 链路（2026-11-01，P2-16）：DUMATE_TRAEWORK_REMOTE=1 时，**纯文本的
+    // auto 档请求**走 remote（逐轮账单可查、上游自选模型）。边界刻意收窄：
+    //   · 带 tools 的请求不收——remote 的工具调用矩阵未实测，收了就是赌；
+    //   · 显式模型名不收——remote 的 manual 策略要完整的 custom_model 对象
+    //     （Trae2api-cn 的 resolve_model_config），v1 未实现。显式名继续走
+    //     utils_chat——隐性换模型违背显式契约（计费倍率跟着变）。
+    // 实际模型由 model_config 事件上报（auto 档上游自选，实测 Doubao 系）。
+    const remoteEnabled = process.env.DUMATE_TRAEWORK_REMOTE === '1';
+    const hasTools = Array.isArray(payload && payload.tools) && payload.tools.length > 0;
+    const isAuto = !payload || !payload.model || payload.model === 'auto';
+    const result = (remoteEnabled && !hasTools && isAuto)
+      ? await runRemoteConversation(auth, payload, onChunk, opts, model)
+      : await runConversation(auth, payload, onChunk, opts, model);
     // 成功喂池：清熔断/软退避/防误杀计数（修复重试属于模型行为，不算失败）
     channelPool.noteSuccess(CHANNEL, auth.id);
     return result;
@@ -263,6 +275,103 @@ async function send(payload, onChunk, opts = {}) {
   } finally {
     channelPool.release(uid);
   }
+}
+
+/**
+ * Remote 链路的一次完整对话（auto 档纯文本）。事件形状见 remote.js 顶部注释。
+ * 不做「播报即收尾」修复（remote 是执行型会话，观测形态不同，未实测不预编）；
+ * 不做换号重试（会话粘在选定的账号上，失败如实抛给上层）。
+ */
+async function runRemoteConversation(auth, payload, onChunk, opts, model) {
+  const remote = require('./remote');
+  const startedAt = Date.now();
+  const settle = () => {
+    require('./credits')
+      .capture(auth, { reqId: opts.reqId, model, startedAt })
+      .catch(() => { /* 采集失败绝不影响已发出的响应 */ });
+  };
+  const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  const turnIdReport = (messageId) => {
+    // Remote 的逐轮账单键是**创建会话返回的 message_id**（2026-11-01 真机实测：
+    // 拿它查 get_session_usage 返回真实 amount_float 与明细——utils_chat 链路
+    // 拿不到的 turn id 在这条链路上有）。计费自检探针经此自动切精确口径。
+    if (opts.onTurnId && messageId) {
+      try { opts.onTurnId(messageId, auth); } catch (e) { /* 上报失败不影响响应 */ }
+    }
+  };
+
+  // ---- 非流式：聚合整轮 ----
+  if (!onChunk) {
+    const r = await remote.runTurn(auth, { messages, model: '', mode: 'code' });
+    settle();
+    if (!r.ok) {
+      const e = new Error(r.error);
+      e.statusCode = Number(r.status) || 502;
+      throw e;
+    }
+    turnIdReport(r.messageId);
+    return r.aggregate;
+  }
+
+  // ---- 流式：plan_item 快照 → content/reasoning delta，usage/finish 补帧 ----
+  const text = remote.textAccumulator();
+  const reasoning = remote.textAccumulator();
+  const chunk = (delta, finishReason) => JSON.stringify({
+    id: 'traework', object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000), model,
+    choices: [{ index: 0, delta, finish_reason: finishReason || null }],
+  });
+  let errData = null;
+  let finishData = null;
+  const cs = await remote.createSession(auth, { messages, model: '', mode: 'code' });
+  if (!cs.ok) {
+    const e = new Error(cs.error);
+    e.statusCode = Number(cs.status) || 502;
+    throw e;
+  }
+  const sr = await remote.streamEvents(auth, cs.sessionId, cs.messageId, (ev) => {
+    const d = ev.data || {};
+    if (ev.event === 'plan_item') {
+      const td = text.push(d.thought);
+      if (td) onChunk(chunk({ content: td }));
+      const rd = reasoning.push(d.reasoning_content);
+      if (rd) onChunk(chunk({ reasoning_content: rd }));
+    } else if (ev.event === 'token_usage') {
+      onChunk(JSON.stringify({
+        id: 'traework', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model,
+        choices: [],
+        usage: {
+          prompt_tokens: Number(d.prompt_tokens) || 0,
+          completion_tokens: Number(d.completion_tokens) || 0,
+          total_tokens: Number(d.total_tokens) || 0,
+          completion_tokens_details: { reasoning_tokens: Number(d.reasoning_tokens) || 0 },
+        },
+      }));
+    } else if (ev.event === 'done') {
+      finishData = d;
+      // remote 的 done.status 实测恒 "completed"；非 completed 在流后抛错
+      onChunk(chunk({}, 'stop'));
+    } else if (ev.event === 'error') {
+      errData = d;
+    }
+  }, {});
+  settle();
+  if (errData) {
+    const e = new Error(`traework remote ${errData.code || ''}: ${errData.message || '上游错误'}`);
+    e.statusCode = 502;
+    throw e;
+  }
+  if (!sr.ok) {
+    const e = new Error(sr.error);
+    e.statusCode = 502;
+    throw e;
+  }
+  turnIdReport(cs.messageId);
+  // 返回值与 runConversation 的流式返回对齐：聚合形状（调用方只用其存在性）
+  const agg = remote.aggregateEvents([], model);
+  agg.choices[0].message.content = text.value();
+  agg.usage = null;
+  return agg;
 }
 
 /**

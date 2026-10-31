@@ -399,6 +399,43 @@ const routes = [
     },
   },
   {
+    // 手动领活动/权益（commercial activities）。与签到同形：幂等、可重跑——
+    // 已领过的活动上游回 granted=true + grantable=false，「现在领不到」的
+    // （9069/9090/9070）如实标 pending 不算失败，所以这个端点可以随便点。
+    // 结果明细在 notes 里逐条给出（claimed/granted/pending/error）。
+    method: 'POST',
+    path: '/claim-activities',
+    handler: async ({ res, body }) => {
+      const id = body && body.id;
+      const list = id ? [authStore.get(id)].filter(Boolean) : authStore.findUsable();
+      if (!list.length) return sendJSON(res, 200, { ok: false, error: '没有可用账号' });
+      const out = [];
+      for (const a of list) {
+        const r = await checkin.claimActivitiesAndSave(a, authStore);
+        out.push({ id: a.id, nickname: a.nickname || a.uid || '', ...r });
+      }
+      const okCount = out.filter((r) => r.ok).length;
+      try { require('../auth').audit('admin', 'traework_claim_activities', id || 'all', `${okCount}/${out.length}`); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: true, results: out });
+    },
+  },
+  {
+    // 9074 诊断：查上游认为本账号绑定的设备与登录态（不打对话/签到）。
+    // deviceMatch=false 时 rotateDevice 大概率能修；true 时 9074 另有原因，
+    // 别再瞎轮换设备。DeviceBindStatus 语义未公开，原样透出。
+    method: 'POST',
+    path: '/check-login',
+    handler: async ({ res, body }) => {
+      const a = authStore.get((body && body.id) || '');
+      if (!a) return sendJSON(res, 200, { ok: false, error: '账号不存在' });
+      const b = await checkin.withFreshToken(a);
+      const auth = require('../../traework/auth');
+      const r = await auth.checkLogin(b);
+      try { require('../auth').audit('admin', 'traework_check_login', a.id, r.ok ? JSON.stringify({ isLogin: r.isLogin, deviceMatch: r.deviceMatch }) : String(r.error).slice(0, 80)); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, r);
+    },
+  },
+  {
     // 生成一次登录所需的设备标识 + 授权链接。
     // 前端拿到后开浏览器；用户把回调地址粘回来，再调 /login/callback。
     //

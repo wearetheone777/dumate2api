@@ -886,6 +886,36 @@ async function handleImageGenerations(req, res) {
   return sendJSON(res, 200, { created: r.created, data: r.data });
 }
 
+/** 文生视频（搭子 dumate-video）。OpenAI 没有标准视频端点，形状按 images/generations
+ *  同族给：{model, prompt} → {created, data:[{url}]}。视频是分钟级任务，
+ *  轮询超时（DUMATE_MEDIA_VIDEO_POLL_TIMEOUT_MS，默认 15 分钟）时回 504 + taskId，
+ *  调用方可拿 taskId 直接轮询上游（任务不会因超时取消）。 */
+async function handleVideo(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/videos/generations';
+  req._channel = 'dumate';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const model = body.model || media.DEFAULT_VIDEO_MODEL;
+  const r = await media.generateVideo({
+    prompt: body.prompt,
+    model,
+  });
+  if (!r.ok) {
+    const status = r.status || 502;
+    logRequest(req, res, startedAt, { model, stream: false, messages: 0 }, status, null, { media: 'video', error: r.error });
+    const out = { error: { message: r.error, type: 'api_error' } };
+    if (r.taskId) out.task_id = r.taskId;
+    return sendJSON(res, status, out);
+  }
+  logRequest(req, res, startedAt, { model: r.model || model, stream: false, messages: 0 }, 200, null, { media: 'video' });
+  return sendJSON(res, 200, { created: r.created, data: r.data });
+}
+
 async function handleSpeech(req, res) {
   const startedAt = Date.now();
   req._logPath = '/v1/audio/speech';
@@ -946,6 +976,34 @@ async function handleWebSearch(req, res) {
   } catch (e) {
     const status = Number(e.statusCode) || 502;
     logRequest(req, res, startedAt, { model: 'qwenwork/web-search', stream: false, messages: 0 }, status, null, { media: 'web_search', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+/** 语音润色（千问 voice/polish）：把 ASR 转写文本润色成可直接发送的话。
+ *  通道专属端点（千问能力，OpenAI 无对应标准接口），与 /v1/search/* 同族。 */
+async function handleVoicePolish(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/voice/polish';
+  req._channel = 'qwenwork';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const voice = require('./qwenwork/voice');
+  try {
+    const r = await voice.polishVoiceText(body.text, { accountId: body.account_id });
+    if (!r.ok) {
+      logRequest(req, res, startedAt, { model: 'qwenwork/voice-polish', stream: false, messages: 0 }, r.status || 502, null, { media: 'voice_polish', error: r.error });
+      return sendJSON(res, r.status || 502, { error: { message: r.error, type: 'api_error' } });
+    }
+    logRequest(req, res, startedAt, { model: 'qwenwork/voice-polish', stream: false, messages: 0 }, 200, null, { media: 'voice_polish' });
+    return sendJSON(res, 200, { text: r.text });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'qwenwork/voice-polish', stream: false, messages: 0 }, status, null, { media: 'voice_polish', error: e.message });
     return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
   }
 }
@@ -2005,6 +2063,9 @@ const server = http.createServer(async (req, res) => {
     if ((url === '/v1/images/generations' || url === '/images/generations') && req.method === 'POST') {
       return await handleImageGenerations(req, res);
     }
+    if ((url === '/v1/videos/generations' || url === '/videos/generations') && req.method === 'POST') {
+      return handleVideo(req, res);
+    }
     if ((url === '/v1/audio/speech' || url === '/audio/speech') && req.method === 'POST') {
       return await handleSpeech(req, res);
     }
@@ -2013,6 +2074,9 @@ const server = http.createServer(async (req, res) => {
     // （那是搭子的生图，语义不同——生图是「生成」，图搜是「检索」）。
     if ((url === '/v1/search/web' || url === '/search/web') && req.method === 'POST') {
       return await handleWebSearch(req, res);
+    }
+    if ((url === '/v1/voice/polish' || url === '/voice/polish') && req.method === 'POST') {
+      return handleVoicePolish(req, res);
     }
     if ((url === '/v1/search/images' || url === '/search/images') && req.method === 'POST') {
       return await handleImageSearch(req, res);

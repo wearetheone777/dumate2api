@@ -138,6 +138,26 @@ const HARD_TEXT = /(余额|积分)[^\n]{0,8}(不足|耗尽|用完)|insufficient[
 const MODEL_TEXT = /model[^\n]{0,40}(not available|not found|not exist|unsupported)|模型[^\n]{0,12}(不可用|不存在|不支持)/i;
 
 /**
+ * 内容审核拒绝（确定性拒绝，重试/换号都无用）。
+ *
+ * 词表取自 qoder2api-hub 源码 `_CONTENT_POLICY_MARKERS`（带现场日志：
+ * `InternalError.Algo.DataInspectionFailed: Input text data may contain
+ * inappropriate content.`，阿里云百炼的审核错误形态；千问同属阿里系，
+ * 同一套判据适用）。hub 的处置口径：**不重试、直接返回可读原因**。
+ *
+ * 为什么必须单独识别：这类错误常以 HTTP 500（或 200 帧内 code 字符串
+ * `InternalError.Algo.DataInspectionFailed`）出现——不认它就会落进
+ * 5xx → breaker 分支，换号把每个账号撞一遍同样的拒绝，最后还把账号
+ * 熔断 30 分钟。拒绝的是**这批内容**，不是任何账号。
+ */
+const CONTENT_POLICY_TEXT = /DataInspectionFailed|inappropriate content|input text data may contain|ContentFilter|SensitiveContent|content_policy_rejected/i;
+
+/** 这条错误串是不是上游内容审核拒绝（重试/换号无用） */
+function isContentPolicy(message) {
+  return CONTENT_POLICY_TEXT.test(unescapeDeep(String(message == null ? '' : message)));
+}
+
+/**
  * COSY 上游的**排队/限流**信号（千问与 Qoder 共用一套协议栈）。
  *
  * 实测形状（2026-10-23~26，Qoder）：
@@ -409,6 +429,12 @@ function classifyCore(err) {
     if (base.model && MODEL_QUEUE_TEXT.test(unescapeDeep(full))) out.scope = 'model';
     return out;
   }
+  // 内容审核拒绝（DataInspectionFailed 家族，见 CONTENT_POLICY_TEXT 注释）：
+  // 拒绝的是这批内容而不是账号——换哪个号发同一份 body 都会被拒。必须排在
+  // 401/402/403/5xx 之前：上游常把它包在 HTTP 500 里，落到 breaker 分支会把
+  // 「用户内容的问题」放大成「账号连续硬失败 → 熔断 30 分钟」。
+  // kind 保持 null（不惩罚账号），policy 标志给调用方翻人话用。
+  if (isContentPolicy(full)) return { ...base, kind: null, policy: true };
   if (status === 401) return { ...base, kind: 'session_dead' };
   if (status === 402 || HARD_TEXT.test(message)) return { ...base, kind: 'hard' };
   if (status === 403 && MODEL_TEXT.test(message)) return { ...base, kind: 'model' };
@@ -428,13 +454,16 @@ function classify(err) {
   const out = classifyCore(err);
   const raw = typeof err === 'string' ? err
     : (err && (err.message || err.error)) || '';
-  out.deterministic = isDeterministic(out.status, String(raw));
+  // 审核拒绝也是确定性错误（换号无用）——deterministic 标志让「换号前该不该
+  // 等」的判据直接跳过等待。
+  out.deterministic = out.policy === true || isDeterministic(out.status, String(raw));
   return out;
 }
 
 module.exports = {
   payloadError, envelopeStatus, classify, isThrottle, throttleRetryMs, THROTTLE_TEXT,
   isDeterministic,
+  isContentPolicy, CONTENT_POLICY_TEXT,
   QUEUE_TEXT, QUEUE_THROTTLE_COOLDOWN_MS,
   unescapeDeep,
   traeCodeKind, traeCodeOf,
