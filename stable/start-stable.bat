@@ -12,6 +12,8 @@ echo.
 cd /d "%~dp0"
 set NOPAUSE=%1
 set DUMATE2API_PORT=9080
+rem Enforce registered API keys (keys.json). External clients must send their dmk_ key.
+set DUMATE_REQUIRE_KEY=1
 rem ---------------------------------------------------------------------------
 rem KEEP THIS FILE PURE ASCII. Do not add non-ASCII text here.
 rem

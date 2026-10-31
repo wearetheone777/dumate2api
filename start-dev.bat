@@ -57,6 +57,8 @@ echo ================================================
 echo.
 
 set DUMATE2API_PORT=9082
+rem Enforce registered API keys (keys.json). Remove this line to allow keyless access.
+set DUMATE_REQUIRE_KEY=1
 node src\server.js
 
 echo.

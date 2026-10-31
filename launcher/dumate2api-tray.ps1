@@ -199,6 +199,7 @@ function Start-Services {
         Add-Log '启动网关 9082 …'
         $gw = Start-NodeHidden 'src\server.js' @{
             DUMATE2API_PORT = $script:GatewayPort
+            DUMATE_REQUIRE_KEY = '1'
         } $script:LogGateway
         if ($gw) { $script:Procs += $gw }
 
