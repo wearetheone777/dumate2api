@@ -21,7 +21,7 @@
           千问的模型表接口会 403，当前为静态表（{{ rows.length }} 个）
         </template>
         <template v-else>
-          上游没有模型列表接口，这些名字来自探测（{{ rows.length }} 个）
+          上游没有模型列表接口；真实后端与上限来自真机实测（{{ rows.length }} 个）
         </template>
       </div>
       <a-space v-if="channel === 'traework' || channel === 'qoder'">
@@ -62,6 +62,11 @@
             <a-tag v-if="record.visible === false" color="default" class="ml-1">隐藏</a-tag>
           </div>
           <div class="text-xs text-slate-500 font-mono">{{ record.id }}</div>
+          <!-- 真实后端（搭子：X-Dumate-Gw-Realmodel 实测；其他通道上游直接给）
+               ——请求的模型可能被服务端静默换掉，这一行是唯一真相 -->
+          <div v-if="record.realModel" class="text-xs text-slate-500 font-mono">
+            实跑 {{ record.realModel }}
+          </div>
           <div v-if="!record.native" class="text-xs text-slate-500">
             别名 → {{ record.target }}
           </div>
@@ -74,7 +79,12 @@
             <div class="rate-bar-wrap">
               <div class="rate-bar" :class="rateClass(record.rate)" :style="{ width: rateWidth(record.rate) }" />
             </div>
-            <div class="rate-num num">{{ record.rate.toFixed(2) }}×</div>
+            <!-- 搭子是实测口径（积分/千token），不是标称倍率（×）——单位混着
+                 显示会让人拿它跟 TRAE/Qoder 的倍率比大小 -->
+            <a-tooltip v-if="record.channel === 'dumate'" :title="record.rateNote || ''">
+              <div class="rate-num num">{{ record.rate.toFixed(2) }} <span class="text-xs text-slate-500">积分/千tok</span></div>
+            </a-tooltip>
+            <div v-else class="rate-num num">{{ record.rate.toFixed(2) }}×</div>
           </div>
           <!-- Qoder 的错峰/免费模型 rate 就是 0，只显示 0 会被读成「完全不扣费」
                而它的原价（original_price_factor）其实是 0.1——两个一起给 -->
@@ -84,7 +94,7 @@
           <!-- 拿不到就显示「—」并说明原因，**不估算**：
                编一个数字会让人以为真能按那个价扣 -->
           <a-tooltip v-else-if="record.rate == null" :title="rateHint">
-            <span class="text-xs text-slate-500">— <span class="src-tag">无此数据</span></span>
+            <span class="text-xs text-slate-500">— <span class="src-tag">{{ channel === 'dumate' ? '未实测' : '无此数据' }}</span></span>
           </a-tooltip>
         </template>
 
@@ -155,7 +165,10 @@
 
         <template v-else-if="column.key === 'maxtok'">
           <template v-if="record.maxTokens">
-            <span class="num">{{ compactNum(record.maxTokens) }}</span>
+            <a-tooltip v-if="record.maxTokensNote" :title="record.maxTokensNote">
+              <span class="num">{{ compactNum(record.maxTokens) }}</span>
+            </a-tooltip>
+            <span v-else class="num">{{ compactNum(record.maxTokens) }}</span>
             <div class="text-xs text-slate-500">
               <span class="src-tag">{{ srcText(record.maxTokensSource) }}</span>
             </div>
@@ -224,7 +237,7 @@ const columns = [
 
 const rateHint = computed(() =>
   props.channel === 'dumate'
-    ? '搭子没有倍率概念：计费在上游账单里，本地拿不到单价'
+    ? '未实测：搭子没有标称倍率，点上方「计费自检」可实测该列（积分/千token，7 天有效）'
     : '上游未下发该模型的倍率',
 )
 

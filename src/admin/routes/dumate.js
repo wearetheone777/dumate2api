@@ -7,6 +7,11 @@
 // `dumate-svc.baidu.com` 的 app token（打那边一律 nginx 404）。
 const { sendJSON } = require('../router');
 const api = require('../../dumate-web-api');
+const chatlab = require('./chatlab');
+
+/** 计费自检的默认提示（与 Qoder/TRAE/千问探针同族，但口径不同——见路由内注释） */
+const BILLING_NOTE = '搭子没有标称倍率（上游不吐 price_factor），billed 是实测「每千 token 积分成本」，'
+  + '与其他通道的倍率数字不可互比。cost=null 表示没测到（并发流量混入 / 结算延迟），不补 0。';
 
 const routes = [
   {
@@ -81,6 +86,72 @@ const routes = [
     handler: async ({ res }) => {
       const r = await api.skillsSquare();
       return sendJSON(res, 200, { skills: [], unsupported: true, error: r.error });
+    },
+  },
+  {
+    // 计费自检探针（2026-11-01，与 Qoder/TRAE/千问的同名端点对齐）。
+    // 口径：发一个小请求，**网页余额前后差值** = 本次实测消耗（与 chatlab
+    // 的 costOf 同一份实现）→ 每千 token 积分成本。搭子没有标称倍率，
+    // 所以没有 expected/ratio——这不是缺失，是上游真没有这个字段。
+    // **会真实消耗积分**：数数请求 + 512 预算，单次成本实测在分毫级。
+    method: 'GET',
+    path: '/billing-check',
+    handler: async ({ req, res }) => {
+      const raw = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || '')).replace(/^dumate\//, '').trim();
+      const modelmap = require('../../modelmap');
+      const pool = require('../../web-pool');
+      const reqlog = require('../../reqlog');
+      const billing = require('../../dumate-billing');
+      // mapModel 兜底是网关的真实行为——探针沿用并把映射结果透出
+      // （传错名测到 fallback 至少看得见，比静默好；带 mapped 字段）。
+      const mapped = modelmap.mapModel(raw || 'model-text');
+      const startedAt = Date.now();
+      const before = await chatlab.snapshotBalances();
+      const payload = {
+        model: mapped,
+        messages: [{ role: 'user', content: 'Count from 1 to 200, digits separated by spaces only, no other text.' }],
+        max_tokens: 512,
+        stream: false,
+      };
+      let r;
+      try {
+        r = await pool.callWithFailover('/chat/completions', 'POST', payload, { timeout: 120000 });
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, model: raw || 'model-text', mapped, error: e.message, elapsedMs: Date.now() - startedAt });
+      }
+      if (!r.ok) {
+        return sendJSON(res, 200, { ok: false, model: raw || 'model-text', mapped, error: r.error || `HTTP ${r.status}`, elapsedMs: Date.now() - startedAt });
+      }
+      const j = r.json || {};
+      const u = reqlog.pickUsage(j.usage);
+      const after = await chatlab.snapshotBalances();
+      const acct = r.account || null;
+      const cost = chatlab.costOf(acct && acct.id, before, after);
+      const total = u.total || 0;
+      const v = billing.verdictOf(cost);
+      // 实测值落缓存：模型页「消耗倍率」列按 target 读这里（7 天 TTL）。
+      // 只在测到正数时写——unmeasured/zero/negative 都不能当倍率展示。
+      const billed = billing.billedRate(cost, total);
+      if (billed != null && billed > 0) {
+        billing.saveRateEntry(mapped, {
+          billed, cost, tokens: total,
+          account: acct ? (acct.nickname || acct.name || acct.id) : null,
+        });
+      }
+      try { require('../auth').audit('admin', 'dumate_billing_check', mapped, `cost=${cost} tokens=${total}`); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, {
+        ok: true,
+        model: raw || 'model-text',
+        mapped,
+        account: acct ? (acct.nickname || acct.name || acct.id) : null,
+        expected: null, // 搭子无标称倍率，恒 null（不编）
+        cost,
+        costState: v.state,
+        tokens: total,
+        billed: billing.billedRate(cost, total),
+        elapsedMs: Date.now() - startedAt,
+        note: BILLING_NOTE,
+      });
     },
   },
 ];

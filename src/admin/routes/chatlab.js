@@ -576,4 +576,6 @@ const routes = [
   },
 ];
 
-module.exports = { routes };
+// 余额快照/实测消耗导出：搭子的计费自检探针（admin/routes/dumate.js）与
+// chatlab 用**同一份**余额口径——第二份实现必然漂移（一边修余额接口另一边不知道）。
+module.exports = { routes, balanceOf, snapshotBalances, costOf };

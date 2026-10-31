@@ -1473,6 +1473,23 @@ Responses / Anthropic / Google）都能用，流式/非流式/工具调用全部
   轮询超时回 504 + taskId（任务在上游继续）。分镜/首尾帧/对白
   （`video_elements/async`）未做，见 `docs/FUSION-BACKLOG-2026-10-31.md` §13。
 
+**搭子计费自检探针（2026-11-01，`GET /api/admin/dumate/billing-check?model=`）**：
+小请求 + **网页余额前后差**（与 chatlab 同一份 `costOf` 实现，从 chatlab 导出
+复用——第二份余额口径必然漂移），报实测「每千 token 积分成本」。搭子**没有
+标称倍率**（上游不吐 price_factor，连模型列表接口都没有），`expected` 恒 null
+不是缺失是如实；四态 verdict 在 `src/dumate-billing.js`（`negative`=结算异常
+如实标注、`zero`=低于余额精度不是没花钱、`unmeasured`=并发混入不补 0）。
+真机首批：model-text ≈3.73 积分/千token。模型页「模型信息」卡有按钮。
+
+**实测倍率落缓存并显示在倍率列（2026-11-01，用户明确要求）**：探针成功后写
+`data/dumate-rate-cache.json`（`DUMATE_DUMATE_RATE_FILE` 可覆盖，7 天 TTL、
+原子写），`model-info.dumateRows` 按 **target** 读缓存填 `rate`
+（`rateSource:'measured'`，单位**积分/千token**——与 TRAE/Qoder 的 price_factor
+不同单位，前端对搭子行不显示「×」后缀防止跨通道比大小）。过期如实回落「—」
+——过期数字比缺失更害人。真机五档（2026-11-01）：L2 2.67 / model-text 3.51 /
+L0 3.59 / glm-5 6.55 / L1 7.97 积分每千 token（综合输入+输出，余额两位小数
+限制精度；未实测的 model-artifact-validate 仍显示「未实测」）。
+
 **搭子的只读查询接口在 `www.dumate.cn`，不是模型网关**（2026-10-31 实测定案，
 `src/dumate-web-api.js` + `src/admin/routes/dumate.js`）。清单里记的
 `/api/dumate/session/list` 等路径打在 `dumate-svc.baidu.com` 上**一律 nginx 404**

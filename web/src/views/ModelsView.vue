@@ -440,9 +440,43 @@
         <a-tag class="ml-2" color="blue">只读</a-tag>
       </template>
       <template #extra>
+        <a-button size="small" class="ghost-btn mr-2" :loading="dmBillingChecking" @click="runDmBillingCheck">
+          计费自检
+        </a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="load">刷新</a-button>
       </template>
       <ModelInfoTable :channel="'dumate'" :preloaded="dumateInfoRows" />
+      <!-- 计费自检结果：搭子没有标称倍率，只有实测「每千 token 积分成本」
+           （网页余额差值口径，与 chatlab 的消耗同源）。cost=null 是「没测到」
+           不是 0——界面要把它和 0 分开说，否则会被读成「这次没花钱」 -->
+      <a-alert
+        v-if="dmBillingResult"
+        class="mt-3"
+        :type="dmBillingResult.ok ? (dmBillingResult.costState === 'ok' ? 'success' : 'warning') : 'error'"
+        show-icon
+      >
+        <template #message>
+          <template v-if="dmBillingResult.ok">
+            计费自检 · {{ dmBillingResult.model }}（映射到 {{ dmBillingResult.mapped }}）：
+            实测成本 <span class="num">{{ dmBillingResult.cost ?? '—' }}</span> 积分 /
+            <span class="num">{{ dmBillingResult.tokens ?? '—' }}</span> tokens
+            <template v-if="dmBillingResult.billed != null">
+              ≈ <span class="num">{{ dmBillingResult.billed }}</span> 积分/千token
+            </template>
+            <template v-else-if="dmBillingResult.costState === 'unmeasured'">
+              （没测到：并发流量混入或结算延迟，不按 0 报）
+            </template>
+            <template v-else-if="dmBillingResult.costState === 'zero'">
+              （成本 0：请求太小低于余额精度，换个更长的探针或看多次均值）
+            </template>
+            <template v-else-if="dmBillingResult.costState === 'negative'">
+              （负值：上游结算异常，如实标注）
+            </template>
+            <span class="text-slate-500">· {{ dmBillingResult.elapsedMs }}ms</span>
+          </template>
+          <template v-else>计费自检失败：{{ dmBillingResult.error }}</template>
+        </template>
+      </a-alert>
     </a-card>
 
     <!-- 搭子的积分：与 TRAE 的额度卡同构，回答「这些模型花的是哪份额度」。
@@ -859,6 +893,38 @@ async function runQwBillingCheck() {
     qwBillingChecking.value = false
   }
 }
+
+/** 搭子计费自检：数数小请求 + 网页余额前后差（chatlab 同一份 costOf 实现）。
+ *  默认打 model-text（上游默认档）；没有标称倍率可比，只报实测。 */
+async function runDmBillingCheck() {
+  const target = 'model-text'
+  dmBillingChecking.value = true
+  try {
+    const r = await client.get<DmBillingResult>(`/dumate/billing-check?model=${target}`, { timeout: 180000 })
+    dmBillingResult.value = r.data
+  } catch (e: any) {
+    dmBillingResult.value = { ok: false, model: target, mapped: '', account: null, expected: null, cost: null, costState: null, tokens: null, billed: null, elapsedMs: 0, error: e?.message || '请求失败' }
+  } finally {
+    dmBillingChecking.value = false
+  }
+}
+/** 搭子计费自检结果（/dumate/billing-check）。expected 恒 null：搭子没有标称倍率 */
+interface DmBillingResult {
+  ok: boolean
+  model: string
+  mapped: string
+  account: string | null
+  expected: null
+  cost: number | null
+  costState: 'ok' | 'zero' | 'negative' | 'unmeasured' | null
+  tokens: number | null
+  billed: number | null
+  elapsedMs: number
+  error?: string
+  note?: string
+}
+const dmBillingChecking = ref(false)
+const dmBillingResult = ref<DmBillingResult | null>(null)
 const rows = ref<Row[]>([])
 const saving = ref(false)
 const probing = ref(false)

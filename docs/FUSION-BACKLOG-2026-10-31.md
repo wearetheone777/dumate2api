@@ -926,6 +926,24 @@ R3 + prompt（顶层与 model_parameters 双写） → 200 + task_id
 就是旁证——线上它也可能经常 401）。实现保留、端点已挂网关，上游开放即用，
 无需改代码。
 
+### 搭子计费自检探针（2026-11-01，模型管理页「倍率」问题的最终答案）
+
+搭子模型页此前「消耗倍率」恒显示「—」：上游不吐 price_factor（连模型列表
+接口都没有），标称倍率**不存在**，按「不编造」原则只能显示空。但「这个模型
+花多少」可以用实测回答——与 Qoder/TRAE/千问的同名端点对齐：
+
+| 文件 | 内容 |
+|---|---|
+| `src/dumate-billing.js`（新） | 纯函数：`billedRate`（cost ÷ tokens/1000，四位小数）+ `verdictOf` 四态（ok/zero/negative/unmeasured——负值是结算异常如实标注，0 是「低于余额精度」不是「没花钱」） |
+| `src/admin/routes/dumate.js` | `GET /billing-check?model=`：小请求（数数 + 512 预算）经 `pool.callWithFailover`，**网页余额前后差值**即实测成本；`expected` 恒 null（不是缺失，是上游真没有） |
+| `src/admin/routes/chatlab.js` | `balanceOf`/`snapshotBalances`/`costOf` 导出——探针与 chatlab 用**同一份**余额口径，第二份实现必然漂移 |
+| `web/src/views/ModelsView.vue` | 模型信息卡「计费自检」按钮 + 结果条（cost/tokens/billed/四态各自的人话）；与上一轮的「实跑模型/实测上下文」同页 |
+
+**真机首批（2026-11-01，model-text）**：560 tokens / **2.09 积分 / ≈3.73
+积分每千 token**（2.9s）。这是搭子通道第一个有实测依据的成本数字——口径是
+「每千 token 积分成本」，与 Qoder 的 billed_rate（credits）同形但**不可与
+其他通道的倍率数字互比**（各通道积分体系不同，界面 note 已写明）。
+
 ## 附录：参照仓库
 
 | 平台 | 仓库 | 用途 |

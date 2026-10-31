@@ -24,12 +24,42 @@ const SRC = {
   config: '配置',
 };
 
-// 搭子：上游没有模型列表接口（/models、/model/list 实测 404），
-// 真实可用的名字来自探测（ARCHITECTURE.md 的实测结论 + model-map 的 upstream_models）
-const DUMATE_NOTE = '上游无模型列表接口（/models 404、/model/list 400），ID 来自探测；上游只接受 model-text / model-artifact-validate / glm-5，其余名字一律 404。';
-// 上下文：DuMate 配置声明 192K，但 32K 级实测通过、128K 级 10 分钟未返回。
-// 给区间而不是单值——单值会让人以为 192K 可用。
-const DUMATE_CONTEXT = { min: 32768, max: 192000, note: '配置声明 192K；32K 级实测通过，128K 级 10 分钟未返回' };
+// 搭子：上游没有模型列表接口（/models、/model/list 实测 404）。但**真实后端、
+// 上下文与输出上限不是未知的**——2026-10-31 深度逆向实测定案（CLAUDE.md
+// 「搭子的真实模型」节），证据三件套：上游 400 错误体明示（qianfan/阿里云
+// 直吐范围声明）、二分夹逼（GLM 只报「Prompt 超长」）、响应头
+// X-Dumate-Gw-Realmodel（real_model 埋点同源）。cloud 网关按模型转发，
+// 别名行的数据按**实际落到的 target** 查这张表。
+const DUMATE_NOTE = '上游无模型列表接口（/models 404），真实后端与上限来自真机实测（400 错误体明示 / 二分夹逼 / X-Dumate-Gw-Realmodel 响应头）；此外 qianfan/ 前缀走千帆原生透传通道（独立模型命名空间）。';
+const DUMATE_REAL = {
+  'model-text': {
+    real: 'deepseek-v4.1-flash-low-latency',
+    context: 1048576, contextNote: '实测 1,048,576（上游 400 错误体明示）',
+    maxTokens: 393216,
+  },
+  'dm-auto-model/text.L0': {
+    real: 'deepseek-v4.1-flash-low-latency',
+    context: 1048576, contextNote: '实测 1,048,576（上游 400 错误体明示）',
+    maxTokens: 393216,
+  },
+  'dm-auto-model/mm.L0': { real: 'deepseek-v4.1-flash-low-latency', context: 1048576, contextNote: '同 text.L0（视觉由文本后端承担）', maxTokens: 393216 },
+  'glm-5': {
+    real: 'glm-5.2',
+    context: 1048576, contextNote: '≈1,048,576（二分夹逼；GLM 上游只报「Prompt 超长」不给精确值）',
+    maxTokens: 131072,
+  },
+  'dm-auto-model/text.L1': {
+    real: 'kimi-k3',
+    context: 1048576, contextNote: '实测下界 ≥1M，未探顶',
+    maxTokens: 2000000, maxTokensNote: '实测下界（2,000,000 仍接受），未探顶',
+  },
+  'dm-auto-model/text.L2': {
+    real: 'qwen3.8-max',
+    context: 983616, contextNote: '实测 983,616（阿里云 400 错误体明示）',
+    maxTokens: 131072,
+  },
+  'dm-auto-model/mm.L2': { real: 'qwen3.8-max', context: 983616, contextNote: '同 text.L2', maxTokens: 131072 },
+};
 
 // 千问：上下文上限实测 ~1,024,000（1250K 汉字 = 1,022,745 通过；1262K 起 502）
 const QW_CONTEXT = { min: null, max: 1024000, note: '实测 ~1,024,000（1250K 汉字通过；1262K 起 502）' };
@@ -50,6 +80,12 @@ function dumateRows() {
   const cfg = modelmap.load();
   const upstream = new Set(cfg.upstream_models);
   const budget = require('./budget');
+  // 实测倍率缓存（懒加载：读不到就按未实测处理，不影响行结构）
+  let rateOf = null;
+  try {
+    const billing = require('./dumate-billing');
+    rateOf = (t) => billing.rateForTarget(t);
+  } catch (e) { /* 缓存模块不可用按 null */ }
   const rows = [];
   // 暴露列表里的每个名字都列出来（含别名），因为它们都是客户端可传的
   for (const id of cfg.exposed) {
@@ -58,6 +94,10 @@ function dumateRows() {
     // 界面于是把 claude-3-5-sonnet / gpt-4o 显示成「别名 → 自身」，
     // 与实际转发行为不符（它们实际走 model-text）。
     const target = cfg.aliases[id] || (upstream.has(id) ? id : cfg.fallback);
+    // 真实后端与上限按 **target** 查：别名（claude-* 等）实际走的就是目标
+    // 模型的后端，展示目标的实测值才是真实语义。
+    const real = DUMATE_REAL[target] || null;
+    const rateEntry = rateOf ? rateOf(target) : null;
     rows.push({
       id,
       // 可读名是**本地标注**（上游没有模型列表接口），来源单独标出来
@@ -67,22 +107,33 @@ function dumateRows() {
       channel: 'dumate',
       native: upstream.has(id),
       target,
-      rate: null,
-      rateSource: null,
-      contextWindow: DUMATE_CONTEXT.max,
-      contextWindowMin: DUMATE_CONTEXT.min,
-      contextSource: 'measured',
-      contextNote: DUMATE_CONTEXT.note,
-      // 输出预算：网关钳制后的下限（客户端传更小的值会被抬到这里）
-      maxTokens: budget.resolveMaxTokens(0),
-      maxTokensSource: 'config',
+      // 真实后端（X-Dumate-Gw-Realmodel 实测）。上游不吐元数据，这是埋点口径
+      realModel: real ? real.real : null,
+      realModelSource: real ? 'measured' : null,
+      // 实测倍率（积分/千token）：dumate-billing 的缓存按 target 读，7 天
+      // TTL。搭子没有标称倍率，这里填的是**实测值**——没有实测就如实 null
+      // （模型页「计费自检」按钮补测）。别名行显示 target 的倍率，因为
+      // 计费跟着实际落到的模型走。
+      rate: rateEntry ? rateEntry.billed : null,
+      rateSource: rateEntry ? 'measured' : null,
+      rateNote: rateEntry
+        ? `实测于 ${new Date(rateEntry.measuredAt).toLocaleString('zh-CN')}（${rateEntry.tokens} tokens 花了 ${rateEntry.cost} 积分；综合输入+输出，余额两位小数限制精度）`
+        : null,
+      contextWindow: real ? real.context : null,
+      contextWindowMin: null,
+      contextSource: real ? 'measured' : null,
+      contextNote: real ? real.contextNote : '该模型未实测（上游不吐元数据，也没有 400 错误体可泄漏）',
+      // 输出上限：上游真实范围（dumate-caps 同源实测），不是网关钳制下限。
+      // 网关还有一层输出预算下限（65536，思维链兜底）——传小值会被抬高，
+      // 但「上限」列回答的是上游接受多少，两个数不是一个问题。
+      maxTokens: real ? real.maxTokens : null,
+      maxTokensSource: real ? 'measured' : null,
+      maxTokensNote: real ? (real.maxTokensNote || '网关另有输出预算下限 65536（思维链兜底），客户端传小值会被抬到下限') : null,
       capability: 'chat_model',
       multimodal: false,
       // 上游没给模型列表，这里把「别名实际落到哪里」讲清楚——
       // 比笼统的「无接口」更有用：用户能据此判断一个名字是不是真的换了模型
-      note: upstream.has(id)
-        ? DUMATE_NOTE
-        : `客户端名，网关按别名转到 ${target}（上游只认 model-text / model-artifact-validate / glm-5）`,
+      note: upstream.has(id) ? DUMATE_NOTE : `客户端名，网关按别名转到 ${target}`,
     });
   }
   return rows;
@@ -367,5 +418,5 @@ async function rowsFor(channel, opts = {}) {
 module.exports = {
   SRC, allRows, rowsFor, dumateRows, qwenworkRows, qwenRows, traeworkRows, qoderRows,
   setQwenKeys, setQwenModels, qwenworkCachedEntries, setQoderModels,
-  DUMATE_NOTE, DUMATE_CONTEXT, QW_CONTEXT, CHANNELS: channels.CHANNELS,
+  DUMATE_NOTE, DUMATE_REAL, QW_CONTEXT, CHANNELS: channels.CHANNELS,
 };
