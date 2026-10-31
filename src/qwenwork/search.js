@@ -299,8 +299,53 @@ async function imageSearch(p, opts = {}) {
   return { items: r.items, requestId };
 }
 
+/**
+ * 探活（`GET /algo/api/v1/ping`，客户端 `pingEndpoint` 用的同一路径）。
+ *
+ * 实测真机回纯文本 `pong`，且**带不带 COSY 签名都 200**——所以用裸 Bearer，
+ * 少一层签名开销。不消耗额度、不改账号状态。
+ *
+ * 用途：`/health` 的千问条目可以据此区分「凭证被整体拒（401/403）」与
+ * 「额度耗尽（对话 402 但探活仍 200）」，这两者的处置完全不同。
+ *
+ * @returns {Promise<{ok:boolean, latencyMs:number|null, error?:string}>}
+ */
+async function ping(opts = {}) {
+  let agent = null;
+  try { agent = require('../proxy-agent').getAgentFor(opts.account || null); } catch (e) {
+    return { ok: false, latencyMs: null, error: `出站代理配置错误: ${e.message}` };
+  }
+  const account = await chat.ensureAccount(authStore, opts.account || authStore.preferred());
+  if (!account) return { ok: false, latencyMs: null, error: '千问办公没有可用账号' };
+  const startedAt = Date.now();
+  const r = await new Promise((resolve) => {
+    let u;
+    try { u = new URL(c.GATEWAY + c.PING_PATH); } catch (e) { return resolve({ status: 0, error: e.message }); }
+    const req = https.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers: { ...sign.clientHeaders(), Authorization: `Bearer ${account.accessToken}`, Accept: '*/*' },
+      timeout: 10000,
+      ...(agent ? { agent } : {}),
+    }, (res) => {
+      let b = '';
+      res.on('data', (x) => { b += x; });
+      res.on('end', () => resolve({ status: res.statusCode, body: b }));
+    });
+    req.on('error', (e) => resolve({ status: 0, error: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ status: 0, error: 'timeout' }); });
+    req.end();
+  });
+  const latencyMs = Date.now() - startedAt;
+  if (r.status !== 200) {
+    return { ok: false, latencyMs, error: r.error || `HTTP ${r.status}: ${String(r.body || '').slice(0, 120)}` };
+  }
+  return { ok: true, latencyMs, body: String(r.body || '').trim() };
+}
+
 module.exports = {
-  webSearch, imageSearch,
+  webSearch, imageSearch, ping,
   buildWebSearchPayload, buildImageSearchPayload,
   parseWebSearchResponse, parseImageSearchResponse,
   normalizeSearchItem, normalizeImageItem,

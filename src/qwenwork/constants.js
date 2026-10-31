@@ -28,6 +28,10 @@ const MODELS_PATH = '/api/v2/model/list';
 // CN（当前账号是 CN），国际版等有账号再补——**不预编一条没验证过的路径**。
 const WEB_SEARCH_PATH = '/algo/api/v1/webSearch/oneSearch';
 const IMAGE_SEARCH_PATH = '/algo/api/v2/service/pro/imageSearch';
+// 探活端点（客户端 `pingEndpoint` 用的就是它）。**实测真机回 `pong`**，
+// 且**带不带 COSY 签名都能通**（裸 Bearer 也 200）——所以它是判断
+// 「网关侧网络可达 + 凭证未被整体拒绝」的最轻量探针，不消耗额度。
+const PING_PATH = '/algo/api/v1/ping';
 // 两个搜索端点的 query 串。imageSearch 的 `Encode=1` 是客户端明写的
 // （`.query({Encode:"1"})`），webSearch 的取自 CNl="Encode=1"。
 const SEARCH_QUERY = 'Encode=1';
@@ -93,6 +97,7 @@ module.exports = {
   MODELS_PATH,
   WEB_SEARCH_PATH,
   IMAGE_SEARCH_PATH,
+  PING_PATH,
   SEARCH_QUERY,
   ACCOUNT_CONTEXT_PATH,
   IDENTITIES_PATH,

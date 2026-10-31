@@ -243,12 +243,12 @@ wss://qwenwork.cn/api/chat-ws
 |---|---|---|
 | 16 | TRAE Remote 链路 | TRAE |
 | 17 | 千问 ACP 会话（独立通道；也是附件的唯一出路） | 千问 | ⚠️ HTTP 半边（barn 上传）已落地，WS 帧协议无证据不预编（见 §10） |
-| 18 | 搭子 opencode Agent / MCP connector / 技能广场 | 搭子 |
+| 18 | 搭子 opencode Agent / MCP connector / 技能广场 | 搭子 | ⚠️ 会话/项目/MCP connector **只读**已接（见 §12）；技能广场端点不存在（404）；opencode Agent 与 CDP 中继未做 |
 | 18b | 千问联网搜索 `/algo/api/v1/webSearch/oneSearch` | 千问 | ✅ 已完成 2026-10-31（见 §10） |
 | 18c | 千问图搜 `/algo/api/v2/service/pro/imageSearch` | 千问 | ✅ 已完成 2026-10-31（见 §10） |
 | 18d | 千问版本常量对齐（COSY 1.1.71 + X-QwenWork-* 头） | 千问 | ✅ 已完成 2026-10-31（见 §10） |
 | 19 | 搭子浏览器 CDP 中继 / IM 桥 / 记忆库 | 搭子 |
-| 20 | 千问企业身份 / 区域发现 / 定时任务 | 千问 |
+| 20 | 千问企业身份 / 区域发现 / 定时任务 | 千问 | ⚠️ 探活已接（`/algo/api/v1/ping`，见 §12）；区域发现实测 404（需机器身份+响应解密，缺证据不做）；企业身份/定时任务未做 |
 
 ---
 
@@ -672,6 +672,62 @@ TRAE 业务码已收进 `src/upstream-errors.js`（见 P1-13）。Qoder 与千�
 这是 2026-10-30 的既有架构决策：`upstream-errors` 是两条 COSY 通道共用的
 识别层，通道私有码放进去会让另一条通道误判。完整字典见 CLAUDE.md 的
 「错误形态」各节。
+
+---
+
+## 12. 落地记录（2026-10-31 第三批：搭子只读查询 + 千问探活）
+
+### 搭子会话 / 项目 / MCP connector 只读接口
+
+| 文件 | 内容 |
+|---|---|
+| `src/dumate-web-api.js`（新） | `listSessions` / `sessionDetail` / `listProjects` / `listConnectors` / `connectorTemplates` / `skillsSquare` |
+| `src/admin/routes/dumate.js`（新） | `GET /api/admin/dumate/{sessions,sessions/:id,projects,connectors,connectors/templates,skills}` |
+| `test/unit/dumate-web-api.test.js` | 12 项：会话归一、connector 归一、`code` 判据、非 JSON/网络错误 |
+
+**端点在 `www.dumate.cn`，不是模型网关**。清单里记的这些路径打在
+`dumate-svc.baidu.com` 上一律 **nginx 404**——它们是**网页端**接口，鉴权是
+网页 cookie（与 web-pool 同一份凭证），不是 Bearer app token。这是本项
+第一次探测时的直接结论。
+
+**真机实测（2026-10-31，账号「我谁敌」）**：
+
+| 端点 | 结果 |
+|---|---|
+| `GET /api/dumate/session/list` | 200，**9 条会话**（标题/时间/目录/模型档位/代码改动统计） |
+| `GET /api/dumate/session/detail?sessionID=<id>` | 200，单条元数据 |
+| `GET /api/dumate/projects` | 200，`total: 0`（该账号无项目） |
+| `GET /api/dumate/connector/v2/list` | 200，`total: 0`（未装任何 connector） |
+| `GET /api/dumate/connector/v2/template/list` | 200，**50 个官方模板**（hyper3d / 美图设计室 …，带 `serverUrl` + `transProtocol: streamablehttp`） |
+| `GET /api/dumate/skills/square/list` | **404** ← 清单里「技能广场 101 个」这条在网页端不成立 |
+
+**三个踩过的细节**（都写进代码注释）：
+1. `session/detail` 的参数名是 **`sessionID` / `sessionId`**，传 `id` 回
+   `{"code":400,"message":"参数错误:SessionID"}`——**HTTP 仍是 200**，不读 `code`
+   就会把「参数错」当成「会话不存在」。
+2. **detail 只回元数据，不含消息历史**。消息在本地
+   `~/.qianfan/workspace/sessions/<uid>/<date>/<slug>/`，上游没有拉整段对话的
+   HTTP 接口——所以它**不能**给 `previous_response_id` 提供真历史。
+3. 会话的 `directory` 是**发起会话那台机器**的本机路径，换机器即失效，界面标出来。
+
+**为什么全部只读且失败不喂池**：这些查询不打模型、不消耗额度、不改账号状态。
+读接口的失败与账号健康无关，喂池只会让对话请求被无辜跳过。
+
+### 千问 `/algo/api/v1/ping` 探活
+
+`src/qwenwork/search.js` 的 `ping()`。真机 **164ms 回 `pong`**，且
+**带不带 COSY 签名都 200**（裸 Bearer 即可）。价值是区分两种失败：
+「凭证被整体拒（401/403）」与「额度耗尽（对话 402 但探活仍 200）」——
+两者的处置完全不同（换号 vs 等重置）。不消耗额度。
+
+### 区域端点发现：**未做**（缺证据）
+
+`/api/v3/service/region/endpoints` 与 `/algo/api/v5/service/region/endpoints`
+两个路径实测都 **404**。客户端代码显示 v5 那条需要
+`withBearerToken().withMachineIdentity().withResponseDecryption()` ——
+**机器身份与响应解密**我们都没有（device flow 账号不带机器身份）。
+v3 那条只需 wasm 签名，但仍 404（可能按 region/灰度路由）。
+按「无证据不预编」纪律不做，不猜 header。
 
 ---
 

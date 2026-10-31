@@ -26,6 +26,7 @@ const { routes: ccswitchRoutes } = require('./routes/ccswitch');
 const { routes: accountRoutes } = require('./routes/account');
 const { routes: webAccountsRoutes } = require('./routes/accounts');
 const { routes: checkinRoutes } = require('./routes/checkin');
+const { routes: dumateRoutes } = require('./routes/dumate');
 const autotask = require('./routes/autotask');
 const taskScheduler = require('../task-scheduler');
 // 启动接线（集成阶段）：池状态机 / 热配置 / 计量挂钩与本进程优雅停止。
@@ -127,6 +128,7 @@ router.mount(PREFIX + '/cc-switch', ccswitchRoutes);
 router.mount(PREFIX + '/account', accountRoutes);
 router.mount(PREFIX + '/web-accounts', webAccountsRoutes);
 router.mount(PREFIX + '/checkin', checkinRoutes);
+router.mount(PREFIX + '/dumate', dumateRoutes);
 router.mount(PREFIX + '/auto-checkin', autotask.routes);
 
 const server = http.createServer((req, res) => {

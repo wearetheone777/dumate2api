@@ -1444,8 +1444,7 @@ Responses / Anthropic / Google）都能用，流式/非流式/工具调用全部
   只列实测可用的 `qwen3.5-35b-a3b`（上游没有模型列表接口，`/gateway/v2/models`
   回 404），其它名字原样透传由上游报错。
 
-**工具类网关 `/gateway/v2/tools/dumate/*` 用同一份凭证**（2026-10-31 实测）：
-生图 `image_generate_v3/async`（提交 POST + 查询 GET `?task_id=`）、TTS
+**工具类网关 `/gateway/v2/tools/dumate/*` 用同一份凭证**（2026-10-31 实测）：生图 `image_generate_v3/async`（提交 POST + 查询 GET `?task_id=`）、TTS
 `t2a_v2/sync`、视频 `video_generate/async`、BOS 上传
 `appbuilder.baidu.com/v2/tools/bos/upload`。**生图与 TTS 已暴露成网关端点**
 （`src/media.js` + `POST /v1/images/generations` / `POST /v1/audio/speech`）：
@@ -1457,6 +1456,41 @@ Responses / Anthropic / Google）都能用，流式/非流式/工具调用全部
   再回给客户端（OpenAI 的 speech 语义是二进制，不是链接）。
 - 视频生成仍未接入（分镜/首尾帧/对白链路长），排期见
   `docs/FUSION-BACKLOG-2026-10-31.md`。
+
+**搭子的只读查询接口在 `www.dumate.cn`，不是模型网关**（2026-10-31 实测定案，
+`src/dumate-web-api.js` + `src/admin/routes/dumate.js`）。清单里记的
+`/api/dumate/session/list` 等路径打在 `dumate-svc.baidu.com` 上**一律 nginx 404**
+——它们是网页端接口，鉴权是**网页 cookie**（与 web-pool 同一份凭证），
+不是 Bearer app token。真机结果：会话列表 9 条、connector 模板 **50 个**、
+projects 与已装 connector 均为 0（空列表是真实结果）。
+
+三个细节，改之前先看：
+
+1. **`session/detail` 的参数名是 `sessionID` / `sessionId`**，传 `id` 回
+   `{"code":400,"message":"参数错误:SessionID"}` 且 **HTTP 仍是 200**——
+   不读 `code`/`success` 就会把「参数错」当成「会话不存在」。统一判据在
+   `apiError()`：`code !== 0` 或 `success === false` 都算失败。
+2. **detail 只回元数据，不含消息历史**。消息在本地
+   `~/.qianfan/workspace/sessions/<uid>/<date>/<slug>/`，上游没有拉整段对话的
+   接口——所以它**不能**给 `previous_response_id` 提供真历史，别指望。
+3. **`GET /api/dumate/skills/square/list` 是 404**——清单里「技能广场 101 个」
+   这条在网页端不成立（技能是桌面客户端内部资产）。`skillsSquare()` 如实返回
+   `unsupported: true` 而不是让调用方猜 URL。
+
+全部**只读**且失败**不喂池**：不打模型、不消耗额度、不改账号状态，读接口的
+失败与账号健康无关，罚号只会让对话请求被无辜跳过。
+
+**千问探活 `/algo/api/v1/ping`**（`src/qwenwork/search.js` 的 `ping()`）：
+真机 164ms 回纯文本 `pong`，**带不带 COSY 签名都 200**（裸 Bearer 即可）。
+价值是区分「凭证被整体拒（401/403）」与「额度耗尽（对话 402 但探活仍 200）」
+——处置完全不同（换号 vs 等重置）。
+
+**千问区域端点发现没做成（缺证据，别翻出来重试）**：
+`/api/v3/service/region/endpoints` 与 `/algo/api/v5/service/region/endpoints`
+实测都 **404**。客户端代码显示 v5 需要
+`withBearerToken().withMachineIdentity().withResponseDecryption()`——**机器身份
+与响应解密**我们都没有（device flow 账号不带机器身份）。v3 只需 wasm 签名但
+仍 404（可能按 region/灰度路由）。按纪律不猜 header。
 
 **按模型 max_tokens 钳制**（`src/dumate-caps.js`）：静态实测表 + 自学习（撞
 400 时从错误体解析各家范围声明，7 天 TTL 落 `data/dumate-caps.json`），
