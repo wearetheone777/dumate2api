@@ -3,25 +3,27 @@
     <PageHeader title="API Key" sub="网关鉴权密钥与来源白名单" />
 
     <a-alert
-      :type="data?.require_key ? 'success' : 'warning'"
+      :type="data?.require_key ? 'success' : data?.require_key === false ? 'warning' : 'info'"
       show-icon
     >
       <template #message>
         <span v-if="data?.require_key">
           网关鉴权已开启：所有模型请求必须带已登记的 API key
         </span>
-        <span v-else>
+        <span v-else-if="data?.require_key === false">
           网关鉴权当前<span class="font-medium">关闭</span>：任何来源无需 key 即可调用
         </span>
+        <span v-else>网关不在线，鉴权状态未知</span>
       </template>
       <template #description>
-        <span v-if="!data?.require_key">
+        <span v-if="data?.require_key">
+          状态探测自网关进程（/health 的 require_key），关闭鉴权需要重启网关并去掉该环境变量。
+        </span>
+        <span v-else-if="data?.require_key === false">
           本页的 key 与白名单已生效保存，但只有开启鉴权后才会被校验。
           开启方式：停止网关后用环境变量 <code>DUMATE_REQUIRE_KEY=1</code> 重启。
         </span>
-        <span v-else>
-          关闭鉴权同样需要重启网关并去掉该环境变量。
-        </span>
+        <span v-else>网关进程未启动或不可达，启动后刷新本页。</span>
       </template>
     </a-alert>
 
@@ -39,9 +41,9 @@
         </a-space>
       </div>
 
-      <!-- 直连通道下说明「key 与通道的关系」，否则用户会以为这里的 key 是通道专用的 -->
-      <a-alert v-if="isQw || isTw" type="info" show-icon class="mb-3">
-        <template #message>当前显示可用于{{ channelLabel(channelStore.current) }}的 Key</template>
+      <!-- 列表全量展示；说明保留「key 与通道的关系」，避免被当成通道专用 key -->
+      <a-alert type="info" show-icon class="mb-3">
+        <template #message>显示全部 Key（跨通道）</template>
         <template #description>
           网关按**模型名前缀**分流（<code>qwen/</code> → 千问办公、
           <code>traework/</code> → TRAE Work，无前缀 → 搭子），而不是按 key 分流。
@@ -61,7 +63,13 @@
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'name'">
             <div>{{ record.name }}</div>
-            <div class="text-xs text-slate-400 font-mono">{{ record.prefix }}…</div>
+            <div class="text-xs text-slate-400 font-mono">
+              {{ record.prefix }}…
+              <a v-if="record.plain" class="ml-1" @click="openView(record)">查看</a>
+              <a-tooltip v-else title="明文未存：此 key 创建于明文记录启用前，无法回填，需要查看请重建">
+                <span class="ml-1 text-slate-500 cursor-default">明文未存</span>
+              </a-tooltip>
+            </div>
           </template>
           <template v-else-if="column.key === 'channel'">
             <a-tag v-if="record.channel === 'qwenwork'" color="cyan">仅千问</a-tag>
@@ -201,8 +209,8 @@
       <a-alert
         type="warning"
         show-icon
-        message="这是唯一一次显示明文 key"
-        description="离开此窗口后无法再次查看，只能重新创建。请立即复制保存。"
+        message="key 已创建"
+        description="明文已保存，之后可在列表点「查看」随时取用；建议仍立即复制保存一次。"
         class="mb-3"
       />
       <a-space-compact style="width: 100%">
@@ -214,12 +222,21 @@
       </div>
     </a-modal>
 
+    <!-- 查看完整 key：明文随 key 落盘后随时可取 -->
+    <a-modal v-model:open="viewOpen" title="查看 API Key" :footer="null" :width="560">
+      <div class="mb-2 text-slate-400">{{ viewKey?.name }}</div>
+      <a-space-compact style="width: 100%">
+        <a-input :value="viewKey?.plain || ''" readonly />
+        <a-button type="primary" @click="copyView">复制</a-button>
+      </a-space-compact>
+    </a-modal>
+
     <CcSwitchDialog ref="ccDlg" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import CcSwitchDialog from '@/components/CcSwitchDialog.vue'
 import { App as AntApp } from 'ant-design-vue'
@@ -313,10 +330,9 @@ const ipList = computed(() =>
 )
 
 async function load() {
-  // 按通道过滤：切到千问/TRAE 时只看与该通道相关的 key
-  // （channel 绑定为该通道，或未限定通道的通用 key）
-  const q = isQw.value ? '?channel=qwenwork' : isTw.value ? '?channel=traework' : isQd.value ? '?channel=qoder' : ''
-  const { data: d } = await client.get('/keys' + q)
+  // 列表全量（2026-11-01 用户要求）：API Key 管理页显示所有 key，
+  // 不再随顶栏通道切换过滤——通道归属在「通道」列一眼可见
+  const { data: d } = await client.get('/keys')
   data.value = d
   try {
     const { data: g } = await client.get('/models/gateway-list')
@@ -407,6 +423,21 @@ async function remove(k: ApiKey) {
   await load()
 }
 
+const viewOpen = ref(false)
+const viewKey = ref<ApiKey | null>(null)
+function openView(k: ApiKey) {
+  viewKey.value = k
+  viewOpen.value = true
+}
+async function copyView() {
+  try {
+    await navigator.clipboard.writeText(viewKey.value?.plain || '')
+    message.success('已复制到剪贴板')
+  } catch (e) {
+    message.warning('复制失败，请手动选中复制')
+  }
+}
+
 async function copyToken() {
   try {
     await navigator.clipboard.writeText(newToken.value)
@@ -417,7 +448,4 @@ async function copyToken() {
 }
 
 onMounted(load)
-
-// 切通道重拉：千问只显示可用于千问的 key
-watch(() => channelStore.current, load)
 </script>

@@ -2,6 +2,9 @@ export interface ApiKey {
   id: number
   name: string
   prefix: string
+  /** 完整明文（2026-11-01 起随 key 落盘，管理端可随时查看复制）。
+   *  旧 key（明文记录启用前创建的）为 null——明文从未落盘，无法回填。 */
+  plain: string | null
   created_at: number
   expires_at: number | null
   enabled: boolean
@@ -24,6 +27,8 @@ export interface KeysData {
   keys: ApiKey[]
   /** 服务端实际应用的通道筛选（'' = 全部） */
   channel?: string
-  require_key: boolean
+  /** 网关实况的鉴权开关（探测网关 /health 得来；null = 网关不在线，未知） */
+  require_key: boolean | null
+  gateway_online?: boolean
   days: number
 }

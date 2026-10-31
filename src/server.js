@@ -1954,6 +1954,10 @@ const server = http.createServer(async (req, res) => {
         status: 'ok',
         upstream_port: upstreamPort,
         upstream_managed: upstreamManaged,
+        // 网关进程自己的鉴权开关（REQUIRE_KEY 含 DUMATE2API_KEY 的语义）。
+        // 管理端进程读不到网关的环境变量——它此前用 process.env 判断，
+        // 两个进程环境不同导致页面恒显示「鉴权关闭」。读这里才是实况。
+        require_key: REQUIRE_KEY,
         // 通道状态：搭子是主链路，千问是可选。分开报，便于一眼看出
         // 「qwen/ 请求会在哪一步失败」。千问是进程内直连，没有端口，
         // 所以报的是 wasm 版本与登录态而不是 port。

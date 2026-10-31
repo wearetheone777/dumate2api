@@ -220,7 +220,8 @@ function list() {
   const { keys } = load();
   return keys.map((k) => ({
     ...k,
-    // 明文 hash 不出接口：管理端只需要展示与统计
+    // hash 不出接口（校验用），plain 出接口（管理端查看/复制完整 key；
+    // 旧 key 没有这个字段，前端按「明文未存」显示）
     hash: undefined,
   }));
 }
@@ -248,6 +249,13 @@ function create(opts = {}) {
       name: String(opts.name || '').trim() || autoName,
       prefix: token.slice(0, 12),
       hash: hash(token),
+      // 明文随 key 一起落盘（2026-11-01 用户要求）：管理端要支持随时查看与
+      // 复制完整 key——「明文仅创建时返回一次」的旧策略废除了。明文本就
+      // 属于签发方（网关/管理端）自持的凭证，data/ 目录已 gitignore，与
+      // web-accounts.json 明文存 cookie 是同一种信任边界。
+      // 旧 key 没有 plain 字段：明文在旧策略下从未落盘，无法回填，界面对
+      // 这些 key 如实显示「明文未存」。
+      plain: token,
       created_at: now,
       expires_at: opts.expires_at || null,
       enabled: opts.enabled !== false,

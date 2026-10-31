@@ -1,7 +1,35 @@
 // src/admin/routes/keys.js - API Key 管理
+const http = require('http');
 const keysvc = require('../../keys');
 const reqlog = require('../../reqlog');
 const { sendJSON } = require('../router');
+
+// 网关的鉴权开关是**网关进程**的环境变量，管理端读自己的 process.env 永远
+// 是错的（两个进程环境不同，曾导致页面恒显示「鉴权关闭」而 9082 实际已开）。
+// 探测网关 /health 的 require_key 字段才是实况；网关不在线时给 null，
+// 前端显示「未知」而不是编一个关闭。
+function gatewayRequireKey() {
+  const port = parseInt(
+    process.env.DUMATE_ADMIN_GATEWAY_PORT || process.env.DUMATE2API_PORT || '9080',
+    10,
+  );
+  return new Promise((resolveProbe) => {
+    const r = http.request(
+      { host: '127.0.0.1', port, path: '/health', method: 'GET', timeout: 2500 },
+      (res) => {
+        let raw = '';
+        res.on('data', (c) => { raw += c; });
+        res.on('end', () => {
+          try { resolveProbe({ online: true, requireKey: !!JSON.parse(raw).require_key }); }
+          catch (e) { resolveProbe({ online: true, requireKey: null }); }
+        });
+      },
+    );
+    r.on('timeout', () => { r.destroy(); resolveProbe({ online: false, requireKey: null }); });
+    r.on('error', () => resolveProbe({ online: false, requireKey: null }));
+    r.end();
+  });
+}
 
 // 每个 key 的用量从请求日志聚合，而不是在 key 记录里累加计数：
 // 累加会写坏（进程被杀就丢），日志是既成事实，重算总是对的。
@@ -68,7 +96,7 @@ const routes = [
   {
     method: 'GET',
     path: '',
-    handler: ({ res, req }) => {
+    handler: async ({ res, req }) => {
       const usage = usageByKey(30);
       // 通道过滤：管理端切到千问时只列与千问相关的 key
       // （channel 为 qwenwork，或未限定通道的通用 key）
@@ -79,11 +107,13 @@ const routes = [
         usage: usage[k.id] || { requests: 0, total_tokens: 0, failed: 0, last_at: 0, channels: {} },
       }));
       if (ch) list = list.filter((k) => !k.channel || k.channel === ch);
+      const gw = await gatewayRequireKey();
       return sendJSON(res, 200, {
         keys: list,
         channel: ch,
-        // 鉴权开关是环境变量，管理端只做展示与提醒
-        require_key: process.env.DUMATE_REQUIRE_KEY === '1',
+        // 鉴权开关读网关实况（/health 的 require_key），不读管理端自己的环境变量
+        require_key: gw.requireKey,
+        gateway_online: gw.online,
         days: 30,
       });
     },
@@ -100,7 +130,8 @@ const routes = [
 
       const created = keysvc.create(body || {});
       require('../../admin/auth').audit('admin', 'key_create', created.key.name);
-      // 明文 token 只在这里出现一次，之后无法再取回
+      // 明文已随 key 落盘（plain 字段），之后可在列表随时查看复制；
+      // 这里仍返回一次方便当场保存
       return sendJSON(res, 200, created);
     },
   },

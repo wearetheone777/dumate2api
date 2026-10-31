@@ -1055,7 +1055,7 @@ provider config 自带顶层 `model_context_window = 200000` +
 |---|---|---|
 | 桌面凭证 | `%APPDATA%\qianfan-desktop-app\auth.json` | 客户端登录态，**同一时刻只有一份**；cookie 由 Go 后端读，本项目不接触 |
 | 网页凭证 | `data/web-accounts.json` | 浏览器 cookie，**明文存**（必须原样重放），可多账号并存 |
-| API Key | `data/keys.json` | 我们签发给调用方的，**只存 sha256** |
+| API Key | `data/keys.json` | 我们签发给调用方的，**存 sha256（校验用）+ plain 明文（2026-11-01 起支持管理端查看/复制）** |
 
 **关键分界**：桌面端同一时刻只有一个账号可用，网页端可以管多个。所以「两个账号都有效」只在网页端成立——仪表盘的「账号状态」表（桌面）与「账号健康快照」（网页）是两套数据，**不要互相替代**。
 
@@ -1743,7 +1743,7 @@ per-key 限流（低价值场景）。
 
 | 文件 | 内容 |
 |---|---|
-| `keys.json` | API key，**只存 sha256**，明文仅在创建时返回一次 |
+| `keys.json` | API key，**存 sha256（校验用）+ plain 明文**（2026-11-01 起管理端可随时查看复制；旧策略「明文仅创建时返回一次」已废，启用前创建的旧 key 明文无法回填，界面标「明文未存」） |
 | `model-map.json` | `aliases` / `upstream_models` / `exposed` / `fallback` |
 | `admin-users.json` | 管理员口令（scrypt，N=2^18）与 `session_version` |
 | `admin.secret` | 会话签名密钥，与用户表分开存 |
