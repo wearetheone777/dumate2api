@@ -231,7 +231,7 @@ wss://qwenwork.cn/api/chat-ws
 |---|---|---|
 | 9 | 媒体层：生图 + TTS（视频后置） | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
 | 10 | JSON mode（走千帆原生端点） | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
-| 11 | 千问附件上传 | 千问 | ⚠️ 证据不足，暂缓（见 §10） |
+| 11 | 千问附件上传 | 千问 | ❌ 确认 HTTP 侧不可行（见 §10 与 [客户端解包分析](QWENWORK-CLIENT-1.4.0-ANALYSIS.md)） |
 | 12 | 千问模型元数据复核与接入 | 千问 | ✅ 已完成 2026-10-31（见 §10） |
 | 13 | TRAE `ide_user_pay_status` + 错误码补全 + 请求体韧性 | TRAE |
 | 14 | Qoder 前缀缓存亲和 + 历史字节稳定 | Qoder |
@@ -242,8 +242,11 @@ wss://qwenwork.cn/api/chat-ws
 | # | 项目 | 通道 |
 |---|---|---|
 | 16 | TRAE Remote 链路 | TRAE |
-| 17 | 千问 ACP 会话（独立通道） | 千问 |
+| 17 | 千问 ACP 会话（独立通道；也是附件的唯一出路） | 千问 |
 | 18 | 搭子 opencode Agent / MCP connector / 技能广场 | 搭子 |
+| 18b | 千问联网搜索 `/algo/api/v1/webSearch/oneSearch` | 千问 |
+| 18c | 千问图搜 `/algo/api/v2/service/pro/imageSearch` | 千问 |
+| 18d | 千问版本常量对齐（COSY 1.1.71 + X-QwenWork-* 头） | 千问 |
 | 19 | 搭子浏览器 CDP 中继 / IM 桥 / 记忆库 | 搭子 |
 | 20 | 千问企业身份 / 区域发现 / 定时任务 | 千问 |
 
@@ -557,6 +560,13 @@ qwen3.8-max-preview  rate=1.8   context=[200000, 400000, 1000000]  is_vl=true
 **所以「能上传」不等于「模型能读到」**：上传只是文件进了网盘，还需要一个
 对话侧的引用字段。这一步没有证据，按项目纪律不猜（不预编协议）。
 要推进只有两条路：接入 ACP 通道（P2-17），或恢复桌面客户端后抓一次真实附件请求。
+
+**2026-10-31 更新（已解包 1.4.0 客户端，结论确定）**：`chat_context` 的构造是
+`imageUrls: null` **写死**，附件在这个端点上结构性地不可能。真正的链路是
+「barn 预上传 → ACP 会话里用 `file_uuid` 引用」。详见
+[QWENWORK-CLIENT-1.4.0-ANALYSIS.md](QWENWORK-CLIENT-1.4.0-ANALYSIS.md)。
+同一份解包还挖到两个新端点（`webSearch/oneSearch`、`pro/imageSearch`）与一处
+版本号漂移（`COSY_VERSION` 1.1.52 vs 实际 1.1.71）。
 
 ---
 

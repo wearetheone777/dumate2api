@@ -592,6 +592,20 @@ inspector，再用 WebSocket 连 `:9229` 发 `Debugger.pause` 抓调用栈。
 槽上游**不消费**——dataURL 数组、裸 base64、pro 档重试全部「看不到图片」。槽位存在
 （Buddy2api 也发 None）但纯文本才是有效载荷，占位文本方案维持。
 
+**原因已由客户端解包确认（2026-10-31，`docs/QWENWORK-CLIENT-1.4.0-ANALYSIS.md`）**：
+官方客户端构造这个对象时 **`imageUrls` 恒为 `null`**（`ydl()` 里写死），
+`text` 是唯一载荷。附件与图片走的是**另一条链路**：`barn` 预上传
+（`POST /api/barn/v1/upload` → 分片 → 完成，拿到 `session_id`）→ **ACP 会话**
+（`wss://qwenwork.cn/api/chat-ws`）里用 `file_uuid` 引用，内容由
+`GET /api/oauth/files/{file_uuid}/content` 取。所以「千问不能收图」不是缺陷，
+是**这个端点上结构性地不可能**——要图片只有接 ACP（清单 P2-17）。
+同一份解包还确认了三个未接入端点（`/algo/api/v1/webSearch/oneSearch`、
+`/algo/api/v2/service/pro/imageSearch`、`/algo/api/v5/service/region/endpoints`）
+与版本漂移（`COSY_VERSION` 我们写 1.1.52，客户端 worker runtime 已是 1.1.71，
+且官方请求带 `X-QwenWork-Version` / `-Release-Version` / `-Build` / `-Platform` /
+`-Arch` / `-Channel` / `-App-Mode` 一整套身份头）。**1.1.52 目前仍能出流，
+不必立刻改**；上游开始做版本门时先改这里。
+
 **千问的预算与上下文（实测值，别照抄搭子的）**：
 - 预算走 `resolveQwenMaxTokens`，下限 **16384**（`DUMATE_QWENWORK_MIN_MAX_TOKENS`），**默认值 131072**（`DUMATE_QWENWORK_DEFAULT_MAX_TOKENS`，与搭子的 `DEFAULT_BUDGET=32768` 分开）。搭子的 32768 对千问偏大，但 4096 又太小——实测 4096 时 reasoning 会把预算吃光，模型陷入反复推演后只吐一句话。
 - **上游接受的 `max_tokens` 范围是 `[1, 131072]`**（实测 2026-09-27）：131072 通过，**131073 起一律 400**（`pro` / `flash` 边界一致）。**省略该字段不报错**，实测一次输出到 66807 token 才自然收尾（`finish=stop`）——说明上游自己的默认值远大于 66807。
