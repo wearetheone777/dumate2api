@@ -1,13 +1,11 @@
 // dumate2api - Anthropic Messages API -> OpenAI Chat Completions translation layer
 //
 // ============================================================================
-// 两种工具模式，按通道选（2026-10-04 修）
+// 两种工具模式，按入口选
 //
-//   text（默认，搭子用）：上游不支持 function calling，工具调用降级为纯文本
-//     （`[Tool Use: 名字]` / `[Tool Result]`）。这是能力边界，不是缺陷。
-//
-//   native（三条直连通道用）：把 Anthropic 的 tools / tool_use / tool_result
-//     真正转成 OpenAI 形状发上去。**必须开**，依据是实测对照：
+//   native（主网关 9080/9082 的四条通道全用，2026-10-31 起）：把 Anthropic 的
+//     tools / tool_use / tool_result 真正转成 OpenAI 形状发上去。**必须开**，
+//     依据是实测对照：
 //
 //       同一模型（TRAE Doubao-Seed-Evolving）、同一 prompt、同一套 tools：
 //         直连上游（只过 buildBody）→ 结构化 tool_calls
@@ -17,12 +15,22 @@
 //     客户端（Claude Code）收到的是普通文本、没有 tool_use 块，于是判定回合
 //     正常结束——表现为「很快就输出、任务没做」。**不是上游不支持，是这里丢了 tools。**
 //
+//     搭子（needsModelMap）原先是唯一的例外，理由是「上游不支持 function
+//     calling」。2026-10-31 实测推翻：`glm-5` + tools 在应用链路上非流式与
+//     流式都返回标准 tool_calls，所以这个例外取消了。
+//
+//   text（默认值，只剩 9084 多账号网关用）：降级为纯文本
+//     （`[Tool Use: 名字]` / `[Tool Result]`）。9084 的流式翻译器
+//     （web-gateway.js 的 translateStreamToAnthropic）还没有 tool_use 块，
+//     开 native 会让工具调用在流式路径上被丢掉——那里补完之前别改。
+//
 //   Codex 走 /v1/responses，那条路径的 responses.js 一直有 convertTools，
 //   所以「Codex 用 TRAE 能用工具」掩盖了本文件的问题：两条路径不是同一套代码。
 // ============================================================================
 const { resolveMaxTokens } = require('./budget');
 const modelmap = require('./modelmap');
 const { toImageUrlPart } = require('./images');
+const { cachedTokensOf } = require('./usage-norm');
 
 // 模型映射已抽到 modelmap.js（可经管理端编辑，落 data/model-map.json）。
 // 这里保留 MODEL_MAP 导出以兼容既有引用，值是默认表。
@@ -111,7 +119,7 @@ function toolResultText(block) {
 
 // Convert Anthropic Messages request to OpenAI Chat Completions request
 //
-// opts.nativeTools=true 时才转发结构化工具（直连通道）；默认 false = 旧的文本降级。
+// opts.nativeTools=true 时转发结构化工具；默认 false = 文本降级（只有 9084 还在用）。
 function anthropicToOpenAI(anthropicReq, opts = {}) {
   const native = opts.nativeTools === true;
   const messages = [];
@@ -331,6 +339,15 @@ function openAIToAnthropic(openaiResp, originalModel) {
   // 回合结束、**不去执行工具**，于是「模型说要调工具但什么都没发生」。
   const stopReason = toolCalls.length ? 'tool_use' : mapFinishReason(choice ? choice.finish_reason : null);
 
+  // usage 口径转换：OpenAI 的 prompt_tokens **含**缓存命中，Anthropic 的
+  // input_tokens **不含**（缓存单独报在 cache_read_input_tokens）。直接照搬会
+  // 让 Claude Code 把缓存部分既算进上下文、又看不到缓存命中——两个数都错。
+  // 上游没报缓存时 cached=0，减法自然退化成原值。
+  const openaiUsage = openaiResp.usage || {};
+  const promptTokens = Number(openaiUsage.prompt_tokens) || 0;
+  const cachedTokens = Math.min(cachedTokensOf(openaiUsage), promptTokens);
+  const cacheCreation = Number(openaiUsage.cache_creation_input_tokens) || 0;
+
   const anthropicResp = {
     id: openaiResp.id || ('msg_' + Date.now()),
     type: 'message',
@@ -340,8 +357,10 @@ function openAIToAnthropic(openaiResp, originalModel) {
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
-      input_tokens: openaiResp.usage ? openaiResp.usage.prompt_tokens : 0,
-      output_tokens: openaiResp.usage ? openaiResp.usage.completion_tokens : 0,
+      input_tokens: promptTokens - cachedTokens,
+      output_tokens: Number(openaiUsage.completion_tokens) || 0,
+      cache_read_input_tokens: cachedTokens,
+      cache_creation_input_tokens: cacheCreation,
     },
   };
 

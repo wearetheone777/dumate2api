@@ -1221,7 +1221,29 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 - `src/google.js` — Google Generative Language ↔ OpenAI
 - `src/budget.js` — 输出预算策略，**三个入口共用同一个 `resolveMaxTokens`**
 
-上游不支持 function calling，工具调用被**降级为纯文本**（`[Tool Use: 名字]`、`[Tool Result]`）——工具降级维持（搭子的 function calling 未实测通过，别顺手放开）；**图像则相反**：2026-10-31 真机实证上游认 OpenAI 标准 `image_url` part（data URI，网页凭证与桌面链路一致、能正确识别图像内容），四个翻译入口全部保真透传，`flattenImageParts` 压回已删除（见下文「搭子的真实模型」节）。
+**四条通道都支持原生 function calling**（2026-10-31 实测推翻旧结论）。搭子
+`glm-5` + tools 在应用链路 `/gateway/apis/v1/chat/completions` 上非流式返回
+`tool_calls`、流式返回完整 `delta.tool_calls`（`id`/`name`/`arguments`）与
+`finish_reason:"tool_calls"`——所以 Anthropic 入口**一律** `nativeTools: true`，
+工具调用转成结构化 `tool_use` 块交给 Claude Code。旧实现把搭子当「上游不支持
+function calling」而降级成 `[Tool Use: 名字]` 文本，那是历史能力误判，不是上游边界。
+
+**唯一保留文本降级的入口是 9084 多账号网关**（`src/web-gateway.js`）：它的流式
+翻译器只发 text/thinking 块、没有 `tool_use`，开 native 会让工具调用在流式路径上
+被丢掉。补完那个翻译器之前不要改它。
+
+**图像同样全入口保真**：2026-10-31 真机实证上游认 OpenAI 标准 `image_url` part
+（data URI，网页凭证与桌面链路一致、能正确识别图像内容），四个翻译入口全部保真
+透传，`flattenImageParts` 压回已删除（见下文「搭子的真实模型」节）。
+
+**usage 的缓存命中要在协议出口换算，不能只搬 input/output**（2026-10-31 修）。
+OpenAI 的 `prompt_tokens` **含**缓存，Anthropic 的 `input_tokens` **不含**
+（缓存单独报 `cache_read_input_tokens`），Gemini 的 `promptTokenCount` 含、
+另列 `cachedContentTokenCount` 子集。取值统一走 `usage-norm.cachedTokensOf`
+（认标准位 / DeepSeek / Qwen / Anthropic 四种形状）。此前 Anthropic 与 Google
+两个出口漏了这一步：Claude Code 既把缓存算进上下文、又看不到命中。
+真机复核（`glm-5`，同一段长 system 连发两次）：首次 `input 3017 / cache 0`，
+第二次 `input 201 / cache 2816`，201+2816=3017。
 
 ## 搭子的真实模型、自动档与上限（2026-10-31 深度逆向定案）
 
@@ -1256,7 +1278,26 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 **图像输入已支持**（推翻「上游不支持图像」）：上游认 OpenAI 标准 `image_url`
 part（data URI），网页凭证与桌面链路一致且能正确识别内容。翻译层全入口保真
 （含 anthropic 搭子分支），压回逻辑已删。测试图别用 8x8 退化尺寸（撞千帆
-internal_error）。工具调用降级维持——搭子的 function calling 未实测，别顺手放开。
+internal_error）。**原生工具调用也已支持**（2026-10-31 实测，推翻旧结论）：
+Anthropic 入口一律 `nativeTools: true`，细节与 9084 的例外见上文「协议翻译层」节。
+
+**第二条端点：千帆原生透传 `/gateway/v2/chat/completions`**（2026-10-31 实测）。
+与应用链路 `/gateway/apis/v1/chat/completions` 的能力边界不同：
+
+| 端点 | 原生 tools | JSON mode | 视觉 | 模型名 |
+|---|---|---|---|---|
+| `apis/v1`（应用链路） | 支持 | 400 | 支持 | 应用别名（`glm-5`、`model-text` 等） |
+| `v2`（千帆原生） | 支持 | 支持 | 支持 | 千帆原生模型（如 `qwen3.5-35b-a3b`）；应用别名 401 |
+
+两者都带 `Authorization: Bearer <app token>`；`v2` 另需 `X-Appbuilder-From: openclaw`。
+app token 来自 `GET https://www.dumate.cn/api/dumate/app/token/get`（带网页 cookie），
+与现有网页凭证池同一份。
+
+**工具类网关 `/gateway/v2/tools/dumate/*` 也能用同一份凭证**（2026-10-31 实测）：
+生图 `image_generate_v3/async`（提交 POST + 查询 GET `?task_id=`）、TTS
+`t2a_v2/sync`、视频 `video_generate/async`、BOS 上传
+`appbuilder.baidu.com/v2/tools/bos/upload`。它们是**网关尚未暴露**的能力，
+排期见 `docs/FUSION-BACKLOG-2026-10-31.md`。
 
 **按模型 max_tokens 钳制**（`src/dumate-caps.js`）：静态实测表 + 自学习（撞
 400 时从错误体解析各家范围声明，7 天 TTL 落 `data/dumate-caps.json`），

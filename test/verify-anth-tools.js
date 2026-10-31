@@ -9,7 +9,8 @@
 //      user 的 tool_result → role:'tool' 且**紧跟在 tool_calls 之后**
 //      （中间夹一条 user 文本会让上游认为「工具结果没有对应的调用」）
 //   3. 执行纪律在「带工具」时注入、幂等、且能关（与千问同一口径）
-//   4. nativeTools=false（搭子）时 tools 被丢弃、工具块降级为文本——**旧行为不变**
+//   4. nativeTools=false 时 tools 被丢弃、工具块降级为文本——现在只有 9084
+//      多账号网关还用这条路（它的流式翻译器没有 tool_use 块），行为必须不变
 const assert = require('assert');
 const anthropic = require('../src/anthropic');
 const traeworkChat = require('../src/traework/chat');
@@ -121,7 +122,18 @@ check('纪律可关：DUMATE_TRAEWORK_AGENT_DISCIPLINE=0', () => {
   } finally { delete process.env.DUMATE_TRAEWORK_AGENT_DISCIPLINE; }
 });
 
-console.log('\nnativeTools=false（搭子，旧行为必须不变）');
+console.log('\nnativeTools=true（搭子模型名同样走 native，2026-10-31 实测上游支持）');
+check('glm-5 的 tools 同样被转发', () => {
+  const out = anthropic.anthropicToOpenAI(
+    { ...anthReq, model: 'glm-5' },
+    { nativeTools: true },
+  );
+  assert.deepStrictEqual(out.tools.map((t) => t.function.name), ['Glob', 'Read']);
+  const a = out.messages.find((m) => m.role === 'assistant');
+  assert.ok(Array.isArray(a.tool_calls), 'tool_use 应转成 tool_calls');
+});
+
+console.log('\nnativeTools=false（9084 多账号网关，旧行为必须不变）');
 const oaiText = anthropic.anthropicToOpenAI(anthReq, { nativeTools: false });
 
 check('tools 被丢弃', () => assert.strictEqual(oaiText.tools, undefined));

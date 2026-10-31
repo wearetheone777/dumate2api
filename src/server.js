@@ -7,6 +7,7 @@ const { responsesToOpenAI, openAIToResponse, translateStreamToResponses } = requ
 const images = require('./images');
 const dumateCaps = require('./dumate-caps');
 const promptGuard = require('./prompt-guard');
+const { cachedTokensOf } = require('./usage-norm');
 const { resolveMaxTokens, resolveQwenMaxTokens, resolveTraeworkMaxTokens, resolveQoderMaxTokens } = require('./budget');
 const webFallback = require('./fallback-web');
 
@@ -1304,12 +1305,16 @@ async function handleAnthropicMessages(req, res) {
   }
   req._channel = route.channel;
 
-  // Convert to OpenAI format。直连通道开 nativeTools：不开的话 Anthropic 的
-  // tools 会被整段丢弃，模型收不到工具定义，只能在正文里吐 `<seed:tool_call>`
+  // Convert to OpenAI format。**四条通道一律开 nativeTools**：不开的话 Anthropic
+  // 的 tools 会被整段丢弃，模型收不到工具定义，只能在正文里吐 `<seed:tool_call>`
   // 文本式调用——Claude Code 拿不到 tool_use 块，直接判定回合结束
-  // （表现为「很快就输出、任务没做」）。搭子（needsModelMap）保持文本降级，
-  // 它的上游确实不支持 function calling，这是能力边界不是缺陷。
-  const openaiReq = anthropicToOpenAI(anthropicReq, { nativeTools: !route.target.needsModelMap });
+  // （表现为「很快就输出、任务没做」）。
+  //
+  // 搭子（needsModelMap）原先保持文本降级，理由是「上游不支持 function calling」。
+  // 2026-10-31 实测推翻：`glm-5` + tools 在应用链路 `/gateway/apis/v1/chat/completions`
+  // 上非流式返回 tool_calls、流式返回完整 delta.tool_calls（id/name/arguments）
+  // 与 finish_reason=tool_calls。降级只是历史能力误判，不是上游边界。
+  const openaiReq = anthropicToOpenAI(anthropicReq, { nativeTools: true });
   req._mappedModel = openaiReq.model;
 
   if (route.target.needsModelMap) {
@@ -1410,7 +1415,17 @@ function translateStreamToAnthropic(upstreamRes, res, originalModel, onDone) {
   let hasText = false;
   let inputTokens = 0;
   let outputTokens = 0;
+  let cachedTokens = 0;
+  let cacheCreation = 0;
   let lastFinishReason = null;
+  // Anthropic 的 usage 口径：input_tokens **不含**缓存，缓存单独报在
+  // cache_read_input_tokens。上游的 prompt_tokens 含缓存，所以出口要减。
+  const usageOut = () => ({
+    input_tokens: Math.max(0, inputTokens - cachedTokens),
+    output_tokens: outputTokens,
+    cache_read_input_tokens: cachedTokens,
+    cache_creation_input_tokens: cacheCreation,
+  });
   // 工具调用缓冲。**刻意缓冲到流末再发**，两个理由：
   //   1. Anthropic 的 content block 是**顺序**的（必须关掉前一个才能开下一个），
   //      而上游的多个 tool_call 增量会按 index 交错到达。实时发块会让「往已关闭
@@ -1437,6 +1452,10 @@ function translateStreamToAnthropic(upstreamRes, res, originalModel, onDone) {
         if (chunk.usage) {
           if (chunk.usage.prompt_tokens != null) inputTokens = chunk.usage.prompt_tokens;
           if (chunk.usage.completion_tokens != null) outputTokens = chunk.usage.completion_tokens;
+          const c = cachedTokensOf(chunk.usage);
+          if (c > 0) cachedTokens = c;
+          const cc = Number(chunk.usage.cache_creation_input_tokens);
+          if (Number.isFinite(cc) && cc > 0) cacheCreation = cc;
         }
         const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
         if (!delta) continue;
@@ -1574,7 +1593,7 @@ function translateStreamToAnthropic(upstreamRes, res, originalModel, onDone) {
         stop_reason: sentToolUse ? 'tool_use' : mapFinishReason(lastFinishReason),
         stop_sequence: null,
       },
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+      usage: usageOut()
     });
     sendEvent('message_stop', { type: 'message_stop' });
     finish(200);
@@ -1601,7 +1620,7 @@ function translateStreamToAnthropic(upstreamRes, res, originalModel, onDone) {
     sendEvent('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: mapFinishReason(lastFinishReason), stop_sequence: null },
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+      usage: usageOut()
     });
     sendEvent('message_stop', { type: 'message_stop' });
     finish(502);
