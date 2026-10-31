@@ -7,6 +7,7 @@ const { responsesToOpenAI, openAIToResponse, translateStreamToResponses } = requ
 const images = require('./images');
 const dumateCaps = require('./dumate-caps');
 const promptGuard = require('./prompt-guard');
+const media = require('./media');
 const { cachedTokensOf } = require('./usage-norm');
 const { resolveMaxTokens, resolveQwenMaxTokens, resolveTraeworkMaxTokens, resolveQoderMaxTokens } = require('./budget');
 const webFallback = require('./fallback-web');
@@ -827,6 +828,71 @@ async function handleOpenAIModels(req, res) {
   } catch (e) { /* 配置不可用按全量列表 */ }
 
   sendJSON(res, 200, { object: 'list', data });
+}
+
+// ==================== 媒体端点（搭子的工具接口）====================
+// 2026-10-31：生图与 TTS 走**同一份网页凭证**，端点挂在
+// `dumate-svc.baidu.com/gateway/v2/tools/dumate/*`。四家上游里只有搭子有
+// 这类工具，所以不做通道分流；请求体是标准 OpenAI 形状，翻译在 src/media.js。
+async function handleImageGenerations(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/images/generations';
+  req._channel = 'dumate';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const model = body.model || media.DEFAULT_IMAGE_MODEL;
+  const r = await media.generateImage({
+    prompt: body.prompt,
+    model,
+    n: body.n,
+    size: body.size,
+    quality: body.quality,
+    imageUrls: body.image_urls || body.imageUrls,
+    responseFormat: body.response_format,
+  });
+  if (!r.ok) {
+    const status = r.status || 502;
+    logRequest(req, res, startedAt, { model, stream: false, messages: 0 }, status, null, { media: 'image', error: r.error });
+    return sendJSON(res, status, { error: { message: r.error, type: 'api_error' } });
+  }
+  logRequest(req, res, startedAt, { model: r.model || model, stream: false, messages: 0 }, 200, null, { media: 'image' });
+  return sendJSON(res, 200, { created: r.created, data: r.data });
+}
+
+async function handleSpeech(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/audio/speech';
+  req._channel = 'dumate';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const model = body.model || media.DEFAULT_TTS_MODEL;
+  const r = await media.synthesizeSpeech({
+    input: body.input,
+    model,
+    voice: body.voice,
+    speed: body.speed,
+    responseFormat: body.response_format,
+  });
+  if (!r.ok) {
+    const status = r.status || 502;
+    logRequest(req, res, startedAt, { model, stream: false, messages: 0 }, status, null, { media: 'tts', error: r.error });
+    return sendJSON(res, status, { error: { message: r.error, type: 'api_error' } });
+  }
+  logRequest(req, res, startedAt, { model, stream: false, messages: 0 }, 200, null, { media: 'tts' });
+  res.writeHead(200, {
+    'Content-Type': r.contentType || 'audio/mpeg',
+    'Content-Length': r.buffer.length,
+    ...(res._cors || {}),
+  });
+  return res.end(r.buffer);
 }
 
 async function handleOpenAIChat(req, res) {
@@ -1813,6 +1879,15 @@ const server = http.createServer(async (req, res) => {
     // Chat completions (OpenAI format, pass-through with model mapping)
     if (url === '/v1/chat/completions' && req.method === 'POST') {
       return await handleOpenAIChat(req, res);
+    }
+
+    // 媒体端点（搭子工具接口）：生图 / 语音合成。标准 OpenAI 形状，
+    // 凭证走网页池，与对话共用同一套账号冷却与熔断。
+    if ((url === '/v1/images/generations' || url === '/images/generations') && req.method === 'POST') {
+      return await handleImageGenerations(req, res);
+    }
+    if ((url === '/v1/audio/speech' || url === '/audio/speech') && req.method === 'POST') {
+      return await handleSpeech(req, res);
     }
 
     // Responses API (Codex CLI 0.155+ 只认 wire_api="responses")

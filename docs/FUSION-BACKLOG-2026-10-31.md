@@ -229,7 +229,7 @@ wss://qwenwork.cn/api/chat-ws
 
 | # | 项目 | 通道 |
 |---|---|---|
-| 9 | 媒体层：生图 + TTS（视频后置） | 搭子 |
+| 9 | 媒体层：生图 + TTS（视频后置） | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
 | 10 | JSON mode（走千帆原生端点） | 搭子 |
 | 11 | 千问附件上传 | 千问 |
 | 12 | 千问模型元数据复核与接入 | 千问 |
@@ -451,6 +451,39 @@ token_usage.name = ""
 实现保留（`parseSessionUsage` 已认实测的 `amount_float`，全零骨架如实返回
 `null` 而不是 0），接入 Remote 链路（P2-10）后自动生效。当前 billing-check
 行为与改动前一致：走 consumed 差值并在 note 里说明口径。
+
+### 2026-10-31 · P1-9 搭子媒体层（生图 + TTS）
+
+| 文件 | 内容 |
+|---|---|
+| `src/media.js`（新） | 生图（v3/v2/v1/beta 四档端点，异步提交 + 轮询）与 TTS（`t2a_v2/sync`）；凭证复用 `web-pool`（同一套账号冷却/熔断） |
+| `src/server.js` | 新增 `POST /v1/images/generations`、`POST /v1/audio/speech`（裸路径也认），走标准 OpenAI 形状 |
+| `test/unit/media-payload.test.js` | 12 项：参数映射、尺寸/分辨率、n 钳制、voice 映射、格式校验 |
+
+**接口**
+
+```text
+POST /v1/images/generations
+{ "prompt": "...", "model": "dumate-image2.2", "n": 1, "size": "1024x1024" | "1K/2K/4K",
+  "quality": "low|high", "image_urls": ["<参考图>"], "response_format": "url|b64_json" }
+→ 200 { created, data: [{ url }] }  或  data: [{ b64_json }]
+
+POST /v1/audio/speech
+{ "input": "...", "voice": "nova|alloy|...|Chinese (Mandarin)_Sweet_Lady",
+  "response_format": "mp3|wav|pcm|ogg", "speed": 0.5~2 }
+→ 200 二进制音频（Content-Type: audio/mpeg 等）
+```
+
+**真机（9082）**
+
+```text
+生图  → 200 {"created":...,"data":[{"url":"https://entertain.bj.bcebos.com/..."}]}
+TTS   → 200 Content-Type: audio/mpeg, Content-Length: 40308
+错误  → 空 prompt 400；response_format=flac 400（文案明确）
+```
+
+**未做**：视频生成（`video_generate/async`，分镜/首尾帧/对白链路长，留到 P2）；
+`b64_json` 走的是「生成后下载再编码」，会多一次对象存储下载。
 
 ---
 

@@ -1250,6 +1250,8 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `/health` `/ping` | 内联，返回 `{upstream_port, upstream_managed}` |
 | `GET /v1/models` | 从 `modelmap.load()` 读 `exposed`，`owned_by` 区分上游真实模型（`dumate`）与别名（`dumate-proxy`） |
 | `POST /v1/chat/completions` | **最小干预透传**：只改 `model` 和 `max_tokens`，响应不重打包 |
+| `POST /v1/images/generations` | 搭子生图（`src/media.js`）：标准 OpenAI 形状 → 上游异步提交 + 轮询；凭证走网页池 |
+| `POST /v1/audio/speech` | 搭子 TTS（`t2a_v2/sync`）：回二进制音频，不回转链接 |
 | `POST /v1/responses` 或 `/responses` | 全量翻译（Responses ↔ Chat），Codex CLI 0.155+ 只认 `wire_api="responses"` |
 | `POST /v1/messages` 或 `/messages` 或 `/api/v1/messages` | 全量翻译 Anthropic ↔ OpenAI |
 | `POST .../count_tokens` | `字符数/4` 估算（`String.length`，汉字与 ASCII 同等计 1），仅供客户端算上下文预算 |
@@ -1336,11 +1338,19 @@ Anthropic 入口一律 `nativeTools: true`，细节与 9084 的例外见上文�
 app token 来自 `GET https://www.dumate.cn/api/dumate/app/token/get`（带网页 cookie），
 与现有网页凭证池同一份。
 
-**工具类网关 `/gateway/v2/tools/dumate/*` 也能用同一份凭证**（2026-10-31 实测）：
+**工具类网关 `/gateway/v2/tools/dumate/*` 用同一份凭证**（2026-10-31 实测）：
 生图 `image_generate_v3/async`（提交 POST + 查询 GET `?task_id=`）、TTS
 `t2a_v2/sync`、视频 `video_generate/async`、BOS 上传
-`appbuilder.baidu.com/v2/tools/bos/upload`。它们是**网关尚未暴露**的能力，
-排期见 `docs/FUSION-BACKLOG-2026-10-31.md`。
+`appbuilder.baidu.com/v2/tools/bos/upload`。**生图与 TTS 已暴露成网关端点**
+（`src/media.js` + `POST /v1/images/generations` / `POST /v1/audio/speech`）：
+
+- 凭证复用 `web-pool`（同一套选号/冷却/熔断），不要另建 token 缓存。
+- 生图是**异步任务**：提交拿 `task_id` → 同路径 GET 轮询到 `imageUrls`。
+  默认 `dumate-image2.2`（v3 端点），另有 2.1 / 1.2 / 0.1 三套端点。
+- TTS 走 minimax `t2a_v2/sync`，`output_format=url` 拿链接后**下载成字节**
+  再回给客户端（OpenAI 的 speech 语义是二进制，不是链接）。
+- 视频生成仍未接入（分镜/首尾帧/对白链路长），排期见
+  `docs/FUSION-BACKLOG-2026-10-31.md`。
 
 **按模型 max_tokens 钳制**（`src/dumate-caps.js`）：静态实测表 + 自学习（撞
 400 时从错误体解析各家范围声明，7 天 TTL 落 `data/dumate-caps.json`），
@@ -1546,6 +1556,8 @@ per-key 限流（低价值场景）。
 | `DUMATE_TOOL_OUTPUT_CAP` | 未设（关闭） | 历史 role:'tool' 输出超过此字符数截断并标注原始长度（0/未设关闭） |
 | `DUMATE_TRAEWORK_CONNECT_TIMEOUT_MS` | `10000` | TRAE 基址候选轮转的连接超时（tnc.js 候选链；黑洞主机不占满 600s） |
 | `DUMATE_DUMATE_CAPS_FILE` | 未设 | 搭子按模型 max_tokens 上限学习表的落盘路径覆盖（测试用） |
+| `DUMATE_MEDIA_POLL_TIMEOUT_MS` | `120000` | 生图异步任务的轮询总超时（ms），超时回 504 |
+| `DUMATE_MEDIA_POLL_INTERVAL_MS` | `1500` | 生图轮询间隔（ms） |
 
 ## 数据文件（`data/`，已 gitignore）
 
