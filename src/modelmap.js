@@ -137,6 +137,11 @@ function reset() {
 function mapModel(name) {
   const cfg = load();
   if (!name) return cfg.fallback;
+  // 上游真名**直接透传**（2026-11-01）：upstream_models 是实测过的、上游接受
+  // 的名字，它们不需要别名条目就能用——此前别名表是唯一的允许名单，表里
+  // 没有自映射条目的真名会静默落 fallback，逼着配置里躺一堆 glm-5 -> glm-5
+  // 的自映射。别名表现在只承担「真正的改名映射」（如 auto-l0 简写）。
+  if (cfg.upstream_models.includes(name)) return name;
   return cfg.aliases[name] || cfg.fallback;
 }
 
