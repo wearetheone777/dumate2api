@@ -850,6 +850,18 @@ async function handleOpenAIModels(req, res) {
     data = livecfg.applyHiddenModels(data);
   } catch (e) { /* 配置不可用按全量列表 */ }
 
+  // Key 的通道绑定同样约束模型列表（2026-11-01）：绑定了通道的 key 只能看到
+  // 该通道的模型——与对话侧的 channel_not_allowed 同一口径，否则客户端从
+  // 列表里选了别的通道的模型，请求时才撞 403，体验割裂。未绑定/未开鉴权
+  // 时维持全量（现状）。qianfan/ 的通道归属是 dumate（同一份凭证），所以
+  // dumate key 的列表里带 qianfan-raw 分组。
+  if (req._apiKey && req._apiKey.channel) {
+    const bound = req._apiKey.channel;
+    data = data.filter((m) => {
+      try { return (require('./upstream-router').resolve(m.id).channel || '') === bound; }
+      catch (e) { return false; }
+    });
+  }
   sendJSON(res, 200, { object: 'list', data });
 }
 
