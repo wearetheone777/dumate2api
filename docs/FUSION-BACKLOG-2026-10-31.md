@@ -230,7 +230,7 @@ wss://qwenwork.cn/api/chat-ws
 | # | 项目 | 通道 |
 |---|---|---|
 | 9 | 媒体层：生图 + TTS（视频后置） | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
-| 10 | JSON mode（走千帆原生端点） | 搭子 |
+| 10 | JSON mode（走千帆原生端点） | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
 | 11 | 千问附件上传 | 千问 |
 | 12 | 千问模型元数据复核与接入 | 千问 |
 | 13 | TRAE `ide_user_pay_status` + 错误码补全 + 请求体韧性 | TRAE |
@@ -484,6 +484,33 @@ TTS   → 200 Content-Type: audio/mpeg, Content-Length: 40308
 
 **未做**：视频生成（`video_generate/async`，分镜/首尾帧/对白链路长，留到 P2）；
 `b64_json` 走的是「生成后下载再编码」，会多一次对象存储下载。
+
+### 2026-10-31 · P1-10 千帆原生透传（`qianfan/` 前缀）
+
+应用链路 `/gateway/apis/v1` 对 `response_format` 回 400，而千帆原生
+`/gateway/v2` 支持——但两者**模型命名空间不同**（应用别名在 v2 上 401，
+千帆原生名在应用链路上也不认）。所以做成显式前缀，不做隐式路由。
+
+| 文件 | 内容 |
+|---|---|
+| `src/qianfan-raw.js`（新） | provider 接口：`status` / `listModels` / `send`（流式逐帧 + `[DONE]`）；凭证复用 `web-pool`；`buildRequest` 负责去前缀与 stream_options |
+| `src/upstream-router.js` | 新增 `QIANFAN_PREFIX` 与 resolve 分支：**channel 仍是 dumate**，但 `target.direct` + `provider: './qianfan-raw'`、`needsModelMap/needsBudget` 全关 |
+| `src/server.js` | `handleDirectChannel` 优先用 `route.target.provider`；`/v1/models` 列出 `qianfan/qwen3.5-35b-a3b` |
+| `test/unit/qianfan-raw.test.js` | 7 项：前缀解析、未知前缀仍报错、请求体形状 |
+
+**真机（9082）**
+
+```text
+JSON mode   qianfan/qwen3.5-35b-a3b + response_format=json_object
+            → {"message":{"content":"{\"ok\":true,\"n\":3}"}}
+流式        → chunk 帧 … data: [DONE]
+Anthropic   /v1/messages → 200 content「收到」，usage 带缓存字段
+Responses   /v1/responses → status=completed，out「收到」
+工具        → finish=tool_calls, get_weather:{"city":"北京"}
+```
+
+**约束**：不钳预算（透传语义）；模型名必须写千帆原生名；`/v1/models` 只列
+实测可用的那一个（上游没有模型列表接口）。
 
 ---
 

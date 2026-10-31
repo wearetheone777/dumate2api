@@ -33,6 +33,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `traework/glm-5.2` | TRAE Work（`src/traework/` 直连，凭证自持） |
 | `qoder/gfmodel` | Qoder（`src/qoder/` 直连，**签名纯本地、不需要客户端**） |
 | `dm-auto-model/text.L0` / `auto-l0` 等 | DuMate（router 显式认领该前缀并**全名透传**——档位编码在模型名里，斜杠不是通道分隔符，见下文「搭子的真实模型」节） |
+| `qianfan/qwen3.5-35b-a3b` | **千帆原生透传**（`src/qianfan-raw.js`）：与搭子共用网页凭证与额度，但走 `/gateway/v2/chat/completions`。**只有这个端点支持 `response_format`（JSON mode）**；模型名必须是千帆原生名，应用别名（glm-5 等）在这里会 401 |
 | 未知前缀（如 `qwn/pro`） | **400 报错，不静默回落** |
 
 **通道 id 的单一来源是 `src/channels.js`**（`dumate` / `qwenwork` / `traework` / `qoder`）。
@@ -1337,6 +1338,17 @@ Anthropic 入口一律 `nativeTools: true`，细节与 9084 的例外见上文�
 两者都带 `Authorization: Bearer <app token>`；`v2` 另需 `X-Appbuilder-From: openclaw`。
 app token 来自 `GET https://www.dumate.cn/api/dumate/app/token/get`（带网页 cookie），
 与现有网页凭证池同一份。
+
+**v2 端点已接入为 `qianfan/` 前缀**（`src/qianfan-raw.js`，2026-10-31）：它按
+provider 接口（`send`）挂进 `handleDirectChannel`，所以四个协议入口（OpenAI /
+Responses / Anthropic / Google）都能用，流式/非流式/工具调用全部透传。
+三个设计约束别改：
+
+- **通道归属仍是 `dumate`**（同一份凭证、同一份额度、同一套冷却），不是第五个通道；
+- **不做预算钳制**（`needsBudget: false`）——透传语义是「调用方给什么发什么」；
+- **模型名必须显式**：应用别名在这个端点上回 401 `invalid_model`。`/v1/models`
+  只列实测可用的 `qwen3.5-35b-a3b`（上游没有模型列表接口，`/gateway/v2/models`
+  回 404），其它名字原样透传由上游报错。
 
 **工具类网关 `/gateway/v2/tools/dumate/*` 用同一份凭证**（2026-10-31 实测）：
 生图 `image_generate_v3/async`（提交 POST + 查询 GET `?task_id=`）、TTS

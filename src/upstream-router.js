@@ -25,6 +25,18 @@ const TRAEWORK_PREFIX = 'traework';
 /** Qoder 通道的前缀。`qoder/gfmodel` → 上游模型 `gfmodel` */
 const QODER_PREFIX = 'qoder';
 /**
+ * 千帆原生透传的前缀（2026-10-31）。`qianfan/qwen3.5-35b-a3b` → 千帆原生
+ * `qwen3.5-35b-a3b`。
+ *
+ * 它不是「第五个上游」：凭证/账号/额度与搭子完全共用（channel 仍记 dumate），
+ * 但**模型命名空间不同**——应用别名（glm-5 / model-text）在这个端点上会
+ * 401 invalid_model，反过来千帆模型名在应用链路上也不认。所以用显式前缀
+ * 隔离，而不是让同一个模型名两条路都能走。
+ *
+ * 存在的理由：只有这个端点支持 `response_format`（JSON mode / json_schema）。
+ */
+const QIANFAN_PREFIX = 'qianfan';
+/**
  * 搭子自动档的前缀：`dm-auto-model/text.L0` 的**档位编码在模型名里**，
  * 斜杠不是通道分隔符（2026-10-31 真机实证：L0/L1/L2 分别实跑
  * DeepSeek-V4.1-Flash-Low-Latency / Kimi-K3 / Qwen3.8-Max）。整个名字
@@ -149,6 +161,26 @@ function resolve(model) {
       return { channel: 'dumate', target: targetOf(UPSTREAMS.dumate), model: name };
     }
     const rest = name.slice(slash + 1);
+    // 千帆原生透传：显式前缀、走 provider（不是本地转发），但通道归属仍是
+    // 搭子（同一份网页凭证与额度）。必须在通道前缀循环之前判——它没有
+    // 独立的 UPSTREAMS 条目。
+    if (head === QIANFAN_PREFIX) {
+      const t = targetOf(UPSTREAMS.dumate);
+      return {
+        channel: 'dumate',
+        model: rest,
+        rawQianfan: true,
+        target: {
+          ...t,
+          direct: true,
+          provider: './qianfan-raw',
+          needsModelMap: false,
+          needsBudget: false,
+          budgetKind: '',
+          rawQianfan: true,
+        },
+      };
+    }
     for (const up of Object.values(UPSTREAMS)) {
       if (up.prefix && up.prefix === head) {
         return { channel: up.id, target: targetOf(up), model: rest };
@@ -249,6 +281,7 @@ module.exports = {
   QWEN_PREFIX,
   TRAEWORK_PREFIX,
   QODER_PREFIX,
+  QIANFAN_PREFIX,
   DUMATE_AUTO_PREFIX,
   UPSTREAMS,
   resolve,

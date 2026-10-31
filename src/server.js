@@ -162,11 +162,13 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   //   qwenwork → 官方 wasm 封装请求体（依赖客户端安装的 wasm）
   //   traework → 自持凭证，直接调上游
   //   qoder    → 纯本地签名（cosy.js），连 wasm 都不需要
-  const provider = route.channel === 'traework'
-    ? require('./traework')
-    : route.channel === 'qoder'
-      ? require('./qoder')
-      : require('./qwenwork');
+  const provider = route.target.provider
+    ? require(route.target.provider)
+    : route.channel === 'traework'
+      ? require('./traework')
+      : route.channel === 'qoder'
+        ? require('./qoder')
+        : require('./qwenwork');
   const wantStream = !!payload.stream;
 
   // 请求 id 在这里就定下来：埋点与积分归因两边都要用同一个值才能配对。
@@ -821,6 +823,18 @@ async function handleOpenAIModels(req, res) {
       }
     } catch (e) { /* 通道不可用，不列 */ }
   }
+
+  // 千帆原生透传（qianfan/ 前缀）：只有这个端点支持 response_format。
+  // 模型清单**静态**——上游没有模型列表接口（/gateway/v2/models 回 404），
+  // 只列实测验证过的那个，其余名字原样透传由上游报错。
+  try {
+    const qr = require('./qianfan-raw');
+    if (qr.status().ready) {
+      for (const m of qr.listModels()) {
+        data.push({ id: `qianfan/${m}`, object: 'model', created, owned_by: 'qianfan-raw', name: m });
+      }
+    }
+  } catch (e) { /* 不可用不列 */ }
 
   // hiddenModels 热配置（F5）：输出侧过滤。管理端 PUT 后下一次列表即新口径。
   try {
