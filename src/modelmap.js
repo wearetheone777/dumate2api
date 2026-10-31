@@ -154,6 +154,12 @@ const MODEL_NAMES = {
   'model-text': '文本模型（上游默认）',
   'model-artifact-validate': '制品校验模型',
   'glm-5': 'GLM-5',
+  // 自动三档（2026-10-31 真机实证，网页凭证直打云端网关）：模型名即档位，
+  // 不需要请求头。括号里是网关响应头 X-Dumate-Gw-Realmodel 回传的真实后端，
+  // 仍是本地标注——上游没有模型列表接口
+  'dm-auto-model/text.L0': '自动档 L0（实跑 DeepSeek-V4.1-Flash-Low-Latency）',
+  'dm-auto-model/text.L1': '自动档 L1（实跑 Kimi-K3）',
+  'dm-auto-model/text.L2': '自动档 L2（实跑 Qwen3.8-Max）',
 };
 
 /** 上游 ID → 可读名；没有标注就原样返回（别名表里的 claude-* / gpt-* 属于客户端协议名） */

@@ -608,7 +608,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           lastUsage = null;       // 每轮独立结算（每轮都是一次真实上游请求）
           nextRound = false;
         }
-        gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP) : null;
+        gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP, { model: modelKey, channel: 'qoder' }) : null;
         // 尝试可能以**异常**结束（静默形态：content deadline / read idle 掐断
         // 时 postStream reject）——不能让它在等待判定之前飞出循环
         let res = null;
@@ -879,6 +879,8 @@ function makeMeter(account, opts) {
           ms: opts.startedAt ? Date.now() - opts.startedAt : null,
           // 实测倍率（上游改路由的可见性，见 credits.computeBilledRate）
           billedRate: require('./credits').computeBilledRate(credits, extra.usage, extra.expectedRate),
+          // 折扣前额度（usage 帧若带 original_credits，见 credits.capture）
+          originalCredits: extra.usage && extra.usage.original_credits,
         });
       } catch (e) { /* 记账失败绝不影响已发出的响应 */ }
     },

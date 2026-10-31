@@ -333,7 +333,17 @@ async function runConversation(auth, payload, onChunk, opts, model) {
     logRepair(opts.reqId, attempt, g.text);
   }
 
-  if (res && res.gate) res.gate.finish();
+  // finish() 内的 DSML fail-closed（leak 分支）会抛错：reasoning 帧此前已直发
+  // （缓冲门对 reasoning 不扣），必须如实标 sent，否则上层会当成「没开始输出」
+  // 而换号重试——客户端就会看到两段内容。
+  if (res && res.gate) {
+    try {
+      res.gate.finish();
+    } catch (e) {
+      e.sent = true;
+      throw e;
+    }
+  }
   if (res && res.fatal) throw res.fatal;
   if (res && res.streamErr) throw upstreamError(res.streamErr);
   return { streamed: true };

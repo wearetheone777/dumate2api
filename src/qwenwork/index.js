@@ -180,8 +180,10 @@ async function runOnce(account, payload, onChunk, opts) {
       let sent = false;
       let doneSeen = false;
       const down = (inner) => { sent = true; onChunk(inner); };
-      // 每轮新开一扇门：重试轮要丢弃上一轮的缓冲（含暂扣的 usage/finish）
-      gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP) : null;
+      // 每轮新开一扇门：重试轮要丢弃上一轮的缓冲（含暂扣的 usage/finish）。
+      // opts 带模型与通道名：finish 阶段的 DSML fail-closed 兜底要用
+      // （recovered 帧要合成 OpenAI chunk，leak 日志要通道前缀）
+      gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP, { model: modelKey, channel: 'qwenwork' }) : null;
       const deliver = gate ? (inner) => gate.onInner(inner) : down;
       try {
         res = await chat.postStream(built.url, built.body, built.headers, (inner) => {
@@ -397,20 +399,24 @@ async function send(payload, onChunk, opts = {}) {
 async function listModels() {
   try {
     const account = await chat.ensureAccount(authStore, pickAccount());
-    const built = await bridge.prepareInferAsync({
+    // **签名必须覆盖模型表自己的路径**（2026-10-31 实测）：签名串里带 pathSig，
+    // 复用聊天路径的签名去打 /api/v2/model/list，上游判 Signature invalid（403）。
+    // 旧实现在这里静默回落静态表——模型表从未真正来自上游。
+    const sign = require('./cosy-sign');
+    const sess = sign.newSession({
       uid: account.uid,
       token: account.accessToken,
-      bodyJson: '{}',
-      modelKey: constants.DEFAULT_MODEL,
       machineId: account.machineId || '',
     });
+    // GET 无请求体，按空串签名（与 Qoder 的 queue/status 同一约定）
+    const headers = sign.buildHeaders(sess, constants.MODELS_PATH, '', 'application/json');
     const u = new URL(constants.GATEWAY);
     const res = await new Promise((resolve, reject) => {
       const req = require('https').request({
         hostname: u.hostname,
         path: constants.MODELS_PATH,
         method: 'GET',
-        headers: { ...built.headers, 'Accept': 'application/json' },
+        headers: { ...headers, Accept: 'application/json' },
         timeout: 20000,
       }, (r) => {
         let b = '';

@@ -11,7 +11,14 @@
 const https = require('https');
 
 // ---- 主机 ----
+// AGENT_HOST 是**逻辑主机名**（referer 里的名字）：官方客户端不直连它，TTNet
+// 按 TNC 下发的域名表改写成具体后端（api5-normal.mchost.guru 等，见 tnc.js）。
+// 它目前可用，但上游换分片时（2026-10-15 国服就换过）会静默失效——运行时以
+// tnc.js 的候选链优先，这里只作 TNC 不可用时的兜底。
+// 国际版（2026-10-31，hub 证据）：llm_raw_chat 走 core-normal.traeapi.us；
+// utils_chat 的国际基址未实测——要接国际版先补国际账号验证。
 const AGENT_HOST = 'https://trae-api-cn.mchost.guru';
+const AGENT_HOST_INTL = 'https://core-normal.traeapi.us';
 const UG_HOST = 'https://api.trae.cn';
 const OAUTH_HOST = 'https://api.trae.com.cn';
 const CONSOLE_HOST = 'https://www.trae.cn';
@@ -68,6 +75,10 @@ const APP_VERSION = '0.1.45';
 // 超时：对话是长流，必须用无总超时的客户端，否则 SSE 会被截断
 const TIMEOUT_MS = 30000;
 const STREAM_TIMEOUT_MS = 600000;
+// 基址候选轮转的**连接**超时：黑名单主机（DNS 悬空/黑洞）不该占满 600s——
+// 到点换下一家候选（tnc.js 的候选链）
+const CONNECT_TIMEOUT_MS = Math.max(3000,
+  parseInt(process.env.DUMATE_TRAEWORK_CONNECT_TIMEOUT_MS || '10000', 10) || 10000);
 
 /** 统一发 JSON 请求。返回 { status, data, raw, error }。
  *  opts.agent 出站代理（E 包接线）：凭证请求与对话同出口，null = 直连。 */
@@ -106,11 +117,12 @@ function request(host, path, { method = 'POST', body = null, headers = {}, timeo
 }
 
 module.exports = {
-  AGENT_HOST, UG_HOST, OAUTH_HOST, CONSOLE_HOST,
+  AGENT_HOST, AGENT_HOST_INTL, UG_HOST, OAUTH_HOST, CONSOLE_HOST,
   EP_CHAT, EP_MODELS, EP_EXCHANGE, EP_USER_INFO,
   EP_CHECKIN_STATUS, EP_CHECKIN_CLAIM, EP_ENT_USAGE,
   CLIENT_ID, APP_ID, IDE_VERSION, IDE_VERSION_CODE,
   DEVICE_BRAND, OS_VERSION, FUNCTION, DEFAULT_MODEL,
-  USER_AGENT, UA_VSCODE, MARKET_CLIENT_ID, APP_VERSION, TIMEOUT_MS, STREAM_TIMEOUT_MS,
+  USER_AGENT, UA_VSCODE, MARKET_CLIENT_ID, APP_VERSION,
+  TIMEOUT_MS, STREAM_TIMEOUT_MS, CONNECT_TIMEOUT_MS,
   request,
 };

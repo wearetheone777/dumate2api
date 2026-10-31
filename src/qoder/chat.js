@@ -258,6 +258,10 @@ function buildBody(modelKey, payload, opts = {}) {
       name: '',
       begin_at: Date.now(),
       stage: 'processing',
+      // 计费归因（qoder2api-hub #119）：官方 CLI 在 business 块带 model_key，
+      // 上游按它记账；缺失时**所有模型都被记成 auto 档计费**——这也是
+      // billing-check 里实测倍率与标称不符的一条候选解释
+      model_key: modelKey,
     },
     system,
     messages: turns,
@@ -646,6 +650,31 @@ function aggregate(payloads, model) {
         }
       }
     } catch (e) { /* 非 JSON 帧跳过 */ }
+  }
+  // DSML fail-closed 兜底（2026-10-31，hub#120 推广）：Qoder 同跑 DeepSeek 系，
+  // 一样会把工具调用写成正文里的 DSML 标记。三分判据见 src/repair.js
+  // classifyDsml——recovered 还原成结构化调用；空壳剥离 + WARN；未闭合结构
+  // 报错（半截协议喂给客户端比明确失败更糟）。原生调用永远优先，不碰正文。
+  if (!calls.size && content && /dsml/i.test(require('../repair').stripFences(content))) {
+    const cls = require('../repair').classifyDsml(content);
+    if (cls.kind === 'recovered') {
+      content = cls.clean;
+      cls.calls.forEach((cc, i) => {
+        calls.set(i, {
+          id: `call_dsml_${Date.now().toString(36)}${i}`,
+          type: 'function',
+          function: { name: cc.name, arguments: cc.arguments },
+        });
+      });
+    } else if (cls.kind === 'empty') {
+      content = require('../repair').stripDsmlTags(content);
+      require('../repair').logDsml('qoder', 'empty', content);
+    } else {
+      require('../repair').logDsml('qoder', 'leak', content);
+      const err = new Error('DSML 协议残片无法还原：正文带未闭合的 tool 调用结构（fail-closed，本轮丢弃）');
+      err.statusCode = 502;
+      throw err;
+    }
   }
   const message = { role: 'assistant', content };
   if (reasoning) message.reasoning_content = reasoning;

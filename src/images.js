@@ -84,29 +84,4 @@ function hasImageContent(content) {
     && (p.type === 'image_url' || p.type === 'input_image' || (p.image_url && !p.text)));
 }
 
-/**
- * 把 openaiReq 消息里的图像 part 压回占位文本（就地改写）。
- * 给不支持图像的通道（搭子）用：翻译层现在保真透传图像，而搭子上游
- * 不认识 image_url part——恢复翻译层保真前的行为（占位文本进正文）。
- * OpenAI 直通路径不经翻译层，客户端自己发的图像不在此列。
- */
-function flattenImageParts(openaiReq, placeholder) {
-  const ph = placeholder || '[Image content - not supported by DuMate backend]';
-  const msgs = openaiReq && Array.isArray(openaiReq.messages) ? openaiReq.messages : [];
-  for (const m of msgs) {
-    if (!m || !Array.isArray(m.content)) continue;
-    if (!hasImageContent(m.content)) continue;
-    const flat = [];
-    for (const p of m.content) {
-      if (p && typeof p === 'object' && (p.type === 'image_url' || p.type === 'input_image')) {
-        flat.push({ type: 'text', text: ph });
-      } else if (p && typeof p === 'object' && typeof p.text === 'string') {
-        flat.push(p);
-      }
-    }
-    m.content = flat.map((p) => p.text).filter(Boolean).join('\n');
-  }
-  return openaiReq;
-}
-
-module.exports = { toImageUrlPart, responsesPartToUrl, imagePartsFromContent, contentText, hasImageContent, flattenImageParts };
+module.exports = { toImageUrlPart, responsesPartToUrl, imagePartsFromContent, contentText, hasImageContent };

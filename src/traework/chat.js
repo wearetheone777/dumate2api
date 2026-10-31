@@ -149,29 +149,71 @@ function buildBody(payload, model, meta) {
   return JSON.stringify(obj);
 }
 
-/** 发流式请求。返回 { stream, status, raw }。auth 兼作账号记录：出站代理
- *  （E 包接线）按它的 proxy 字段 > 全局 DUMATE_PROXY 解析，null 直连。 */
-function postStream(body, auth) {
+// ---------------------------------------------------------------------------
+// 基址候选轮转（2026-10-31，TNC 域名动态发现）。
+//
+// 官方客户端不写死 agent 网关：它请求逻辑主机名，TTNet 按 TNC 下发的域名表
+// 改写成具体后端。上游换分片时（国服 2026-10-15 换过）写死的基址静默失效。
+// postStream 按 tnc.js 的候选链轮转：连接级失败换下一家，全部失败清表下轮重拉。
+// ---------------------------------------------------------------------------
+
+const tnc = require('./tnc');
+
+/** 该错误是不是连接级失败（换基址有意义的）；代理配置错误不是，直接终止 */
+function isConnectError(msg) {
+  return /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|EHOSTUNREACH|ENETUNREACH|connect timeout|socket hang up|certificate|timeout/i
+    .test(String(msg || ''));
+}
+
+/** 发流式请求到单个基址。连接阶段有独立超时（黑洞主机不该占满 600s） */
+function postStreamOnce(host, body, auth) {
   return new Promise((resolve) => {
     let agent = null;
     try { agent = require('../proxy-agent').getAgentFor(auth); } catch (e) {
-      return resolve({ stream: null, status: 0, error: `出站代理配置错误: ${e.message}` });
+      // 代理配置错误与基址无关，不参与轮转
+      return resolve({ stream: null, status: 0, error: `出站代理配置错误: ${e.message}`, fatal: true });
     }
-    const u = new URL(c.AGENT_HOST + c.EP_CHAT);
+    const u = new URL(host + c.EP_CHAT);
+    let settled = false;
+    const settle = (v) => { if (settled) return; settled = true; clearTimeout(connectTimer); resolve(v); };
     const req = https.request({
       hostname: u.hostname,
       path: u.pathname,
       method: 'POST',
       headers: { ...soloHeaders(auth, true), 'Content-Length': Buffer.byteLength(body) },
-      // 长流不能设总超时，否则 SSE 会被掐断
+      // 长流不能设总超时，否则 SSE 会被掐断（socket 空闲 600s 仍兜底）
       timeout: c.STREAM_TIMEOUT_MS,
       ...(agent ? { agent } : {}),
-    }, (res) => resolve({ stream: res, status: res.statusCode }));
-    req.on('error', (e) => resolve({ stream: null, status: 0, error: e.message }));
-    req.on('timeout', () => { req.destroy(); resolve({ stream: null, status: 0, error: 'timeout' }); });
+    }, (res) => settle({ stream: res, status: res.statusCode, host }));
+    // 连接超时：到点主动断，error 事件带原因交 settle
+    const connectTimer = setTimeout(() => {
+      try { req.destroy(new Error(`connect timeout (${host})`)); } catch (e) { /* 已结束 */ }
+      settle({ stream: null, status: 0, error: `connect timeout (${host})`, host });
+    }, c.CONNECT_TIMEOUT_MS);
+    if (connectTimer.unref) connectTimer.unref();
+    req.on('error', (e) => settle({ stream: null, status: 0, error: e.message, host }));
+    req.on('timeout', () => { req.destroy(); settle({ stream: null, status: 0, error: 'timeout', host }); });
     req.write(body);
     req.end();
   });
+}
+
+/** 发流式请求。返回 { stream, status, raw }。auth 兼作账号记录：出站代理
+ *  （E 包接线）按它的 proxy 字段 > 全局 DUMATE_PROXY 解析，null 直连；
+ *  auth.region（'cn'|'intl'，缺省 cn）决定候选链。 */
+async function postStream(body, auth) {
+  const hosts = await tnc.agentHosts(auth);
+  let last = null;
+  for (const host of hosts) {
+    const r = await postStreamOnce(host, body, auth);
+    if (r.stream || r.fatal) return r;
+    // 拿到响应（含 4xx/5xx）就交上层按状态码处置——换基址只救「连不上」
+    if (r.status !== 0 || !isConnectError(r.error)) return r;
+    last = r;
+  }
+  // 全部候选都连不上：TNC 表可能已过期，清缓存让下次请求重新拉表
+  tnc.invalidate(auth);
+  return last;
 }
 
 /**
@@ -409,16 +451,23 @@ function createTextGate(emit, model, hold) {
       }
       if (evt.event === 'token_usage') {
         const d = evt.data || {};
+        const usage = {
+          prompt_tokens: d.prompt_tokens || 0,
+          completion_tokens: d.completion_tokens || 0,
+          total_tokens: d.total_tokens || 0,
+          completion_tokens_details: { reasoning_tokens: d.reasoning_tokens || 0 },
+        };
+        // 缓存命中镜像（2026-10-31，traework2api-panel issue#3）：上游报顶层
+        // cache_read_input_tokens，不镜像进标准位的话按标准协议解析的客户端
+        // 恒显示缓存未命中。原字段口径与 usage-norm.js 一致：上游没给不造字段。
+        if (d.cache_read_input_tokens != null) {
+          usage.prompt_tokens_details = { cached_tokens: Number(d.cache_read_input_tokens) || 0 };
+        }
         held.push(JSON.stringify({
           id: 'traework', object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000), model,
           choices: [],
-          usage: {
-            prompt_tokens: d.prompt_tokens || 0,
-            completion_tokens: d.completion_tokens || 0,
-            total_tokens: d.total_tokens || 0,
-            completion_tokens_details: { reasoning_tokens: d.reasoning_tokens || 0 },
-          },
+          usage,
         }));
         return;
       }
@@ -438,28 +487,49 @@ function createTextGate(emit, model, hold) {
     result() { return { toolCalls, text, live, pending }; },
     /** 收尾：把还没下发的正文与暂扣的帧补发出去 */
     finish() {
-      // DSML 流式兜底（2026-10-30）：整轮零工具调用、正文还没 flush（pending
-      // 仍在缓冲里）、且正文带 DSML 块——解析还原成 tool_calls 补发，正文发
-      // 剥离后的干净版（pending 置空阻止 flush 发原文）。已 flush（live）的
-      // 场景正文出去了收不回，维持现状（不劣化）；reasoning 早已直发不受影响。
-      if (!live && toolCalls === 0 && pending && /dsml/i.test(pending)) {
-        const parsed = parseDsmlToolCalls(pending);
-        if (parsed) {
+      // DSML 流式兜底（2026-10-30 引入；2026-10-31 升级为共享分类器的
+      // fail-closed 三分判据——recovered 还原 / empty 剥离 + WARN / leak 报错，
+      // 见 src/repair.js classifyDsml 注释）。只救「还没 flush（pending 仍在
+      // 缓冲里）」的场景；已 flush（live）的正文出去了收不回，维持现状
+      // （不劣化）；reasoning 早已直发不受影响。
+      if (!live && toolCalls === 0 && pending && /dsml/i.test(repair.stripFences(pending))) {
+        const cls = repair.classifyDsml(pending);
+        if (cls.kind === 'recovered') {
           pending = '';
-          emit(mkChunk({ content: parsed.clean }));
+          emit(mkChunk({ content: cls.clean }));
           emit(mkChunk({
-            tool_calls: parsed.calls.map((cc, i) => ({
+            tool_calls: cls.calls.map((cc, i) => ({
               index: i,
               id: `call_dsml_${Date.now().toString(36)}${i}`,
               type: 'function',
               function: { name: cc.name, arguments: cc.arguments },
             })),
           }));
+          // 上游 done 报 stop 的话纠正为 tool_calls（与 aggregate 同一口径）
+          for (let i = 0; i < held.length; i++) {
+            try {
+              const h = JSON.parse(held[i]);
+              if (h.choices && h.choices[0] && h.choices[0].finish_reason === 'stop') {
+                h.choices[0].finish_reason = 'tool_calls';
+                held[i] = JSON.stringify(h);
+              }
+            } catch (e) { /* 非 JSON 帧跳过 */ }
+          }
           held.push(JSON.stringify({
             id: 'traework', object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000), model,
             choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
           }));
+        } else if (cls.kind === 'empty') {
+          pending = repair.stripDsmlTags(pending);
+          repair.logDsml('traework', 'empty', pending);
+        } else {
+          // leak：fail-closed。reasoning 已直发，调用方 catch 后按已发头处理
+          repair.logDsml('traework', 'leak', pending);
+          pending = '';
+          const err = new Error('DSML 协议残片无法还原：正文带未闭合的 tool 调用结构（fail-closed，本轮丢弃）');
+          err.statusCode = 502;
+          throw err;
         }
       }
       flush(); for (const f of held) emit(f);
@@ -468,51 +538,12 @@ function createTextGate(emit, model, hold) {
 }
 
 // ---------------------------------------------------------------------------
-// DeepSeek DSML 工具调用回退解析（2026-10-30，融合自 trae2api-hub trae_proxy.py）
-//
-// 现象：DeepSeek 系模型偶尔把工具调用以**文本标记**写进正文而不是走原生
-// tool_calls 增量——形状是 `<dsml:calls>` 包 `<dsml:invoke name="…">` 包
-// `<dsml:parameter name="…">`（标签名里 DSML 的位置与分隔符不固定，前缀
-// 任意）。客户端拿到的是一段 XML 文本，本轮工具调用不执行。
-//
-// 处置是**纯兜底**：只在「正文含 DSML 标记且本轮没有任何原生 tool_calls」
-// 时才解析——原生工具调用永远优先（真实调用带调用 id 与上游语义，文本
-// 解析只是尽力还原），有原生调用时正文里的 DSML 文本原样保留（那可能是
-// 模型在讨论格式而不是在调用）。流式路径不解析：正文可能已直发，收不回；
-// 非流式（aggregate，含 chatlab 试调台）在聚合出口做，正文全量在手。
+// DeepSeek DSML 工具调用回退解析（2026-10-30 引入；2026-10-31 解析函数与
+// fail-closed 分类器收敛到 src/repair.js——千问/Qoder 同款协议残片同修，
+// 这里的 parseDsmlToolCalls 只是对共享层的 re-export，别在这里加逻辑）
 // ---------------------------------------------------------------------------
 
-/** `<…DSML…calls>…</…DSML…calls>` 块（DOTALL：块可跨行） */
-const DSML_CALLS_RE = /<[^>]*dsml[^>]*calls>([\s\S]*?)<\/[^>]*dsml[^>]*calls>/i;
-/** `<…DSML…invoke name="…">…</…DSML…invoke>`（g 必须：exec 循环推进靠它） */
-const DSML_INVOKE_RE = /<[^>]*dsml[^>]*invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/[^>]*invoke>/gi;
-/** `<…DSML…parameter name="…">…</…DSML…parameter>`（g 同上） */
-const DSML_PARAM_RE = /<[^>]*dsml[^>]*parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/[^>]*parameter>/gi;
-
-/**
- * 从正文解析 DSML 工具调用块。
- * @returns {{calls:Array<{name:string,arguments:string}>, clean:string}|null}
- *          null = 没有 DSML 块或块里没有 invoke（正文原样保留）
- */
-function parseDsmlToolCalls(text) {
-  const s = String(text || '');
-  if (!/dsml/i.test(s)) return null;
-  const m = DSML_CALLS_RE.exec(s);
-  if (!m) return null;
-  const calls = [];
-  let inv;
-  while ((inv = DSML_INVOKE_RE.exec(m[1])) !== null) {
-    const params = {};
-    let p;
-    while ((p = DSML_PARAM_RE.exec(inv[2])) !== null) {
-      params[p[1]] = p[2].trim();
-    }
-    calls.push({ name: inv[1], arguments: JSON.stringify(params) });
-  }
-  if (!calls.length) return null;
-  const clean = (s.slice(0, m.index).trim() + ' ' + s.slice(m.index + m[0].length).trim()).trim();
-  return { calls, clean };
-}
+const parseDsmlToolCalls = repair.parseDsmlToolCalls;
 
 /**
  * 聚合整轮结果（非流式路径）。
@@ -554,23 +585,36 @@ function aggregate(events, model) {
         total_tokens: d.total_tokens || 0,
         completion_tokens_details: { reasoning_tokens: d.reasoning_tokens || 0 },
       };
+      // 缓存命中镜像（与流式门同一口径，misakano issue#3）
+      if (d.cache_read_input_tokens != null) {
+        usage.prompt_tokens_details = { cached_tokens: Number(d.cache_read_input_tokens) || 0 };
+      }
     }
     if (e.event === 'done' && d.finish_reason) finish = d.finish_reason;
   }
 
-  // DSML 回退（见 parseDsmlToolCalls 注释）：零原生调用且正文带 DSML 块时
-  // 还原成结构化工具调用并从正文剥离；原生调用优先，不碰正文。
-  if (!calls.size && content) {
-    const parsed = parseDsmlToolCalls(content);
-    if (parsed) {
-      content = parsed.clean;
-      parsed.calls.forEach((c, i) => {
+  // DSML 回退（fail-closed 三分判据见 src/repair.js classifyDsml）：零原生
+  // 调用且正文带 DSML 块时还原成结构化工具调用并从正文剥离；空壳剥离 + WARN；
+  // 未闭合结构报错（把半截协议喂给客户端比明确失败更糟）。原生调用优先，不碰正文。
+  if (!calls.size && content && /dsml/i.test(repair.stripFences(content))) {
+    const cls = repair.classifyDsml(content);
+    if (cls.kind === 'recovered') {
+      content = cls.clean;
+      cls.calls.forEach((c, i) => {
         calls.set(i, {
           id: `call_dsml_${Date.now().toString(36)}${i}`,
           type: 'function',
           function: { name: c.name, arguments: c.arguments },
         });
       });
+    } else if (cls.kind === 'empty') {
+      content = repair.stripDsmlTags(content);
+      repair.logDsml('traework', 'empty', content);
+    } else {
+      repair.logDsml('traework', 'leak', content);
+      const e = new Error('DSML 协议残片无法还原：正文带未闭合的 tool 调用结构（fail-closed，本轮丢弃）');
+      e.statusCode = 502;
+      throw e;
     }
   }
 

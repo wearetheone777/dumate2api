@@ -135,8 +135,10 @@ function anthropicToOpenAI(anthropicReq, opts = {}) {
     if (!Array.isArray(msg.content)) continue;
 
     if (!native) {
-      // ---- 文本降级（搭子）----
+      // ---- 搭子降级（工具仍降级为文本；图像 2026-10-31 起保真透传——
+      // 真机实证搭子上游认 image_url part，与直连通道同一形状）----
       const parts = [];
+      const imageParts = [];
       for (const block of msg.content) {
         if (block.type === 'text') {
           parts.push({ type: 'text', text: block.text });
@@ -145,10 +147,24 @@ function anthropicToOpenAI(anthropicReq, opts = {}) {
         } else if (block.type === 'tool_result') {
           parts.push({ type: 'text', text: `[Tool Result]\n${toolResultText(block)}` });
         } else if (block.type === 'image') {
-          parts.push({ type: 'text', text: '[Image content - not supported by DuMate backend]' });
+          const src = block.source || {};
+          const url = src.type === 'url' ? src.url
+            : src.type === 'base64' ? `data:${src.media_type || 'image/png'};base64,${src.data || ''}`
+              : '';
+          const part = toImageUrlPart(url);
+          if (part) imageParts.push(part);
+          else parts.push({ type: 'text', text: '[Image content - unsupported source]' });
         }
       }
-      messages.push({ role: msg.role, content: parts.map(p => p.text).join('\n') });
+      if (imageParts.length) {
+        const content = [];
+        const text = parts.map((p) => p.text).filter(Boolean).join('\n');
+        if (text) content.push({ type: 'text', text });
+        content.push(...imageParts);
+        messages.push({ role: msg.role, content });
+      } else {
+        messages.push({ role: msg.role, content: parts.map((p) => p.text).join('\n') });
+      }
       continue;
     }
 

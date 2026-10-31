@@ -48,10 +48,12 @@ const MACHINE_OS = 'x86_64_win32';
 const LOGIN_VERSION = 'v2';
 const USER_AGENT = 'qoderwork/1.1.0';
 
-// 模型目录会随服务端变化（1.1.0 实测只有 flash / pro / qwen3.8-max-preview，
-// 旧版的 qwork-advanced 等已不存在），所以这里只作兜底，实际以
-// /api/v2/model/list 为准。
-const FALLBACK_MODELS = ['pro', 'flash'];
+// 模型目录会随服务端变化。**2026-10-31 真机复核**（/api/v2/model/list，修复了
+// 签名路径 bug 后首次拉通）：上游当前只有 flash（标准）/ pro（高级）/
+// qwen3.8-max-preview（Qwen3.8-Max，千问最强）三个，Buddy2api 等社区项目
+// 提到的 qwork-auto/advanced/ultimate 在当前上游**不存在**。此表只作兜底，
+// 实际以 /api/v2/model/list 为准。
+const FALLBACK_MODELS = ['pro', 'flash', 'qwen3.8-max-preview'];
 const DEFAULT_MODEL = 'pro';
 const MODEL_ALIASES = { auto: 'pro', 'qwork-advanced': 'pro', 'qwork-auto': 'pro' };
 
