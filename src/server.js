@@ -1101,6 +1101,10 @@ async function handleOpenAIChat(req, res) {
   // 通道分流：`qwen/xxx` 走千问办公，其余走搭子。
   // 必须在 mapModel 之前——千问的模型名（pro/flash）不在搭子的别名表里，
   // 先过 mapModel 会被兜底成 model-text，等于把请求打到错的模型上。
+  // Claude Desktop 3p 直连的 claude-* 路由名按 key 通道重写（幂等：重写后的
+  // 名字带通道前缀，不再是 claude-* 形状）；key 没绑通道时原样放行。
+  const _cl = modelmap.normalizeIncomingModel(reqBody.model, req._apiKey && req._apiKey.channel);
+  if (_cl) reqBody.model = _cl;
   const route = router.resolve(reqBody.model);
   if (route.error) {
     return sendJSON(res, 400, { error: { message: route.error, type: 'invalid_request_error' } });
@@ -1330,7 +1334,10 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
   req._mappedModel = openaiReq.model;
 
   // 通道分流：Google 路径的模型名来自 URL，googleToOpenAI 已把它落到
-  // openaiReq.model，所以这里与 chat 路径共用同一套解析。
+  // openaiReq.model，所以这里与 chat 路径共用同一套解析。claude-* 路由名
+  // 按 key 通道重写，同 chat 路径。
+  const _cl = modelmap.normalizeIncomingModel(openaiReq.model, req._apiKey && req._apiKey.channel);
+  if (_cl) openaiReq.model = _cl;
   const route = router.resolve(openaiReq.model);
   if (route.error) {
     return sendJSON(res, 400, { error: { message: route.error, code: 400, status: 'INVALID_ARGUMENT' } });
@@ -1451,7 +1458,10 @@ async function handleOpenAIResponses(req, res) {
   const openaiReq = responsesToOpenAI(reqBody, isStream);
   req._mappedModel = openaiReq.model;
 
-  // 通道分流：Codex 的 responses 接口同样支持 qwen/ 前缀
+  // 通道分流：Codex 的 responses 接口同样支持 qwen/ 前缀。claude-* 路由名
+  //（Claude Desktop 3p 直连）按 key 通道重写，同 chat 路径。
+  const _cl = modelmap.normalizeIncomingModel(openaiReq.model, req._apiKey && req._apiKey.channel);
+  if (_cl) openaiReq.model = _cl;
   const route = router.resolve(openaiReq.model);
   if (route.error) {
     return sendJSON(res, 400, { error: { message: route.error, type: 'invalid_request_error' } });
@@ -1550,6 +1560,10 @@ async function handleAnthropicMessages(req, res) {
   // 通道分流**必须在转换之前**：工具模式按通道选（直连通道转发结构化工具、
   // 搭子保持文本降级），而模式要在调用转换时就定下来。模型名直接取
   // anthropicReq.model——转换不会改它（映射在下面的 needsModelMap 分支里做）。
+  // Claude Desktop 3p 直连（Anthropic 协议）的 claude-* 路由名按 key 通道
+  // 重写——这是 Desktop 直连的主路径，同 chat 路径的幂等重写。
+  const _cl = modelmap.normalizeIncomingModel(anthropicReq.model, req._apiKey && req._apiKey.channel);
+  if (_cl) anthropicReq.model = _cl;
   const route = router.resolve(anthropicReq.model);
   if (route.error) {
     return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: route.error } });
@@ -2030,6 +2044,15 @@ const server = http.createServer(async (req, res) => {
             model = parsed && parsed.model ? String(parsed.model) : null;
           } catch (e) { model = null; }
         }
+      }
+      // Claude Desktop 3p 直连只发 claude-* 路由名（无通道前缀），按 key 的
+      // 通道解析成带前缀的网关模型名——否则无前缀名会被 router 归进搭子，
+      // 再被下面的通道绑定判定 403。只在 key 绑了通道时解析（与
+      // resolveClaudeRoute 的约定一致）；重写只影响这里的判定与后续 handler
+      // 的 route 解析，handler 会做同样的重写（幂等），请求体原文不动。
+      if (model && key && key.channel) {
+        const cl = modelmap.normalizeIncomingModel(model, key.channel);
+        if (cl) model = cl;
       }
       // 通道绑定判定：靠模型名前缀，与 upstream-router 的分流口径一致。
       // 解析不出来（如 GET /v1/models）就不传通道，validate 会跳过这条规则

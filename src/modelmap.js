@@ -133,16 +133,91 @@ function reset() {
   return load();
 }
 
+// Claude Desktop 3p 直连网关只发 claude-* 路由名（cc-switch 直连模式的硬约束：
+// direct_inference_model_specs 拒绝非 claude-* 名，真实模型只出现在 label 里）。
+// 按 **key 的通道** 把路由名解析成带前缀的网关模型名——一个 profile 配一把
+// 通道 key，同样的 claude-sonnet-5 在 qoder key 下落 Qwen3.8-Flash、在搭子
+// key 下落 L0。映射表与 cc-switch 四个 9082 provider 的 env 档位一一对应。
+// key 没绑通道时不解析（返回 null 走原 fallback）——不限通道的 key 配哪个
+// profile 都可能，替它选通道等于编造。
+const CLAUDE_ROUTES = {
+  dumate: {
+    sonnet: 'dm-auto-model/text.L0',
+    opus: 'dm-auto-model/text.L1',
+    haiku: 'model-text',
+    fable: 'dm-auto-model/text.L2',
+  },
+  qwenwork: {
+    sonnet: 'qwen/flash',
+    opus: 'qwen/pro',
+    haiku: 'qwen/flash',
+    fable: 'qwen/pro',
+  },
+  traework: {
+    sonnet: 'traework/deepseek-v4.1-flash',
+    opus: 'traework/glm-5.3-flash',
+    haiku: 'traework/glm-5.3-flash',
+    fable: 'traework/kimi-k3.1-pro',
+  },
+  qoder: {
+    sonnet: 'qoder/Qwen3.8-Flash',
+    opus: 'qoder/GLM-5.3-Flash',
+    haiku: 'qoder/DeepSeek-Flash',
+    fable: 'qoder/Qwen3.8-Max',
+  },
+};
+
+// 旧式名不劫持：claude-3-5-sonnet-20241022（role 前有版本段）与
+// claude-sonnet-4-20250514（role 后带 8 位日期串）继续走别名表/fallback，
+// 历史行为不变。只认 claude-{role} 后跟短版本号（1-2 位数字，可多段）的
+// 新式路由名——Claude Desktop / 新版 Claude Code 的形状。
+const CLAUDE_ROUTE_RE = /^claude-(sonnet|opus|haiku|fable)(?:-\d{1,2})*$/i;
+
+/**
+ * claude-* 路由名 → 该通道的网关模型名（带通道前缀，router 可直接认领）。
+ * 兼容三种写法：anthropic/ 前缀、[1M] 后缀、大小写混合。非路由名或通道
+ * 无映射时返回 null，调用方原样放行。
+ */
+function resolveClaudeRoute(name, channel) {
+  if (!name || !channel) return null;
+  let s = String(name).trim();
+  if (s.toLowerCase().startsWith('anthropic/')) s = s.slice('anthropic/'.length);
+  s = s.replace(/\[1M\]$/i, '');
+  const m = CLAUDE_ROUTE_RE.exec(s);
+  if (!m) return null;
+  const table = CLAUDE_ROUTES[channel];
+  if (!table) return null;
+  return table[m[1].toLowerCase()] || null;
+}
+
+/**
+ * 入口统一清理（鉴权段与四个协议 handler 的 route 解析之前调用）：
+ * claude-* 路由名按通道重写；其余名字只剥 [1M] 标记（Claude Code /
+ * Claude Desktop 的「1M 上下文」后缀，qwen/pro[1M] 不剥的话直连通道会
+ * 把 'pro[1M]' 当模型名打上游）。返回 null 表示无需改动。
+ */
+function normalizeIncomingModel(name, channel) {
+  if (!name) return null;
+  const cl = resolveClaudeRoute(name, channel);
+  if (cl) return cl;
+  const s = String(name);
+  return /\[1M\]$/i.test(s) ? s.replace(/\[1M\]$/i, '') : null;
+}
+
 // 与改造前的 mapModel 行为一致：查不到就回落到 fallback
 function mapModel(name) {
   const cfg = load();
   if (!name) return cfg.fallback;
+  // [1M] 后缀是「1M 上下文」标记（Claude Code / Claude Desktop 的约定），
+  // 不是模型身份的一部分——不剥的话 glm-5[1M] 会静默落 fallback（历史
+  // 日志里 200 但实际跑的是 model-text，正是这种静默兜底）。
+  const base = String(name).replace(/\[1M\]$/i, '');
   // 上游真名**直接透传**（2026-11-01）：upstream_models 是实测过的、上游接受
   // 的名字，它们不需要别名条目就能用——此前别名表是唯一的允许名单，表里
   // 没有自映射条目的真名会静默落 fallback，逼着配置里躺一堆 glm-5 -> glm-5
   // 的自映射。别名表现在只承担「真正的改名映射」（如 auto-l0 简写）。
-  if (cfg.upstream_models.includes(name)) return name;
-  return cfg.aliases[name] || cfg.fallback;
+  if (cfg.upstream_models.includes(base)) return base;
+  return cfg.aliases[base] || cfg.fallback;
 }
 
 /**
@@ -185,6 +260,9 @@ module.exports = {
   DEFAULT_ALIASES,
   DEFAULT_UPSTREAM,
   DEFAULT_EXPOSED,
+  CLAUDE_ROUTES,
+  resolveClaudeRoute,
+  normalizeIncomingModel,
   filePath,
   load,
   save,
