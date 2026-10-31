@@ -233,20 +233,20 @@ wss://qwenwork.cn/api/chat-ws
 | 10 | JSON mode（走千帆原生端点） | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
 | 11 | 千问附件上传 | 千问 | ❌ 确认 HTTP 侧不可行（见 §10 与 [客户端解包分析](QWENWORK-CLIENT-1.4.0-ANALYSIS.md)） |
 | 12 | 千问模型元数据复核与接入 | 千问 | ✅ 已完成 2026-10-31（见 §10） |
-| 13 | TRAE `ide_user_pay_status` + 错误码补全 + 请求体韧性 | TRAE |
-| 14 | Qoder 前缀缓存亲和 + 历史字节稳定 | Qoder |
-| 15 | 统一错误码字典 | 全部 |
+| 13 | TRAE `ide_user_pay_status` + 错误码补全 + 请求体韧性 | TRAE | ✅ 已完成 2026-10-31（见 §10） |
+| 14 | Qoder 前缀缓存亲和 + 历史字节稳定 | Qoder | ✅ 已完成 2026-10-31（见 §10） |
+| 15 | 统一错误码字典 | 全部 | ⚠️ TRAE 业务码已收进 upstream-errors（见 §10）；Qoder/千问通道私有码留在各自通道层（105→401、112/110/114/430 等已在） |
 
 ### P2 / P3
 
 | # | 项目 | 通道 |
 |---|---|---|
 | 16 | TRAE Remote 链路 | TRAE |
-| 17 | 千问 ACP 会话（独立通道；也是附件的唯一出路） | 千问 |
+| 17 | 千问 ACP 会话（独立通道；也是附件的唯一出路） | 千问 | ⚠️ HTTP 半边（barn 上传）已落地，WS 帧协议无证据不预编（见 §10） |
 | 18 | 搭子 opencode Agent / MCP connector / 技能广场 | 搭子 |
-| 18b | 千问联网搜索 `/algo/api/v1/webSearch/oneSearch` | 千问 |
-| 18c | 千问图搜 `/algo/api/v2/service/pro/imageSearch` | 千问 |
-| 18d | 千问版本常量对齐（COSY 1.1.71 + X-QwenWork-* 头） | 千问 |
+| 18b | 千问联网搜索 `/algo/api/v1/webSearch/oneSearch` | 千问 | ✅ 已完成 2026-10-31（见 §10） |
+| 18c | 千问图搜 `/algo/api/v2/service/pro/imageSearch` | 千问 | ✅ 已完成 2026-10-31（见 §10） |
+| 18d | 千问版本常量对齐（COSY 1.1.71 + X-QwenWork-* 头） | 千问 | ✅ 已完成 2026-10-31（见 §10） |
 | 19 | 搭子浏览器 CDP 中继 / IM 桥 / 记忆库 | 搭子 |
 | 20 | 千问企业身份 / 区域发现 / 定时任务 | 千问 |
 
@@ -567,6 +567,111 @@ qwen3.8-max-preview  rate=1.8   context=[200000, 400000, 1000000]  is_vl=true
 [QWENWORK-CLIENT-1.4.0-ANALYSIS.md](QWENWORK-CLIENT-1.4.0-ANALYSIS.md)。
 同一份解包还挖到两个新端点（`webSearch/oneSearch`、`pro/imageSearch`）与一处
 版本号漂移（`COSY_VERSION` 1.1.52 vs 实际 1.1.71）。
+
+---
+
+## 11. 落地记录（2026-10-31 第二批：18b/18c/18d/P1-13/P1-14/P2-17 前置）
+
+### 18d 千问版本常量对齐
+
+| 文件 | 内容 |
+|---|---|
+| `src/qwenwork/constants.js` | `COSY_VERSION` 1.1.52 → **1.1.71**（解包 1.4.0 的 `cosy-version` 头实际取值，obf 里 `ZLe = UH \|\| "1.1.71"`）；`IDE_VERSION` 1.1.0 → 1.4.0；`RELEASE_VERSION` / `BUILD` → `1.4.0-26102705` / `26102705`（解包 `package.json` 的 `qoderworkUpgradeVersion`，Build 由 release 派生成对取）。四个常量都可环境变量覆盖 |
+| `src/qwenwork/cosy-sign.js` | `clientHeaders()`：六个 `X-QwenWork-*` 身份头（Version/Release-Version/Build/Platform/Arch/Channel），`DUMATE_QWENWORK_OS_HEADERS=0` 关 |
+
+**刻意不做**：`X-QwenWork-App-Mode`。它的取值在解包里是运行时配置
+（`constants$4.a.appModeId`），没有字面量依据——**不编一个假值发出去**。
+真机验证：1.1.71 + 新头对话 200 正常出流（`qwen/flash`，正文「收到」）。
+
+### 18b/18c 千问联网搜索与图搜
+
+| 文件 | 内容 |
+|---|---|
+| `src/qwenwork/search.js`（新） | `webSearch` / `imageSearch`；请求体 `{payload: JSON.stringify(业务参数), encodeVersion:"1"}`（与 chat_context **不是**一套形状）；响应解析按客户端 `tkd()`/`rkd()` 的候选字段表 |
+| `src/qwenwork/constants.js` | `WEB_SEARCH_PATH` / `IMAGE_SEARCH_PATH` / `SEARCH_QUERY`（`Encode=1`） |
+| `src/server.js` | `POST /v1/search/web`、`POST /v1/search/images`（**通道专属**，不占用 `/v1/images/*`——那是搭子的生图，语义不同） |
+| `test/unit/qwen-search.test.js` | 14 项：请求体形状、count 越界、pageItems/page_items 双写法、错误码、空壳剔除 |
+
+**关键实现细节**：
+- 请求体是 `{payload, encodeVersion}` 而不是业务参数本身——客户端 `.json({payload: JSON.stringify(e), encodeVersion:"1"})` 明写。整个体再走 cosy.encode（`withWasmSigning()`）。
+- `imageSearch` 比 `webSearch` 多 `requestId`（UUID）与 `timestamp`（秒字符串）两个字段，count 客户端硬校验 [1,10]。
+- 国际版 webSearch 是 `/unifiedSearch`（客户端按 LINGMA_ENV 切换）——只接 CN，**不预编没验证过的路径**。
+
+**真机（2026-10-31，账号 2）**：
+```text
+webSearch "Node.js 24 发布"   → 10 条（title/link/snippet/publishedTime/hostname 全有值）
+imageSearch "红色跑车" ×3      → 3 条（imageUrl/width/height，bbox 无）
+网关 9082 /v1/search/web      → 200 /v1/search/images → 200
+```
+
+### P2-17 前置：千问附件上传（barn，HTTP 半边）
+
+| 文件 | 内容 |
+|---|---|
+| `src/qwenwork/files.js`（新） | `uploadBytes`（分片 `clamp(1MB,100MB,ceil(size/10))` → 逐片 POST → 无 body 收尾）、`downloadFile`（`/api/oauth/files/{file_uuid}/content`）；**纯 Bearer，不走 COSY 签名**（客户端 `credentialRequest` 只有 `X-QwenWork-*` + Bearer） |
+| `src/server.js` | `POST /v1/files/upload`（`{name, content_base64, mime_type}`） |
+| `test/unit/qwen-files.test.js` | 4 项：分片公式边界、基址、上限 |
+
+**真机**：32B 与 3MB（3 片）都 200/201 成功落盘（`storage_path` 返回）。
+
+**缺口如实记录——为什么这不等于附件能用**：
+1. barn 完成体只回 `storage_path`，**没有 `file_uuid`**；
+2. `file_uuid` 由上游在 **ACP 会话侧**下发（worker 里 `file_attachments` 的
+   `J.object({file_uuid, file_name})` 是 ACP 消息的响应 schema）；
+3. ACP WebSocket（`/api/chat-ws`，Go 后端）的**帧协议没有证据**：二进制里只有
+   路径字符串，`join/new_prompt/session/publish` 等方法名在明文里搜不到，
+   worker runtime 里是 ACP **agent 侧**（stdio，标准 `session/new`/`session/prompt`）。
+   按项目纪律「无证据不预编」，WS 通道不做。**fileUuid 恒为 null 时端点如实
+   返回 `reference_note` 说明，调用方不要拿 session_id 当引用键。**
+
+### P1-13 TRAE 付费状态 + 错误码 + 请求体韧性
+
+| 文件 | 内容 |
+|---|---|
+| `src/traework/constants.js` | `EP_PAY_STATUS = /trae/api/v2/pay/ide_user_pay_status`（v1/v2 都 200，v2 多 `detail`/`enable_solo_*`/`can_purchase_pro_oneweek`，取 v2） |
+| `src/traework/checkin.js` | `payStatus()` + `parsePayStatus()` 纯函数 + `ACTIVITY_KINDS` 映射 |
+| `src/admin/routes/traework.js` | `/credits` 行带 `payIdentity` / `isFreshman` / `capabilities` / `claimableActivities` |
+| `src/traework/chat.js` | buildBody 韧性三类：`developer`→`system`、孤儿 tool 剔除（收集 assistant 声明的 id 再过滤）、空 assistant 剔除、system 提前；`meta.dropped` 计数 |
+| `src/upstream-errors.js` | `traeCodeKind` / `traeCodeOf`：1005→model、3003/3004/4008→soft（额度）、4015/4019→soft（风控）、1001/4001/4011/4023/4026/10101/20405→不惩罚。**判据带 `traework <code>` 前缀**，只在 TRAE 语境认码 |
+| `test/unit/trae-pay-status.test.js` | 9 项 |
+| `test/unit/trae-error-codes.test.js` | 9 项 |
+
+**真机实测 pay_status（Free 号）**：
+```text
+user_pay_identity_str = "Free"   is_pay_freshman = true
+enable_solo_lite/web/coder/builder = true   enable_fission = false
+commercial_activities: send_message_reward(type 105) eligible=true general_credits=500
+```
+最后一条正是「活动/邀请积分」的数据源——**当前账号有一笔可领的 500 积分活动**
+（本清单原以为「本账号无配置」）。
+
+### P1-14 Qoder 前缀缓存亲和 + 历史字节稳定
+
+| 文件 | 内容 |
+|---|---|
+| `src/qoder/chat.js` | `stableSessionId()`（首条 user 消息指纹 → UUIDv5 形状，与 channel-pool.sessionKeyOf 同一截断锚点）、`deriveUuid()` / `deriveEpochMs()`（business.id 与 begin_at 的确定性派生，基准点固定 2026-01-01） |
+| `test/unit/qoder-cache-affinity.test.js` | 10 项 |
+
+**改动前的问题**（`buildBody` 实测复现）：客户端从不带 `session_id`，修复轮
+才有 `opts.sessionId`——所以**每一轮都拿到新的随机 UUID**，`business.id` 与
+`business.begin_at` 同样每轮变。上游按 (session, 历史) 做前缀缓存时缓存键
+每轮换，命中率从 ~95% 掉到 ~8%（hub #48 的实测口径）：既费钱又拖慢首字。
+
+**现在的口径**：`session_id` = 首条 user 消息指纹（追加轮次后不变）、
+`business.id` / `begin_at` 由 session_id 确定性派生；`request_id` **保持每轮新**
+（复用会被上游当幂等重试合并，这是 2026-10-31 实测过的 103 Duplicate request
+的同族机制，不能一起稳定化）。显式传入的 session_id 仍然最高优先。
+
+**真机回归**：`qoder/DeepSeek-Flash` 200 正常出流（`qfmodel` 撞上上游排队
+10605，与改动无关——排队信封带 `isQueued:true`，是上游限流形态）。
+
+### 15（部分）统一错误码字典
+
+TRAE 业务码已收进 `src/upstream-errors.js`（见 P1-13）。Qoder 与千问的
+通道私有码（105→401、112/110/114/430、10605）**留在各自通道层**——
+这是 2026-10-30 的既有架构决策：`upstream-errors` 是两条 COSY 通道共用的
+识别层，通道私有码放进去会让另一条通道误判。完整字典见 CLAUDE.md 的
+「错误形态」各节。
 
 ---
 

@@ -918,9 +918,105 @@ async function handleSpeech(req, res) {
   return res.end(r.buffer);
 }
 
-async function handleOpenAIChat(req, res) {
+// 千问搜索端点（2026-10-31）。两条都是**只读检索**，不消耗对话额度里的
+// 输出预算，但走的是同一份账号凭证与出站代理。
+//
+// 响应刻意**不做 OpenAI 兼容包装**：搜索结果的形状与 chat completion 无关，
+// 硬套一个 `choices` 只会让客户端去猜。直接给 `{items:[...]}`，字段名与
+// 上游一致（title/link/snippet/publishedTime/hostname）。
+async function handleWebSearch(req, res) {
   const startedAt = Date.now();
+  req._logPath = '/v1/search/web';
+  req._channel = 'qwenwork';
   const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const search = require('./qwenwork/search');
+  try {
+    const r = await search.webSearch({
+      query: body.query || body.q,
+      allowedDomains: body.allowed_domains || body.allowedDomains,
+      blockedDomains: body.blocked_domains || body.blockedDomains,
+    });
+    logRequest(req, res, startedAt, { model: 'qwenwork/web-search', stream: false, messages: 0 }, 200, null, { media: 'web_search', results: r.items.length });
+    return sendJSON(res, 200, { object: 'search_result', items: r.items, request_id: r.requestId });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'qwenwork/web-search', stream: false, messages: 0 }, status, null, { media: 'web_search', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleImageSearch(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/search/images';
+  req._channel = 'qwenwork';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const search = require('./qwenwork/search');
+  try {
+    const r = await search.imageSearch({ query: body.query || body.q, count: body.count });
+    logRequest(req, res, startedAt, { model: 'qwenwork/image-search', stream: false, messages: 0 }, 200, null, { media: 'image_search', results: r.items.length });
+    return sendJSON(res, 200, { object: 'image_search_result', items: r.items, request_id: r.requestId });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'qwenwork/image-search', stream: false, messages: 0 }, status, null, { media: 'image_search', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleFileUpload(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/files/upload';
+  req._channel = 'qwenwork';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  // 请求体形状：{ name, content_base64, mime_type? }。用 base64 而不是
+  // multipart，是因为网关没有 multipart 解析器（零第三方依赖），而文件
+  // 上传是低频动作，客户端做一次 base64 编码完全可以接受。
+  const name = String(body.name || body.path || '').trim();
+  const b64 = String(body.content_base64 || body.data || '');
+  if (!name || !b64) {
+    return sendJSON(res, 400, { error: { message: '需要 name 与 content_base64', type: 'invalid_request_error' } });
+  }
+  let buf;
+  try { buf = Buffer.from(b64, 'base64'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'content_base64 不是合法 base64', type: 'invalid_request_error' } });
+  }
+  const files = require('./qwenwork/files');
+  try {
+    const r = await files.uploadBytes(buf, { path: name, mimeType: body.mime_type || body.mimeType });
+    logRequest(req, res, startedAt, { model: 'qwenwork/file-upload', stream: false, messages: 0 }, 200, null, { media: 'file_upload', bytes: r.size });
+    return sendJSON(res, 200, {
+      object: 'file',
+      size: r.size,
+      path: r.raw && r.raw.storage_path ? r.raw.storage_path : r.path,
+      // 如实标注：file_uuid 由上游 ACP 会话下发，当前 HTTP 链路拿不到。
+      // 不要把 session_id 当引用键回给客户端——它不是文件标识。
+      file_uuid: r.fileUuid,
+      reference_note: r.fileUuid ? null
+        : '上游只回了 storage_path，file_uuid 由 ACP 会话下发；当前 HTTP 链路无法在对话里引用该文件',
+    });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'qwenwork/file-upload', stream: false, messages: 0 }, status, null, { media: 'file_upload', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleOpenAIChat(req, res) {
+  const startedAt = Date.now();  const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let reqBody;
   try {
@@ -1911,6 +2007,22 @@ const server = http.createServer(async (req, res) => {
     }
     if ((url === '/v1/audio/speech' || url === '/audio/speech') && req.method === 'POST') {
       return await handleSpeech(req, res);
+    }
+    // 千问搜索端点（2026-10-31，解包 1.4.0 客户端挖到）。**通道专属**：
+    // 只有千问有这两个能力，不做跨通道分流；路径刻意不占用 `/v1/images/...`
+    // （那是搭子的生图，语义不同——生图是「生成」，图搜是「检索」）。
+    if ((url === '/v1/search/web' || url === '/search/web') && req.method === 'POST') {
+      return await handleWebSearch(req, res);
+    }
+    if ((url === '/v1/search/images' || url === '/search/images') && req.method === 'POST') {
+      return await handleImageSearch(req, res);
+    }
+    // 千问附件上传（barn，P2-17 的 HTTP 半边）。返回的 file_uuid 是**引用键**，
+    // 但当前只能在上游 ACP 会话里用——我们还没有那条通道（见 docs 的缺口说明）。
+    // 所以这个端点如实返回 `file_uuid: null` 时表示上游没下发引用键，
+    // 调用方不要拿 session_id 当引用（它只是上传会话，不是文件标识）。
+    if ((url === '/v1/files/upload' || url === '/files/upload') && req.method === 'POST') {
+      return await handleFileUpload(req, res);
     }
 
     // Responses API (Codex CLI 0.155+ 只认 wire_api="responses")

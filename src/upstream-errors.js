@@ -290,6 +290,60 @@ function isDeterministic(status, full) {
   return DETERMINISTIC_TEXT.test(unescapeDeep(String(full || '')));
 }
 
+/**
+ * TRAE（llm_utils_chat / agent 链路）的业务码表。
+ *
+ * **来源与可信度分级，不要当成实测清单**：我们这条链路上真正实测出现过的
+ * 只有 **4001**（模型名/参数无效，流内 `event:error`，HTTP 200）与 **401**
+ * （鉴权失效，HTTP 状态码）。其余取自社区参照（Trae2api-cn / traework2api-panel
+ * / bluechonk 的端点清单），**未在本项目链路复现**，所以判据只按「码值语义 +
+ * 文案特征」做保守分类，不猜处置细节：
+ *
+ *   1001  通用参数错误
+ *   1005  订阅专享模型（Free 号打订阅模型；换模型即可用）—— 已有独立分支
+ *   3003  额度/权益不足
+ *   3004  权益不可用
+ *   4001  参数无效（**实测**：模型名未知时就是这个，文案无信息量）
+ *   4008  额度耗尽（国际版 raw 链路）
+ *   4011  会话/上下文超限
+ *   4015  风控拦截
+ *   4019  风控/设备异常
+ *   4023  上下文超限（**实测出现过 4026 同族**，见 models.js 的上下文探测）
+ *   4026  上下文超限（实测：1,050,036 token 被拒时就是这个码）
+ *   10101 账号/租户问题
+ *   20405 服务端拒绝
+ *
+ * 分类原则：**确定性错误（重发同一份字节必然同一个失败）不进熔断**，
+ * 它们换账号也没用。风控类（4015/4019）与额度类（3003/4008）要分开——
+ * 前者换号可能有用（不同设备指纹），后者换号确实有用（别的号还有额度）。
+ */
+
+/** TRAE 业务码 → 处置类别。返回 null 表示「不在表里」，交回通用判据 */
+function traeCodeKind(code) {
+  const n = Number(code);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // 订阅专享（1005）：换模型即可用，进 (账号,模型) 负缓存
+  if (n === 1005) return 'model';
+  // 额度/权益类：换号有用（别的账号可能还有额度）
+  if (n === 3003 || n === 3004 || n === 4008) return 'quota';
+  // 风控类：换号可能有用（不同设备指纹），但不进熔断（不是服务故障）
+  if (n === 4015 || n === 4019) return 'risk';
+  // 确定性请求错误：参数/上下文超限，换号无用
+  if (n === 1001 || n === 4001 || n === 4011 || n === 4023 || n === 4026) return 'deterministic';
+  // 账号/租户与服务端拒绝：保守按确定性处理（不惩罚账号）
+  if (n === 10101 || n === 20405) return 'deterministic';
+  return null;
+}
+
+/**
+ * 从错误串里认 TRAE 的业务码。**只在明确是 TRAE 语境时调用**
+ * （`traework <code>: ...` 前缀），否则会把别的通道的数字误判进来。
+ */
+function traeCodeOf(text) {
+  const m = /traework\s+(\d{3,6})\b/i.exec(String(text || ''));
+  return m ? Number(m[1]) : null;
+}
+
 function classifyCore(err) {
   if (err == null) return { kind: null, status: 0, message: '' };
   if (typeof err === 'string') err = { status: 0, message: err };
@@ -309,6 +363,20 @@ function classifyCore(err) {
   if (Number.isFinite(pinned) && pinned > 0) base.retryAfterMs = pinned;
 
   if (status === 429) return { ...base, kind: 'soft' };
+  // TRAE 业务码（2026-10-31，来源见 traeCodeKind 的注释）。
+  // **必须排在 5xx / 403 分支之前**：这些码都 ≥ 1000，会被下面的 breaker
+  // 分支当成服务故障误吃，把「换模型就好」的订阅专享错误放大成账号熔断。
+  const traeCode = traeCodeOf(full);
+  if (traeCode != null) {
+    const k = traeCodeKind(traeCode);
+    if (k === 'model') return { ...base, kind: 'model' };
+    // 额度类与风控类都不进熔断：额度是「稍后/换号」，风控是「换设备/换号」。
+    // 两者都按 soft 交回（客户端会退避重试），但**不给固定时长**——
+    // 上游没在错误里带恢复时刻，编一个会让下一轮误判。
+    if (k === 'quota' || k === 'risk') return { ...base, kind: 'soft' };
+    // 确定性请求错误：请求本身的问题，不惩罚账号（kind 保持 null）
+    if (k === 'deterministic') return base;
+  }
   // 「订阅专享」模型（2026-10-31 融合，语义对齐 traework2api-panel / Trae2api-cn）：
   // Free 号打订阅模型上游回 403 或业务码 1005——**换模型即可用**，进 (账号,模型)
   // 负缓存并明确报错，不罚账号、不进熔断。判据必须放在 5xx 分支之前：
@@ -369,4 +437,5 @@ module.exports = {
   isDeterministic,
   QUEUE_TEXT, QUEUE_THROTTLE_COOLDOWN_MS,
   unescapeDeep,
+  traeCodeKind, traeCodeOf,
 };

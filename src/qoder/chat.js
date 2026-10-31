@@ -209,6 +209,76 @@ function resolveReasoningEffort(payload, modelMeta) {
   return best;
 }
 
+/**
+ * 由「首条 user 消息」派生一个**跨轮稳定**的 session_id（UUID 形状）。
+ *
+ * 为什么要 UUID 形状：上游对 session_id 的格式期望是 UUID（客户端日志里全是
+ * UUID）。直接塞 sha1 前缀可能被拒，所以把指纹拼成 UUIDv5 的字节布局
+ * （版本位 5、variant 位 RFC4122），形状合法、内容确定。
+ *
+ * 为什么取首条 user 消息而不是「整个 messages」：会话是**逐轮追加**的，
+ * 拿整个 messages 做指纹等于每轮都换 id（等于没做）。首条 user 消息在
+ * 一段会话里不变，这才是稳定的锚点。
+ *
+ * 取不到（空消息 / 非标准形状）返回 null，调用方回落随机 UUID——没有稳定
+ * 锚点时不硬凑一个（凑出来的会在两个不同会话之间撞 id）。
+ *
+ * @param {object} payload OpenAI 请求体
+ * @returns {string|null}
+ */
+function stableSessionId(payload) {
+  try {
+    const msgs = payload && Array.isArray(payload.messages) ? payload.messages : [];
+    const first = msgs.find((m) => m && m.role === 'user');
+    if (!first) return null;
+    let text = '';
+    if (typeof first.content === 'string') text = first.content;
+    else if (Array.isArray(first.content)) {
+      const part = first.content.find((p) => p && typeof p === 'object' && typeof p.text === 'string');
+      text = part ? part.text : '';
+    }
+    if (!text.trim()) return null;
+    // 与 channel-pool.sessionKeyOf 同一截断（2048 字符）——两处取同一个锚点，
+    // 粘性绑定与前缀缓存亲和才不会指向两个不同的「会话」。
+    const h = crypto.createHash('sha1').update(text.slice(0, 2048)).digest();
+    // 拼成 UUIDv5 形状：版本位 = 5，variant = RFC4122
+    const b = Buffer.from(h.subarray(0, 16));
+    b[6] = (b[6] & 0x0f) | 0x50;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const hex = b.toString('hex');
+    // 8-4-4-4-12 布局（共 32 个 hex 字符）
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  } catch (e) { return null; }
+}
+
+/** 由会话 id 派生一个确定性的 UUID（用于 business.id） */
+function deriveUuid(seed, salt) {
+  const h = crypto.createHash('sha1').update(`${salt}:${seed}`).digest();
+  const b = Buffer.from(h.subarray(0, 16));
+  b[6] = (b[6] & 0x0f) | 0x50;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = b.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+/**
+ * 由会话 id 派生一个确定性的 `begin_at`（毫秒时间戳）。
+ *
+ * 为什么不是 `Date.now()`：它每轮都变，等于把缓存键改了。为什么也不是一个
+ * 固定的历史时刻（比如 0）：上游可能按它算时长/会话生命周期，给一个明显
+ * 荒谬的值（1970 年）风险更大。
+ *
+ * **完全确定性**（不含 Date.now()）：把哈希映射到一个固定基准点之后的
+ * 0~365 天窗口。同一会话 id 永远得到同一个值——这正是缓存亲和需要的。
+ * 基准点写死而不是取「当前时间」：否则同一会话在跨天后会换值，缓存键又变了。
+ */
+const BEGIN_BASE_MS = Date.UTC(2026, 0, 1);
+function deriveEpochMs(seed) {
+  const h = crypto.createHash('sha1').update(`t:${seed}`).digest();
+  const off = h.readUInt32BE(0) % (365 * 86400000);
+  return BEGIN_BASE_MS + off;
+}
+
 /** 构造上游请求体（OpenAI 形状 → Qoder 形状） */
 function buildBody(modelKey, payload, opts = {}) {
   // 上下文档位：上游同一模型挂着 200K / 400K / 1M 三档（模型表的
@@ -222,7 +292,24 @@ function buildBody(modelKey, payload, opts = {}) {
   // 对话的下一句。
   const requestId = crypto.randomUUID();
   const requestSetId = opts.requestSetId || requestId;
-  const sessionId = (payload && payload.session_id) || opts.sessionId || crypto.randomUUID();
+  // ---- 会话 id 跨轮稳定（2026-10-31，前缀缓存亲和）----
+  //
+  // 原来这里写的是 `payload.session_id || opts.sessionId || randomUUID()`——
+  // **客户端（Codex / Claude Code）从不带 session_id**，opts.sessionId 又只有
+  // 「播报即收尾」的修复轮才传，所以每一轮都拿到一个新的随机 UUID。
+  //
+  // 后果不只是「上游看不出这是同一段对话」：Qoder 的前缀缓存按 (session, 历史)
+  // 做亲和，每轮换 session 等于每轮都从零开始算 prefill——命中率从 ~95% 掉到
+  // ~8%（hub #48 的实测）。既费钱又拖慢首字。
+  //
+  // 现在的口径：**会话键取「首条 user 消息的指纹」**，与 channel-pool 的
+  // sessionKeyOf 同一思路（会话逐轮追加消息，首条不变，跨轮稳定）。显式传入
+  // 的 session_id（payload / opts）仍然优先——客户端真要控制会话时说了算。
+  //
+  // 用 UUIDv5 风格的确定性派生而不是直接用指纹串：上游对 session_id 的格式
+  // 期望是 UUID（客户端日志里全是 UUID），塞一个 sha1 前缀可能被拒。
+  const stable = stableSessionId(payload);
+  const sessionId = (payload && payload.session_id) || opts.sessionId || stable || crypto.randomUUID();
   const messages = (payload && payload.messages) || [];
   let system = '';
   if (payload && typeof payload.system === 'string') system = payload.system;
@@ -323,9 +410,14 @@ function buildBody(modelKey, payload, opts = {}) {
       product: 'qoder_work',
       version: c.COSY_VERSION,
       type: 'agent',
-      id: crypto.randomUUID(),
+      // business.id / begin_at 都是**会话级**字段（不是请求级）。
+      // 原来每轮新生成：id 用 randomUUID、begin_at 用 Date.now()——这两个
+      // 每轮变一次，上游按 (session, 历史) 做前缀缓存时缓存键跟着变，
+      // 亲和直接失效（hub #48：命中率 95% → 8%）。现在与 session_id 同源：
+      // 有稳定会话键时用派生值，没有才退回随机/当前时间。
+      id: stable ? deriveUuid(sessionId, 'biz') : crypto.randomUUID(),
       name: '',
-      begin_at: Date.now(),
+      begin_at: stable ? deriveEpochMs(sessionId) : Date.now(),
       stage: 'processing',
       // 计费归因（qoder2api-hub #119）：官方 CLI 在 business 块带 model_key，
       // 上游按它记账；缺失时**所有模型都被记成 auto 档计费**——这也是

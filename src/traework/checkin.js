@@ -301,6 +301,103 @@ function parsePacks(d) {
 }
 
 /**
+ * 付费状态 / 套餐身份 / 活动资格（`ide_user_pay_status`，2026-10-31 实测）。
+ *
+ * 这个端点补上了两块此前拿不到的信息：
+ *
+ *   1. **套餐档位**：`user_pay_identity_str`（实测 "Free"）+ `is_pay_freshman`。
+ *      TRAE 的账一直是「单 credits + 签到」，看不出账号是什么套餐——
+ *      界面只能说「额度还剩多少」，答不出「为什么这么少」。
+ *   2. **活动资格**：`commercial_activities[]` 里带 `activity_type` 与
+ *      `work_extra`（eligible/grantable/granted/general_credits）。
+ *      实测 `send_message_reward`（type 105）`eligible:true` +
+ *      `general_credits:500`——这是清单里「活动/邀请积分」的数据源，
+ *      也是「为什么我这号没有活动」这个问题的答案。
+ *
+ * **解析口径**：只搬上游原值，不推断。`commercial_activities` 原样透出
+ * （activity_type 的语义映射单独给一份，但**不改写原数组**）；能力位
+ * （`enable_solo_*`）原样保留——它们是布尔，缺字段就是 null 而不是 false
+ * （false 会被读成「明确不支持」，而真相是「上游没说」）。
+ *
+ * 失败不阻断任何东西：调用方（管理端 /status）拿不到就当没有这组信息，
+ * 界面显示「—」而不是编一个 Free。
+ */
+async function payStatus(auth) {
+  let agent;
+  try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
+  const r = await c.request(c.UG_HOST, c.EP_PAY_STATUS, {
+    method: 'POST', body: {}, headers: ugHeaders(withDevice(auth)), agent,
+  });
+  if (r.status !== 200 || !r.data) {
+    return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+  }
+  const d = r.data.data || r.data;
+  return { ok: true, ...parsePayStatus(d), raw: d };
+}
+
+/** activity_type 的语义（来自上游 activity_id 对照，非官方文档） */
+const ACTIVITY_KINDS = {
+  101: 'work_lite',
+  102: 'new_user_credits',
+  103: 'work_fission',
+  105: 'send_message_reward',
+};
+
+/**
+ * 纯函数：上游 pay_status 体 → 界面用的扁平结构。便于离线验证。
+ *
+ * `capabilities` 里每个值都可能是 null（上游没给这个字段），
+ * **不用 `!!` 兜成 false**——见函数头注释。
+ */
+function parsePayStatus(d) {
+  const src = d && typeof d === 'object' ? d : {};
+  const boolOrNull = (v) => (typeof v === 'boolean' ? v : null);
+  const numOrNull = (v) => (v == null ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
+
+  const acts = Array.isArray(src.commercial_activities) ? src.commercial_activities : [];
+  const activities = acts.map((a) => {
+    if (!a || typeof a !== 'object') return null;
+    const type = numOrNull(a.activity_type);
+    const we = a.work_extra && typeof a.work_extra === 'object' ? a.work_extra : {};
+    return {
+      activityId: String(a.activity_id || ''),
+      activityType: type,
+      // 语义映射只作展示辅助；映射不上就 null，不改写 type
+      kind: ACTIVITY_KINDS[type] || null,
+      enabled: typeof a.Enabled === 'boolean' ? a.Enabled : boolOrNull(a.enabled),
+      startAt: numOrNull(a.start_time_ms),
+      endAt: numOrNull(a.end_time_ms),
+      // 活动资格三态（work_extra 只在这几类活动里出现）
+      eligible: boolOrNull(we.eligible),
+      grantable: boolOrNull(we.grantable),
+      granted: boolOrNull(we.granted),
+      // 可领的通用积分（实测 send_message_reward=500）
+      generalCredits: numOrNull(we.general_credits),
+    };
+  }).filter(Boolean);
+
+  return {
+    // 套餐档位（实测 "Free"）；上游没给就 null
+    payIdentity: src.user_pay_identity_str || null,
+    payIdentityCode: numOrNull(src.user_pay_identity),
+    isFreshman: boolOrNull(src.is_pay_freshman),
+    isCreditsBilling: boolOrNull(src.is_credits_billing),
+    supportCommercialization: boolOrNull(src.is_support_commercialization),
+    // 能力位：null = 上游没说，不是「不支持」
+    capabilities: {
+      soloLite: boolOrNull(src.enable_solo_lite),
+      soloWeb: boolOrNull(src.enable_solo_web),
+      soloCoder: boolOrNull(src.enable_solo_coder),
+      soloBuilder: boolOrNull(src.enable_solo_builder),
+      fission: boolOrNull(src.enable_fission),
+    },
+    activities,
+    // 服务端时间（用来对活动起止做本地时区换算，不依赖本机时钟）
+    serverTimeMs: numOrNull(src.server_time_ms),
+  };
+}
+
+/**
  * 算「本次签到实际到账多少」。
  *
  * 两侧余额都拿得到时取差值；算不出就退回上游直接给的 gained（通常为 null）。
@@ -382,4 +479,4 @@ async function checkinAndSave(rawAuth, authStore, opts = {}) {
   };
 }
 
-module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining, parsePacks };
+module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining, parsePacks, payStatus, parsePayStatus, ACTIVITY_KINDS };

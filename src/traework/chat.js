@@ -59,8 +59,13 @@ function buildBody(payload, model, meta) {
 
   // messages：content 字符串 → 数组；assistant 的 tool_calls → function_call
   if (Array.isArray(obj.messages)) {
+    const dropped = { images: 0, orphanTool: 0, emptyAssistant: 0, roleFixed: 0 };
     for (const m of obj.messages) {
       if (!m || typeof m !== 'object') continue;
+      // role 归一（2026-10-31）：OpenAI 的 `developer` 与 Anthropic 的 `system`
+      // 在 SOLO 链路上都只认 `system`。不归一的话整轮被上游拒（4001），
+      // 而 4001 的文案是「param is invalid」，完全看不出是 role 的问题。
+      if (m.role === 'developer') { m.role = 'system'; dropped.roleFixed += 1; }
       // 图像只属于 user 消息（OpenAI/Anthropic 规范如此）。历史里的
       // assistant/tool 图像 part 剥掉——上游对非 user 图像的行为未知，
       // 不给它赌的机会。user 的 image_url part 原样透传（实测上游接受，
@@ -68,7 +73,10 @@ function buildBody(payload, model, meta) {
       if (m.role !== 'user' && Array.isArray(m.content)) {
         const kept = m.content.filter((p) => !(p && typeof p === 'object'
           && (p.type === 'image_url' || p.type === 'input_image')));
-        if (kept.length !== m.content.length) m.content = kept;
+        if (kept.length !== m.content.length) {
+          m.content = kept;
+          dropped.images += 1;
+        }
       }
       if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
         const kept = [];
@@ -91,6 +99,51 @@ function buildBody(payload, model, meta) {
       }
       // 已是数组则透传
     }
+
+    // ---- 请求体韧性（2026-10-31，三类会在上游炸整轮的形状）----
+    //
+    // 1. **孤儿 tool 消息**：role:'tool' 的 tool_call_id 找不到对应的
+    //    assistant tool_call（客户端截断历史 / 用户手工编辑时常见）。
+    //    上游对孤儿 tool 的反应是整轮 4001，且文案毫无信息量。
+    // 2. **空 assistant 消息**：content 空数组 + 无 tool_calls。上游同样拒。
+    // 3. **首条非 system**：SOLO 要求 system 在最前（我们注入纪律时依赖它）。
+
+    // 先收集所有「被 assistant 声明的 tool_call id」
+    const declaredIds = new Set();
+    for (const m of obj.messages) {
+      if (!m || m.role !== 'assistant' || !Array.isArray(m.tool_calls)) continue;
+      for (const tc of m.tool_calls) {
+        const id = tc && tc.id;
+        if (id) declaredIds.add(String(id));
+      }
+    }
+    // 再剔掉引用不到声明 id 的 tool 消息
+    const pruned = obj.messages.filter((m) => {
+      if (!m || typeof m !== 'object') return false;
+      if (m.role === 'tool') {
+        const id = m.tool_call_id != null ? String(m.tool_call_id) : '';
+        if (!id || !declaredIds.has(id)) { dropped.orphanTool += 1; return false; }
+        return true;
+      }
+      // 空 assistant：既没正文也没工具调用，上游拒
+      if (m.role === 'assistant') {
+        const hasCalls = Array.isArray(m.tool_calls) && m.tool_calls.length;
+        const ctext = Array.isArray(m.content)
+          ? m.content.map((p) => (p && p.text) || '').join('').trim()
+          : String(m.content == null ? '' : m.content).trim();
+        if (!hasCalls && !ctext) { dropped.emptyAssistant += 1; return false; }
+      }
+      return true;
+    });
+    // system 必须在最前：把第一条 system 提前（不是复制，是移动）
+    const sysIdx = pruned.findIndex((m) => m && m.role === 'system');
+    if (sysIdx > 0) {
+      const [s] = pruned.splice(sysIdx, 1);
+      pruned.unshift(s);
+      dropped.roleFixed += 1;
+    }
+    obj.messages = pruned;
+    if (meta) meta.dropped = dropped;
   }
 
   // tools：parameters 对象 → JSON 字符串；非 function 形状剔除

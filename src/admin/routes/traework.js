@@ -72,6 +72,9 @@ const routes = [
         const a = await checkin.withFreshToken(raw);
         const st = await checkin.status(a);
         const u = await checkin.usage(a);
+        // 付费状态 / 套餐身份 / 活动资格（2026-10-31）。**失败不阻断这一行**：
+        // 拿不到就如实 null，界面显示「—」而不是编一个 Free。
+        const ps = await checkin.payStatus(a).catch(() => ({ ok: false }));
         rows.push({
           id: a.id,
           nickname: a.nickname || '',
@@ -86,6 +89,15 @@ const routes = [
           // 签到可得的额度（不是余额），来自 status 接口
           checkinCredits: st.ok ? st.credits : null,
           checkinExtra: st.ok ? st.extraCredits : null,
+          // 套餐档位与能力位（pay_status）。null = 上游没给/查询失败
+          payIdentity: ps.ok ? ps.payIdentity : null,
+          isFreshman: ps.ok ? ps.isFreshman : null,
+          capabilities: ps.ok ? ps.capabilities : null,
+          // 活动资格表（只透出 eligible/grantable 的，其余是噪音）。
+          // 实测 send_message_reward 带 general_credits=500 且 eligible=true。
+          claimableActivities: ps.ok
+            ? (ps.activities || []).filter((x) => x.eligible === true || x.grantable === true)
+            : [],
           lastCheckin: a.lastCheckin || null,
           // 额度包明细（含各自到期时间）。仪表盘据此回答「哪些积分快过期了」
           // ——签到奖励是一批批到期的，只给总额答不出这个问题。

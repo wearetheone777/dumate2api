@@ -421,6 +421,25 @@ throw** 两种形态——只有它们才走等待轮）。注意该套件前 4 
 离线验证：`node --test test/unit/qoder-stability.test.js`（9 项）。
 
 
+**前缀缓存亲和（2026-10-31 落地，hub #48：命中率 95% ↔ 8% 的分界线）。**
+上游按 (session, 历史) 做前缀缓存。改动前 `buildBody` 实测复现的问题：客户端
+（Codex / Claude Code）从不带 `session_id`，只有「播报即收尾」的修复轮才有
+`opts.sessionId`——所以**每一轮都拿到新的随机 UUID**，`business.id` 与
+`business.begin_at` 同样每轮变。缓存键每轮换，等于每轮从零算 prefill。
+
+四个字段两条规则，**不能一起稳定化也不能一起随机化**：
+
+| 字段 | 规则 | 原因 |
+|---|---|---|
+| `session_id` | 跨轮稳定：首条 user 消息指纹 → UUIDv5 形状（`stableSessionId`，截断 2048 字符与 `channel-pool.sessionKeyOf` 同锚点） | 追加轮次后不变；显式传入（payload/opts）仍最高优先 |
+| `business.id` / `begin_at` | 由 session_id 确定性派生（`deriveUuid`/`deriveEpochMs`，基准点固定 2026-01-01） | 会话级字段，每轮变等于改缓存键 |
+| `request_id` | **每轮必须新** | 单次请求标识，复用被上游按签名字节去重判 103（与排队重发同族机制） |
+
+取不到首条 user 消息时回落随机 UUID——没有稳定锚点时不硬凑（凑出来的会在
+不同会话间撞 id）。离线验证：`node --test test/unit/qoder-cache-affinity.test.js`
+（10 项：跨轮稳定、追加轮不变、跨会话互异、UUID 形状、request_id 必变、
+不篡改调用方 payload）。
+
 **Qoder 的实测倍率账本（2026-10-30 落地，上游改路由的可见性）**。融合自
 qoder2api-hub #113 的 billed_model 思路（保守版）：Qoder 响应的 model 恒为
 "auto"，请求的模型可能被服务端静默换掉。每条积分账本现在带 `billed_rate`
@@ -603,8 +622,34 @@ inspector，再用 WebSocket 连 `:9229` 发 `Debugger.pause` 抓调用栈。
 `/algo/api/v2/service/pro/imageSearch`、`/algo/api/v5/service/region/endpoints`）
 与版本漂移（`COSY_VERSION` 我们写 1.1.52，客户端 worker runtime 已是 1.1.71，
 且官方请求带 `X-QwenWork-Version` / `-Release-Version` / `-Build` / `-Platform` /
-`-Arch` / `-Channel` / `-App-Mode` 一整套身份头）。**1.1.52 目前仍能出流，
-不必立刻改**；上游开始做版本门时先改这里。
+`-Arch` / `-Channel` / `-App-Mode` 一整套身份头）。
+
+**版本漂移已于 2026-10-31 同日对齐**（真机 1.1.71 + 新头正常出流）：
+`COSY_VERSION=1.1.71`、`IDE_VERSION=1.4.0`、`RELEASE_VERSION=1.4.0-26102705`
+（取自解包 `package.json` 的 `qoderworkUpgradeVersion`，`BUILD=26102705` 由
+release 派生、两者必须成对）。六个有字面量依据的 `X-QwenWork-*` 头已随签名
+发出；`X-QwenWork-App-Mode` **刻意不发**——它的取值是解包里的运行时配置
+（`constants$4.a.appModeId`），没有字面量依据，不编假值。四个常量与头都有
+环境变量开关（`DUMATE_QWENWORK_COSY_VERSION` 等，见环境变量表）。
+
+**联网搜索与图搜已接入**（`src/qwenwork/search.js` + `POST /v1/search/web`
+与 `/v1/search/images`）。与对话链路的形状**完全不同**：请求体是
+`{payload: JSON.stringify(业务参数), encodeVersion:"1"}`（业务参数二次序列化），
+不是 `chat_context`；`imageSearch` 还多 `requestId`（UUID）与 `timestamp`
+（秒字符串）两个字段，count 硬校验 [1,10]；响应没有信封，直接是业务体
+（`pageItems` / 结果数组在 `results`/`data.items` 等多个候选位置——按客户端
+`tkd()`/`rkd()` 的候选表解析）。国际版 webSearch 是 `/unifiedSearch`
+（按 LINGMA_ENV 切换），**只接了 CN，不预编没验证的路径**。
+
+**barn 附件上传已接 HTTP 半边**（`src/qwenwork/files.js` +
+`POST /v1/files/upload`）：分片公式 `clamp(1MB,100MB,ceil(size/10))`、
+基址 `https://gateway.qwenwork.cn/api`（少写 `/api` 404）、**纯 Bearer
+不走 COSY 签名**。真机 32B 与 3MB（3 片）都成功。但**这不等于附件能用**：
+barn 完成体只回 `storage_path`，`file_uuid` 由上游在 **ACP 会话侧**下发；
+ACP WebSocket（Go 后端的 `/api/chat-ws`）的帧协议没有证据（二进制里只有路径
+字符串，方法名搜不到；worker runtime 里是 ACP agent 侧、stdio 传输）——
+按「无证据不预编」纪律 WS 通道不做。`/v1/files/upload` 在上游没给
+`file_uuid` 时如实回 null + `reference_note`，**不要拿 session_id 当引用键**。
 
 **千问的预算与上下文（实测值，别照抄搭子的）**：
 - 预算走 `resolveQwenMaxTokens`，下限 **16384**（`DUMATE_QWENWORK_MIN_MAX_TOKENS`），**默认值 131072**（`DUMATE_QWENWORK_DEFAULT_MAX_TOKENS`，与搭子的 `DEFAULT_BUDGET=32768` 分开）。搭子的 32768 对千问偏大，但 4096 又太小——实测 4096 时 reasoning 会把预算吃光，模型陷入反复推演后只吐一句话。
@@ -716,6 +761,32 @@ trae2api-hub 的码表（1001/4001/4015/4019/4023/3003）是 agent/v3 业务码�
 不预编分类。离线验证：`node --test test/unit/trae-model-known.test.js`；
 真机：模型表就绪后打 `traework/no-such-model-xyz` 应立即 400 + 列表
 （不再等上游 4001）。
+
+**TRAE 业务码分类与请求体韧性（2026-10-31，P1-13）。** 三件事：
+
+1. **业务码收进 `upstream-errors.js`**（`traeCodeKind`/`traeCodeOf`）：
+   1005→model（订阅专享）、3003/3004/4008→soft（额度，换号有用）、
+   4015/4019→soft（风控，不进熔断）、1001/4001/4011/4023/4026/10101/20405→
+   不惩罚（确定性请求错误）。**判据带 `traework <code>` 前缀**（`traeCodeOf`
+   只在 TRAE 语境认码）——否则会把别的通道的数字误判进来。这些分支必须排在
+   5xx/403 的 breaker 分支之前：码值都 ≥1000，放后面会被误吃。除 4001 与
+   HTTP 401 外**其余码值未在本项目链路实测**（来源是社区参照），只做保守分类。
+2. **`ide_user_pay_status` 已接**（`/trae/api/v2/pay/ide_user_pay_status`；
+   v1 与 v2 都 200，v2 多 `detail`/`enable_solo_*`，取 v2）。
+   `checkin.payStatus` + 纯函数 `parsePayStatus`。它解答了「Free 号为什么
+   额度看着不对」：`user_pay_identity_str` 直接给档位（实测 "Free"）、
+   `enable_solo_*` 是能力位（**缺失给 null 不是 false**——false 会被读成
+   「明确不支持」，null 是「上游没说」）；`commercial_activities` 是活动资格表，
+   实测 `send_message_reward`(type 105) `eligible:true` + `general_credits:500`
+   ——**当前账号有一笔可领的 500 积分活动**（此前清单记「本账号无配置」是错的）。
+   管理端 `/credits` 行带 `payIdentity` / `capabilities` / `claimableActivities`。
+3. **buildBody 请求体韧性**（三类会把上游炸成无信息量 4001 的形状）：
+   `role:'developer'`→`system`（OpenAI/Anthropic 都归一）、孤儿 tool 消息剔除
+   （先收集 assistant 声明的 tool_call id，再剔引用不到的）、空 assistant 剔除、
+   首条 system 移到最前。计数进 `meta.dropped`（`orphanTool`/`emptyAssistant`/
+   `roleFixed`/`images`），排障能看到动了什么。离线验证：
+   `node --test test/unit/trae-pay-status.test.js`（9 项）+
+   `test/unit/trae-error-codes.test.js`（9 项）。
 
 **DSML 工具调用回退解析（2026-10-30 落地，`src/traework/chat.js` 的 `parseDsmlToolCalls`）**。
 DeepSeek 系模型偶尔把工具调用以**文本标记**写进正文（`<dsml:calls>` 包
@@ -1273,6 +1344,9 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `POST /v1/chat/completions` | **最小干预透传**：只改 `model` 和 `max_tokens`，响应不重打包 |
 | `POST /v1/images/generations` | 搭子生图（`src/media.js`）：标准 OpenAI 形状 → 上游异步提交 + 轮询；凭证走网页池 |
 | `POST /v1/audio/speech` | 搭子 TTS（`t2a_v2/sync`）：回二进制音频，不回转链接 |
+| `POST /v1/search/web` | 千问联网搜索（`src/qwenwork/search.js`）：`{query, allowed_domains?, blocked_domains?}` → `{items:[{title,link,snippet,publishedTime,hostname}]}`。**通道专属**，不占用 `/v1/images/*`（那是搭子的生图） |
+| `POST /v1/search/images` | 千问图搜：`{query, count 1~10}` → `{items:[{imageUrl,...}]}` |
+| `POST /v1/files/upload` | 千问 barn 附件上传：`{name, content_base64, mime_type?}` → `{path, file_uuid, reference_note?}`。file_uuid 由 ACP 会话下发，当前 HTTP 链路拿不到时如实 null |
 | `POST /v1/responses` 或 `/responses` | 全量翻译（Responses ↔ Chat），Codex CLI 0.155+ 只认 `wire_api="responses"` |
 | `POST /v1/messages` 或 `/messages` 或 `/api/v1/messages` | 全量翻译 Anthropic ↔ OpenAI |
 | `POST .../count_tokens` | `字符数/4` 估算（`String.length`，汉字与 ASCII 同等计 1），仅供客户端算上下文预算 |
@@ -1590,6 +1664,9 @@ per-key 限流（低价值场景）。
 | `DUMATE_DUMATE_CAPS_FILE` | 未设 | 搭子按模型 max_tokens 上限学习表的落盘路径覆盖（测试用） |
 | `DUMATE_MEDIA_POLL_TIMEOUT_MS` | `120000` | 生图异步任务的轮询总超时（ms），超时回 504 |
 | `DUMATE_MEDIA_POLL_INTERVAL_MS` | `1500` | 生图轮询间隔（ms） |
+| `DUMATE_QWENWORK_COSY_VERSION` | `1.1.71` | 千问的 cosy 版本（进 payload 与请求头，2026-10-31 对齐官方 1.4.0）。上游做版本门时可覆盖回退 |
+| `DUMATE_QWENWORK_IDE_VERSION` / `_RELEASE_VERSION` / `_BUILD` | `1.4.0` / `1.4.0-26102705` / `26102705` | 千问客户端身份（进 `X-QwenWork-*` 头）。release 与 build **必须成对改**（build 由 release 派生） |
+| `DUMATE_QWENWORK_OS_HEADERS` | 未设（发送） | 设 `0` 关闭 `X-QwenWork-*` 六个身份头（排障对照用） |
 
 ## 数据文件（`data/`，已 gitignore）
 

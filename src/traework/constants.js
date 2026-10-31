@@ -31,6 +31,20 @@ const EP_USER_INFO = '/cloudide/api/v3/trae/GetUserInfo';
 const EP_CHECKIN_STATUS = '/trae/api/v2/ug/checkin_credits/status';
 const EP_CHECKIN_CLAIM = '/trae/api/v2/ug/checkin_credits/claim';
 const EP_ENT_USAGE = '/trae/api/v2/pay/ide_user_ent_usage';
+// 付费状态 / 套餐身份 / 活动资格（2026-10-31 实测）。
+//
+// **v1 与 v2 都返回 200 且字段不同**——v2 多 `can_purchase_pro_oneweek` 与
+// 完整的 `detail`/`enable_solo_*` 能力位，v1 只有前半截。用 v2。
+// 这个端点解答了「Free 号为什么额度看着不对」：`user_pay_identity_str` 直接给
+// 套餐档位（实测 "Free"），`enable_solo_lite/web/coder/builder` 是能力位，
+// `is_support_commercialization=false` 说明该账号不在商业化名单里。
+//
+// `commercial_activities` 是**活动资格表**（不是签到）：
+//   activity_type 102=new_user_credits、105=send_message_reward、
+//   101/103=work_lite/work_fission（带 work_extra.eligible/grantable/granted）。
+// 实测 send_message_reward 的 work_extra 带 `general_credits: 500` 且
+// eligible=true——这是**清单里「活动/邀请积分」那一项的数据源**。
+const EP_PAY_STATUS = '/trae/api/v2/pay/ide_user_pay_status';
 // 逐轮账单（2026-10-31，Trae2api-cn 实测）：body {session_id: <本轮 turn id>}，
 // 回 data.user_usage_group_by_session.credits_float。turn id 取自流里的
 // reply_to_message_id / user_message_id。这是 TRAE 唯一能拿到「单请求扣了多少」
@@ -124,7 +138,7 @@ function request(host, path, { method = 'POST', body = null, headers = {}, timeo
 module.exports = {
   AGENT_HOST, AGENT_HOST_INTL, UG_HOST, OAUTH_HOST, CONSOLE_HOST,
   EP_CHAT, EP_MODELS, EP_EXCHANGE, EP_USER_INFO,
-  EP_CHECKIN_STATUS, EP_CHECKIN_CLAIM, EP_ENT_USAGE, EP_SESSION_USAGE,
+  EP_CHECKIN_STATUS, EP_CHECKIN_CLAIM, EP_ENT_USAGE, EP_SESSION_USAGE, EP_PAY_STATUS,
   CLIENT_ID, APP_ID, IDE_VERSION, IDE_VERSION_CODE,
   DEVICE_BRAND, OS_VERSION, FUNCTION, DEFAULT_MODEL,
   USER_AGENT, UA_VSCODE, MARKET_CLIENT_ID, APP_VERSION,
