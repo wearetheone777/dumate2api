@@ -70,6 +70,11 @@
             <a-tag v-else-if="record.channel === 'qoder'" color="geekblue">仅 Qoder</a-tag>
             <a-tag v-else color="default">不限</a-tag>
           </template>
+          <template v-else-if="column.key === 'region'">
+            <a-tag v-if="record.region === 'intl'" color="orange">国际</a-tag>
+            <a-tag v-else-if="record.region === 'cn'" color="green">国内</a-tag>
+            <span v-else class="text-xs text-slate-500">不限</span>
+          </template>
           <template v-else-if="column.key === 'state'">
             <a-tag :color="stateColor(record)">{{ stateText(record) }}</a-tag>
           </template>
@@ -153,6 +158,14 @@
           <div class="text-xs text-slate-500 mt-1">
             留空 = 不限通道（网关按模型名前缀分流）。选「仅千问办公」后，
             这把 key 只能调 <code>qwen/*</code> 模型，调搭子模型会被 403 拒绝。
+          </div>
+        </a-form-item>
+        <a-form-item label="区域绑定">
+          <a-select v-model:value="form.region" style="width: 100%" :options="regionOptions" />
+          <div class="text-xs text-slate-500 mt-1">
+            留空 = 不限区域。「国内/国际」只对 Qoder 与 TRAE 有区分度（按账号池
+            过滤）；搭子与千问是纯国内产品，国际 key 打它们会被 403 拒绝。
+            TRAE 国际通道尚未接入，国际 key 会拿到明确的「未接入」报错。
           </div>
         </a-form-item>
         <a-form-item label="模型白名单">
@@ -258,13 +271,21 @@ const form = reactive({
   ipText: '',
   models: [] as string[],
   channel: '' as '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder',
+  region: '' as '' | 'cn' | 'intl',
   expiresAt: null as Dayjs | null,
   note: '',
 })
 
+const regionOptions = [
+  { label: '不限区域', value: '' },
+  { label: '仅国内（cn）', value: 'cn' },
+  { label: '仅国际（intl）', value: 'intl' },
+]
+
 const columns = [
   { title: '名称', key: 'name', width: '16%' },
   { title: '通道', key: 'channel', width: '9%' },
+  { title: '区域', key: 'region', width: '8%' },
   { title: '状态', key: 'state', width: '9%' },
   { title: '限制', key: 'limits', width: '19%' },
   { title: '用量', key: 'usage', width: '19%' },
@@ -350,6 +371,7 @@ async function save() {
     ip_allowlist: items,
     model_allowlist: form.models,
     channel: form.channel,
+    region: form.region,
     note: form.note,
     expires_at: form.expiresAt ? form.expiresAt.valueOf() : null,
   }

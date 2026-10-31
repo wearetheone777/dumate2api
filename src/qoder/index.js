@@ -1055,6 +1055,21 @@ function makeMeter(account, opts) {
   };
 }
 
+/** 按区域过滤账号（keys.region 的运行时约束）。'' = 不限 */
+function accountsForRegion(usable, region) {
+  if (!region) return usable;
+  const want = region === 'intl' ? 'global' : 'cn';
+  return usable.filter((a) => constants.normalizeRegion(a.region) === want);
+}
+
+/** 区域过滤后为空时的报错——要说出是哪个区域没号，而不是笼统的「没有账号」 */
+function noRegionAccountError(region) {
+  if (!region) return new Error('Qoder 没有可用账号，请先添加一个');
+  const e = new Error(`Qoder 没有可用的${region === 'intl' ? '国际' : '国内'}账号（该 API Key 限定区域：${region === 'intl' ? '国际' : '国内'}）`);
+  e.statusCode = 503;
+  return e;
+}
+
 async function send(payload, onChunk, opts = {}) {
   const tried = new Set();
   const errors = [];
@@ -1062,8 +1077,12 @@ async function send(payload, onChunk, opts = {}) {
   const startedAt = Date.now();
   // 会话粘性 + 池选号（冷却/熔断/禁用/暂停/在途满跳过），见 channel-pool.js
   const sessionKey = channelPool.sessionKeyOf(payload, opts);
-  const usable = authStore.findUsable();
-  if (!usable.length) throw new Error('Qoder 没有可用账号，请先添加一个');
+  // 区域约束（API Key 的 region，2026-11-01）：'cn' → 只用国内账号，'intl' →
+  // 只用国际（global）账号，'' = 不限。请求的模型名不编码区域，区域约束只能
+  // 落在账号池选择上——不加过滤的话，intl key 的请求会被 FEFO/轮询派给国内
+  // 账号，约束形同虚设。
+  const usable = accountsForRegion(authStore.findUsable(), opts.region);
+  if (!usable.length) throw noRegionAccountError(opts.region);
   // 排队等待预算 + 共享 request_set_id（官方轮询协议，2026-10-30）。
   // 预算是**整次请求**的（所有账号共享）——runOnce 内的排队等待受它约束，
   // 耗尽后 throttle 错误按旧路交回（换号/429）。request_set_id 在多次尝试间
@@ -1339,5 +1358,5 @@ module.exports = {
   // 额度类业务码的识别与处置（离线验证用：test/verify-qoder-throttle.js）
   quotaKindOfText, quotaFrameError, quotaFromBody, retryable, poolInfoOf,
   // 客户端渲染错误码（2026-11-01）：鉴权映射 / 无语义码 / statusCode 钳制
-  httpStatusOf, frameThrown, thrownFrameErr, bizFrameError, bizFromBody,
+  httpStatusOf, frameThrown, thrownFrameErr, bizFrameError, bizFromBody, accountsForRegion,
 };

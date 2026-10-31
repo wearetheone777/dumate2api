@@ -187,7 +187,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   try {
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
-      const result = await provider.send(payload, undefined, { reqId, onAccount, onModel });
+      const result = await provider.send(payload, undefined, { reqId, onAccount, onModel, region: ctx.region || '' });
       const out = kind === 'openai' ? result : result;
       if (kind === 'anthropic') {
         const anth = openAIToAnthropic(out, payload.model);
@@ -327,7 +327,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
           seen += `data: ${inner}\n`;
           if (seen.length > TAIL) seen = seen.slice(-TAIL);
           shim.write(`data: ${inner}\n\n`);
-        }, { reqId, onAccount, onModel });
+        }, { reqId, onAccount, onModel, region: ctx.region || '' });
         // traework 的 provider 回调不发 [DONE]（事件流用 event:done 收尾，
         // 已在 readStream 里吃掉），所以这里补一个再关流。
         // **顺序关键**：先补 [DONE]、再 end——直接 end 会让翻译器在
@@ -1128,7 +1128,7 @@ async function handleOpenAIChat(req, res) {
   // 在 mapModel / 预算之后、转发之前分流——它的 body 构造与搭子不同，
   // 且要经官方 wasm 封装。
   if (target.direct) {
-    return await handleDirectChannel(req, res, reqBody, route, { startedAt, info, kind: 'openai' });
+    return await handleDirectChannel(req, res, reqBody, route, { startedAt, info, kind: 'openai', region: req._apiKeyRegion || '' })
   }
 
   // 云端网关（dumate-svc.baidu.com）只在被显式要求时才在流尾补一个 usage 帧；
@@ -1347,7 +1347,7 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
   const target = route.target;
   if (target.direct) {
     openaiReq.stream = isStream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'google' });
+    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'google', region: req._apiKeyRegion || '' })
   }
   // 同 handleOpenAIChat：云端只在被显式要求时回流 usage 帧。
   if (isStream) openaiReq.stream_options = { include_usage: true };
@@ -1473,7 +1473,7 @@ async function handleOpenAIResponses(req, res) {
   const target = route.target;
   if (target.direct) {
     openaiReq.stream = isStream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'responses' });
+    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'responses', region: req._apiKeyRegion || '' })
   }
   // 同 handleOpenAIChat：云端只在被显式要求时回流 usage 帧。
   if (isStream) openaiReq.stream_options = { include_usage: true };
@@ -1582,7 +1582,7 @@ async function handleAnthropicMessages(req, res) {
   const target = route.target;
   if (target.direct) {
     openaiReq.stream = !!anthropicReq.stream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'anthropic' });
+    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'anthropic', region: req._apiKeyRegion || '' })
   }
   // Ask the upstream for a usage-bearing final chunk so we can report real
   // token counts instead of zeroes. Harmless if the upstream ignores it.

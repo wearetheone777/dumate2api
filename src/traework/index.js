@@ -206,6 +206,12 @@ async function assertImageSupport(payload, model) {
   throw err;
 }
 
+/** 按区域过滤账号（keys.region 的运行时约束）。'' = 不限；traework 账号缺省按国内 */
+function accountsForRegion(usable, region) {
+  if (!region) return usable;
+  return usable.filter((a) => (String(a.region || 'cn').toLowerCase() === 'cn' ? 'cn' : 'intl') === region);
+}
+
 /**
  * 发对话请求。
  * @param {object} payload OpenAI 格式请求体
@@ -225,8 +231,17 @@ async function send(payload, onChunk, opts = {}) {
   // traework 单账号时代不做故障转移；多账号后由池提供「跳过坏号」能力，
   // 换号重试仍交给上层（一次会话内修不动模型行为问题）。
   const sessionKey = channelPool.sessionKeyOf(payload, opts);
-  const usable = authStore.findUsable();
-  if (!usable.length) throw new Error('traework 没有可用账号');
+  // 区域约束（API Key 的 region，2026-11-01）：traework 账号目前全部是国内
+  // （region 字段缺省按 'cn'）；intl key 会在这里拿到明确的「未接入」报错，
+  // 而不是被派给国内账号静默跑错区域。
+  const usable = accountsForRegion(authStore.findUsable(), opts.region);
+  if (!usable.length) {
+    const e = opts.region === 'intl'
+      ? new Error('TRAE 国际版未接入（没有国际账号；国际链路也未实测）。该 API Key 限定国际区域，请换国内 key 或等待国际通道接入')
+      : new Error('traework 没有可用的国内账号');
+    e.statusCode = 503;
+    throw e;
+  }
   const sel = channelPool.pickCandidate(CHANNEL, usable, { sessionKey, model });
   if (!sel) {
     const err = new Error('traework 没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
