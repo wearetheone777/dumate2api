@@ -1811,6 +1811,18 @@ per-key 限流（低价值场景）。
 
 **千问登录态只读，管理端绝不写入。** 它存在官方客户端的 `auth-v2.dat` 里（Electron safeStorage：DPAPI 解 `Local State` 的 `encrypted_key` → 32B AES key → AES-256-GCM 解密）。官方客户端和我们各写一次会互相把对方的登录态刷掉，所以换账号必须开客户端操作。**不复制这个文件到 `data/`**——它会过期，复制一份立刻失效。`refresh_token` 过期（`refreshExpired`）要提前告警：access token 到期后无法自动续期。
 
+**API Key 区域绑定（2026-11-01，四通道 × 国内/国际）**：`keys.js` 的 `region`
+字段（`''` 不限 / `cn` / `intl`）。**intl key 打纯国内通道（dumate/qwenwork）
+在 validate 直接拒** `region_not_available`——上游连国际端点都不存在；qoder/
+traework 的区域约束落在**账号池选择**（`accountsForRegion`，send 里过滤——
+模型名不编码区域，约束只能落在这里；qoder 的 intl 映射到 global 术语，
+traework intl → 明确「未接入」503）。无 model 字段的工具端点按路径归通道
+（搜索/语音润色/文件上传=千问、媒体=搭子），否则区域 key 可绕过判定。
+**区域约束只在 `DUMATE_REQUIRE_KEY=1` 时生效**（不开开关 key 完全不校验）。
+预留六把 key：dumate / qwenwork / qoder-cn / qoder-intl / traework-cn /
+traework-intl（明文已交付；traework-intl 是真预留——国际链路未接入，
+用时明确报错）。搭子与千问**没有国际版**（纯国内产品）。
+
 **API Key 可选绑定通道**（`keys.js` 的 `channel` 字段，`''` = 不限）。网关鉴权段用 `upstream-router.resolve(model).channel` 解析请求走哪条通道再传给 `validate()`——设了 `qwenwork` 的 key 调搭子模型会被 403 `channel_not_allowed`。注意鉴权段**只在 key 真的配了模型白名单或通道绑定时才预读请求体**，否则给默认路径凭空加一次完整读取。key 用量按通道分开统计（`usage.channels`），因为网关按模型名前缀分流、不按 key 分流，同一把 key 可能两条通道都在用。
 
 **两套「用量」视图不要互相替代**：`stats.js` 与 `usage.js` 都读 `data/requests.jsonl`，但 `usage.js` 还额外查上游计费记录——本地只知道「发了多少 token」，不知道「扣了多少积分」，计费规则在上游。`reqlogs.js` 则是逐条明细与单条详情（聚合看趋势、明细查个案）。

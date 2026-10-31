@@ -2028,6 +2028,12 @@ const server = http.createServer(async (req, res) => {
           const r = require('./upstream-router').resolve(model);
           reqChannel = r.channel || '';
         } catch (e) { reqChannel = ''; }
+      } else if (req.method === 'POST') {
+        // 无 model 字段的工具端点按路径归通道：搜索/语音润色/文件上传是千问
+        // （纯国内），生图/视频/TTS 是搭子。不映射的话，区域绑定的 key 打
+        // 这些端点会绕过 validate 的区域判定（channel 未知即跳过）。
+        if (/^\/(v1\/)?(search|voice\/polish|files\/upload)/.test(url)) reqChannel = 'qwenwork';
+        else if (/^\/(v1\/)?(images\/generations|videos\/generations|audio\/speech)/.test(url)) reqChannel = 'dumate';
       }
 
       const verdict = keysvc.validate(key, reqlog.clientIP(req), model, reqChannel);
@@ -2045,6 +2051,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
       req._apiKey = key;
+      // 区域约束（keys.region）：qoder/traework 的 send 用它过滤账号池
+      req._apiKeyRegion = (key && key.region) || '';
     }
 
     // ==================== OpenAI compatible ====================
