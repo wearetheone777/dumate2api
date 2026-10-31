@@ -396,6 +396,29 @@ throw** 两种形态——只有它们才走等待轮）。注意该套件前 4 
 工具调用泄漏回读（hub 的场景是文本标记工具历史被模型照抄进正文——我们发的是
 结构化工具历史，且部署中无实测案例，不值得为它给热路径加跨帧缓冲门）。
 
+**Qoder 稳定性四件 + Pro 福利包（2026-10-31 落地）**：
+
+1. **请求体 29MB 前置拒绝**（`chat.assertBodySize`，`DUMATE_QODER_MAX_BODY_MB`）。
+   阿里云 SLB 对单 POST 有 30MB 硬限，超限直接 RST；不前置拦的话，RST 会被
+   当成瞬态网络错误 → 换号重试 → 每次重放几十 MB → 整池熔断。抛 413 +
+   `tooLarge`，`retryable(413)=false` 所以不换号。
+2. **DeepSeek 族的 `reasoning_content` 回填**（`chat.rememberReasoning` /
+   `backfillReasoning`）：该族多轮一致性依赖上一轮思维链，而客户端只回传正文。
+   按 session 记「最后一条 assistant 的正文 → reasoning」（LRU 200 条 / 30 分钟），
+   下一轮匹配得上才补；只对 DeepSeek 族（`dmodel`/`dfmodel`/`deepseek`），
+   客户端自带时不覆盖。
+3. **`tool_call.id` 补全**（`chat.backfillToolCallIds`）：上游偶发不带 id 的
+   增量帧，按 index 稳定补一个 `call_qd_*`；流式与聚合出口同一口径。
+4. **Pro 福利包 + 团队共享额度**：`ProEligibilityEndpoint` / `ProClaimEndpoint`
+   （cn/global 各一套，`/sash/api/v1/me/pro-upgrade/{eligibility,claim}`）；
+   管理端 `GET /pro-eligibility`、`POST /pro-claim`（**必须 `confirm:true`**，
+   一次性不可逆）。`fetchQuota` 现在解析 `orgResourcePackage`（团队号；
+   `cap=-1` = 不限量，按 `unlimited` 处理，别当数字比大小）。**实测 CN 账号的
+   eligibility 返回 gone=true（端点 404/403/410）**——活动不覆盖当前账号，
+   界面据此不显示按钮，不是故障。
+
+离线验证：`node --test test/unit/qoder-stability.test.js`（9 项）。
+
 
 **Qoder 的实测倍率账本（2026-10-30 落地，上游改路由的可见性）**。融合自
 qoder2api-hub #113 的 billed_model 思路（保守版）：Qoder 响应的 model 恒为
@@ -441,6 +464,26 @@ glm-5.2 ratio≈0.96（Δ1.79 / 2393 tokens，正常）；**DeepSeek-V4-Flash �
 （历史 `traework-credits.jsonl` 的差值受 60 秒采集节流影响会合并多条请求，
 不能用来反推单模型倍率——只有探针的前后快照是单请求的干净测量。）离线验证：
 `node --test test/unit/trae-billing.test.js`（11 项）。
+
+**TRAE 逐轮账单端点存在，但 `llm_utils_chat` 给不出入参 id（2026-10-31 实测定案）**。
+`POST /api/v1/commercial/get_session_usage` body `{session_id: <turn id>}` 确实存在
+（Trae2api-cn 的结论来自 **Remote** 链路，事件里带 `reply_to_message_id`）。
+我们这条链路的 `metadata` 只有 `session_id` 与 `prompt_completion_id`，**后者恒为
+0**，`token_usage.name` 为空——没有任何可当 turn id 的值。拿 `session_id` 去查，
+返回的是全零骨架（`amount_float=0`、`usage_group_details=[]`），等 8 秒仍然为 0。
+所以实现只保留、不启用：`billing.fetchSessionUsage` + `parseSessionUsage`
+（认实测字段 `amount_float`，全零骨架返回 `null` 而非 0）、`chat.turnIdOf`
+（**不拿 session_id 兜底**，避免每轮多打一次上游却永远拿不到数）。
+`billing-check` 在拿到 turn id 时自动切精确口径（`source: session_usage`），
+否则维持 consumed 差值。**接入 Remote 链路（P2）后自动生效，不需要再改这里。**
+
+**额度包要按官方收银台口径过滤，签到两份额度不能相加（2026-10-31）**。
+`parsePacks` 剔除 `product_type=3`（促销）/ `is_hide` / `status=3` 三类包——
+不剔的话「剩余额」被不可用的包抬高，界面数字是假的；`credits_limit = -1`
+表示**不限量**，解析成 `unlimited`，按普通数字算会得到「剩余 0」（读成用完）。
+`status()` 增加 `claimable = max(credits, extra_credits)`：这两项是二选一，
+**不是两笔相加**（「credits=100 + extra=100 显示 200、实到 100」）。
+离线验证：`node --test test/unit/trae-billing-usage.test.js`（13 项）。
 
 **千问的计费自检探针（2026-10-30 同日，与 TRAE 同形不同判据）**。
 `GET /api/admin/qwenwork/billing-check?model=flash`（admin/routes/qwenwork.js）——

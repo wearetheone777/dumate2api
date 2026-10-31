@@ -62,6 +62,17 @@ export interface QoderCreditRow {
   userQuota: QoderQuotaBucket | null
   /** 签到/赠送得到的积分。**免费用户实际能用的就是这个** */
   addOnQuota: QoderQuotaBucket | null
+  /**
+   * 团队共享额度池（团队号才有）。有效余额 = 套餐 + 可用共享池。
+   * `cap = -1` 表示不限量（用 `unlimited` 判断，别按数字比大小）。
+   */
+  orgResourcePackage: {
+    used: number
+    remaining: number
+    cap: number
+    unlimited: boolean
+    available: boolean
+  } | null
   isQuotaExceeded: boolean | null
   error: string
   /**
@@ -258,6 +269,36 @@ export const qoderApi = {
     note: string
   }>(`/qoder/grants?days=${days}`),
   checkin: (id?: number) => client.post('/qoder/checkin', id ? { id } : {}),
+  /** Pro 福利包资格（只读，一次性 +1800）。eligible=null 表示查不出来，不猜成「不能领」 */
+  proEligibility: (id?: number) =>
+    client.get<{
+      rows: Array<{
+        id: number
+        nickname: string
+        region: 'cn' | 'global'
+        eligible: boolean | null
+        /** true = 活动端点不存在（活动已下线），与「已领过」区分 */
+        gone?: boolean
+        error: string
+      }>
+      note: string
+    }>(`/qoder/pro-eligibility${id ? `?id=${id}` : ''}`),
+  /** 领取 Pro 福利包。**一次性不可逆**，后端要求 confirm: true */
+  proClaim: (id?: number) =>
+    client.post<{
+      ok: boolean
+      results: Array<{
+        id: number
+        nickname: string
+        ok: boolean
+        skipped?: boolean
+        already?: boolean
+        /** 到账差值（上游只回 success，不告诉我们发了多少） */
+        gained?: number | null
+        reason?: string
+        error?: string
+      }>
+    }>('/qoder/pro-claim', { confirm: true, ...(id ? { id } : {}) }),
   // ---- device flow 登录 ----
   loginStart: (region: 'cn' | 'global' = 'cn') =>
     client.post<QoderLoginSession>('/qoder/login/start', { region }),

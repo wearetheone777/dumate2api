@@ -62,12 +62,18 @@ async function status(auth) {
   }
   // 上游把结果包在 data 里，也可能是平铺——两种都认
   const d = r.data.data || r.data;
+  const credits = Number(d.credits ?? d.credit ?? 0) || 0;
+  const extraCredits = Number(d.extra_credits ?? d.extraCredits ?? 0) || 0;
   return {
     ok: true,
     checkedIn: !!(d.checked_in ?? d.did_checked_in ?? d.checkedIn),
-    credits: Number(d.credits ?? d.credit ?? 0) || 0,
+    credits,
     // 额外赠送（如连续签到奖励）。没有就如实给 0，不编
-    extraCredits: Number(d.extra_credits ?? d.extraCredits ?? 0) || 0,
+    extraCredits,
+    // **credits 与 extra_credits 是二选一，不是两笔相加**（traework2api-panel
+    // 实测：「credits=100 + extra=100 显示 200，实到 100」）。要给「本次可得」
+    // 一个数时取较大的那个；两者都保留是为了让界面能如实展示上游原值。
+    claimable: Math.max(credits, extraCredits),
     enable: d.enable !== false,
   };
 }
@@ -227,7 +233,8 @@ async function usage(auth) {
       if (!it || typeof it !== 'object') continue;
       const base = it.entitlement_base_info || it;
       const v = Number(base.credits_limit ?? base.creditsLimit ?? base.limit ?? base.total_amount);
-      if (Number.isFinite(v)) { sum += v; any = true; }
+      // 负数 = 不限量，不能计入「总额」——加个 -1 只会让合计变小
+      if (Number.isFinite(v) && v >= 0) { sum += v; any = true; }
     }
     if (any) limit = sum;
   }
@@ -260,21 +267,33 @@ function parsePacks(d) {
     if (!it || typeof it !== 'object') continue;
     const b = it.entitlement_base_info || {};
     const q = b.quota || {};
+    // 官方收银台同口径剔除三类包（traework2api-panel 的 creditspool_test）：
+    // 促销包（product_type=3）、隐藏包（is_hide）、已失效包（status=3）。
+    // 不剔除的话「剩余额」会被这些不可用的包抬高，界面显示的数字是假的。
+    const productType = Number(it.product_type ?? it.ProductType ?? b.product_type);
+    const hidden = it.is_hide === true || it.IsHide === true || it.hide === true || b.is_hide === true;
+    const statusNum = it.status == null ? null : Number(it.status);
+    if (productType === 3 || hidden || statusNum === 3) continue;
+
     const limit = Number(q.credits_limit ?? b.credits_limit);
     const used = Number((it.usage || {}).credits_amount);
     const exp = Number(it.expire_time || b.end_time) || null;
     if (!Number.isFinite(limit) && !Number.isFinite(used) && !exp) continue;
-    const lim = Number.isFinite(limit) ? limit : null;
+    // credits_limit = -1 表示**不限量**（官方语义）。按普通数字算会得到
+    // 「剩余 0」，把不限量读成用完了。
+    const unlimited = Number.isFinite(limit) && limit < 0;
+    const lim = Number.isFinite(limit) && !unlimited ? limit : null;
     const usd = Number.isFinite(used) ? used : 0;
     out.push({
       name: String(it.display_desc || it.group_name || '额度包'),
       // 面额拿不到就 null——补 0 会被读成「这个包是空的」
       limit: lim,
+      unlimited,
       used: Number.isFinite(used) ? usd : null,
-      // 剩余按 limit − used；面额缺失时推不出来，如实 null
+      // 剩余按 limit − used；面额缺失/不限量时推不出来，如实 null
       remain: lim == null ? null : Math.max(0, Number((lim - usd).toFixed(4))),
       expireAt: exp ? exp * 1000 : null,
-      status: it.status == null ? null : Number(it.status),
+      status: statusNum,
     });
   }
   // 先按到期时间排，让「最快过期的」排在最前
@@ -363,4 +382,4 @@ async function checkinAndSave(rawAuth, authStore, opts = {}) {
   };
 }
 
-module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining };
+module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining, parsePacks };

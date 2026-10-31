@@ -218,12 +218,12 @@ wss://qwenwork.cn/api/chat-ws
 |---|---|---|---|
 | 1 | 打开搭子 Anthropic 入口的 `nativeTools` | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
 | 2 | 搭子接 `usage-norm` | 搭子 | ✅ 已完成 2026-10-31（见 §10） |
-| 3 | Qoder Pro 福利包 + 团队共享额度 | Qoder | 小 |
-| 4 | Qoder 29MB 前置 413 | Qoder | 小 |
-| 5 | Qoder DeepSeek `reasoning_content` 回填 | Qoder | 小 |
-| 6 | Qoder `tool_call.id` 补全 | Qoder | 小 |
-| 7 | TRAE `get_session_usage` 逐轮账单 | TRAE | 小 |
-| 8 | TRAE 额度包过滤 + 签到 `extra_credits` 口径 | TRAE | 小 |
+| 3 | Qoder Pro 福利包 + 团队共享额度 | Qoder | ✅ 已完成 2026-10-31（见 §10；CN 账号端点已下线） |
+| 4 | Qoder 29MB 前置 413 | Qoder | ✅ 已完成 2026-10-31（见 §10） |
+| 5 | Qoder DeepSeek `reasoning_content` 回填 | Qoder | ✅ 已完成 2026-10-31（见 §10） |
+| 6 | Qoder `tool_call.id` 补全 | Qoder | ✅ 已完成 2026-10-31（见 §10） |
+| 7 | TRAE `get_session_usage` 逐轮账单 | TRAE | ⚠️ 端点已接，但 utils_chat 无 turn id（见 §10） |
+| 8 | TRAE 额度包过滤 + 签到 `extra_credits` 口径 | TRAE | ✅ 已完成 2026-10-31（见 §10） |
 
 ### P1
 
@@ -390,6 +390,67 @@ google               usageMetadata { promptTokenCount: 3017,
 **注意**：`src/web-gateway.js`（9084）的 usage 走 `pickUsage`，本次未改。
 
 
+
+---
+
+### 2026-10-31 · P0-3 Qoder Pro 福利包 + 团队共享额度
+
+| 文件 | 内容 |
+|---|---|
+| `src/qoder/constants.js` | 新增 `ProEligibilityEndpoint` / `ProClaimEndpoint`（cn 与 global 各一套） |
+| `src/qoder/session.js` | `fetchProEligibility` / `claimProBenefit`；`fetchQuota` 增加 `orgResourcePackage`（`cap=-1` 解析成 `unlimited`） |
+| `src/admin/routes/qoder.js` | `GET /pro-eligibility`（只读）、`POST /pro-claim`（**要求 `confirm:true`**，领取前后取额度算到账差值）；`/credits` 行带 `orgResourcePackage`，汇总加 `orgTotal` / `orgUnlimited` |
+| `web/src/api/qoder.ts` + `QoderAccounts.vue` | 账号卡显示团队共享池；仅在资格为 `true` 时显示「领 Pro 福利包」（带二次确认） |
+
+**真机（2026-10-31，两个 CN 账号）**：`eligibility` 均返回 `gone=true`
+（端点 404/403/410），即该活动对当前账号不覆盖——界面因此不显示按钮，符合设计。
+`orgResourcePackage` 为 `null`（个人号），团队共享池的解析代码待团队账号验证。
+
+### 2026-10-31 · P0-4/5/6 Qoder 稳定性三件
+
+| 项 | 实现 | 依据 |
+|---|---|---|
+| 请求体上限 | `chat.assertBodySize`（`DUMATE_QODER_MAX_BODY_MB`，默认 29）→ 413 + `tooLarge`，`retryable(413)=false` 故不换号 | 阿里云 SLB 30MB 硬限，超限 RST 会被当瞬态重试打崩账号池 |
+| reasoning 回填 | `chat.rememberReasoning` / `backfillReasoning`（按 session 的 LRU，30 分钟 TTL）；只对 DeepSeek 族、只补匹配得上的最后一条 assistant、客户端自带时不覆盖 | 该族多轮一致性依赖上一轮 `reasoning_content` |
+| tool_call.id | 流式 `chat.backfillToolCallIds`（按 index 稳定），聚合出口同补 | 上游偶发不带 id 的增量帧 |
+
+离线验证：`node --test test/unit/qoder-stability.test.js`（9 项）。
+
+### 2026-10-31 · P0-8 TRAE 额度包与签到口径
+
+| 项 | 实现 |
+|---|---|
+| 额度包过滤 | `parsePacks` 剔除 `product_type=3`（促销）/ `is_hide` / `status=3`；`credits_limit=-1` 解析成 `unlimited`，不再算成「剩余 0」 |
+| 不限量不参与求和 | `usage()` 的兜底求和跳过负数面额 |
+| 签到可得口径 | `status()` 增加 `claimable = max(credits, extra_credits)`——两者是二选一，**不是相加**（「100+100 显示 200、实到 100」） |
+
+离线验证：`node --test test/unit/trae-billing-usage.test.js`（13 项）。
+
+### 2026-10-31 · P0-7 TRAE 逐轮账单：端点已接，当前链路不可用
+
+已落地：`EP_SESSION_USAGE`、`chat.turnIdOf`、`billing.fetchSessionUsage` /
+`parseSessionUsage`，`billing-check` 在拿到 turn id 时自动用精确口径
+（`source: session_usage`, `exact: true`），否则退回 consumed 差值。
+
+**真机结论（同一天，两次请求）**：
+
+```text
+metadata = { session_id: "<uuid>", prompt_completion_id: 0, ... }
+token_usage.name = ""
+→ 没有任何可用的 turn id
+
+用 session_id 查 get_session_usage：
+  +0s   amount_float=0  usage_group_details=[]
+  +3s   amount_float=0  usage_group_details=[]
+  +5s   amount_float=0  usage_group_details=[]
+  +8s   amount_float=0  usage_group_details=[]
+```
+
+所以 `get_session_usage` 只在 **Remote 链路**（`/api/remote/v1/chat_sessions`，
+事件里带 `reply_to_message_id`）可用；`llm_utils_chat` 不提供入参 id。
+实现保留（`parseSessionUsage` 已认实测的 `amount_float`，全零骨架如实返回
+`null` 而不是 0），接入 Remote 链路（P2-10）后自动生效。当前 billing-check
+行为与改动前一致：走 consumed 差值并在 note 里说明口径。
 
 ---
 

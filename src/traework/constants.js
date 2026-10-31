@@ -31,6 +31,11 @@ const EP_USER_INFO = '/cloudide/api/v3/trae/GetUserInfo';
 const EP_CHECKIN_STATUS = '/trae/api/v2/ug/checkin_credits/status';
 const EP_CHECKIN_CLAIM = '/trae/api/v2/ug/checkin_credits/claim';
 const EP_ENT_USAGE = '/trae/api/v2/pay/ide_user_ent_usage';
+// 逐轮账单（2026-10-31，Trae2api-cn 实测）：body {session_id: <本轮 turn id>}，
+// 回 data.user_usage_group_by_session.credits_float。turn id 取自流里的
+// reply_to_message_id / user_message_id。这是 TRAE 唯一能拿到「单请求扣了多少」
+// 的接口——consumed 前后差值只是推断口径。
+const EP_SESSION_USAGE = '/api/v1/commercial/get_session_usage';
 
 // ---- 客户端标识 ----
 // 这些值随客户端版本变化。升级 TRAE 后若接口报错，优先核对这几个。
@@ -119,7 +124,7 @@ function request(host, path, { method = 'POST', body = null, headers = {}, timeo
 module.exports = {
   AGENT_HOST, AGENT_HOST_INTL, UG_HOST, OAUTH_HOST, CONSOLE_HOST,
   EP_CHAT, EP_MODELS, EP_EXCHANGE, EP_USER_INFO,
-  EP_CHECKIN_STATUS, EP_CHECKIN_CLAIM, EP_ENT_USAGE,
+  EP_CHECKIN_STATUS, EP_CHECKIN_CLAIM, EP_ENT_USAGE, EP_SESSION_USAGE,
   CLIENT_ID, APP_ID, IDE_VERSION, IDE_VERSION_CODE,
   DEVICE_BRAND, OS_VERSION, FUNCTION, DEFAULT_MODEL,
   USER_AGENT, UA_VSCODE, MARKET_CLIENT_ID, APP_VERSION,

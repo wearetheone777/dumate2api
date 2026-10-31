@@ -322,6 +322,33 @@ function normalizeToolCall(tc) {
   return out;
 }
 
+/**
+ * 从整轮事件里取「本轮 turn id」（逐轮账单的入参）。
+ *
+ * 上游把 `reply_to_message_id` / `user_message_id` 放在事件数据里，位置不固定
+ * （可能是顶层、也可能嵌一层 data）。取最后一个非空值——一轮里会重复出现，
+ * 后面的是本轮最终 id。取不到就返回 null，调用方据此跳过逐轮账单、退回过
+ * consumed 差值口径，不编一个 id。
+ */
+function turnIdOf(events) {
+  let id = null;
+  for (const e of Array.isArray(events) ? events : []) {
+    const d = (e && e.data) || {};
+    const inner = (d.data && typeof d.data === 'object') ? d.data : {};
+    const v = d.reply_to_message_id || d.user_message_id || d.message_id
+      || inner.reply_to_message_id || inner.user_message_id || inner.message_id;
+    if (v) id = String(v);
+    // utils_chat 的 metadata 里这两个字段存在但**实测恒为 0/空**（2026-10-31）。
+    // 仍认非零值：别的部署或 Remote 链路上可能填得出来，到时候逐轮账单直接可用。
+    const pcid = Number(d.prompt_completion_id ?? inner.prompt_completion_id);
+    if (Number.isFinite(pcid) && pcid > 0) id = String(pcid);
+    // **不拿 session_id 兜底**：实测用 session_id 查 get_session_usage 只回
+    // 全零骨架（amount_float=0、usage_group_details 空），把它当 turn id 会让
+    // 每轮多打一次上游却永远拿不到数。宁可返回 null，让调用方走差值口径。
+  }
+  return id;
+}
+
 /** TRAE 的 output 事件 → OpenAI delta 形状（content / reasoning_content / tool_calls） */
 function deltaOf(evt) {
   const d = (evt && evt.data) || {};
@@ -654,5 +681,5 @@ function aggregate(events, model) {
 module.exports = {
   buildBody, postStream, readStream, toOpenAIChunk, deltaOf, aggregate, eventError, normalizeToolCall,
   createTextGate, looksUnfinished, withRepairNudge, REPAIR_NUDGE, REPAIR_MAX, HOLD_CAP,
-  parseDsmlToolCalls,
+  parseDsmlToolCalls, turnIdOf,
 };

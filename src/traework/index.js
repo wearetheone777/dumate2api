@@ -292,11 +292,13 @@ async function runConversation(auth, payload, onChunk, opts, model) {
     let curBody = body;
     let agg = null;
     let fatal = null;
+    let lastEvents = null;
     for (;;) {
       const r = await runAttempt(curBody, auth, model, null, false);
       settle();
       if (r.fatal) { fatal = r.fatal; break; }
       if (r.streamErr) { fatal = upstreamError(r.streamErr); break; }
+      lastEvents = r.events;
       agg = chat.aggregate(r.events, model);
       const msg = (agg.choices && agg.choices[0] && agg.choices[0].message) || {};
       const hasCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
@@ -308,6 +310,14 @@ async function runConversation(auth, payload, onChunk, opts, model) {
       logRepair(opts.reqId, attempt, msg.content);
     }
     if (fatal) throw fatal;
+    // 逐轮账单的 turn id（计费自检探针用）：取**最终那一轮**的 id，
+    // 修复轮的请求已重建，前面几轮的 id 与本次交付内容无关。
+    if (opts.onTurnId) {
+      try {
+        const tid = chat.turnIdOf(lastEvents);
+        if (tid) opts.onTurnId(tid, auth);
+      } catch (e) { /* 上报失败不影响响应 */ }
+    }
     return agg;
   }
 

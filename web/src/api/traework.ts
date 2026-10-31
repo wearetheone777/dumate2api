@@ -220,8 +220,14 @@ export interface TraeworkBillingCheck {
   billed: number | null
   /** billed / expected，三位小数。任一侧缺失为 null */
   ratio: number | null
-  /** 本次 consumed 增量（credits）。未观测到增量为 null */
+  /** 本次扣费（credits）。session_usage 口径时是上游单请求账单；未测到为 null */
   delta: number | null
+  /** 数据来源：session_usage=上游逐轮账单（精确）；consumed_delta=前后快照差值（推断） */
+  source?: 'session_usage' | 'consumed_delta'
+  /** true = delta 来自逐轮账单，不受结算延迟/并发影响 */
+  exact?: boolean
+  /** 逐轮账单用的 turn id（拿不到为 null） */
+  turnId?: string | null
   tokens: { input: number; output: number; total: number } | null
   /** 被扣费的账号列表（并发时可能不止一个） */
   charged: Array<{ id: string; delta: number }>

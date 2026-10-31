@@ -422,6 +422,9 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     });
     // encode 进 worker（审计 P1-5b）：几 MB 请求的编码不再独占事件循环
     encBody = await cosy.encodeAsync(Buffer.from(bodyJson));
+    // 体积前置检查：超 SLB 上限就本地拒绝，别让连接被 RST 后当成网络错误
+    // 反复换号重放（会把整池打进熔断）。
+    chat.assertBodySize(encBody);
     headers = cosy.buildHeaders(sess, ep.ChatPathSig, encBody, 'text/event-stream', HEADER_EXTRA, { sse: true });
   };
   /**
@@ -548,6 +551,15 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       let firstErr = null;
       let doneSeen = false;
       let gate = null;
+      // DeepSeek 族 reasoning 回填的素材：本轮正文与思维链（只有最终成功的
+      // 那一轮才会写进缓存，修复轮整轮丢弃）。
+      let contentAcc = '';
+      let reasoningAcc = '';
+      const toolIds = new Map(); // tool_call index -> 补出来的 id
+      const rememberTurn = () => {
+        try { chat.rememberReasoning(pinnedSession, contentAcc, reasoningAcc, modelKey); }
+        catch (e) { /* 缓存失败不影响响应 */ }
+      };
       const candidates = constants.chatStreamCandidates(region);
       // 排队状态查询打「本次尝试实际用的主机」——队列跟着主机走
       let statusOrigin = '';
@@ -556,6 +568,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       // 原样重发，四个状态标志随之复位
       const attemptStream = () => {
         firstErr = null; sent = false; doneSeen = false; sawUp = false;
+        contentAcc = ''; reasoningAcc = ''; toolIds.clear();
         // 识别到错误帧就立刻中止上游：Qoder 零额度时是**挂起**而不是报错，
         // 不主动断就要等 socket 空闲超时（600s），客户端早已超时。
         const ac = new AbortController();
@@ -575,10 +588,20 @@ async function runOnce(account, payload, onChunk, opts, meter) {
               return;
             }
             noteCredits(parsed);
-          // usage 缓存字段归一化（#112）：DeepSeek/Qwen 的缓存命中数字搬到
-          // 标准位 prompt_tokens_details.cached_tokens，改写发生在转发前——
-          // 原样转发的话按标准协议解析的客户端读到的缓存恒为 0
-          if (parsed.usage && chat.normalizeUsageCache(parsed.usage)) inner = JSON.stringify(parsed);
+            // 累积本轮正文/思维链，供下一轮 DeepSeek reasoning 回填
+            const ch0 = parsed.choices && parsed.choices[0];
+            const d0 = ch0 && ch0.delta;
+            if (d0) {
+              if (d0.content) contentAcc += d0.content;
+              if (d0.reasoning_content) reasoningAcc += d0.reasoning_content;
+            }
+            // usage 缓存字段归一化（#112）：DeepSeek/Qwen 的缓存命中数字搬到
+            // 标准位 prompt_tokens_details.cached_tokens，改写发生在转发前——
+            // 原样转发的话按标准协议解析的客户端读到的缓存恒为 0。
+            // tool_call.id 缺失同样就地补全（上游偶发不带 id 的增量帧）。
+            const changedUsage = parsed.usage && chat.normalizeUsageCache(parsed.usage);
+            const changedIds = chat.backfillToolCallIds(parsed, toolIds);
+            if (changedUsage || changedIds) inner = JSON.stringify(parsed);
           }
           // 只有**过了错误判定**的帧才算「上游真实数据」——排队信封（10605）
           // 与额度错误帧必须留在 sawUp=false，否则排队等待轮的守卫失效。
@@ -685,11 +708,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
         if (!gate && doneSeen) onChunk('[DONE]');
         meter.settle(peakCredits, { usage: lastUsage, expectedRate: billingExpectedRate(modelMeta) });
         // ----「播报即收尾」修复判定（与千问 / TRAE 同构）----
-        if (!gate) return res;
+        if (!gate) { rememberTurn(); return res; }
         const g = gate.result();
-        if (g.live || g.toolCalls > 0) { gate.finish(); return res; }          // 正常或在干活
-        if (!repair.looksUnfinished(g.text, caps.HOLD_CAP)) { gate.finish(); return res; }
-        if (repairAttempt >= caps.REPAIR_MAX) { gate.finish(); return res; }  // 上限到，吐给它收尾
+        if (g.live || g.toolCalls > 0) { rememberTurn(); gate.finish(); return res; }  // 正常或在干活
+        if (!repair.looksUnfinished(g.text, caps.HOLD_CAP)) { rememberTurn(); gate.finish(); return res; }
+        if (repairAttempt >= caps.REPAIR_MAX) { rememberTurn(); gate.finish(); return res; }  // 上限到，吐给它收尾
         repairAttempt++;
         curPayload = repair.appendRepairNudge(curPayload);
         repair.logRepair('qoder', opts.reqId, repairAttempt, g.text);
@@ -777,14 +800,22 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     // 流式帧是原样转发上游的（上游恒为 "auto"），非流式这条却会把
     // gfmodel 这种代号回给客户端，两边观感不一致
     const out = chat.aggregate(payloads, (modelMeta && modelMeta.name) || modelKey);
+    // 非流式同样记下本轮 reasoning，供下一轮 DeepSeek 回填。**只在确认收尾时记**
+    // ——修复轮会整轮丢弃，提前记会把被丢弃的那轮思维链留给下一句对话。
+    const rememberOut = () => {
+      try {
+        const om = out && out.choices && out.choices[0] && out.choices[0].message;
+        if (om) chat.rememberReasoning(pinnedSession, om.content, om.reasoning_content, modelKey);
+      } catch (e) { /* 缓存失败不影响响应 */ }
+    };
     if (out && out.usage) noteCredits(out.usage);
     if (opts && opts.onAccount) { /* 非流式也报一次 */ }
     meter.settle(peakCredits, { usage: lastUsage, expectedRate: billingExpectedRate(modelMeta) });
     // ----「播报即收尾」修复判定（与流式同构；不带工具 / 上限到 → 原样返回）----
-    if (!repairable || repairAttempt >= caps.REPAIR_MAX) return out;
+    if (!repairable || repairAttempt >= caps.REPAIR_MAX) { rememberOut(); return out; }
     const omsg = (out.choices && out.choices[0] && out.choices[0].message) || {};
-    if (Array.isArray(omsg.tool_calls) && omsg.tool_calls.length) return out;
-    if (!repair.looksUnfinished(omsg.content, caps.HOLD_CAP)) return out;
+    if (Array.isArray(omsg.tool_calls) && omsg.tool_calls.length) { rememberOut(); return out; }
+    if (!repair.looksUnfinished(omsg.content, caps.HOLD_CAP)) { rememberOut(); return out; }
     repairAttempt++;
     curPayload = repair.appendRepairNudge(curPayload);
     repair.logRepair('qoder', opts.reqId, repairAttempt, omsg.content);

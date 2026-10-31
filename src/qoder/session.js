@@ -272,10 +272,25 @@ async function fetchQuota(token, region, opts = {}) {
     const total = num(o.total), used = num(o.used), remaining = num(o.remaining);
     return { total, used, remaining, percentage: num(o.percentage), unit: o.unit || 'credits' };
   };
+  // 团队共享额度池（qoder2api-hub #39 实测）：团队号的有效余额 = 套餐 + 可用共享池。
+  // cap = -1 表示不限量（不是 0，别按数字大小判断）。个人号通常没有这个对象。
+  const org = r.data.orgResourcePackage && typeof r.data.orgResourcePackage === 'object'
+    ? (() => {
+      const cap = num(r.data.orgResourcePackage.cap);
+      return {
+        used: num(r.data.orgResourcePackage.used),
+        remaining: num(r.data.orgResourcePackage.remaining),
+        cap,
+        unlimited: cap < 0,
+        available: r.data.orgResourcePackage.available === true,
+      };
+    })()
+    : null;
   return {
     ok: true,
     userQuota: bucket(r.data.userQuota),
     addOnQuota: bucket(r.data.addOnQuota),
+    orgResourcePackage: org,
     isQuotaExceeded: r.data.isQuotaExceeded === true,
     userType: r.data.userType || '',
   };
@@ -284,6 +299,43 @@ async function fetchQuota(token, region, opts = {}) {
 function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
+
+// ---- Pro 升级福利包（一次性 +1800，2026-10-31 融合 hub）----
+//
+// 免费号一次性福利，额度是每日签到（100）的 18 倍。**只领一次**，所以调用方
+// 必须把它当成不可逆动作：先查资格、再让用户点。
+//
+// 端点不存在（404/403/410）= 活动已下线，按「不可领取」返回，不当成错误——
+// 不同区域/账号类型覆盖的活动不同，报错会把「没有这个活动」误显示成故障。
+async function fetchProEligibility(token, region, opts = {}) {
+  const ep = c.endpointsOf(region);
+  const r = await request(ep.ProEligibilityEndpoint, { headers: bearerHeaders(token), agent: opts.agent || null });
+  if (r.status === 404 || r.status === 403 || r.status === 410) return { ok: true, eligible: false, gone: true };
+  if (r.status !== 200 || !r.data) return { ok: false, error: r.error || `HTTP ${r.status}`, eligible: null };
+  return { ok: true, eligible: r.data.eligible === true, raw: r.data };
+}
+
+/**
+ * 领取 Pro 福利包。返回 `{ ok, already?, error? }`。
+ *
+ * 已领过：上游回 409 或 body 含 ALREADY——按成功但 `already:true` 处理，
+ * 不当成失败（否则界面会让人反复点，而每次都是同一个结果）。
+ */
+async function claimProBenefit(token, region, opts = {}) {
+  const ep = c.endpointsOf(region);
+  const r = await request(ep.ProClaimEndpoint, {
+    method: 'POST', body: {}, headers: bearerHeaders(token), agent: opts.agent || null,
+  });
+  if (r.status === 409 || /ALREADY/i.test(String(r.raw || ''))) {
+    return { ok: true, already: true };
+  }
+  if (r.status !== 200) return { ok: false, error: `HTTP ${r.status} ${String(r.raw || '').slice(0, 160)}` };
+  if (r.data && r.data.success === false) {
+    return { ok: false, error: String(r.data.message || r.raw || '').slice(0, 160) };
+  }
+  return { ok: true, data: r.data };
+}
+
 
 // ---- 官方积分消耗（credits-summary / credits-heatmap，2026-10-30）----
 // 上游唯一给出「真实消耗口径」的接口：累计消耗 + 单日峰值 + 近 365 天逐日。
@@ -520,6 +572,6 @@ function cachedModels(account) {
 
 module.exports = {
   request, bearerHeaders, exchange, ensureAccount, fetchUserInfo, fetchPlan,
-  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
+  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchProEligibility, claimProBenefit, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
   parseThinkingConfig,
 };

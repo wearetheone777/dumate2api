@@ -283,6 +283,8 @@ const routes = [
       const startedAt = Date.now();
       let servedId = null;
       let servedName = '';
+      let servedAuth = null;
+      let turnId = null;
       let tokens = null;
       try {
         const agg = await tw.send({
@@ -294,6 +296,8 @@ const routes = [
         }, null, {
           reqId,
           onAccount: (name, id) => { servedName = name || ''; if (id != null) servedId = id; },
+          // 逐轮账单的 turn id（非流式路径在聚合出口上报）
+          onTurnId: (tid, auth) => { turnId = tid; servedAuth = auth; },
         });
         const u = (agg && agg.usage) || null;
         if (u) tokens = { input: u.prompt_tokens || 0, output: u.completion_tokens || 0, total: u.total_tokens || 0 };
@@ -301,18 +305,39 @@ const routes = [
         return sendJSON(res, 200, { ok: false, model, expected, error: e.message, elapsedMs: Date.now() - startedAt });
       }
 
-      // 结算延迟：consumed 不会在响应返回的瞬间更新。轮询到增量出现为止
-      // （4 次尝试共约 8 秒）；仍没有就如实报 null——不把「没测到」编成 0。
+      // **优先用逐轮账单**（get_session_usage）：单请求精确扣费，不用等结算，
+      // 也不受同账号并发流量干扰。拿不到才退回 consumed 前后差值——
+      // 后者是推断口径（量化 + 结算延迟 + 并发都会串账）。
+      let source = 'consumed_delta';
+      let delta = null;
+      let charged = [];
+      let singleAccount = false;
+      let sessionUsageError = '';
       let last = null;
-      for (let i = 0; i < 4; i++) {
-        if (i > 0) await new Promise((r) => setTimeout(r, [1500, 2500, 4000][i - 1]));
-        const after = await snapshot();
-        last = billing.attributeDelta(before, after, servedId);
-        if (last.delta != null && last.delta > 0) break;
-        // 别的账号先涨（并发流量）也停——再等只会把对方的消耗卷进来
-        if (last.charged.length) break;
+      if (turnId && servedAuth) {
+        const su = await billing.fetchSessionUsage(servedAuth, turnId);
+        if (su.ok && su.credits != null) {
+          delta = su.credits;
+          source = 'session_usage';
+        } else {
+          sessionUsageError = su.error || '逐轮账单未返回 credits';
+        }
       }
-      const delta = last ? last.delta : null;
+      if (source !== 'session_usage') {
+        // 结算延迟：consumed 不会在响应返回的瞬间更新。轮询到增量出现为止
+        // （4 次尝试共约 8 秒）；仍没有就如实报 null——不把「没测到」编成 0。
+        for (let i = 0; i < 4; i++) {
+          if (i > 0) await new Promise((r) => setTimeout(r, [1500, 2500, 4000][i - 1]));
+          const after = await snapshot();
+          last = billing.attributeDelta(before, after, servedId);
+          if (last.delta != null && last.delta > 0) break;
+          // 别的账号先涨（并发流量）也停——再等只会把对方的消耗卷进来
+          if (last.charged.length) break;
+        }
+        delta = last ? last.delta : null;
+        charged = last ? last.charged : [];
+        singleAccount = last ? last.singleAccount : false;
+      }
       const billed = billing.billedRate(delta, tokens && tokens.total);
       const ratio = billing.ratioOf(billed, expected);
       return sendJSON(res, 200, {
@@ -325,15 +350,20 @@ const routes = [
         ratio,
         delta,
         tokens,
-        charged: last ? last.charged : [],
-        singleAccount: last ? last.singleAccount : false,
+        // 数据来源：session_usage = 上游单请求账单（精确）；consumed_delta = 前后快照差值（推断）
+        source,
+        exact: source === 'session_usage',
+        turnId,
+        charged,
+        singleAccount,
         elapsedMs: Date.now() - startedAt,
         warning: delta == null
-          ? '请求成功，但 8 秒内未观测到 consumed 增量（结算延迟或上游未计量）；可稍后在逐笔明细里复核'
-          : '',
-        note: '实测倍率 = consumed 增量 ÷ (total_tokens/1000)，与 Qoder 的 billed_rate 同口径；'
-          + '标称取模型表 consumption_rate（命中会员折扣取折后价）。偏差可能来自：结算延迟、'
-          + '同账号并发请求、consumed 两位小数量化，或上游静默改路由——结合模型页标称值人工判读。',
+          ? '请求成功，但未取到本次扣费（逐轮账单无 credits 且 8 秒内未观测到 consumed 增量）；可稍后在逐笔明细里复核'
+          : (sessionUsageError ? `逐轮账单不可用（${sessionUsageError}），已退回过 consumed 差值口径` : ''),
+        note: 'source=session_usage 时 delta 是上游单请求扣费（get_session_usage），exact=true；'
+          + 'source=consumed_delta 时是前后快照差值（推断口径，受结算延迟/并发影响）。'
+          + '倍率 = delta ÷ (total_tokens/1000)，标称取模型表 consumption_rate（命中会员折扣取折后价）。'
+          + '偏差可能来自：量化、并发请求，或上游静默改路由——结合模型页标称值人工判读。',
       });
     },
   },

@@ -48,6 +48,80 @@ function ratioOf(billed, expected) {
 }
 
 /**
+ * 解析逐轮账单响应（`get_session_usage`）。
+ *
+ * 实测形状（Trae2api-cn）：`data.user_usage_group_by_session.credits_float`。
+ * 字段位置可能因上游版本变化，所以同时认 credits_float / creditsFloat / credits；
+ * 数组形状按求和（一轮里可能有多个会话记录）。取不到如实 null，不补 0。
+ */
+function parseSessionUsage(data) {
+  if (!data || typeof data !== 'object') return { credits: null };
+  const d = data.data && typeof data.data === 'object' ? data.data : data;
+  // 真实响应用的是 amount_float（2026-10-31 实测），hub 的文档写 credits_float
+  // ——两个都认，再加 credits/amount 兜底。
+  const pick = (o) => {
+    if (!o || typeof o !== 'object') return null;
+    return num(o.credits_float ?? o.creditsFloat ?? o.credits ?? o.amount_float ?? o.amountFloat ?? o.amount);
+  };
+  let g = d.user_usage_group_by_session
+    || (d.usage && d.usage.user_usage_group_by_session)
+    || null;
+  if (Array.isArray(g)) {
+    let sum = 0;
+    let any = false;
+    for (const x of g) {
+      const v = pick(x);
+      if (v != null) { sum += v; any = true; }
+    }
+    return { credits: any ? Number(sum.toFixed(4)) : null };
+  }
+  if (g && typeof g === 'object') {
+    const v = pick(g);
+    // amount_float=0 且没有明细 = 这一轮还没结算/不是该 id 的记录。返回 0 会
+    // 被读成「本次免费」，所以只有明细非空时才把 0 当成合法值。
+    const hasDetails = Array.isArray(g.usage_group_details) && g.usage_group_details.length > 0;
+    if (v === 0 && !hasDetails) return { credits: null };
+    return { credits: v };
+  }
+  // 个别版本可能把数字直接放在 data 上
+  return { credits: pick(d) };
+}
+
+/**
+ * 取某一轮的精确扣费。**这是 TRAE 唯一的单请求账单口径**——`consumed` 前后
+ * 差值只是推断（并发会串账、结算有延迟）。
+ *
+ * 失败时如实返回 `{ ok:false, error }`，调用方退回过 consumed 差值口径，
+ * 不把「没测到」当成 0。
+ */
+async function fetchSessionUsage(auth, turnId, opts = {}) {
+  const c = require('./constants');
+  const { soloHeaders } = require('./headers');
+  const tnc = require('./tnc');
+  if (!turnId) return { ok: false, error: '缺少 turn id' };
+  let agent = null;
+  try { agent = require('../proxy-agent').getAgentFor(auth); } catch (e) {
+    return { ok: false, error: `出站代理配置错误: ${e.message}` };
+  }
+  const hosts = await tnc.agentHosts(auth).catch(() => [c.AGENT_HOST]);
+  let last = null;
+  for (const host of hosts) {
+    const r = await c.request(host, c.EP_SESSION_USAGE, {
+      method: 'POST', body: { session_id: String(turnId) },
+      headers: soloHeaders(auth, false), timeout: 15000, agent,
+    });
+    if (r.status === 200 && r.data) {
+      const parsed = parseSessionUsage(r.data);
+      return { ok: true, credits: parsed.credits, raw: r.data };
+    }
+    last = r;
+    // 拿到响应（含 4xx/5xx）就不再换主机——换主机只救「连不上」
+    if (r.status !== 0) break;
+  }
+  return { ok: false, error: last ? `HTTP ${last.status} ${String(last.raw || '').slice(0, 120)}` : '无可用主机' };
+}
+
+/**
  * 从「请求前 / 请求后的 consumed 快照」推导本次消耗。
  *
  * @param {Map<string, number>} before 账号 id → consumed
@@ -75,4 +149,4 @@ function attributeDelta(before, after, servedId) {
   return { charged, delta, singleAccount: charged.length === 1 };
 }
 
-module.exports = { expectedRate, billedRate, ratioOf, attributeDelta };
+module.exports = { expectedRate, billedRate, ratioOf, attributeDelta, parseSessionUsage, fetchSessionUsage };

@@ -23,6 +23,72 @@ const { payloadError, envelopeStatus, throttleRetryMs } = require('../upstream-e
 const TIMEOUT_MS = 600000;
 
 /**
+ * 出站请求体上限。阿里云 SLB 对单 POST 有 30MB 硬限制，超过直接 RST。
+ *
+ * **必须在本地前置拒绝**：不拦的话连接被重置 → 当成瞬态网络错误 → 换号重试
+ * → 每次重放几十 MB → 整池进熔断（qoder2api-hub 实测的失败链）。而换号对
+ * 体积问题毫无作用——每一份请求一样大。
+ */
+const MAX_BODY_MB = Math.max(1, Number(process.env.DUMATE_QODER_MAX_BODY_MB) || 29);
+
+function assertBodySize(encBody) {
+  const bytes = Buffer.byteLength(String(encBody || ''));
+  const limit = MAX_BODY_MB * 1024 * 1024;
+  if (bytes <= limit) return bytes;
+  const err = new Error(
+    `Qoder 请求体 ${(bytes / 1048576).toFixed(1)}MB 超过上游单请求上限 ${MAX_BODY_MB}MB：`
+    + '请缩短上下文（减少历史/附件）。换账号无用——这是请求本身体积的问题。',
+  );
+  err.statusCode = 413;
+  err.tooLarge = true;
+  throw err;
+}
+
+// ---- DeepSeek 族的 reasoning_content 回填（2026-10-31，融合 hub）----
+// 这族模型的多轮一致性与上一轮的 reasoning_content 强相关，而 OpenAI 兼容
+// 客户端（Codex / Claude Code）只回传正文、不带上轮的思维链。网关把每轮
+// 最后一次 assistant 的「正文 + reasoning」记在内存里，下一轮请求里匹配到
+// 同一条 assistant 消息时补回 reasoning_content。
+//
+// 只对 DeepSeek 族做：其它模型没有这个依赖，多塞一个未知字段是白风险。
+const DEEPSEEK_FAMILY = /dfmodel|dmodel|deepseek/i;
+const REASONING_TTL_MS = 30 * 60 * 1000;
+const REASONING_MAX = 200;
+const reasoningCache = new Map(); // sessionId -> { text, reasoning, model, at }
+
+function rememberReasoning(sessionId, text, reasoning, model) {
+  const key = String(sessionId || '');
+  const t = String(text || '').trim();
+  const r = String(reasoning || '');
+  if (!key || !t || !r) return;
+  const now = Date.now();
+  reasoningCache.delete(key); // 重新插入到队尾（LRU）
+  reasoningCache.set(key, { text: t, reasoning: r, model: String(model || ''), at: now });
+  for (const [k, v] of reasoningCache) {
+    if (reasoningCache.size <= REASONING_MAX && now - v.at <= REASONING_TTL_MS) break;
+    reasoningCache.delete(k);
+  }
+}
+
+function backfillReasoning(modelKey, turns, sessionId) {
+  if (!sessionId || !DEEPSEEK_FAMILY.test(String(modelKey || ''))) return false;
+  const rec = reasoningCache.get(String(sessionId));
+  if (!rec || Date.now() - rec.at > REASONING_TTL_MS) return false;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const m = turns[i];
+    if (!m || m.role !== 'assistant') continue;
+    if (m.reasoning_content) return false; // 客户端自己带了，不覆盖
+    const text = String(contentText(m.content, '')).trim();
+    if (text && text === rec.text) {
+      m.reasoning_content = rec.reasoning;
+      return true;
+    }
+    return false; // 只看最后一条 assistant
+  }
+  return false;
+}
+
+/**
  * 给带工具的请求注入「执行纪律」。
  *
  * 与千问同一问题：上游是对话型产品，脚手架鼓励「每完成一步汇报一句」，
@@ -166,6 +232,9 @@ function buildBody(modelKey, payload, opts = {}) {
   if (!system && sysMsg) system = contentText(sysMsg.content, '[Image content - not supported by Qoder channel]');
   // system 留在 messages 里（与千问同一实测结论：上游只认 messages 里的 system 角色）
   const turns = messages;
+  // DeepSeek 族的多轮一致性依赖上一轮 reasoning_content（客户端不回传，见
+  // rememberReasoning 的注释）。匹配不上就原样发，不编造。
+  backfillReasoning(modelKey, turns, opts.sessionId);
   const lastUser = [...turns].reverse().find((m) => m && m.role === 'user');
   const text = lastUser ? contentText(lastUser.content, '[Image content - not supported by Qoder channel]') : '';
 
@@ -679,7 +748,12 @@ function aggregate(payloads, model) {
   const message = { role: 'assistant', content };
   if (reasoning) message.reasoning_content = reasoning;
   if (calls.size) {
-    message.tool_calls = [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+    message.tool_calls = [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([idx, v]) => {
+      // 上游偶尔发不带 id 的 tool_call（hub 实测）。客户端按 id 去重/回填
+      // 工具结果，空 id 会让整轮工具失败——缺就补一个稳定的本地 id。
+      if (!v.id) v.id = `call_qd_${Date.now().toString(36)}_${idx}`;
+      return v;
+    });
     if (!content) message.content = null;
   }
   normalizeUsageCache(usage);
@@ -753,8 +827,38 @@ function getQueueStatus(origin, headers, { modelKey, queueType, requestId, agent
   });
 }
 
+/**
+ * 流式路径的 tool_call.id 补全（就地改写，返回是否改过）。
+ *
+ * 上游偶尔发不带 `id` 的 tool_call 增量（hub 实测）。客户端按 id 关联工具结果，
+ * 空 id 会让整轮工具失败。按 index 记住第一次生成的 id，后续帧复用同一个——
+ * 每帧都新生成会让同一次调用变成多个不同调用。
+ */
+function backfillToolCallIds(parsed, ids) {
+  const delta = parsed && parsed.choices && parsed.choices[0] && parsed.choices[0].delta;
+  if (!delta || !Array.isArray(delta.tool_calls)) return false;
+  let changed = false;
+  for (const tc of delta.tool_calls) {
+    if (!tc || typeof tc !== 'object') continue;
+    const idx = tc.index != null ? tc.index : 0;
+    if (tc.id) {
+      if (!ids.has(idx)) ids.set(idx, tc.id);
+      continue;
+    }
+    let id = ids.get(idx);
+    if (!id) {
+      id = `call_qd_${Date.now().toString(36)}_${idx}`;
+      ids.set(idx, id);
+    }
+    tc.id = id;
+    changed = true;
+  }
+  return changed;
+}
+
 module.exports = {
   buildBody, hasFunctionTools, resolveModelKey, unwrap, envelopeStatus, payloadError,
   post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
   getQueueStatus, parseQueueStatus, normalizeUsageCache,
+  assertBodySize, rememberReasoning, backfillToolCallIds,
 };

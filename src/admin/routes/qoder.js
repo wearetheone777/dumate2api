@@ -83,7 +83,7 @@ const routes = [
             nickname: a.nickname || a.uid || `账号 ${a.id}`,
             region: a.region,
             planName: a.planName || '',
-            userQuota: null, addOnQuota: null, isQuotaExceeded: null,
+            userQuota: null, addOnQuota: null, orgResourcePackage: null, isQuotaExceeded: null,
             checkedIn: null, checkinPending: null, checkinNextAt: null,
             lastCheckin: a.lastCheckin || null,
             error: `出站代理配置错误: ${e.message}`,
@@ -102,6 +102,9 @@ const routes = [
           // 取不到时给 null，不补 0——0 会被读成「用完了」
           userQuota: q.ok ? q.userQuota : null,
           addOnQuota: q.ok ? q.addOnQuota : null,
+          // 团队共享额度池（团队号才有）。有效余额 = 套餐 + 可用共享池；
+          // cap=-1 表示不限量，界面按 unlimited 显示，不按数字比大小。
+          orgResourcePackage: q.ok ? q.orgResourcePackage : null,
           isQuotaExceeded: q.ok ? q.isQuotaExceeded : null,
           // null = 查不出来；true/false = 今日已签 / 未签
           checkedIn: ck.ok ? ck.checkedIn : null,
@@ -117,6 +120,10 @@ const routes = [
       const known = rows.filter((r) => r.addOnQuota || r.userQuota);
       const sumAddOn = known.reduce((s, r) => s + ((r.addOnQuota && r.addOnQuota.remaining) || 0), 0);
       const sumUser = known.reduce((s, r) => s + ((r.userQuota && r.userQuota.remaining) || 0), 0);
+      // 共享池合计只加「可用且不是不限量」的账号——不限量（cap=-1）没有有限
+      // 的剩余额可以求和，混进去会让合计看起来像个有限的数字。
+      const orgRows = known.filter((r) => r.orgResourcePackage && r.orgResourcePackage.available && !r.orgResourcePackage.unlimited);
+      const sumOrg = orgRows.reduce((s, r) => s + (r.orgResourcePackage.remaining || 0), 0);
       // 即将过期的批次：本地账本，不打上游（数据源见 /grants 的注释）
       const grants = require('../../qoder/grants');
       const now = Date.now();
@@ -135,6 +142,9 @@ const routes = [
           // 两份额度**分开合计**，不合并
           addOnTotal: Number(sumAddOn.toFixed(4)),
           userTotal: Number(sumUser.toFixed(4)),
+          // 团队共享池合计（只含可用且有限额的账号；不限量账号不计入）
+          orgTotal: Number(sumOrg.toFixed(4)),
+          orgUnlimited: known.some((r) => r.orgResourcePackage && r.orgResourcePackage.unlimited),
           exceeded: rows.filter((r) => r.isQuotaExceeded).length,
           // 7 天内到期且有记录的批次数与**领取额合计**（不是剩余额，见 note）
           expiringCount: expiring.length,
@@ -313,6 +323,86 @@ const routes = [
       // 审计（Q4）：签到是真实消耗/获取积分的动作，成败都留痕
       const okCount = results.filter((r) => r.ok).length;
       try { require('../auth').audit('admin', 'qoder_checkin', id || 'all', `${okCount}/${results.length}`); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: true, results });
+    },
+  },
+  {
+    // Pro 升级福利包：**只读查询**资格，不领取（一次性 +1800，不可逆）。
+    // 端点不存在（活动下线）按 eligible=false 返回，不报错。
+    method: 'GET',
+    path: '/pro-eligibility',
+    handler: async ({ res, req }) => {
+      const idm = req.url.match(/[?&]id=(\d+)/);
+      const id = idm ? Number(idm[1]) : null;
+      const list = id ? [authStore.get(id)].filter(Boolean) : authStore.list();
+      const proxyAgent = require('../../proxy-agent');
+      const rows = [];
+      for (const a of list) {
+        const raw = authStore.get(a.id);
+        const base = { id: a.id, nickname: a.nickname || a.uid || `账号 ${a.id}`, region: a.region };
+        let agent = null;
+        try { agent = proxyAgent.getAgentFor(raw); } catch (e) {
+          rows.push({ ...base, eligible: null, error: `出站代理配置错误: ${e.message}` });
+          continue;
+        }
+        const r = await session.fetchProEligibility(raw.accessToken, a.region, { agent });
+        rows.push({
+          ...base,
+          // null = 查不出来，不猜成「不能领」
+          eligible: r.ok ? r.eligible : null,
+          gone: !!(r.ok && r.gone),
+          error: r.ok ? '' : (r.error || '查询失败'),
+        });
+      }
+      return sendJSON(res, 200, {
+        rows,
+        note: '一次性福利包（+1800）。eligible=false 可能是已领过或活动未覆盖该账号；端点不存在时 gone=true（活动已下线）。',
+      });
+    },
+  },
+  {
+    // 领取 Pro 福利包。**一次性的不可逆动作**，所以要求 body.confirm === true——
+    // 防止误触把每个账号的福利一口气点掉。
+    // 领取前后各取一次额度，报**到账差值**（上游只回 success，不告诉我们发了多少）。
+    method: 'POST',
+    path: '/pro-claim',
+    handler: async ({ res, body }) => {
+      if (!body || body.confirm !== true) {
+        return sendJSON(res, 400, { ok: false, error: '这是一次性不可逆操作，需带 confirm: true' });
+      }
+      const id = body.id;
+      const list = id ? [authStore.get(id)].filter(Boolean) : authStore.list();
+      if (!list.length) return sendJSON(res, 200, { ok: false, error: '没有可用账号', results: [] });
+      const proxyAgent = require('../../proxy-agent');
+      const results = [];
+      for (const a of list) {
+        const raw = authStore.get(a.id);
+        const base = { id: a.id, nickname: a.nickname || a.uid || `账号 ${a.id}` };
+        let agent = null;
+        try { agent = proxyAgent.getAgentFor(raw); } catch (e) {
+          results.push({ ...base, ok: false, error: `出站代理配置错误: ${e.message}` }); continue;
+        }
+        // 先查资格：不可领就不打领取接口（已领过的账号不会有副作用，但少一次请求）
+        const el = await session.fetchProEligibility(raw.accessToken, a.region, { agent });
+        if (!el.ok) { results.push({ ...base, ok: false, error: el.error }); continue; }
+        if (!el.eligible) { results.push({ ...base, ok: true, skipped: true, reason: el.gone ? '活动已下线' : '不可领取（可能已领过）' }); continue; }
+        const before = await session.fetchQuota(raw.accessToken, a.region, { agent });
+        const r = await session.claimProBenefit(raw.accessToken, a.region, { agent });
+        let gained = null;
+        if (r.ok && !r.already) {
+          const after = await session.fetchQuota(raw.accessToken, a.region, { agent });
+          if (before.ok && after.ok && before.addOnQuota && after.addOnQuota) {
+            gained = Number((after.addOnQuota.remaining - before.addOnQuota.remaining).toFixed(4));
+          }
+        }
+        results.push({
+          ...base, ok: r.ok, already: !!r.already, gained,
+          before: before.ok ? before.addOnQuota : null,
+          error: r.ok ? '' : (r.error || '领取失败'),
+        });
+      }
+      const okCount = results.filter((x) => x.ok && !x.skipped).length;
+      try { require('../auth').audit('admin', 'qoder_pro_claim', id || 'all', `${okCount}/${results.length}`); } catch (e) { /* 审计失败不影响结果 */ }
       return sendJSON(res, 200, { ok: true, results });
     },
   },

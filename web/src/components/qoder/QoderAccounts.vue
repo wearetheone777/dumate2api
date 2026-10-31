@@ -125,6 +125,19 @@
                 </div>
               </div>
             </div>
+            <!-- 团队共享额度池：团队号才有，个人号没有这个对象。
+                 有效余额 = 套餐 + 可用共享池，所以它必须单列，不能加进上面两格 -->
+            <div v-if="creditOf(a.id)?.orgResourcePackage" class="mt-2 text-xs">
+              <span class="text-slate-500">团队共享池：</span>
+              <span v-if="creditOf(a.id)!.orgResourcePackage!.unlimited" class="text-cyan-700">不限量</span>
+              <span v-else class="num text-cyan-700">
+                {{ fmtQ(creditOf(a.id)!.orgResourcePackage!.remaining) }}
+                <span class="text-slate-500">
+                  / {{ fmtQ(creditOf(a.id)!.orgResourcePackage!.cap) }}
+                  <template v-if="!creditOf(a.id)!.orgResourcePackage!.available">（不可用）</template>
+                </span>
+              </span>
+            </div>
             <div v-else class="mt-3 text-xs text-slate-500">额度未查询（点「刷新」）</div>
 
             <!-- 该账号的积分到期情况。签到积分**领取后 30 天作废**，
@@ -146,6 +159,14 @@
               </span>
               <div class="flex gap-2">
                 <a-button size="small" :loading="checkinBusy[a.id]" @click="checkinOne(a)">签到</a-button>
+                <a-popconfirm
+                  v-if="proEligible(a.id)"
+                  title="Pro 福利包是一次性领取（+1800），领取后不可撤回，确定？"
+                  ok-text="确定领取"
+                  @confirm="claimPro(a)"
+                >
+                  <a-button size="small" :loading="proBusy[a.id]">领 Pro 福利包</a-button>
+                </a-popconfirm>
                 <a-button size="small" v-if="!a.preferred" @click="setMain(a)">设为主账号</a-button>
                 <a-popconfirm title="确定删除这个账号？" @confirm="remove(a)">
                   <a-button size="small" danger>删除</a-button>
@@ -236,6 +257,11 @@ const err = ref('')
 const loading = ref(false)
 const checkinLoading = ref(false)
 const checkinBusy = reactive<Record<number, boolean>>({})
+// Pro 福利包：一次性领取（+1800），资格是只读查询。true 才显示按钮，
+// null（查不出）不显示——不拿一个没查到的事实催用户点。
+const proBusy = reactive<Record<number, boolean>>({})
+const proEligibility = ref<Record<number, boolean>>({})
+const proEligible = (id: number) => proEligibility.value[id] === true
 
 const enabledCount = computed(() => rows.value.filter((a) => a.enabled).length)
 // 只数**明确**已签的；查不出的（null）不算，否则「已签 2/2」会把未知当已签
@@ -374,19 +400,26 @@ async function cancelLogin() {
 async function load() {
   loading.value = true
   try {
-    const [s, c, g] = await Promise.all([
+    const [s, c, g, p] = await Promise.all([
       qoderApi.status(),
       qoderApi.credits().catch(() => ({ data: { rows: [] as QoderCreditRow[] } })),
       qoderApi.grants(365).catch(() => ({ data: { rows: [] as QoderGrant[] } })),
+      qoderApi.proEligibility().catch(() => ({ data: { rows: [], note: '' } })),
     ])
     rows.value = s.data.rows || []
     credits.value = (c.data.rows || []) as QoderCreditRow[]
     grants.value = (g.data.rows || []) as QoderGrant[]
+    const next: Record<number, boolean> = {}
+    for (const r of p.data.rows || []) {
+      if (r.eligible === true) next[r.id] = true
+    }
+    proEligibility.value = next
     err.value = s.data.error || ''
   } catch (e: any) {
     rows.value = []
     credits.value = []
     grants.value = []
+    proEligibility.value = {}
     err.value = e?.response?.data?.error || e?.message || '读取 Qoder 账号失败'
   } finally {
     loading.value = false
@@ -426,6 +459,26 @@ async function checkinOne(a: QoderAccount) {
     message.error(e?.response?.data?.error || '签到失败')
   } finally {
     checkinBusy[a.id] = false
+  }
+}
+
+async function claimPro(a: QoderAccount) {
+  proBusy[a.id] = true
+  try {
+    const { data } = await qoderApi.proClaim(a.id)
+    const r = (data.results || [])[0] || {}
+    if (r.skipped) message.info(`${a.nickname || a.id}：${r.reason || '不可领取'}`)
+    else if (r.already) message.info(`${a.nickname || a.id} 已领取过 Pro 福利包`)
+    else if (r.ok) {
+      message.success(r.gained != null
+        ? `${a.nickname || a.id} 领取成功，到账 ${r.gained} credits`
+        : `${a.nickname || a.id} 领取成功（上游未回报到账数量）`)
+    } else message.error(r.error || '领取失败')
+    await load()
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '领取失败')
+  } finally {
+    proBusy[a.id] = false
   }
 }
 
