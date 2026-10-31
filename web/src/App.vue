@@ -69,6 +69,16 @@ const themeConfig = {
       itemHoverBg: 'rgba(15, 23, 42, 0.04)',
       itemHoverColor: '#1a2332',
     },
+    // Tabs 的墨条与选中色与全站信号色对齐（AntD 默认蓝在青色体系里是外来色）
+    Tabs: {
+      inkBarColor: '#0891b2',
+      itemSelectedColor: '#0891b2',
+      itemHoverColor: '#0891b2',
+    },
+    // 浮层（Select 下拉等）圆角与卡片体系一致
+    Dropdown: { borderRadiusSM: 10 },
+    // 积分明细页「查看账号」切换器：选中底色走信号色
+    Radio: { buttonSolidCheckedBg: '#0891b2', buttonSolidCheckedHoverBg: '#0e7490' },
   },
 }
 </script>

@@ -382,9 +382,15 @@ onMounted(() => { channelStore.load() })
   font-size: 11.5px;
 }
 
-/* 内容区：给页面留一致的呼吸空间 */
+/* 内容区：给页面留一致的呼吸空间。宽屏上加大上边距，
+   让 sticky 顶栏与首个卡片之间有一段明确的空气 */
 .lab-content {
   margin: 20px;
+}
+@media (min-width: 1440px) {
+  .lab-content {
+    margin: 24px 28px 28px;
+  }
 }
 
 /* 窄屏适配：面包屑只留当前页名，避免顶栏溢出 */
