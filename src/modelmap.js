@@ -155,16 +155,22 @@ function mapModel(name) {
  * 因此下面的中文名是**本地标注**，不是百度下发的官方名称——界面必须标明
  * 来源，不能让人以为这是上游给的元信息。
  */
+// 显示名 = **真实后端名**（X-Dumate-Gw-Realmodel 实测）+ 档位限定词。
+// cc-switch 等客户端的模型列表读 `name` 显示——之前给的是内部 key，用户看不出
+// 是哪个模型；现在直接显示实跑模型。model-text 与 L0 实跑同一个后端，
+// 靠限定词区分（名字完全相同的话客户端列表里分不清谁是谁）。
+// 注意：真实后端串保持 X-Dumate-Gw-Realmodel 的原样小写（忠实于上游回传）。
 const MODEL_NAMES = {
-  'model-text': '文本模型（上游默认）',
-  'model-artifact-validate': '制品校验模型',
-  'glm-5': 'GLM-5',
-  // 自动三档（2026-10-31 真机实证，网页凭证直打云端网关）：模型名即档位，
-  // 不需要请求头。括号里是网关响应头 X-Dumate-Gw-Realmodel 回传的真实后端，
-  // 仍是本地标注——上游没有模型列表接口
-  'dm-auto-model/text.L0': '自动档 L0（实跑 DeepSeek-V4.1-Flash-Low-Latency）',
-  'dm-auto-model/text.L1': '自动档 L1（实跑 Kimi-K3）',
-  'dm-auto-model/text.L2': '自动档 L2（实跑 Qwen3.8-Max）',
+  'model-text': 'deepseek-v4.1-flash-low-latency（上游默认档）',
+  'model-artifact-validate': 'model-artifact-validate（制品校验，后端未实测）',
+  'glm-5': 'glm-5.2',
+  'dm-auto-model/text.L0': 'deepseek-v4.1-flash-low-latency（自动档 L0）',
+  'dm-auto-model/text.L1': 'kimi-k3（自动档 L1）',
+  'dm-auto-model/text.L2': 'qwen3.8-max（自动档 L2）',
+  // mm 命名空间（2026-10-31 实测：视觉由文本后端直接承担）
+  'model-mm': 'deepseek-v4.1-flash-low-latency（视觉）',
+  'dm-auto-model/mm.L0': 'deepseek-v4.1-flash-low-latency（视觉 L0）',
+  'dm-auto-model/mm.L2': 'qwen3.8-max（视觉 L2）',
 };
 
 /** 上游 ID → 可读名；没有标注就原样返回（别名表里的 claude-* / gpt-* 属于客户端协议名） */
