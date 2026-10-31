@@ -5,6 +5,8 @@ const { mapModel, anthropicToOpenAI, openAIToAnthropic, mapFinishReason } = requ
 const { googleToOpenAI, openAIToGoogle, translateStreamToGoogle } = require('./google');
 const { responsesToOpenAI, openAIToResponse, translateStreamToResponses } = require('./responses');
 const images = require('./images');
+const dumateCaps = require('./dumate-caps');
+const promptGuard = require('./prompt-guard');
 const { resolveMaxTokens, resolveQwenMaxTokens, resolveTraeworkMaxTokens, resolveQoderMaxTokens } = require('./budget');
 const webFallback = require('./fallback-web');
 
@@ -12,12 +14,14 @@ const webFallback = require('./fallback-web');
 // 分开写必然漂移（曾经就漏了千问，导致小预算直接截断正文）。
 // 千问与 TRAE 的下限都远低于搭子（16384 vs 32768），因为它们的
 // reasoning 峰值比搭子小一个量级。
-function resolveBudget(target, requested) {
+// 搭子（默认分支）带映射后的模型名取**按模型上限**（dumate-caps.js）：
+// 全局 CEIL 来自 GLM 一家的范围，对 deepseek 低延迟/kimi-k3 是白压低。
+function resolveBudget(target, requested, model) {
   const kind = target && target.budgetKind;
   if (kind === 'qwenwork') return resolveQwenMaxTokens(requested);
   if (kind === 'traework') return resolveTraeworkMaxTokens(requested);
   if (kind === 'qoder') return resolveQoderMaxTokens(requested);
-  return resolveMaxTokens(requested);
+  return resolveMaxTokens(requested, dumateCaps.capOf(model));
 }
 const reqlog = require('./reqlog');
 // 首字标记归 reqlog 统一实现：三个协议翻译器（Responses / Anthropic / Google）
@@ -501,6 +505,9 @@ function forwardWithFallback(portOrTarget, path, method, headers, body, clientRe
       // 账号在池子选中时就回填（早于流结束），供埋点记录「实际用了哪个」。
       // 多账号轮询下只有池子知道，在埋点处猜必然是错的。
       onAccount: (name) => { if (name && clientReq) clientReq._upstreamAccount = String(name); },
+      // 云端网关回传的真实后端模型（响应头 X-Dumate-Gw-Realmodel），
+      // 响应头一到就回填，赶在埋点落笔之前
+      onRealModel: (m) => { if (m && clientReq) clientReq._realModel = String(m); },
     });
     // 标记这次走了回落——埋点与界面据此区分「用的是哪套凭证」
     if (clientReq) clientReq._credentialSource = 'web';
@@ -681,6 +688,10 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 映射后的模型：客户端发来的名字经 modelmap 转换后实际打给上游的值。
     // 排查「为什么 glm-5 变成了 model-text」这类问题时要看它。
     mapped_model: req._mappedModel || '',
+    // 上游真实执行的模型（网页链路云端网关回传 X-Dumate-Gw-Realmodel）。
+    // 上游会按请求模型静默改路由（glm-5 预置展示 GLM-5.2），不记这个
+    // 就只能靠猜。桌面链路拿不到这个头，如实留空。
+    real_model: req._realModel || '',
     stream: !!info.stream,
     messages: info.messages || 0,
     status: status || 0,
@@ -850,6 +861,10 @@ async function handleOpenAIChat(req, res) {
   if (route.target.needsModelMap) {
     reqBody.model = mapModel(route.model);
     req._mappedModel = reqBody.model;
+    // 出站提示词卫生（两项都是默认关闭的选通开关，见 src/prompt-guard.js）：
+    // 合规词零宽空格脱敏（DUMATE_DESENSITIZE=1）+ 超大工具输出截断（DUMATE_TOOL_OUTPUT_CAP）
+    promptGuard.desensitizeBody(reqBody);
+    promptGuard.capToolOutputs(reqBody, process.env.DUMATE_TOOL_OUTPUT_CAP);
   } else {
     reqBody.model = route.model;
   }
@@ -860,7 +875,7 @@ async function handleOpenAIChat(req, res) {
   // 千问办公不套这一档：实测它的推理与正文分开流（reasoning 2060 字 / 正文
   // 96 字），机制不同，套上搭子的 32768 下限只会把小请求凭空撑大。
   if (route.target.needsBudget) {
-    reqBody.max_tokens = resolveBudget(route.target, reqBody.max_tokens);
+    reqBody.max_tokens = resolveBudget(route.target, reqBody.max_tokens, reqBody.model);
   }
 
   const target = route.target;
@@ -1078,7 +1093,12 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
     req._mappedModel = route.model;
   }
   if (route.target.needsBudget) {
-    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens);
+    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens, openaiReq.model);
+  }
+  // 出站提示词卫生（搭子路径；默认关闭的选通开关，见 src/prompt-guard.js）
+  if (route.target.needsModelMap) {
+    promptGuard.desensitizeBody(openaiReq);
+    promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
   if (target.direct) {
@@ -1191,15 +1211,20 @@ async function handleOpenAIResponses(req, res) {
     req._mappedModel = openaiReq.model;
     // 与 Anthropic 路径同口径：reasoning_effort 只给直连通道，搭子透传前剥掉
     delete openaiReq.reasoning_effort;
-    // 图像同理：翻译层（Google→OpenAI）现在保真透传 image_url part，
-    // 搭子上游不认识——压回占位文本（恢复保真前的行为）
-    images.flattenImageParts(openaiReq);
+    // 图像保真透传（2026-10-31 真机实证）：搭子上游认 OpenAI 标准 image_url
+    // part（data URI，网页凭证与桌面链路均 200 且能识别颜色），不再压回占位
+    // 文本。此前「上游不支持图像」是能力边界误判
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
   }
   if (route.target.needsBudget) {
-    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens);
+    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens, openaiReq.model);
+  }
+  // 出站提示词卫生（搭子路径；默认关闭的选通开关，见 src/prompt-guard.js）
+  if (route.target.needsModelMap) {
+    promptGuard.desensitizeBody(openaiReq);
+    promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
   if (target.direct) {
@@ -1293,14 +1318,18 @@ async function handleAnthropicMessages(req, res) {
     // 思考强度是直连通道（Qoder）才下发的字段；搭子是「最小干预透传」，
     // 多余字段原样进云端，行为未知——剥掉（翻译层加的，这里剥干净）。
     delete openaiReq.reasoning_effort;
-    // 图像同理（Responses→OpenAI 翻译层已保真透传 image_url part）
-    images.flattenImageParts(openaiReq);
+    // 图像保真透传（同 Google 路径：搭子上游认 image_url part，2026-10-31 实测）
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
   }
   if (route.target.needsBudget) {
-    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens);
+    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens, openaiReq.model);
+  }
+  // 出站提示词卫生（搭子路径；默认关闭的选通开关，见 src/prompt-guard.js）
+  if (route.target.needsModelMap) {
+    promptGuard.desensitizeBody(openaiReq);
+    promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
   if (target.direct) {

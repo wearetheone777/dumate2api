@@ -173,13 +173,18 @@ function callWebPool(body, opts = {}) {
     const run = body.stream
       ? pool.callStreamWithFailover('/chat/completions', 'POST', body, onChunkSniff, {
         timeout: 600000,
+        // 真实模型回调（X-Dumate-Gw-Realmodel）：池子在响应头到达时上报
+        ...(opts.onRealModel ? { onRealModel: opts.onRealModel } : {}),
         // **不在 onStatus 里 settle(200)**：云端网关对部分错误回 HTTP 200 +
         // body 内错误体，响应头先于 body 到达——在这里 settle 会把状态码
         // 定格成 200，等首块嗅探发现错误体时已经改不了（处理器早已
         // writeHead）。状态码统一由首块嗅探定：正常 SSE 首帧毫秒级到达，
         // 代价只是 ready 晚解析一个首块的时间。
       })
-      : pool.callWithFailover('/chat/completions', 'POST', body, { timeout: 600000 });
+      : pool.callWithFailover('/chat/completions', 'POST', body, {
+        timeout: 600000,
+        ...(opts.onRealModel ? { onRealModel: opts.onRealModel } : {}),
+      });
 
     Promise.resolve(run).then((r) => {
       if (r && r.account) {
@@ -188,6 +193,15 @@ function callWebPool(body, opts = {}) {
         emitter._account = accounts.displayName(r.account);
         if (typeof opts.onAccount === 'function') {
           try { opts.onAccount(accounts.displayName(r.account)); } catch (e) { /* 归因失败不影响转发 */ }
+        }
+      }
+      // 真实后端模型（X-Dumate-Gw-Realmodel）。池子在响应头到达时已经通过
+      // onRealModel 上报过；这里再挂一份到 emitter 上，供不走回调的调用方读取
+      const realModel = (r && (r.realModel || (r.headers && r.headers['x-dumate-gw-realmodel']))) || '';
+      if (realModel) {
+        emitter._realModel = realModel;
+        if (typeof opts.onRealModel === 'function') {
+          try { opts.onRealModel(realModel); } catch (e) { /* 归因失败不影响转发 */ }
         }
       }
       if (!r) {

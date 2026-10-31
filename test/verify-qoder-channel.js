@@ -47,6 +47,7 @@ check('model_config.key 是模型名', () => assert.strictEqual(body.model_confi
 check('chat_context.extra.modelConfig.key 同步', () => assert.strictEqual(body.chat_context.extra.modelConfig.key, 'gfmodel'));
 check('stream 为 true（上游只走 SSE）', () => assert.strictEqual(body.stream, true));
 check('带 business 对象（缺了会 503）', () => assert.strictEqual(body.business.product, 'qoder_work'));
+check('business.model_key 计费归因（hub #119：缺失时所有模型被记成 auto 档）', () => assert.strictEqual(body.business.model_key, 'gfmodel'));
 check('session_type 正确', () => assert.strictEqual(body.session_type, 'qoder_work'));
 check('max_tokens 透传', () => assert.strictEqual(body.parameters.max_tokens, 100));
 check('chat_context.text 取最后一条 user', () => assert.strictEqual(body.chat_context.text, '你好'));

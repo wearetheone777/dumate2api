@@ -4,7 +4,8 @@
 // 被错套到所有通道。实测（2026-10-30 真机）TRAE llm_utils_chat 直接认
 // OpenAI 标准 image_url part（data URI），故翻译层保真、通道层消歧：
 //   TRAE 直通 + 多模态校验；千问/Qoder 展开占位文本（COSY 只有纯文本槽）；
-//   搭子压回占位文本（恢复保真前的行为）。
+//   搭子 2026-10-31 起也保真透传（真机实证上游认 image_url part 且能
+//   识别图像内容，web 凭证与桌面链路一致）。
 const { test } = require('node:test');
 const assert = require('assert');
 const images = require('../../src/images');
@@ -46,23 +47,6 @@ test('images: imagePartsFromContent 兼容 input_image 字符串/对象/顶层 u
   assert.strictEqual(parts[2].image_url.url, 'data:image/png;base64,c');
 });
 
-test('images: flattenImageParts 就地把图像压回占位文本（搭子路径）', () => {
-  const req = {
-    messages: [
-      { role: 'user', content: [
-        { type: 'text', text: '图里是什么' },
-        { type: 'image_url', image_url: { url: `data:image/png;base64,${RED_PNG_B64}` } },
-      ] },
-      { role: 'user', content: '纯文本保持原样' },
-    ],
-  };
-  images.flattenImageParts(req);
-  assert.strictEqual(typeof req.messages[0].content, 'string');
-  assert.ok(req.messages[0].content.includes('图里是什么'));
-  assert.ok(req.messages[0].content.includes('not supported'));
-  assert.strictEqual(req.messages[1].content, '纯文本保持原样');
-});
-
 // ---- Anthropic 入口 ----
 
 test('anthropic: base64 source → data URI image_url part（结构化路径保真）', () => {
@@ -90,17 +74,19 @@ test('anthropic: url source 原样透传', () => {
   assert.strictEqual(last.content[0].image_url.url, 'https://example.com/a.png');
 });
 
-test('anthropic: 搭子路径（nativeTools=false）保持占位文本降级', () => {
+test('anthropic: 搭子路径（nativeTools=false）图像也保真透传（2026-10-31 真机实证）', () => {
   const out = anthropic.anthropicToOpenAI({
     model: 'glm-5', max_tokens: 1024,
     messages: [{ role: 'user', content: [
-      { type: 'text', text: 'hi' },
+      { type: 'text', text: '主色调' },
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: RED_PNG_B64 } },
     ] }],
   }, { nativeTools: false });
   const last = out.messages[out.messages.length - 1];
-  assert.strictEqual(typeof last.content, 'string');
-  assert.ok(last.content.includes('not supported'));
+  assert.ok(Array.isArray(last.content));
+  assert.strictEqual(last.content[0].type, 'text');
+  assert.strictEqual(last.content[0].text, '主色调');
+  assert.strictEqual(last.content[1].image_url.url, `data:image/png;base64,${RED_PNG_B64}`);
 });
 
 // ---- Responses 入口 ----

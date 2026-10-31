@@ -309,6 +309,13 @@ function classifyCore(err) {
   if (Number.isFinite(pinned) && pinned > 0) base.retryAfterMs = pinned;
 
   if (status === 429) return { ...base, kind: 'soft' };
+  // 「订阅专享」模型（2026-10-31 融合，语义对齐 traework2api-panel / Trae2api-cn）：
+  // Free 号打订阅模型上游回 403 或业务码 1005——**换模型即可用**，进 (账号,模型)
+  // 负缓存并明确报错，不罚账号、不进熔断。判据必须放在 5xx 分支之前：
+  // 业务码 1005 > 500 会被下面的 breaker 分支误吃。
+  if (/\b1005\b/.test(unescapeDeep(full)) || /订阅专享|subscription[- ]only/i.test(unescapeDeep(full))) {
+    return { ...base, kind: 'model' };
+  }
   // 限流先于 403/5xx 判：它本质是 429 语义（「稍后再来」），不是服务坏了。
   // 顺序很关键——放后面就会被下面那条 403/5xx 的 breaker 分支吃掉。
   if (isThrottle(full)) {

@@ -104,6 +104,94 @@ function logRepair(channel, reqId, attempt, text) {
 }
 
 // ---------------------------------------------------------------------------
+// DeepSeek DSML 工具调用回退解析 + fail-closed 分类（2026-10-31 收敛到共享层）
+//
+// 现象（TRAE 2026-10-30 实测、hub#120 生产日志同款）：DeepSeek 系模型偶尔把
+// 工具调用以**文本标记**写进正文而不走原生 tool_calls 增量——`<dsml:calls>` 包
+// `<dsml:invoke name="…">` 包 `<dsml:parameter name="…">`（标签名里 DSML 的位置
+// 与分隔符不固定）。客户端拿到 XML 文本，本轮工具调用不执行。
+//
+// 三通道共用一个分类器（fail-closed 语义，对齐 hub#120）：
+//   none      正文没有（代码围栏外的）DSML 标记——原样交付（围栏内是模型在讨论格式）
+//   recovered 完整 calls 块且解析出 invoke——还原成结构化工具调用 + 干净正文
+//   empty     只有空壳/残片（标签闭合但没有 invoke）——剥离标记 + WARN
+//             （不剥离会被「播报即收尾」的判据反复捞出来，形成无限重试）
+//   leak      协议结构未闭合（calls/invoke/parameter 开了没收）——**报错**，
+//             把半截协议喂给客户端比明确失败更糟
+//
+// TRAE（event:output 门）与千问/Qoder（标准 OpenAI chunk 门）的 finish 阶段
+// 都接这个分类器；解析函数从 traework/chat.js 收敛到这里，只留 re-export。
+// ---------------------------------------------------------------------------
+
+/** `<…DSML…calls>…</…DSML…calls>` 块（DOTALL：块可跨行） */
+const DSML_CALLS_RE = /<[^>]*dsml[^>]*calls>([\s\S]*?)<\/[^>]*dsml[^>]*calls>/i;
+/** `<…DSML…invoke name="…">…</…DSML…invoke>`（g 必须：exec 循环推进靠它） */
+const DSML_INVOKE_RE = /<[^>]*dsml[^>]*invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/[^>]*invoke>/gi;
+/** `<…DSML…parameter name="…">…</…DSML…parameter>`（g 同上） */
+const DSML_PARAM_RE = /<[^>]*dsml[^>]*parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/[^>]*parameter>/gi;
+
+/**
+ * 从正文解析 DSML 工具调用块。
+ * @returns {{calls:Array<{name:string,arguments:string}>, clean:string}|null}
+ *          null = 没有 DSML 块或块里没有 invoke（正文原样保留）
+ */
+function parseDsmlToolCalls(text) {
+  const s = String(text || '');
+  if (!/dsml/i.test(s)) return null;
+  const m = DSML_CALLS_RE.exec(s);
+  if (!m) return null;
+  const calls = [];
+  let inv;
+  while ((inv = DSML_INVOKE_RE.exec(m[1])) !== null) {
+    const params = {};
+    let p;
+    while ((p = DSML_PARAM_RE.exec(inv[2])) !== null) {
+      params[p[1]] = p[2].trim();
+    }
+    calls.push({ name: inv[1], arguments: JSON.stringify(params) });
+  }
+  if (!calls.length) return null;
+  const clean = (s.slice(0, m.index).trim() + ' ' + s.slice(m.index + m[0].length).trim()).trim();
+  return { calls, clean };
+}
+
+/** 代码围栏剥离：围栏内的 DSML 是模型在讨论格式，不是协议。定长空串占位保偏移 */
+function stripFences(s) {
+  return String(s || '').replace(/```[\s\S]*?(?:```|$)/g, (m) => ' '.repeat(m.length));
+}
+
+/**
+ * DSML 残片分类（见本节头注释）。text 传**缓冲中的整轮正文**。
+ */
+function classifyDsml(text) {
+  const s = String(text || '');
+  if (!/dsml/i.test(stripFences(s))) return { kind: 'none' };
+  const parsed = parseDsmlToolCalls(s);
+  if (parsed) return { kind: 'recovered', calls: parsed.calls, clean: parsed.clean };
+  // 无完整块：区分「空壳」（标签都闭合，只是没有 invoke）与「未闭合结构」。
+  // 自闭合标签（<dsml:parameter …/>）不算开。
+  const outside = stripFences(s);
+  const count = (re) => (outside.match(re) || []).length;
+  const opens = count(/<(?!\/)[^>]*dsml[^>]*(?:calls|invoke|parameter)[^>]*>/gi)
+    - count(/<(?!\/)[^>]*dsml[^>]*(?:calls|invoke|parameter)[^>]*\/>/gi);
+  const closes = count(/<\/[^>]*dsml[^>]*(?:calls|invoke|parameter)\s*>/gi);
+  return { kind: opens > closes ? 'leak' : 'empty' };
+}
+
+/** 剥掉正文里全部 DSML 标签（empty 处置用），多余空白收敛 */
+function stripDsmlTags(text) {
+  return String(text || '').replace(/<[^>]*dsml[^>]*>/gi, '').trim();
+}
+
+/** empty/leak 处置的统一日志（channel 拼前缀，hub#120 的 WARN 语义） */
+function logDsml(channel, kind, text) {
+  try {
+    const snip = String(text || '').replace(/\s+/g, ' ').slice(0, 120);
+    console.warn(`[${channel}] DSML ${kind}：${kind === 'leak' ? '未闭合协议结构，本轮按 fail-closed 丢弃' : '空壳残片已剥离'}｜正文片段=「${snip}」`);
+  } catch (e) { /* 日志失败不影响请求 */ }
+}
+
+// ---------------------------------------------------------------------------
 // OpenAI chunk 缓冲门（千问 / Qoder 流式路径共用）。
 //
 // 两条 COSY 通道解信封后得到的就是标准 OpenAI chunk（delta.content /
@@ -144,11 +232,14 @@ function chunkKind(o) {
  * @param {function} emit 下游回调（收 OpenAI chunk 的 JSON 串）
  * @param {boolean} hold 是否缓冲（只在「带工具的请求」上启用）
  * @param {number} [cap] content 缓冲上限
+ * @param {object} [opts] { model, channel } —— model 用于 finish 阶段合成
+ *   DSML 还原帧；channel 用于日志前缀。两者都给才启用 DSML fail-closed。
  */
-function createChunkGate(emit, hold, cap) {
+function createChunkGate(emit, hold, cap, opts = {}) {
   cap = cap || DEFAULT_HOLD_CAP;
   let pendingFrames = [];      // 已收到但还没下发的正文帧（原串）
   let pendingLen = 0;          // 待下发正文的字符数（flush 时清零）
+  let pendingText = '';        // 待下发正文的纯文本（DSML 分类用）
   let text = '';               // 本轮收到的全部正文（包括已直发的，供判定）
   let live = !hold;            // 是否已转为直发
   let toolCalls = 0;           // 带名字的工具调用个数
@@ -160,6 +251,61 @@ function createChunkGate(emit, hold, cap) {
   const flush = () => {
     while (pendingFrames.length) fwd(pendingFrames.shift());
     pendingLen = 0;
+    pendingText = '';
+  };
+  const mkChunk = (delta, finish) => JSON.stringify({
+    id: 'dsml', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+    model: opts.model || '',
+    choices: [{ index: 0, delta, ...(finish ? { finish_reason: finish } : {}) }],
+  });
+
+  /**
+   * finish 阶段的 DSML 兜底（2026-10-31，hub#120）：整轮零原生调用、正文还在
+   * 缓冲（没转直发）时才有救——已直发的收不回。三分判据见 classifyDsml 注释。
+   * 返回 true = 本轮已被 DSML 处置接管（finish 的剩余流程照走）。
+   */
+  const dsmlFixup = () => {
+    if (!opts.model) return false;
+    if (live || toolCalls > 0 || !pendingFrames.length || !pendingText) return false;
+    if (!/dsml/i.test(stripFences(pendingText))) return false;
+    const cls = classifyDsml(pendingText);
+    if (cls.kind === 'recovered') {
+      // 丢弃缓冲原文帧，改发干净正文 + 还原的 tool_calls；上游 finish 帧
+      // 若报 stop 会被一并纠正（与 TRAE aggregate 的同一口径）。
+      pendingFrames = [];
+      pendingText = '';
+      if (cls.clean) fwd(mkChunk({ content: cls.clean }));
+      cls.calls.forEach((cc, i) => {
+        fwd(mkChunk({ tool_calls: [{ index: i, id: `call_dsml_${Date.now().toString(36)}${i}`, type: 'function', function: { name: cc.name, arguments: cc.arguments } }] }));
+      });
+      toolCalls = cls.calls.length;
+      for (let i = 0; i < held.length; i++) {
+        try {
+          const h = JSON.parse(held[i]);
+          const fr = h.choices && h.choices[0] && h.choices[0].finish_reason;
+          if (fr === 'stop') {
+            h.choices[0].finish_reason = 'tool_calls';
+            held[i] = JSON.stringify(h);
+          }
+        } catch (e) { /* 非原串帧跳过 */ }
+      }
+      return true;
+    }
+    if (cls.kind === 'empty') {
+      const cleaned = stripDsmlTags(pendingText);
+      logDsml(opts.channel || 'gate', 'empty', pendingText);
+      pendingFrames = [];
+      pendingText = '';
+      if (cleaned) pendingFrames.push(mkChunk({ content: cleaned }));
+      return true;
+    }
+    // leak：fail-closed。reasoning 已直发（emitted 计数如实），调用方的
+    // catch 会把错误交给翻译器收尾（error 终结事件），客户端看到明确失败
+    // 而不是半截协议。
+    logDsml(opts.channel || 'gate', 'leak', pendingText);
+    const err = new Error('DSML 协议残片无法还原：正文带未闭合的 tool 调用结构（fail-closed，本轮丢弃）');
+    err.statusCode = 502;
+    throw err;
   };
 
   return {
@@ -187,6 +333,7 @@ function createChunkGate(emit, hold, cap) {
         const d = ch ? (ch.delta || ch.message || {}) : {};
         const seg = String(d.content || '');
         text += seg;
+        pendingText += seg;
         pendingFrames.push(inner);
         pendingLen += seg.length;
         if (pendingLen > cap) { live = true; flush(); }
@@ -199,6 +346,7 @@ function createChunkGate(emit, hold, cap) {
     result() { return { toolCalls, text, live, emitted, pending: pendingFrames.length, held: held.length }; },
     /** 收尾：把还没下发的正文与暂扣的帧补发出去 */
     finish() {
+      dsmlFixup();
       flush();
       for (const f of held) fwd(f);
       if (doneSeen) fwd('[DONE]');
@@ -210,4 +358,5 @@ module.exports = {
   REPAIR_NUDGE, DEFAULT_HOLD_CAP, DEFAULT_REPAIR_MAX,
   envCaps, looksUnfinished, appendRepairNudge, logRepair,
   chunkKind, createChunkGate,
+  parseDsmlToolCalls, classifyDsml, stripFences, stripDsmlTags, logDsml,
 };

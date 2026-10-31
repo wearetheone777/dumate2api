@@ -32,6 +32,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `qwen/pro` / `qwen/flash` / `qwen/auto` | 千问办公（`src/qwenwork/` 直连 `gateway.qwenwork.cn`） |
 | `traework/glm-5.2` | TRAE Work（`src/traework/` 直连，凭证自持） |
 | `qoder/gfmodel` | Qoder（`src/qoder/` 直连，**签名纯本地、不需要客户端**） |
+| `dm-auto-model/text.L0` / `auto-l0` 等 | DuMate（router 显式认领该前缀并**全名透传**——档位编码在模型名里，斜杠不是通道分隔符，见下文「搭子的真实模型」节） |
 | 未知前缀（如 `qwn/pro`） | **400 报错，不静默回落** |
 
 **通道 id 的单一来源是 `src/channels.js`**（`dumate` / `qwenwork` / `traework` / `qoder`）。
@@ -385,6 +386,10 @@ throw** 两种形态——只有它们才走等待轮）。注意该套件前 4 
    `promotion` 字段原样透出（discountFactor + 窗口）。**不解读成「x 折」**——
    discount_factor 的乘性方向没实测过，编一个口径会被对账打脸。真机实测
    qmodel_38max 带 `{discountFactor:0.4, window:"22:00-08:00"}`。
+   **2026-10-31 补**：上游 `usage.original_credits`（折扣前额度，社区项目
+   EchoPing07/Qoder-2API-Go 实测字段）若下发则随积分账本落 `original_credits`
+   + `discount` 两字段——credits/original 即真实折扣，乘性方向从此实测化；
+   上游没给不造字段（usage-norm 同款口径）。
 
 **P2 明确不做的两项（别再翻出来做）**：上下文窗口按请求可调（hub 的默认是
 200K 档才需要「抬窗」，我们已经默认按最大档下发，覆盖只能往下调没有意义）；
@@ -402,7 +407,7 @@ price_factor 人工比对——**不做自动 mismatch 判定**：错峰优惠
 （22:00-08:00）免费档的 price_factor 标 0 但实际按 original_price_factor
 计费**（实测 qfmodel：credits 0.136 / 91 tokens → billed_rate 1.4947，与
 标称的 0/0.1 严重不符——要么上游改路由要么倍率元数据过期，这正是要暴露的
-信号）。期望倍率缺失（两者都 ≤0）时如实 null 不编。离线验证：
+信号）。期望倍率缺失（两者都 ≤0）时如实 null 不编。**2026-10-31 补：悬案的第三种解释已确认并修复**——官方 CLI 在 business 块带 `model_key`，缺失时**所有模型被记成 auto 档计费**（hub #119）；我们 `buildBody` 的 business 块正是缺这个字段，已补（`chat.js`），离线断言在 verify-qoder-channel。离线验证：
 `node --test test/unit/qoder-billing-rate.test.js`（13 项）。管理端探针端点：
 `GET /api/admin/qoder/billing-check?model=qfmodel`（admin/routes/qoder.js）——按
 模型发一个小请求，从账本读回 billed_rate 与标称值并排返回（expected/billed/
@@ -527,6 +532,16 @@ inspector，再用 WebSocket 连 `:9229` 发 `Debugger.pause` 抓调用栈。
 5. **`tools` 必须过滤成只留 `function` 形状**。上游只认标准 OpenAI 形状；Codex 每次请求都会带 `namespace`（`multi_agent_v1` / `mcp__cua_repl`）与 `web_search`，**带上任何一个都整轮 400**（不是丢弃那个工具，而是整个请求失败）。过滤在 `src/qwenwork/chat.js` 的 `buildBody`。
 6. **`system` 必须留在 `messages` 里**。上游**不读顶层 `system` 字段**——原实现把 system 摘出来单独传，导致系统提示词（含 skills 定义、行为约束）全部丢失，表现为模型「随口答两句就停、不按要求做事」。顶层字段可以照旧带上做兼容，但权威来源是 messages。
 
+**千问的 `listModels` 签名必须覆盖模型表自己的路径（2026-10-31 修，此前从未拉通）**：
+签名串带 `pathSig`，旧实现复用聊天路径的签名去打 `/api/v2/model/list`，上游判
+`Signature invalid`（403）且**静默回落静态表**——管理端模型表从来没真正来自上游。
+现按 `cosy-sign.buildHeaders(sess, constants.MODELS_PATH, '', 'application/json')`
+重签（GET 空体签名，与 Qoder 的 queue/status 同一约定）。
+
+**千问的 `imageUrls` 槽定案（2026-10-31，别再试）**：body 里的 `chat_context.imageUrls`
+槽上游**不消费**——dataURL 数组、裸 base64、pro 档重试全部「看不到图片」。槽位存在
+（Buddy2api 也发 None）但纯文本才是有效载荷，占位文本方案维持。
+
 **千问的预算与上下文（实测值，别照抄搭子的）**：
 - 预算走 `resolveQwenMaxTokens`，下限 **16384**（`DUMATE_QWENWORK_MIN_MAX_TOKENS`），**默认值 131072**（`DUMATE_QWENWORK_DEFAULT_MAX_TOKENS`，与搭子的 `DEFAULT_BUDGET=32768` 分开）。搭子的 32768 对千问偏大，但 4096 又太小——实测 4096 时 reasoning 会把预算吃光，模型陷入反复推演后只吐一句话。
 - **上游接受的 `max_tokens` 范围是 `[1, 131072]`**（实测 2026-09-27）：131072 通过，**131073 起一律 400**（`pro` / `flash` 边界一致）。**省略该字段不报错**，实测一次输出到 66807 token 才自然收尾（`finish=stop`）——说明上游自己的默认值远大于 66807。
@@ -534,7 +549,7 @@ inspector，再用 WebSocket 连 `:9229` 发 `Debugger.pause` 抓调用栈。
 - 上下文上限 **~1,024,000 token**（1250K 汉字 = 1,022,745 token 通过；1262K 起 502，1300K 起 400）。`pro` 与 `flash` 边界一致。
 - **超限不是截断而是整轮失败**（400/502），所以客户端声明的 `model_context_window` 宁可小一点。
 - 输出侧 `max_tokens` 约束比搭子松：传 4000 实测能输出 7808，且自然收尾（`stop`）而非被截断。
-- 上游只有 `pro` / `flash` 两个模型，没有别的。
+- 上游模型表（**2026-10-31 真机复核**——修复 `listModels` 签名 bug 后首次真正从上游拉通）：`pro`（高级）/ `flash`（标准）/ `qwen3.8-max-preview`（千问最强，已实测可用并补进 `FALLBACK_MODELS`）。社区项目（Buddy2api）提到的 `qwork-auto/advanced/ultimate` 在当前上游**不存在**。
 
 **千问通道必须给带工具的请求注入「执行纪律」**（`src/qwenwork/chat.js` 的 `withAgentDiscipline`）。
 千问上游是**对话型**产品，其脚手架鼓励「每完成一步汇报一句」；Codex 的 `AGENTS.md` 里也有同样的进度播报要求。两者叠加后模型会把播报当成一次完整回合：只输出 `进度：N/8｜下一步：写第 N 章` 就结束，**不调用任何工具**——Codex 收到「无工具调用」的回合即判定任务完成并退出，用户看到的就是「没按要求做完就退出」。**TRAE 通道同样会犯这个毛病**（2026-10-03 实测：139-141 续写任务在 15% 处播报即收工），所以 `src/traework/chat.js` 移植了同一份注入（`DUMATE_TRAEWORK_AGENT_DISCIPLINE=0` 关闭），与千问共用文本与判定口径。实测（2026-09-27，真实 Codex 会话 `01a0e205`，一次写 3 章小说）：
@@ -593,10 +608,7 @@ deepseek-v4.1-flash 答「红色」）；而 Trae2api-cn 的「渲染层媒体�
   形状（HTTP 200，裸 base64 也可）；模型对图像的识别准确度由上游决定，
   网关层面只负责透传。实测：纯红色 PNG 发过去，Qoder 返回 200 并尝试回答
   颜色（回答不准属上游模型问题，非网关透传问题）。
-- **搭子压回**（`server.js` 两处 needsModelMap 分支的 `images.flattenImageParts`）：
-  Responses/Google 路径的翻译层是通道无关的，保真出的 image_url part 会在搭子
-  路径压回占位文本（恢复保真前的行为）。OpenAI 直通路径不经翻译层，客户端自己
-  发的图像不在此列（与改动前一致）。
+- **搭子图像透传**（2026-10-31 起，推翻 10-30 的压回）：真机实证搭子云网关认 OpenAI 标准 `image_url` part（data URI，网页凭证与桌面链路一致，能正确识别图像内容如颜色），`server.js` 两处 `flattenImageParts` 压回已删除、`anthropic.js` 搭子分支图像保真、`images.js` 的 `flattenImageParts` 已删。**测试图不要用 8x8 这类退化尺寸**——会撞千帆 v2 `internal_error`（502），与权益无关。OpenAI 直通路径不经翻译层，客户端自己发的图像照旧直达上游。
 
 离线验证：`node --test test/unit/image-passthrough.test.js`（12 项：翻译层三个入口
 的保真、搭子降级、TRAE 透传与非 user 剥除、千问防 [object Object]、images.js 基元）。
@@ -655,6 +667,45 @@ DeepSeek 系模型偶尔把工具调用以**文本标记**写进正文（`<dsml:
 块跨帧，逐帧解析必然切碎。离线验证：`node --test test/unit/trae-dsml.test.js`（8 项）。
 踩过的坑：`exec` 循环的正则**必须带 `g` 标志**（无 `g` 的 exec 永远返回第一个
 匹配，while 循环死循环挂死进程——单测超时就是这么暴露的）。
+
+**DSML fail-closed 三分判据（2026-10-31，hub#120 推广到三通道，解析器收敛到
+`src/repair.js`）**。Qoder/千问同跑 DeepSeek 系，一样会犯——只救「正文还在缓冲
+（未转直发）」的场景。分类器 `repair.classifyDsml(text)`：
+`recovered`（完整 calls 块还原成 tool_calls + 干净正文，finish 的 stop 纠正）、
+`empty`（标签闭合但没有 invoke 的空壳——剥离标记 + WARN，**不剥离会被
+「播报即收尾」的判据反复捞出形成无限重试**）、`leak`（calls/invoke/parameter
+开了没收——**报错 fail-closed**，把半截协议喂给客户端比明确失败更糟）。
+代码围栏内的 DSML 是模型在讨论格式，不碰（`stripFences` 先判）。TRAE 门
+（createTextGate）与千问/Qoder 共享门（createChunkGate，finish 阶段兜底，
+需传 `{model, channel}`）同一语义；非流式在各自 aggregate 出口接。traework
+流式的 leak 抛错已标 `e.sent=true`（reasoning 早已直发，不标会让上层换号
+重试导致客户端看到两段内容）。离线验证：`node --test
+test/unit/dsml-failclosed.test.js`（11 项）。
+
+**agent 网关的动态发现（2026-10-31，`src/traework/tnc.js`，misakano
+traework2api-panel 同源逆向）**：官方客户端**不写死** agent 网关——它请求逻辑
+主机名（`trae-api-cn.mchost.guru`），TTNet 按 TNC 下发的域名表在传输层改写成
+具体后端（api5-normal.mchost.guru 等）。上游换分片时（国服 2026-10-15 刚换过）
+写死的基址就静默失效。`tnc.js` 拉表（免鉴权，aid 分区：国服 787976 / 国际
+677332，`cronet_version`/`ttnet_version` 不能空——清空退化成 0 条规则），按
+区域段过滤（国服无段/国际带段）、分片号降序，10 分钟缓存 + 60 秒负缓存。
+`chat.postStream` 与 `models.fetchModels` 走候选链轮转：**连接级失败换下一家**
+（拿到响应含 4xx 就交上层处置），连接阶段独立超时（`CONNECT_TIMEOUT_MS` 默认
+10s，黑洞主机不该占满 600s），全部失败清缓存下轮重拉；TNC 不可用回落
+`AGENT_HOST` 常量——发现机制自己坏掉不能影响出流。2026-10-31 真机验证：国服
+表含 api3/api5-normal，实弹对话 200。账号的 `region` 字段（缺省 cn）决定
+候选链；国际版 utils_chat 基址未实测（hub 只证实了 raw 链路的
+`core-normal.traeapi.us`），接国际版先补国际账号。
+
+**TRAE 的 usage 缓存镜像（2026-10-31，traework2api-panel issue#3）**：上游
+token_usage 报顶层 `cache_read_input_tokens`，不镜像进
+`prompt_tokens_details.cached_tokens` 的话按标准协议解析的客户端恒显示缓存
+未命中。门与非流式两处都镜像（真机实测字段已出现）；原字段保留，上游没给
+不造字段。**业务码 1005「订阅专享」（2026-10-31 分类，语义对齐
+traework2api-panel）**：Free 号打订阅模型上游回 403/业务码 1005——换模型即可
+用，进 (账号,模型) 负缓存并明确报错，不罚账号、不进熔断。判据在
+`upstream-errors.classify` 里、5xx 分支之前（1005 > 500 会被 breaker 误吃）；
+真机暂无订阅模型可打，分类为对齐实现、待首个真实样本校准。
 
 **「播报即收尾」现在是三通道共用一条修法（2026-10-30，收敛到 `src/repair.js`）**。
 TRAE 2026-10-05 的实测结论（见下一条）推广到千问与 Qoder：两家同样会「只播报进度
@@ -1170,7 +1221,58 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 - `src/google.js` — Google Generative Language ↔ OpenAI
 - `src/budget.js` — 输出预算策略，**三个入口共用同一个 `resolveMaxTokens`**
 
-上游不支持 function calling / 图像，工具调用被**降级为纯文本**（`[Tool Use: 名字]`、`[Tool Result]`）——这是能力边界，不是实现缺陷。
+上游不支持 function calling，工具调用被**降级为纯文本**（`[Tool Use: 名字]`、`[Tool Result]`）——工具降级维持（搭子的 function calling 未实测通过，别顺手放开）；**图像则相反**：2026-10-31 真机实证上游认 OpenAI 标准 `image_url` part（data URI，网页凭证与桌面链路一致、能正确识别图像内容），四个翻译入口全部保真透传，`flattenImageParts` 压回已删除（见下文「搭子的真实模型」节）。
+
+## 搭子的真实模型、自动档与上限（2026-10-31 深度逆向定案）
+
+搭子云网关本质是**按模型转发到四家上游的调度器**，客户端的 `glm-5` 只是逻辑
+别名。全部结论经真机实测（网页凭证直打 + 装回的桌面客户端 Gateway.log +
+安装包解包静态分析），推翻了三个旧认知：上游不止 3 个模型、max_tokens 范围
+不是全局 131072、上游支持图像输入。
+
+**真实模型与各家上限**（`X-Dumate-Gw-Realmodel` 响应头 + 400 错误体泄漏——
+错误体会原样透传上游声明，是免费的协议情报来源）：
+
+| 调用名 | 真实模型 | 上游端点 | max_tokens | 输入上限 |
+|---|---|---|---|---|
+| `model-text` / `dm-auto-model/text.L0` | deepseek-v4.1-flash-low-latency | qianfan.baidubce.com/v2 | [1, 393216] | **1,048,576**（错误体明示） |
+| `glm-5` | glm-5.2 | tp.sdns.baidu.com/api/paas/v4 | [1, 131072] | ≈1,048,576（二分夹逼，错误只说「Prompt 超长」） |
+| `dm-auto-model/text.L1` | kimi-k3 | 未泄漏（没报过错） | ≥2,000,000（实测） | ≥1M（未探顶） |
+| `dm-auto-model/text.L2` | qwen3.8-max | cn-beijing.maas.aliyuncs.com（阿里百炼） | [1, 131072] | **983,616**（错误体明示） |
+
+**自动三档**：`dm-auto-model/text.L0/L1/L2`（客户端 UI 档 standard/turbo/ultra），
+**模型名即档位，不需要任何请求头**——`X-Dumate-AutoModel-Level` /
+`-Target` / `X-Dumate-Model-Target` 三个头只是客户端运行态信息（OpenCode
+运行时 `dumate-opencode.exe` 构造，ID 生成式 `dm-auto-model/{text|mm}.{L0|L1|L2}`），
+网关接受但不改变路由。**接入三件套**：`data/model-map.json` 登记自映射 +
+免斜杠别名 `auto-l0/l1/l2`（mtime 热加载）；`upstream-router.js` 的 `resolve()`
+显式认领 `dm-auto-model` 前缀并**全名透传**（模型名里的 `/` 会被通道前缀路由
+误判成 `unknown_channel`——任何带斜杠的新搭子模型名都要在 router 里显式认领，
+单测在 `test/unit/router-auto-model.test.js`）；`modelmap.js` 的 `MODEL_NAMES`
+带真实后端标注。`mm` 命名空间（`model-mm` / `dm-auto-model/mm.*`）在本账号
+路由到 deepseek 低延迟——**视觉由文本模型直接承担**，Kimi-K2.6 只是客户端
+显示映射（二进制 gT0 表），别照抄。
+
+**图像输入已支持**（推翻「上游不支持图像」）：上游认 OpenAI 标准 `image_url`
+part（data URI），网页凭证与桌面链路一致且能正确识别内容。翻译层全入口保真
+（含 anthropic 搭子分支），压回逻辑已删。测试图别用 8x8 退化尺寸（撞千帆
+internal_error）。工具调用降级维持——搭子的 function calling 未实测，别顺手放开。
+
+**按模型 max_tokens 钳制**（`src/dumate-caps.js`）：静态实测表 + 自学习（撞
+400 时从错误体解析各家范围声明，7 天 TTL 落 `data/dumate-caps.json`），
+`budget.resolveMaxTokens(requested, cap)` 接入，四个协议入口都带映射后模型名；
+学习钩子挂在 web-pool 的 400 路径。cap 低于 floor 时上游范围优先。
+
+**real_model 埋点**：web-pool 在响应头到达时捕获 `X-Dumate-Gw-Realmodel` 写进
+请求日志——上游静默改路由从此可见。桌面链路拿不到该头，如实留空。
+
+**桌面客户端链路备忘**（2026-10-31 装回 `D:/dsh-data/apps/DuMate`）：桌面后端
+就是 OpenAI 体**原样转发** + 身份头（真实 uid 的 `X-Dumate-Account-Id`、设备
+指纹 `X-Dumate-Device-Id`、AB 位 `X-Dumate-Abexpids`）；调用方传的档位头被
+原样中继；本地代理端口**动态分配**（本轮实测 52806 而非 8980），必须走
+discovery；鉴权固定 `Bearer nokey`。排障第一入口是
+`%APPDATA%/qianfan-desktop-app/log/desktop-main/Gateway.log`（记录完整上游
+请求/响应头与 body 摘要）。
 
 ## 必须知道的约定与陷阱
 
@@ -1180,7 +1282,7 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 - 预算 32768 → `output=32768 / reasoning=32768 / 正文 0`，耗时 7.5 分钟，整轮空转
 - 实测 reasoning 峰值约 28743（占 32768 的 88%）→ 65536 下降到 44%，留出余量
 
-上游搭子自身接受 `[1, 131072]`（传 200000 报 `max_tokens参数非法：限制数值范围[1,131072]`），**32768 从来不是上游限制，是本地默认值**。
+~~上游搭子自身接受 `[1, 131072]`~~（**2026-10-31 推翻**：那是 glm-5/GLM 系一家的约束，不是全局的——云网关按模型转发，各家范围不同，见下文「搭子的真实模型」节与 `src/dumate-caps.js`）。**32768 从来不是上游限制，是本地默认值**。
 
 **「思维链失控」必须报错而不是 incomplete**（`src/responses.js` 收尾处）。Codex 收到 `status: "incomplete"` 会当成正常收尾（会话日志里 `model_needs_follow_up=false`），前端不提示，用户只看到界面卡回初始态——静默失败，最难排查。现在这种情形发 `response.failed` + `error.code = "reasoning_budget_exhausted"`，客户端会明确报错，埋点也带上 `error` 字段。
 
@@ -1253,7 +1355,7 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 
 **上游转发只回调一次。** `forwardToUpstream` 用 `settled` 标志 + `once()` 包装；`collectAndFinish` 把 `end`/`aborted`/`error` 三路收拢到同一入口。上游 socket 出错时 Node 会同时触发 error 与后续事件，重复回调会让响应被写两次、客户端永久挂在半开的流上（表现为「输出突然停止」）。
 
-**模型名兜底是唯一可行的容错。** 上游真实模型只有 `model-text` / `model-artifact-validate` / `glm-5`，传别的名字硬性报 `api not registered`。`mapModel` 查不到一律回落 `fallback`（默认 `model-text`），改 `data/model-map.json` 的 `fallback` 会影响全部未知模型名。
+**模型名兜底是唯一可行的容错，也是最容易静默吞模型的闸。** 上游接受的模型名远不止三个（`dm-auto-model/text.L0/L1/L2` 三档已登记，见下文「搭子的真实模型」节），但 `mapModel` 查不到一律回落 `fallback`（默认 `model-text`）——**任何新模型名必须显式登记进 `data/model-map.json` 的 `aliases`，否则被静默兜底且响应 200 无从察觉**。改 `fallback` 会影响全部未知模型名。注意它与 router 的 `unknown_channel` 是两道不同的闸：router 拦「带斜杠的未知前缀」，mapModel 兜「无前缀/已认领前缀的未知名字」。
 
 **`DUMATE2API_KEY` 是死变量。** `src/server.js` 顶部把它读进 `API_KEY`，但代码里从未参与任何校验（可以 grep `API_KEY` 确认只有那一处赋值）。真正的鉴权开关是 `DUMATE_REQUIRE_KEY=1` + `data/keys.json`。（README 已加说明标注它是历史遗留。）
 
@@ -1274,6 +1376,26 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 **`count_tokens` 是字符数/4，不是字节数/4。** `estimateTokens` 用的是 `String.length`，即 UTF-16 码元数：100 个汉字和 100 个 ASCII 都算出 29 token（实测一致）。中文按真分词约 1 字 1 token，所以这个估算在中文场景下偏小约 4 倍——只够给客户端做上下文预算，不能当计费依据。文档里写「字节数/4」的地方都是错的。
 
 **测试断言校验「形状」而非字面值。** 早期断言写死 mock 的固定返回（"Hello world"、token 11/7），接真上游时一批失败。现在只断言「非空」「大于 0」这类形状，mock 和真上游都能过。新增断言请沿用这个原则。
+
+**出站提示词卫生（2026-10-31，`src/prompt-guard.js`，两项都是默认关闭的选通
+开关）**：① 合规词零宽空格脱敏（`DUMATE_DESENSITIZE=1` 开启）——上游关键词
+审查会把系统提示词里的敏感词整轮拒掉，在命中词的字符间插 U+200B 让匹配失效
+而肉眼不变；词表在 `data/desensitize-words.txt`（一行一词，# 注释），长词优先，
+天然幂等；**只动 system，user 消息不碰**。② 超大工具输出截断
+（`DUMATE_TOOL_OUTPUT_CAP=<字符数>` 开启）——历史里 role:'tool' 的超限输出
+截断并显式标注原始长度（客户端看得见截断发生，不是静默丢失）。两项只对搭子
+路径生效（四个协议入口的 needsModelMap 分支）。离线验证：
+`node --test test/unit/prompt-guard.test.js`（5 项）。
+
+**2026-10-31 调研缓办清单（每项都有明确的阻塞原因，别翻出来重做）**：
+`/algo/api/v3/user/status` 订阅周期端点与「新版推理协议解锁隐藏模型」（两者都
+要官方**机器身份** machine_id/machine_token——device flow 账号不带，需真实
+指纹；EchoPing07 实现里 userType 是 AES 签进 bearer 的）；TRAE 国际版直连的
+活验证（region 管道已铺，utils_chat 国际基址未实测，需国际账号）；ASR 语音
+转写（搭子要 BOS AK/SK 证据、千问要 WS 协议逆向）；飞书推送（要 webhook
+配置与产品设计）；账号级限额护栏（要存储与界面设计）；remote 端点备选链路
+（要 Max 账号）；Qoder intl 活动域 center.qoder.sh（要国际账号）；多时段签到、
+per-key 限流（低价值场景）。
 
 ## 环境变量
 
@@ -1336,6 +1458,10 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `DUMATE_GATEWAY_HOST` | `dumate-svc.baidu.com` | 网页凭证换模型 token 的目标主机。上游换域名时改这里 |
 | `DUMATE_UPSTREAM_CWD` | DuMate 安装根 | 拉起 `dumate-main-server.exe` 时的工作目录。后端读相对路径配置时用得上 |
 | `DUMATE_ADMIN_SECURE_COOKIE` | 未设（不置 Secure） | 设 `1` 才给会话 cookie 加 Secure（本地 http 下会被浏览器丢弃） |
+| `DUMATE_DESENSITIZE` | 未设（关闭） | 设 `1` 开启系统提示词合规词零宽空格脱敏（词表 `data/desensitize-words.txt`，见 prompt-guard.js） |
+| `DUMATE_TOOL_OUTPUT_CAP` | 未设（关闭） | 历史 role:'tool' 输出超过此字符数截断并标注原始长度（0/未设关闭） |
+| `DUMATE_TRAEWORK_CONNECT_TIMEOUT_MS` | `10000` | TRAE 基址候选轮转的连接超时（tnc.js 候选链；黑洞主机不占满 600s） |
+| `DUMATE_DUMATE_CAPS_FILE` | 未设 | 搭子按模型 max_tokens 上限学习表的落盘路径覆盖（测试用） |
 
 ## 数据文件（`data/`，已 gitignore）
 
@@ -1356,6 +1482,7 @@ Claude Code ── Anthropic ───────┼──→ 网关 :9080 ─�
 | `qwenwork-accounts.json` | 千问自持凭证账号池（**含 refresh token，等同密码**） |
 | `qoder-accounts.json` | Qoder 自持凭证账号池（device flow 换取，含 refresh token） |
 | `qoder-grants.jsonl` | Qoder 积分批次账本（**签到领取记录**，用于过期提醒；上游无逐批余额接口） |
+| `dumate-caps.json` | 搭子按模型 max_tokens 上限的自学习记录（7 天 TTL，`src/dumate-caps.js`；静态实测表在代码里） |
 | `traework-accounts.json` | TRAE 自持凭证账号池（OAuth 换取，含轮换的 refreshToken） |
 | `traework-credits.jsonl` | TRAE 逐请求积分归因（按账号的 consumed 游标，见 `traework/credits.js`） |
 | `points-cursor.jsonl` | 搭子的余额游标（每请求一条，相邻差值即该请求成本） |
@@ -1486,7 +1613,7 @@ Vue 3 + Vite + ant-design-vue 4 + Tailwind + ECharts（按需引入，不用全�
 **先分清「网关错」还是「客户端侧错」**，否则会改错地方：
 
 1. **看 Codex 的会话日志**：`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`。每条都是完整交互记录（含 system 提示词、工具调用、上游返回）。用第一行的 `payload.cwd` 认出是哪次会话。
-2. **看网关埋点**：`data/requests.jsonl` 有 `channel` / `model` / `mapped_model` / `input_tokens` / `output_tokens`。`mapped_model` 能立刻看出前缀有没有生效（`qwen/flash` 应映射成 `flash`，若变成 `model-text` 说明路由错了）。
+2. **看网关埋点**：`data/requests.jsonl` 有 `channel` / `model` / `mapped_model` / `real_model` / `input_tokens` / `output_tokens`。`mapped_model` 能立刻看出前缀有没有生效（`qwen/flash` 应映射成 `flash`，若变成 `model-text` 说明路由错了）。`real_model` 是上游真实执行的模型（网页链路云端回传 `X-Dumate-Gw-Realmodel`，桌面链路拿不到如实留空）——上游会静默改路由（`model-text` 实跑 `deepseek-v4.1-flash-low-latency`、`glm-5` 实跑 `glm-5.2`），排「请求的模型和回答的模型对不上」时先看它。
 3. **看进程存活**：网关崩溃（如 `ERR_STREAM_WRITE_AFTER_END`）会让端口直接消失，表现为客户端「连接被拒」而不是报错。
 
 **Codex 的本地工具走 PowerShell（`pwsh.exe`），不是 bash。** 排查 Codex 工具行为（读文件乱码、命令语法、路径）要按 PowerShell 语义判断。一个真实坑：项目里的 `.md` 是**无 BOM 的 UTF-8**，中文 Windows 上 PowerShell 的 `Get-Content` 默认按 GBK 解码，会把中文读成乱码（`世界观` → `涓栫晫瑙?`），让 Codex 基于垃圾输入工作、反复纠结编码。这是客户端/环境侧的事，网关改不了。

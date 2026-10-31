@@ -81,13 +81,20 @@ const QD_FLOOR = (() => {
   return Number.isFinite(n) && n >= 0 ? n : 16384;
 })();
 
-function resolveMaxTokens(requested) {
+/**
+ * 搭子的预算钳制。cap 是**按模型**的输出上限（src/dumate-caps.js：实测表 +
+ * 上游错误自学习）——旧的单一 CEIL 来自 GLM 一家的范围，对 deepseek 低延迟
+ * （384K）与 kimi-k3（≥200 万）是白压低。cap 缺失时行为与旧版完全一致；
+ * cap 比 FLOOR 小时以 cap 为准（上游范围优先于本地下限，宁可发小也别 400）。
+ */
+function resolveMaxTokens(requested, cap) {
   const n = Number(requested);
   let out = Number.isFinite(n) && n > 0 ? n : DEFAULT_BUDGET;
   // FLOOR=0 表示关闭预算策略：只对缺失/非法入参兜底到默认值，
   // 客户端明确给出的值原样透传，不再抬升也不再压制。
   if (FLOOR > 0) out = Math.max(out, FLOOR);
-  if (CEIL > 0) out = Math.min(out, CEIL);
+  const ceil = Number.isFinite(cap) && cap > 0 ? cap : CEIL;
+  if (ceil > 0) out = Math.min(out, ceil);
   return out;
 }
 

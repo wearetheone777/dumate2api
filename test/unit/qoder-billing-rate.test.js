@@ -48,6 +48,21 @@ check('账本里能按 req_id 读回 billed_rate', hit && hit.billed_rate === 0.
 const entry2 = credits.capture(acc, 0.05, { reqId: 'req_rate_2', model: 'qfmodel' });
 check('没传 billedRate 时不写字段（null 不补 0）', entry2 && entry2.billed_rate === undefined);
 
+// 折扣前额度（2026-10-31，社区项目实测 usage.original_credits 字段）：
+// discount = credits/original_credits 即真实折扣，discountFactor 的方向从此实测化
+const entry3 = credits.capture(acc, 0.04, {
+  reqId: 'req_rate_3', model: 'qfmodel', originalCredits: 0.1,
+});
+check('original_credits 落账 + discount=credits/original',
+  entry3 && entry3.original_credits === 0.1 && entry3.discount === 0.4,
+  entry3 && `${entry3.original_credits}/${entry3.discount}`);
+const entry4 = credits.capture(acc, 0.05, { reqId: 'req_rate_4', model: 'qfmodel' });
+check('上游没给 original_credits 时不凭空造字段',
+  entry4 && entry4.original_credits === undefined && entry4.discount === undefined);
+const hit3 = credits.readHistory().find((r) => r.req_id === 'req_rate_3');
+check('账本能按 req_id 读回 original_credits/discount',
+  hit3 && hit3.original_credits === 0.1 && hit3.discount === 0.4);
+
 console.log('');
 if (failures) { console.log(`✗ ${failures} 项失败`); process.exit(1); }
 console.log('✓ 全部通过');

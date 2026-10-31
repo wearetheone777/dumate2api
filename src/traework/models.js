@@ -19,6 +19,7 @@
 const c = require('./constants');
 const { soloHeaders } = require('./headers');
 const authStore = require('./auth');
+const tnc = require('./tnc');
 
 // 模型表基本不变（随客户端版本走），但 341KB 每次拉太重，必须缓存
 const CACHE_MS = parseInt(process.env.DUMATE_TRAEWORK_MODELS_CACHE_MS || '300000', 10);
@@ -128,14 +129,21 @@ async function fetchModels({ force = false } = {}) {
   try { agent = require('../proxy-agent').getAgentFor(auth); } catch (e) {
     return { ok: false, error: e.message, models: [], fetchedAt: 0 };
   }
-  const r = await c.request(c.AGENT_HOST, c.EP_MODELS, {
-    method: 'POST',
-    // **必须带 function**：空 body 上游只回空表（实测 config_info_list: []）
-    body: { function: c.FUNCTION },
-    headers: soloHeaders(auth),
-    timeout: 60000,
-    agent,
-  });
+  // 基址候选链（tnc.js）：连接级失败换下一家，与 chat.postStream 同一规则
+  const hosts = await tnc.agentHosts(auth);
+  let r = null;
+  for (const host of hosts) {
+    r = await c.request(host, c.EP_MODELS, {
+      method: 'POST',
+      // **必须带 function**：空 body 上游只回空表（实测 config_info_list: []）
+      body: { function: c.FUNCTION },
+      headers: soloHeaders(auth),
+      timeout: 60000,
+      agent,
+    });
+    if (r.status !== 0) break;   // 拿到响应（含 4xx/5xx）就不再换基址
+    if (!/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|EHOSTUNREACH|ENETUNREACH|connect timeout|socket hang up|certificate|timeout/i.test(String(r.error || ''))) break;
+  }
   if (r.status !== 200 || !r.data) {
     return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}`, models: [], fetchedAt: 0 };
   }

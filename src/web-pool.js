@@ -89,18 +89,18 @@ function httpsJSON(hostname, path, method, headers, body, timeout = 30000, agent
           if (data.length > MAX_JSON_RESP_BYTES) {
             data = '';
             req.destroy();
-            resolve({ status: 0, json: null, raw: 'upstream response too large' });
+            resolve({ status: 0, headers: null, json: null, raw: 'upstream response too large' });
           }
         });
         res.on('end', () => {
           let json = null;
           try { json = JSON.parse(data); } catch (e) { json = null; }
-          resolve({ status: res.statusCode, json, raw: json ? null : data.slice(0, 300) });
+          resolve({ status: res.statusCode, headers: res.headers, json, raw: json ? null : data.slice(0, 300) });
         });
       }
     );
-    req.on('error', (e) => resolve({ status: 0, json: null, raw: e.message }));
-    req.on('timeout', () => { req.destroy(); resolve({ status: 0, json: null, raw: 'timeout' }); });
+    req.on('error', (e) => resolve({ status: 0, headers: null, json: null, raw: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ status: 0, headers: null, json: null, raw: 'timeout' }); });
     if (payload) req.write(payload);
     req.end();
   });
@@ -207,13 +207,20 @@ async function callModel(account, path, method, body, opts = {}) {
       'X-Dumate-Account-Id': 'global',
     }, body, opts.timeout || 600000, agent);
 
+    // 云端网关回传的真实后端模型（X-Dumate-Gw-Realmodel）。响应头一到就
+    // 回调——埋点在响应结束时落笔，等返回值链路传下去就赶不上了
+    const realModel = (r.headers && r.headers['x-dumate-gw-realmodel']) || '';
+    if (realModel && typeof opts.onRealModel === 'function') {
+      try { opts.onRealModel(realModel); } catch (e) { /* 埋点失败不影响转发 */ }
+    }
+
     // token 失效：强制刷一次再重试一次。不无限重试——真失效（cookie 过期）
     // 时重试再多次也没用，只会放大延迟。
     if (r.status === 401 && !opts._retried) {
       return callModel(account, path, method, body, { ...opts, forceToken: true, _retried: true });
     }
 
-    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: r.json, raw: r.raw, account };
+    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: r.json, raw: r.raw, headers: r.headers, account };
   } finally {
     pool.release(account.id);
   }
@@ -265,6 +272,12 @@ async function callModelStream(account, path, method, body, onChunk, opts = {}) 
             if (typeof opts.onStatus === 'function') {
               try { opts.onStatus(res.statusCode); } catch (e) { /* 忽略 */ }
             }
+            // 云端网关回传的真实后端模型（X-Dumate-Gw-Realmodel）。响应头
+            // 一到就上报——埋点在流结束时落笔，晚一步就赶不上
+            const realModel = res.headers['x-dumate-gw-realmodel'] || '';
+            if (realModel && typeof opts.onRealModel === 'function') {
+              try { opts.onRealModel(realModel); } catch (e) { /* 忽略 */ }
+            }
             // text 只用于日志/usage 扫描（usage 在流的最后），转发走 onChunk。
             // 原实现全量累积（审计 P1-1c：号称「不缓冲」实际整条 SSE 又存一份），
             // 这里改为尾部固定窗口——语义不变，内存有界。
@@ -278,7 +291,10 @@ async function callModelStream(account, path, method, body, onChunk, opts = {}) 
             });
             res.on('end', () => {
               const ok = res.statusCode >= 200 && res.statusCode < 300;
-              resolve({ ok, status: res.statusCode, text, account, streamed: true });
+              resolve({
+                ok, status: res.statusCode, text, account, streamed: true,
+                realModel: res.headers['x-dumate-gw-realmodel'] || '',
+              });
             });
           },
         );
@@ -328,6 +344,14 @@ async function callWithFailover(path, method, body, opts = {}) {
     // 不要为了一个必然失败的请求把所有账号都试一遍。
     // 402（余额耗尽）与 429（限流）是账号级状态，换号有意义，且各自进冷却域。
     if (status >= 400 && status < 500 && status !== 401 && status !== 402 && status !== 429) {
+      // 400 里可能带 max_tokens 范围声明（上游按模型转发，各家不同）——
+      // 顺手学习（dumate-caps.js）：认不出格式就丢弃，不影响转发
+      if (status === 400) {
+        try {
+          require('./dumate-caps').learn(body && body.model,
+            (r.json && r.json.error && r.json.error.message) || r.raw || r.error || '');
+        } catch (e) { /* 学习失败不影响主流程 */ }
+      }
       return { ...r, attempts: i + 1, no_retry: true };
     }
 
@@ -402,6 +426,12 @@ async function callStreamWithFailover(path, method, body, onChunk, opts = {}) {
 
     // 4xx（除 401/402/429）是请求本身的问题，换账号也一样失败
     if (status >= 400 && status < 500 && status !== 401 && status !== 402 && status !== 429) {
+      // 与 callWithFailover 同款学习：流式失败体在 r.text 尾部窗口里
+      if (status === 400) {
+        try {
+          require('./dumate-caps').learn(body && body.model, r.text || r.error || '');
+        } catch (e) { /* 学习失败不影响主流程 */ }
+      }
       return { ...r, attempts: i + 1, no_retry: true };
     }
     markFailure(item.account.id, failInfo());

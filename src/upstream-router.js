@@ -24,6 +24,13 @@ const QWEN_PREFIX = 'qwen';
 const TRAEWORK_PREFIX = 'traework';
 /** Qoder 通道的前缀。`qoder/gfmodel` → 上游模型 `gfmodel` */
 const QODER_PREFIX = 'qoder';
+/**
+ * 搭子自动档的前缀：`dm-auto-model/text.L0` 的**档位编码在模型名里**，
+ * 斜杠不是通道分隔符（2026-10-31 真机实证：L0/L1/L2 分别实跑
+ * DeepSeek-V4.1-Flash-Low-Latency / Kimi-K3 / Qwen3.8-Max）。整个名字
+ * 原样交给搭子（model-map aliases 已登记自映射，mapModel 不会兜底掉）。
+ */
+const DUMATE_AUTO_PREFIX = 'dm-auto-model';
 
 const UPSTREAMS = {
   dumate: {
@@ -136,6 +143,11 @@ function resolve(model) {
   const slash = name.indexOf('/');
   if (slash > 0) {
     const head = name.slice(0, slash);
+    // 搭子自动档的名字自带斜杠，先于通道前缀匹配认领——否则会撞进
+    // unknown_channel 被 400（网关能调的模型因此少一半）
+    if (head === DUMATE_AUTO_PREFIX) {
+      return { channel: 'dumate', target: targetOf(UPSTREAMS.dumate), model: name };
+    }
     const rest = name.slice(slash + 1);
     for (const up of Object.values(UPSTREAMS)) {
       if (up.prefix && up.prefix === head) {
@@ -237,6 +249,7 @@ module.exports = {
   QWEN_PREFIX,
   TRAEWORK_PREFIX,
   QODER_PREFIX,
+  DUMATE_AUTO_PREFIX,
   UPSTREAMS,
   resolve,
   availability,
