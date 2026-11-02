@@ -219,9 +219,11 @@ export const qoderApi = {
     note: string
   }>('/qoder/dashboard'),
   /** 聊天测试台用的模型清单：**带 qoder/ 前缀**（网关靠前缀分流） */
-  chatlabModels: () => client.get<{
-    models: Array<{ id: string; name: string; prefixed: string }>
-  }>('/chatlab/qoder-models'),
+  chatlabModels: (region?: 'cn' | 'global') => client.get<{
+    models: Array<{ id: string; name: string; prefixed: string; rate?: number | null }>
+    region?: 'cn' | 'global'
+    error?: string
+  }>(`/chatlab/qoder-models${region ? `?region=${region}` : ''}`),
   models: (opts: { refresh?: boolean; region?: 'cn' | 'global' } = {}) => {
     const q: string[] = []
     if (opts.refresh) q.push('refresh=1')

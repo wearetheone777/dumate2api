@@ -164,6 +164,13 @@ function since() {
 
 /** 逐笔明细（按时间倒序），供仪表盘表格 */
 function creditRecords(limit) {
+  // 区域随行给（2026-11-03 页面区分）：按账号 id 回查，global 归一成 intl。
+  // 账号已删除的旧行如实空串，不猜。
+  let regions = null;
+  try {
+    const authStore = require('./auth');
+    regions = new Map(authStore.list().map((a) => [a.id, (String(a.region).toLowerCase() === 'cn' ? 'cn' : 'intl')]));
+  } catch (e) { regions = null; }
   return readHistory()
     .slice()
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
@@ -173,6 +180,7 @@ function creditRecords(limit) {
       req_id: r.req_id || '',
       account: r.account || '',
       account_id: r.account_id,
+      region: regions && r.account_id != null ? (regions.get(r.account_id) || '') : '',
       model: r.model || '',
       ms: r.ms ?? null,
       cost: r.credits ?? null,

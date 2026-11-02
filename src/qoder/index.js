@@ -1121,7 +1121,9 @@ async function send(payload, onChunk, opts = {}) {
     tried.add(account.id);
     if (opts.onAccount) {
       const name = account.nickname || account.uid || `账号 ${account.id}`;
-      try { opts.onAccount(name); } catch (e) { /* 上报失败不影响请求 */ }
+      // 第二个参数是账号 id（2026-11-03）：请求日志按它回查区域，国内/国际
+      // 拆分才有数据源。既有调用方只取第一个参数，不受影响。
+      try { opts.onAccount(name, account.id); } catch (e) { /* 上报失败不影响请求 */ }
     }
     // 每个账号一份：换号重试时归因要记到**实际成功的那个**账号上
     const meter = makeMeter(account, { ...opts, model, startedAt });

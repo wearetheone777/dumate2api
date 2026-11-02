@@ -77,6 +77,10 @@
             <a-tooltip v-else title="分通道埋点上线前的记录">
               <a-tag color="default">搭子*</a-tag>
             </a-tooltip>
+            <!-- 区域（2026-11-03 国际版）：traework/qoder 随实际服务账号记录。
+                 旧数据与纯国内通道没有这个字段，不显示——空串不能读成国内 -->
+            <a-tag v-if="record.region === 'intl'" color="purple" class="ml-1">国际</a-tag>
+            <a-tag v-else-if="record.region === 'cn'" color="blue" class="ml-1">国内</a-tag>
           </template>
           <template v-else-if="column.key === 'model'">
             <div class="text-xs">{{ record.model || '—' }}</div>
@@ -236,6 +240,8 @@
             <a-tag v-else-if="detail.channel === 'qoder'" color="orange">Qoder</a-tag>
             <a-tag v-else-if="detail.channel === 'dumate'" color="blue">百度搭子</a-tag>
             <span v-else class="text-slate-400">百度搭子（分通道前的记录）</span>
+            <a-tag v-if="detail.region === 'intl'" color="purple" class="ml-1">国际</a-tag>
+            <a-tag v-else-if="detail.region === 'cn'" color="blue" class="ml-1">国内</a-tag>
           </div>
 
           <div class="detail-label">账号</div>

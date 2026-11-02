@@ -184,7 +184,23 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   // provider 在发请求前回调「这次实际用了哪个账号」，由它写进埋点。
   // 多账号轮询下（TRAE）只有 provider 知道选中的是哪一个——
   // 在埋点处猜一个必然会在轮询时记错。
-  const onAccount = (name) => { if (name) req._upstreamAccount = String(name); };
+  // 第二个参数是账号 id（2026-11-03）：请求日志按它回查账号区域，国内/国际
+  // 的拆分（请求日志、用量）才有数据源。区域解析失败不影响请求。
+  const onAccount = (name, id) => {
+    if (name) req._upstreamAccount = String(name);
+    if (id != null && (route.channel === 'traework' || route.channel === 'qoder')) {
+      try {
+        const store = require(route.channel === 'qoder' ? './qoder/auth' : './traework/auth');
+        const a = store.get(id);
+        if (a) {
+          const reg = String(a.region || '').toLowerCase();
+          req._upstreamRegion = route.channel === 'qoder'
+            ? (reg === 'cn' ? 'cn' : 'intl')      // qoder 的 global 术语归一成 intl
+            : (reg === 'intl' ? 'intl' : 'cn');
+        }
+      } catch (e) { /* 区域解析失败不影响请求 */ }
+    }
+  };
   // provider 解析出**实际发给上游的模型 key** 后回调（目前只有 Qoder 报）。
   // `route.model` 只是去掉前缀的调用方写法，显示名有没有解析成功看不出来。
   const onModel = (name) => { if (name) req._mappedModel = String(name); };
@@ -723,6 +739,9 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // provider 没报时按通道读当前凭证兜底。都没有就留空——
     // 界面显示「—」，而不是编一个名字。
     account: req._upstreamAccount || require('./upstream-account').fallback(req._channel || 'dumate'),
+    // 区域（2026-11-03 国际版）：traework/qoder 的直连请求随账号记录
+    // cn/intl，请求日志与用量据此拆分。搭子/千问纯国内，不记（空串）。
+    region: req._upstreamRegion || '',
     ...(extra || {}),
   });
 

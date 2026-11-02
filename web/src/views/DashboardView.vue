@@ -24,7 +24,12 @@
               <template #suffix><span class="text-sm text-slate-400">个</span></template>
             </a-statistic>
             <div class="text-xs text-slate-500 mt-2">
-              <template v-if="twSummary">今日已签 {{ twSummary.checkedIn }} 个</template>
+              <template v-if="twSummary">
+                <!-- 区域拆分（2026-11-03 国际版）：两区账号不通用，混在一个数里
+                     看不出国际账号有没有加进来 -->
+                <template v-if="twIntlCount">国内 {{ twCnCount }} · 国际 {{ twIntlCount }} · </template>
+                今日已签 {{ twSummary.checkedIn }} 个
+              </template>
               <span v-else>—</span>
             </div>
           </a-card>
@@ -66,6 +71,11 @@
             <div class="text-xs text-slate-500 mt-2">
               <template v-if="twSummary?.limitTotal">上限合计 {{ fmt(twSummary.limitTotal) }}</template>
               <span v-else>上游未给出额度上限</span>
+              <template v-if="twIntlCount">
+                <!-- 国际账号是订阅制按请求数计，不进积分合计（把 Free plan
+                     算成 0 积分会被读成「国际额度为零」） -->
+                <div>国际账号按请求数计，不进积分合计</div>
+              </template>
             </div>
           </a-card>
         </a-col>
@@ -181,7 +191,10 @@
             在线 {{ twAccounts.filter(a => a.enabled && !a.refreshExpired).length }}
           </a-tag>
           <a-tag v-if="twDash?.summary.checkedInToday != null" color="blue" class="ml-1">
-            今日已签 {{ twDash.summary.checkedInToday }} / {{ twAccounts.length }}
+            今日已签 {{ twDash.summary.checkedInToday }} / {{ twCheckinable }}
+          </a-tag>
+          <a-tag v-if="twIntlCount" color="purple" class="ml-1">
+            国际 {{ twIntlCount }}（订阅制 · 无签到）
           </a-tag>
         </template>
         <a-empty v-if="!twAccounts.length" description="还没有添加 TRAE Work 账号，到「账号管理」加一个" />
@@ -510,6 +523,13 @@
         <template #title>
           <span>账号健康快照</span>
           <a-tag v-if="qdDashAccounts.length" color="green" class="ml-2">在线 {{ qdOnlineCount }}</a-tag>
+          <!-- 区域拆分（2026-11-03）：两区账号与额度不通用，混在一个数里看不出 -->
+          <a-tag v-if="qdDashAccounts.filter(a => a.region !== 'cn').length" color="blue" class="ml-1">
+            国内 {{ qdDashAccounts.filter(a => a.region === 'cn').length }}
+          </a-tag>
+          <a-tag v-if="qdDashAccounts.filter(a => a.region !== 'cn').length" color="purple" class="ml-1">
+            国际 {{ qdDashAccounts.filter(a => a.region !== 'cn').length }}
+          </a-tag>
         </template>
         <a-empty v-if="!qdDashAccounts.length" description="还没有添加 Qoder 账号，到「账号管理」加一个" />
         <a-row v-else :gutter="[16, 16]">
@@ -1460,6 +1480,10 @@ const twRecords = ref<TraeworkCreditRecord[]>([])
 const twWindow = ref<{ cost: number; requests: number; exact: number }>({ cost: 0, requests: 0, exact: 0 })
 const twAccounts = computed(() => twDash.value?.accounts || [])
 const twToday = computed(() => twDash.value?.today || null)
+// 区域计数（2026-11-03 国际版）：统计卡与「今日已签」分母的区域拆分
+const twCnCount = computed(() => twAccounts.value.filter((a) => a.region !== 'intl').length)
+const twIntlCount = computed(() => twAccounts.value.filter((a) => a.region === 'intl').length)
+const twCheckinable = computed(() => twCnCount.value)
 // 顶部的汇总与到期数据来自 /credits 的 summary/expiring（见后端注释：
 // 到期数据要打上游，而 /dashboard 刻意不打）。原来的 twTotals 是前端
 // 自己把 rows 加起来算的——现在后端直接给，两边口径统一由后端保证。

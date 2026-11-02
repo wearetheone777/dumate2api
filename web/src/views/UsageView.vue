@@ -337,8 +337,18 @@
               {{ record.nickname || record.uid || '未命名' }}
               <div v-if="record.error" class="text-xs text-red-600">{{ record.error }}</div>
             </template>
+            <template v-else-if="column.key === 'region'">
+              <a-tag :color="record.region === 'intl' ? 'purple' : 'blue'">
+                {{ record.region === 'intl' ? '国际' : '国内' }}
+              </a-tag>
+            </template>
             <template v-else-if="column.key === 'remain'">
-              <span v-if="record.remain != null" class="font-medium num">
+              <!-- 国际版订阅制：积分口径恒 null，显示套餐名而不是 0 -->
+              <span v-if="record.intlPlan" class="font-medium">
+                {{ record.intlPlan.name }}
+                <span class="text-xs text-slate-400">按请求数计</span>
+              </span>
+              <span v-else-if="record.remain != null" class="font-medium num">
                 {{ record.remain.toLocaleString('zh-CN') }}
               </span>
               <span v-else class="text-slate-400">—</span>
@@ -499,9 +509,10 @@ const accountColumns = [
 // 逐笔账单，只有存量快照
 const twColumns = [
   { title: '账号', key: 'name' },
-  { title: '剩余额度', key: 'remain', width: '24%' },
-  { title: '额度上限', key: 'limit', width: '24%' },
-  { title: '今日签到', key: 'checkin', width: '20%' },
+  { title: '区域', key: 'region', width: '12%' },
+  { title: '剩余额度', key: 'remain', width: '22%' },
+  { title: '额度上限', key: 'limit', width: '22%' },
+  { title: '今日签到', key: 'checkin', width: '18%' },
 ]
 
 const fmt = (n: number) => n.toLocaleString('zh-CN', { maximumFractionDigits: 2 })

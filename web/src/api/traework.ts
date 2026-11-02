@@ -218,6 +218,8 @@ export interface TraeworkCreditRecord {
   req_id: string
   account: string
   account_id: number
+  /** 服务账号的区域（2026-11-03 国际版）。旧行或账号已删除时为空串 */
+  region: 'cn' | 'intl' | ''
   model: string
   ms: number | null
   cost: number | null

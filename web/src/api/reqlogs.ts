@@ -25,6 +25,9 @@ export interface ReqLogRow {
   // **权威来源是 provider 上报**（多账号轮询下只有它知道选中的是哪一个），
   // 没有则按通道读当前凭证兜底。两者都拿不到时缺省——界面显示「—」。
   account?: string
+  // 区域（2026-11-03 国际版）：traework/qoder 随实际服务账号记录。
+  // 旧行与纯国内通道（搭子/千问）没有这个字段——空缺不读成国内
+  region?: 'cn' | 'intl' | ''
   // 实际扣费：由「请求后余额 - 上一条请求后余额」实测得出，非估算。
   // points_exact=false 表示这条与相邻请求并发，差值里可能混了别人的消耗。
   points_delta?: number

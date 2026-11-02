@@ -65,9 +65,14 @@ function capture(account, opts = {}) {
   lastCaptureAt.set(key, Date.now());
   const run = async () => {
     const u = await checkin.usage(account);
+    // 国际版订阅制（2026-11-03）：没有 usage_summary、consumed 恒 null——
+    // 差值口径不适用，但**请求本身要落账**（逐笔明细的区域区分靠它），
+    // 标 intl 让前端显示「订阅制不计积分」而不是「无参照点」。
+    // 国内存量行为 consumed null 的话 computeCosts 会断链处理，不会编差值
+    const isIntl = require('./constants').regionOf(account) === 'intl';
     // 取不到就不落记录。**不补 0**——0 会被读成「这次没花钱」，
     // 而真相是没测到；下一条请求的差值会跨过这一条，界面靠并发/缺档标注体现
-    if (!u.ok || u.consumed == null) return null;
+    if (!u.ok || (u.consumed == null && !isIntl)) return null;
     const entry = {
       ts: Date.now(),
       req_id: opts.reqId || '',
@@ -75,10 +80,11 @@ function capture(account, opts = {}) {
       account: account.nickname || account.uid || `账号 ${account.id}`,
       model: opts.model || '',
       ms: opts.startedAt ? Date.now() - opts.startedAt : null,
-      // 累计已消耗：差值算成本靠它（单调不减）
+      // 累计已消耗：差值算成本靠它（单调不减）。国际订阅制恒 null
       consumed: u.consumed,
       remain: u.remain,
       limit: u.limit,
+      ...(isIntl ? { intl: true } : {}),
     };
     append(entry);
     return entry;
@@ -131,6 +137,10 @@ function computeCosts() {
   for (const k of Object.keys(byAcc)) {
     const list = byAcc[k].sort((a, b) => a.ts - b.ts);
     for (let i = 1; i < list.length; i++) {
+      // 国际订阅行（或任何 consumed 缺失的行）没有游标——差值链在它处断开，
+      // 不把 null 当 0 算（JS 里 null 参与减法会静默变 0，下游账号的成本
+      // 会被编成全额累计值）。断链只少算不编造，符合「宁可缺档」口径
+      if (list[i].consumed == null || list[i - 1].consumed == null) continue;
       const d = list[i].consumed - list[i - 1].consumed;
       // 负数说明账号换过 / 上游重置过累计值，这种情况不硬算
       if (Number.isFinite(d) && d >= 0) {
@@ -213,6 +223,13 @@ function todayUsage() {
 /** 逐笔明细（按时间倒序），供仪表盘表格 */
 function creditRecords(limit) {
   const { rows, delta, inexact } = computeCosts();
+  // 区域随行给（2026-11-03 国际版）：积分明细/用量按国内/国际区分的数据源。
+  // 按账号 id 回查；账号已删除的旧行如实空串，不猜。
+  let regions = null;
+  try {
+    const authStore = require('./auth');
+    regions = new Map(authStore.list().map((a) => [a.id, a.region || 'cn']));
+  } catch (e) { regions = null; }
   return rows
     .slice()
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
@@ -222,6 +239,7 @@ function creditRecords(limit) {
       req_id: r.req_id || '',
       account: r.account || '',
       account_id: r.account_id,
+      region: regions && r.account_id != null ? (regions.get(r.account_id) || '') : '',
       model: r.model || '',
       ms: r.ms ?? null,
       // 成本可能为 null（首条无参照点），如实留空而不是补 0

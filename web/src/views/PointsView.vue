@@ -53,9 +53,10 @@
           </a-col>
           <a-col :span="8">
             <a-card :bordered="false" class="h-full">
-              <a-statistic title="今日已签到" :value="`${twTotals.checked} / ${twRows.length}`" />
+              <a-statistic title="今日已签到" :value="`${twTotals.checked} / ${twTotals.checkinable}`" />
               <div class="text-xs text-slate-500 mt-2">
-                签到每日一次，幂等——重复点不会多领
+                签到每日一次，幂等——重复点不会多领。
+                <template v-if="twTotals.intlCount">国际账号没有签到接口，不计入分母。</template>
               </div>
             </a-card>
           </a-col>
@@ -82,8 +83,19 @@
                 <div>{{ record.nickname || record.uid || '未命名' }}</div>
                 <div class="text-xs text-slate-400 font-mono">UID {{ record.uid || '—' }}</div>
               </template>
+              <template v-else-if="column.key === 'region'">
+                <a-tag :color="record.region === 'intl' ? 'purple' : 'blue'">
+                  {{ record.region === 'intl' ? '国际' : '国内' }}
+                </a-tag>
+              </template>
               <template v-else-if="column.key === 'remain'">
-                <span v-if="record.remain != null" class="font-medium num">
+                <!-- 国际版是订阅制（按请求数计），积分口径恒 null——显示套餐名，
+                     补 0 会被读成「额度用完了」 -->
+                <span v-if="record.intlPlan" class="font-medium">
+                  {{ record.intlPlan.name }}
+                  <span class="text-xs text-slate-400">按请求数计</span>
+                </span>
+                <span v-else-if="record.remain != null" class="font-medium num">
                   {{ record.remain.toLocaleString('zh-CN') }}
                 </span>
                 <span v-else class="text-slate-400">—</span>
@@ -155,15 +167,22 @@
               <template v-if="column.key === 'ts'">
                 <span class="text-xs">{{ dateTimeText(record.ts) }}</span>
               </template>
+              <template v-else-if="column.key === 'region'">
+                <a-tag v-if="record.region === 'intl'" color="purple">国际</a-tag>
+                <a-tag v-else-if="record.region === 'cn'" color="blue">国内</a-tag>
+                <span v-else class="text-xs text-slate-400">—</span>
+              </template>
               <template v-else-if="column.key === 'model'">
                 <span class="font-mono text-xs">{{ record.model || '—' }}</span>
               </template>
               <template v-else-if="column.key === 'cost'">
-                <span v-if="record.cost != null" class="font-medium num">{{ fmtTw(record.cost) }}</span>
+                <!-- 国际订阅行没有积分口径——「订阅制」与「无参照点」是两回事 -->
+                <span v-if="record.region === 'intl'" class="text-xs text-slate-400">— 订阅制不计积分</span>
+                <span v-else-if="record.cost != null" class="font-medium num">{{ fmtTw(record.cost) }}</span>
                 <span v-else class="text-xs text-slate-400">— 无参照点</span>
                 <!-- 并发时的差值里可能混着相邻请求的消耗，必须标出来 -->
                 <a-tooltip
-                  v-if="!record.exact"
+                  v-if="!record.exact && record.region !== 'intl'"
                   title="与相邻请求并发，差值可能含对方的消耗"
                 >
                   <a-tag color="orange" class="ml-1">并发</a-tag>
@@ -520,6 +539,11 @@
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'ts'">
                 <span class="text-xs">{{ dateTimeText(record.ts) }}</span>
+              </template>
+              <template v-else-if="column.key === 'region'">
+                <a-tag v-if="record.region === 'intl'" color="purple">国际</a-tag>
+                <a-tag v-else-if="record.region === 'cn'" color="blue">国内</a-tag>
+                <span v-else class="text-xs text-slate-400">—</span>
               </template>
               <template v-else-if="column.key === 'model'">
                 <span class="font-mono text-xs">{{ record.model || '—' }}</span>
@@ -984,12 +1008,13 @@ const twStatus = ref<TraeworkStatus | null>(null)
 const twRows = ref<TraeworkCreditRow[]>([])
 
 const twColumns = [
-  { title: '账号', key: 'name', width: '20%' },
-  { title: '剩余额度', key: 'remain', width: '13%' },
-  { title: '额度上限', key: 'limit', width: '13%' },
-  { title: '已消耗', key: 'consumed', width: '13%' },
-  { title: '签到可得', key: 'checkinCredits', width: '13%' },
-  { title: '今日签到', key: 'checkin', width: '12%' },
+  { title: '账号', key: 'name', width: '18%' },
+  { title: '区域', key: 'region', width: '8%' },
+  { title: '剩余额度', key: 'remain', width: '12%' },
+  { title: '额度上限', key: 'limit', width: '12%' },
+  { title: '已消耗', key: 'consumed', width: '12%' },
+  { title: '签到可得', key: 'checkinCredits', width: '12%' },
+  { title: '今日签到', key: 'checkin', width: '10%' },
   { title: '上次签到', key: 'last', width: '16%' },
   { title: '错误', key: 'err' },
 ]
@@ -998,12 +1023,13 @@ const twRecords = ref<TraeworkCreditRecord[]>([])
 const twWindow = ref({ cost: 0, requests: 0, exact: 0 })
 
 const twRecordColumns = [
-  { title: '时间', key: 'ts', width: '20%' },
-  { title: '模型', key: 'model', width: '16%' },
-  { title: '消耗', key: 'cost', width: '15%' },
-  { title: '耗时', key: 'ms', width: '11%' },
-  { title: '请求后剩余', key: 'remain', width: '18%' },
-  { title: '账号', key: 'account', width: '20%' },
+  { title: '时间', key: 'ts', width: '19%' },
+  { title: '区域', key: 'region', width: '8%' },
+  { title: '模型', key: 'model', width: '15%' },
+  { title: '消耗', key: 'cost', width: '14%' },
+  { title: '耗时', key: 'ms', width: '10%' },
+  { title: '请求后剩余', key: 'remain', width: '17%' },
+  { title: '账号', key: 'account', width: '17%' },
 ]
 
 // TRAE 的账与千问不同：单一 credits，数值是「次」不是积分小数
@@ -1017,7 +1043,13 @@ const twTotals = computed(() => {
   let checked = 0
   let anyRemain = false
   let anyLimit = false
+  // 分母只数**国内**账号：国际版没有签到接口，把它们算进去会出现
+  // 「今日已签 2 / 3」却永远签不满的假象
+  let checkinable = 0
+  let intlCount = 0
   for (const r of twRows.value) {
+    if (r.region === 'intl') intlCount++
+    else checkinable++
     if (r.remain != null) { remain += r.remain; anyRemain = true }
     if (r.limit != null) { limit += r.limit; anyLimit = true }
     if (r.checkedIn) checked++
@@ -1026,6 +1058,8 @@ const twTotals = computed(() => {
     remain: anyRemain ? remain : null,
     limit: anyLimit ? limit : null,
     checked,
+    checkinable,
+    intlCount,
   }
 })
 
@@ -1106,19 +1140,21 @@ const qdTotals = computed(() => {
 
 const qdColumns = [
   { title: '账号', key: 'name', width: '18%' },
-  { title: '已消耗（上游真值）', key: 'used', width: '26%' },
-  { title: '剩余（签到）', key: 'addOn', width: '12%' },
-  { title: '剩余（订阅）', key: 'user', width: '12%' },
-  { title: '今日签到', key: 'checkin', width: '12%' },
+  { title: '区域', key: 'region', width: '8%' },
+  { title: '已消耗（上游真值）', key: 'used', width: '24%' },
+  { title: '剩余（签到）', key: 'addOn', width: '11%' },
+  { title: '剩余（订阅）', key: 'user', width: '11%' },
+  { title: '今日签到', key: 'checkin', width: '11%' },
   { title: '状态', key: 'err' },
 ]
 
 const qdRecordColumns = [
-  { title: '时间', key: 'ts', width: '24%' },
-  { title: '模型', key: 'model', width: '20%' },
-  { title: '消耗', key: 'cost', width: '18%' },
-  { title: '耗时', key: 'ms', width: '13%' },
-  { title: '账号', key: 'account', width: '25%' },
+  { title: '时间', key: 'ts', width: '21%' },
+  { title: '区域', key: 'region', width: '9%' },
+  { title: '模型', key: 'model', width: '18%' },
+  { title: '消耗', key: 'cost', width: '17%' },
+  { title: '耗时', key: 'ms', width: '12%' },
+  { title: '账号', key: 'account', width: '23%' },
 ]
 
 async function loadQd() {

@@ -55,12 +55,21 @@ function availableModels() {
 
 // TRAE Work 的模型表（只读，来自上游常量）。试调台要能选它，否则在
 // TRAE 通道下只能手打前缀——而手打错就会静默跑到搭子上去。
-function traeworkModels() {
+// region（2026-11-03）：cn（缺省）/ intl，两区模型表不同；国际表没有就
+// 返回空 + 说明，前端显示「没有国际账号」而不是静默给国内表
+async function traeworkModels(region) {
   try {
-    const tw = require('../../traework');
-    return tw.listModels().map((k) => ({ id: k, name: k, prefixed: `traework/${k}` }));
+    const models = require('../../traework/models');
+    const reg = region === 'intl' ? 'intl' : 'cn';
+    const r = await models.fetchModels({ region: reg });
+    const list = (r.models || []).filter(models.isUsableRow);
+    if (!list.length) return { region: reg, error: r.error || (reg === 'intl' ? '没有可用的国际账号，无法拉取国际模型表' : '模型表为空'), models: [] };
+    return {
+      region: reg, error: '',
+      models: list.map((m) => ({ id: m.id, name: m.name || m.id, prefixed: `traework/${m.id}` })),
+    };
   } catch (e) {
-    return [];
+    return { region: region === 'intl' ? 'intl' : 'cn', error: e.message, models: [] };
   }
 }
 
@@ -78,26 +87,31 @@ function traeworkModels() {
  *
  * 上游拿不到时回落静态表（含 0.1 档的便宜模型），避免下拉框空着。
  */
-async function qoderModels() {
+async function qoderModels(region) {
+  // 区域（2026-11-03）：cn（缺省）/ global——按该区域的主账号拉表，
+  // 没有该区域账号时明确报错（不静默回落另一区的表）
+  const reg = region === 'global' || region === 'intl' ? 'global' : 'cn';
   const rates = new Map();
+  let rows = [];
+  let error = '';
   try {
-    const rows = await require('../../model-info').qoderRows();
+    rows = await require('../../model-info').qoderRows({ region: reg });
     for (const r of rows) rates.set(r.prefixed, r.rate);
-  } catch (e) { /* 倍率拿不到就 null，前端退回列表第一个 */ }
-  try {
-    const qd = require('../../qoder');
-    const entries = await qd.listModelEntries();
-    return entries.map((e) => ({
-      id: e.id.replace(/^qoder\//, ''),
-      name: e.name || e.id,
-      prefixed: e.id,
-      rate: rates.has(e.id) ? rates.get(e.id) : null,
-    }));
-  } catch (e) {
-    return require('../../qoder/constants').FALLBACK_MODELS.map((k) => ({
-      id: k, name: k, prefixed: `qoder/${k}`, rate: null,
-    }));
+    if (!rows.length) error = reg === 'global' ? '没有国际（global）账号，无法拉取国际模型表' : '没有可用账号';
+  } catch (e) { error = e.message; }
+  if (rows.length) {
+    return {
+      region: reg, error: '',
+      models: rows.map((r) => ({ id: r.id, name: r.name || r.id, prefixed: r.prefixed, rate: r.rate })),
+    };
   }
+  // 上游拿不到时回落静态表（含 0.1 档的便宜模型），避免下拉框空着
+  return {
+    region: reg, error,
+    models: require('../../qoder/constants').FALLBACK_MODELS.map((k) => ({
+      id: k, name: k, prefixed: `qoder/${k}`, rate: null,
+    })),
+  };
 }
 
 // 每个会话的游标起点，用于算「本次对话消耗了多少」。
@@ -168,6 +182,9 @@ function costOf(accountId, before, after) {
  */
 async function handleDirect(req, res, ctx) {
   const { provider, payload, channel, model, mapped, stream, startedAt, personalAssistant } = ctx;
+  // 区域（2026-11-03 页面区分）：试调台选的国内/国际，随行记进埋点，
+  // 请求日志的区域拆分对试调的行同样生效
+  const region = ctx.region || '';
   const messageCount = Array.isArray(payload && payload.messages) ? payload.messages.length : 0;
   const reqId = reqlog.newReqId();
   let accountName = '';
@@ -188,6 +205,7 @@ async function handleDirect(req, res, ctx) {
       // 通道必须标对：不标会被归成「分通道前的历史记录」，而它是当下跑的
       channel,
       account: accountName,
+      region,
       error: err || '',
     });
   };
@@ -198,7 +216,7 @@ async function handleDirect(req, res, ctx) {
   // 千问/Qoder 的 send 不认识这个字段，多传无害。
   // **必须在流式/非流式两个分支之外**——流式分支也用它，定义进分支
   // 里就是 ReferenceError: sendOpts is not defined（实测踩过）
-  const sendOpts = { reqId, onAccount, personalAssistant: !!personalAssistant };
+  const sendOpts = { reqId, onAccount, personalAssistant: !!personalAssistant, region };
 
   // ---- 非流式 ----
   if (!stream) {
@@ -311,17 +329,26 @@ const routes = [
   {
     // TRAE Work 的模型清单（只读）。与搭子分开一个接口：那份映射表描述的是
     // 搭子的别名，混进来会让人以为改它能影响 TRAE 路由。
+    // ?region=intl 看国际模型表（2026-11-03 区域区分）
     method: 'GET',
     path: '/traework-models',
-    handler: ({ res }) => sendJSON(res, 200, { models: traeworkModels() }),
+    handler: async ({ res, req }) => {
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const r = await traeworkModels(regionRaw);
+      return sendJSON(res, 200, r);
+    },
   },
   {
     // Qoder 的模型清单（带 `qoder/` 前缀 + 真实显示名）。
     // 与搭子分开一个接口：那份映射表描述的是搭子的别名，混进来会让人以为
-    // 改它能影响 Qoder 路由。
+    // 改它能影响 Qoder 路由。?region=global 看国际模型表（2026-11-03）
     method: 'GET',
     path: '/qoder-models',
-    handler: async ({ res }) => sendJSON(res, 200, { models: await qoderModels() }),
+    handler: async ({ res, req }) => {
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const r = await qoderModels(regionRaw);
+      return sendJSON(res, 200, r);
+    },
   },
   {
     // 本次会话已消耗的积分（相对打开页面时的余额）
@@ -393,9 +420,15 @@ const routes = [
           stream,
         };
         if (stream) payload.stream_options = { include_usage: true };
+        // 区域（2026-11-03）：试调台选的国内/国际，随 send 的 opts.region
+        // 约束选号——否则国际模型可能被国内账号接走（反之亦然）。
+        // qoder 的术语是 global，traework 是 intl，统一归一成 intl
+        const rawRegion = String((body && body.region) || '').toLowerCase();
+        const region = (rawRegion === 'intl' || rawRegion === 'global') ? 'intl'
+          : rawRegion === 'cn' ? 'cn' : '';
         return handleDirect(req, res, {
           provider: direct, payload, channel, model, mapped: route.model,
-          stream, startedAt, before, messages,
+          stream, startedAt, before, messages, region,
           // TRAE 宝身份（traebao/ 前缀 → function=personal_assistant）：
           // 前缀在 payload.model 里已被剥掉，provider 靠这个标记认身份。
           // 漏传的话 traebao/auto 会静默走 solo 链路并正常计费——界面选了

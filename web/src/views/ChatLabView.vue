@@ -110,6 +110,17 @@
               :options="channelOptions"
               @change="onChannelChange"
             />
+            <!-- 区域（2026-11-03 国际版）：TRAE/Qoder 两区账号与模型表不同，
+                 试调请求随区域约束选号——否则国际模型可能被国内账号接走 -->
+            <a-radio-group
+              v-if="labChannel === 'traework' || labChannel === 'qoder'"
+              v-model:value="labRegion"
+              size="small"
+              @change="onRegionChange"
+            >
+              <a-radio-button value="cn">国内</a-radio-button>
+              <a-radio-button value="intl">国际</a-radio-button>
+            </a-radio-group>
             <a-select
               v-model:value="model"
               class="model-select"
@@ -219,11 +230,35 @@ const twModelsLoading = ref(false)
 const qdModels = ref<Array<{ id: string; name: string; prefixed: string; rate?: number | null }>>([])
 const qdModelsLoading = ref(false)
 
+// 区域（2026-11-03 国际版）：traework 用 cn/intl、qoder 用 cn/global，
+// 单选器统一用 'cn'|'intl'，发请求时按通道映射。切区域重拉模型表
+const labRegion = ref<'cn' | 'intl'>('cn')
+
+function regionParam(): 'cn' | 'intl' | 'global' | undefined {
+  if (labChannel.value === 'traework') return labRegion.value
+  if (labChannel.value === 'qoder') return labRegion.value === 'intl' ? 'global' : 'cn'
+  return undefined
+}
+
+async function onRegionChange() {
+  model.value = ''
+  if (labChannel.value === 'traework') {
+    await loadTwModels()
+    model.value = twModels.value[0]?.prefixed || ''
+  } else if (labChannel.value === 'qoder') {
+    await loadQdModels()
+    const cheapest = qdModels.value
+      .filter((m) => m.rate != null && m.rate > 0)
+      .sort((a, b) => (a.rate as number) - (b.rate as number))[0]
+    model.value = cheapest?.prefixed || qdModels.value[0]?.prefixed || ''
+  }
+}
+
 async function loadQdModels() {
   if (qdModelsLoading.value) return
   qdModelsLoading.value = true
   try {
-    const { data } = await qoderApi.chatlabModels()
+    const { data } = await qoderApi.chatlabModels(regionParam() as 'cn' | 'global' | undefined)
     qdModels.value = data.models || []
   } catch { /* 拿不到就空列表，不阻断 */ } finally {
     qdModelsLoading.value = false
@@ -234,7 +269,7 @@ async function loadTwModels() {
   if (twModelsLoading.value) return
   twModelsLoading.value = true
   try {
-    const { data } = await traeworkApi.models()
+    const { data } = await traeworkApi.models({ region: labRegion.value })
     // 与网关 /v1/models 的 usableIds 同口径（可见 + 对话用途）——上游全量表
     // 里混着 computer_use_subagent 这类内部模型、custom_model_* 占位与
     // summary，全列出来下拉就是「错乱」的；模型名调不通的也不该出现
@@ -243,14 +278,17 @@ async function loadTwModels() {
     )
     const list = chat.map((m) => ({ id: m.id, name: m.name, prefixed: m.prefixed }))
     // TRAE 宝（traebao/ 前缀 → personal_assistant 身份，当前免费豁免）。
-    // 实测白名单只有 deepseek-v4.1-flash（其余上游 4001），不列调不通的
-    list.push({ id: 'auto', name: 'TRAE 宝自动档（免费）', prefixed: 'traebao/auto' })
-    if (chat.some((m) => m.id === 'deepseek-v4.1-flash')) {
-      list.push({
-        id: 'deepseek-v4.1-flash',
-        name: 'TRAE 宝 · DeepSeek-V4.1-Flash（免费）',
-        prefixed: 'traebao/deepseek-v4.1-flash',
-      })
+    // 实测白名单只有 deepseek-v4.1-flash（其余上游 4001），不列调不通的。
+    // **国内身份**：国际区域不列（personal_assistant 的豁免绑国内活动域）
+    if (labRegion.value === 'cn') {
+      list.push({ id: 'auto', name: 'TRAE 宝自动档（免费）', prefixed: 'traebao/auto' })
+      if (chat.some((m) => m.id === 'deepseek-v4.1-flash')) {
+        list.push({
+          id: 'deepseek-v4.1-flash',
+          name: 'TRAE 宝 · DeepSeek-V4.1-Flash（免费）',
+          prefixed: 'traebao/deepseek-v4.1-flash',
+        })
+      }
     }
     twModels.value = list
   } catch { /* 拿不到就空列表，不阻断 */ } finally {
@@ -414,6 +452,7 @@ async function send() {
     if (streamMode.value === 'plain') {
       const { data } = await client.post('/chatlab/chat', {
         model: model.value, messages: history, stream: false,
+        region: regionParam(),
       })
       target.content = data.content || '(空回答)'
       target.reasoning = data.reasoning || ''
@@ -432,7 +471,7 @@ async function send() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ model: model.value, messages: history, stream: true }),
+      body: JSON.stringify({ model: model.value, messages: history, stream: true, region: regionParam() }),
     })
     if (!resp.ok) {
       const j = await resp.json().catch(() => ({}))

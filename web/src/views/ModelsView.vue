@@ -50,7 +50,13 @@
       <div v-if="twStatus" class="qw-channel-row">
         <div class="qw-channel-cell">
           <div class="cell-label">可用账号</div>
-          <div class="cell-value num">{{ twStatus.accounts ?? '—' }}</div>
+          <div class="cell-value num">
+            {{ twStatus.accounts ?? '—' }}
+            <!-- 区域拆分（2026-11-03 国际版）：两区账号不通用 -->
+            <span v-if="twCnCount || twIntlCount" class="text-xs text-slate-400 ml-1">
+              （国内 {{ twCnCount }} · 国际 {{ twIntlCount }}）
+            </span>
+          </div>
         </div>
         <div class="qw-channel-cell">
           <div class="cell-label">当前账号</div>
@@ -120,7 +126,10 @@
                 {{ twTotals.remain == null ? '—' : twTotals.remain.toLocaleString('zh-CN') }}
                 <span v-if="twTotals.limit" class="qw-pool-cap">/ {{ twTotals.limit.toLocaleString('zh-CN') }}</span>
               </div>
-              <div class="qw-pool-sub">按账号独立计算，不共享</div>
+              <div class="qw-pool-sub">
+                按账号独立计算，不共享
+                <template v-if="twIntlCount">；国际 {{ twIntlCount }} 个账号订阅制按请求数计，不进积分合计</template>
+              </div>
             </div>
           </a-col>
           <a-col :xs="24" :sm="12" :lg="12">
@@ -128,8 +137,12 @@
               <div class="qw-pool-head">
                 <span class="qw-pool-label">今日已签到</span>
               </div>
-              <div class="qw-pool-value num">{{ twTotals.checked }} / {{ twRows.length }}</div>
-              <div class="qw-pool-sub">签到每日一次，幂等</div>
+              <!-- 分母只数国内账号：国际版没有签到接口，算进去会永远签不满 -->
+              <div class="qw-pool-value num">{{ twTotals.checked }} / {{ twTotals.checkinable }}</div>
+              <div class="qw-pool-sub">
+                签到每日一次，幂等
+                <template v-if="twIntlCount">· 国际 {{ twIntlCount }} 个账号订阅制无签到</template>
+              </div>
             </div>
           </a-col>
         </a-row>
@@ -314,7 +327,12 @@
       <div v-if="qdStatus" class="qw-channel-row">
         <div class="qw-channel-cell">
           <div class="cell-label">可用账号</div>
-          <div class="cell-value num">{{ qdStatus.accounts ?? '—' }}</div>
+          <div class="cell-value num">
+            {{ qdStatus.accounts ?? '—' }}
+            <span v-if="qdCnCount || qdIntlCount" class="text-xs text-slate-400 ml-1">
+              （国内 {{ qdCnCount }} · 国际 {{ qdIntlCount }}）
+            </span>
+          </div>
         </div>
         <div class="qw-channel-cell">
           <div class="cell-label">当前账号</div>
@@ -389,8 +407,22 @@
             </div>
           </a-col>
         </a-row>
+        <!-- 区域拆分（2026-11-03）：两区账号的额度不通用，合计里看不出构成 -->
+        <div v-if="qdCnCount && qdIntlCount" class="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-500">
+          <div>
+            国内（{{ qdCnCount }} 账号）：
+            签到 <span class="num">{{ fmtQw(qdRegionTotals.cn.addOn) }}</span>
+            · 订阅 <span class="num">{{ fmtQw(qdRegionTotals.cn.user) }}</span>
+          </div>
+          <div>
+            国际（{{ qdIntlCount }} 账号）：
+            签到 <span class="num">{{ fmtQw(qdRegionTotals.intl.addOn) }}</span>
+            · 订阅 <span class="num">{{ fmtQw(qdRegionTotals.intl.user) }}</span>
+          </div>
+        </div>
         <div class="text-xs text-slate-500 mt-3">
           两份额度<b>不可相加</b>：前者是签到/赠送，后者是订阅套餐内。
+          <template v-if="qdCnCount && qdIntlCount">国内与国际是两套账号，额度也不通用。</template>
         </div>
       </template>
     </a-card>
@@ -747,6 +779,19 @@ const qdTotals = computed(() => {
   }
   return { addOn, user, known: ok }
 })
+// 区域计数（2026-11-03 国际版）：额度两区不通用，顶部元信息行拆开显示
+const qdCnCount = computed(() => qdCredits.value.filter((r) => r.region === 'cn').length)
+const qdIntlCount = computed(() => qdCredits.value.filter((r) => r.region !== 'cn').length)
+// 按区域拆分的额度小计（只有两区并存时才显示——单区时合计本身就是那个区）
+const qdRegionTotals = computed(() => {
+  const out = { cn: { addOn: 0, user: 0 }, intl: { addOn: 0, user: 0 } }
+  for (const r of qdCredits.value) {
+    const bucket = r.region === 'cn' ? out.cn : out.intl
+    if (r.addOnQuota) bucket.addOn += r.addOnQuota.remaining || 0
+    if (r.userQuota) bucket.user += r.userQuota.remaining || 0
+  }
+  return out
+})
 
 async function loadQd(force = false) {
   try {
@@ -885,13 +930,22 @@ const twTotals = computed(() => {
   let remain: number | null = null
   let limit: number | null = null
   let checked = 0
+  // 分母只数国内账号（国际版没有签到接口）；国际订阅账号不进积分合计
+  let checkinable = 0
+  let intlCount = 0
   for (const r of twRows.value) {
+    if (r.region === 'intl') { intlCount++; continue }
+    checkinable++
     if (r.remain != null) remain = (remain ?? 0) + r.remain
     if (r.limit != null) limit = (limit ?? 0) + r.limit
     if (r.checkedIn) checked++
   }
-  return { remain, limit, checked }
+  return { remain, limit, checked, checkinable, intlCount }
 })
+
+// 区域计数（2026-11-03 国际版）：顶部元信息行拆开显示
+const twCnCount = computed(() => twRows.value.filter((r) => r.region !== 'intl').length)
+const twIntlCount = computed(() => twRows.value.filter((r) => r.region === 'intl').length)
 
 // 千问模型：直接问 /qwenwork/models，不再从 /models/map 的 channels 里蹭
 const qwModels = ref<Array<{ id: string; name: string; prefixed: string }>>([])
