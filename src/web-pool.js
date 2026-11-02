@@ -29,6 +29,8 @@ const crypto = require('crypto');
 const accounts = require('./accounts');
 const { classify } = require('./upstream-errors');
 const pool = require('./pool').pool;
+// FEFO 数据源（写方是管理端 /web-accounts 的临期快照）
+const expiringSnap = require('./expiring');
 // per-account 出站代理（施工包 E 接线）：getAgentFor 按账号 proxy 字段 > 全局
 // DUMATE_PROXY 解析，无代理返回 null（直连）。账号配了代理就绝不回退直连——
 // 解析失败抛错走请求失败路径进冷却，静默回退等于把真实出口 IP 裸奔出去。
@@ -161,11 +163,25 @@ async function getToken(account, force = false, agent = null) {
 // model/paid 透传给池做模型级负缓存与积分保底判据。
 // 惩罚态判定（冷却/熔断/禁用/暂停/在途满/保底）全在 pool.pick,这里只提供
 // 「启用账号」这个候选集。
+// FEFO：优先消耗临期积分的账号集合（快照由管理端 /web-accounts 顺带写，
+// 读的时候陈旧/为空即返回 null——走普通轮询，行为回到加这个功能之前）。
+// 快照里的账号 id 是字符串（JSON 对象键），pool.pick 的候选是数字 id，转换。
+function fefoIdSet() {
+  const ids = expiringSnap.accountIds('dumate');
+  if (!ids) return null;
+  return new Set([...ids].map(Number));
+}
+
 function pick(exclude = new Set(), opts = {}) {
   const ids = accounts.load().accounts
     .filter((a) => a.enabled)
     .map((a) => a.id);
-  const id = pool.pick(ids, { exclude, model: opts.model, paid: opts.paid });
+  const id = pool.pick(ids, {
+    exclude, model: opts.model, paid: opts.paid,
+    // 集合非空时候选被限制在临期账号内（pool.pick 的 expiring 语义）；
+    // 临期号不健康时池自动退回全量候选
+    expiring: fefoIdSet(),
+  });
   if (id == null) return null;
   return { account: accounts.getRaw(id), st: stateOf(id) };
 }

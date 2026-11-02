@@ -391,7 +391,9 @@ function fefoUidSet(usable) {
   try {
     const set = new Set();
     for (const g of grants.expiring({ withinMs: days * 86400000 })) {
-      const acc = usable.find((a) => a.id === g.account_id);
+      // 账本字段是 accountId（grants.fromClaim 写入的驼峰命名）——曾写成
+      // account_id，find 恒失败、集合恒空，FEFO 从未生效过（2026-11-01 修）。
+      const acc = usable.find((a) => a.id === g.accountId);
       if (acc) set.add(channelPool.uidOf(CHANNEL, acc.id));
     }
     return set.size ? set : null;
@@ -1318,7 +1320,17 @@ function checkin(account) {
  * 已经自愈的错误（千问/搭子的 lastError 就是这个坑）。只有确实领到了才记时间。
  */
 async function checkinAndSave(account) {
-  const a = account || pickAccount();
+  let a = account || pickAccount();
+  if (!a) return { ok: false, error: '没有可用账号', claimed: [] };
+  // 签到要**新鲜** access token：管理端与 keepalive 拿的是落盘对象，
+  // token 过期后签到必然 401，界面表现为「点了没反应、状态仍未查询」。
+  // 聊天链路的 send() 会自己刷新，签到链路必须同样刷新——刷新是主流程，
+  // 不能靠调用方各自记得。换票失败的原因（如 refresh token 失效）如实带回。
+  try {
+    a = await session.ensureAccount(authStore, a);
+  } catch (e) {
+    return { ok: false, error: e.message, claimed: [] };
+  }
   let r;
   try {
     // 把账号传下去：签到成功时顺手写本地批次账本（过期提醒的数据源）
@@ -1357,6 +1369,8 @@ module.exports = {
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
   // 额度类业务码的识别与处置（离线验证用：test/verify-qoder-throttle.js）
   quotaKindOfText, quotaFrameError, quotaFromBody, retryable, poolInfoOf,
+  // FEFO 候选集推导（离线验证用：账本字段 accountId 的端到端回归）
+  fefoUidSet,
   // 客户端渲染错误码（2026-11-01）：鉴权映射 / 无语义码 / statusCode 钳制
   httpStatusOf, frameThrown, thrownFrameErr, bizFrameError, bizFromBody, accountsForRegion,
 };

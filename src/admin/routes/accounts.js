@@ -10,6 +10,8 @@ const taskScheduler = require('../../task-scheduler');
 const records = require('../../records');
 const ledger = require('../../checkin-ledger');
 const pointsAgg = require('../../points-agg');
+// 临期积分快照（FEFO 数据源）：写方在 /web-accounts，读方在 web-pool.js
+const expiringSnap = require('../../expiring');
 // 余额变动流水（施工包 C）：签到与手动刷新查到的余额都在这里留痕
 const balanceHist = require('../../balance-hist');
 const { sendJSON } = require('../router');
@@ -349,6 +351,9 @@ function aggregateExpiring(packages, accountId, days = 30) {
       count: x.count,
       sources: [...x.sources].filter(Boolean),
       daysLeft: Math.max(0, Math.ceil((x.latest - now) / 86400000)),
+      // 该日**最晚**到期时刻（毫秒）——前端「≤1 天显示小时」用它，
+      // 只有 ceil 后的天数看不出最后一天还剩几小时
+      latest: x.latest,
     }));
 }
 
@@ -1118,10 +1123,26 @@ const routes = [
             count: x.count,
             sources: x.sources,
             daysLeft: x.daysLeft,
+            // 最晚到期时刻（前端 ≤1 天显示小时用它）——这里是**重新映射**
+            // 字段，不加 latest 前端就拿不到（2026-11-01）
+            latest: x.latest,
           });
         }
       }
       expiringPoints.sort((x, y) => (x.date < y.date ? -1 : 1));
+
+      // 临期快照（FEFO 数据源）：网关选号读它优先消耗临期积分。这里本就在
+      // 拉额度概览，顺手落盘；快照陈旧时网关自动退回普通轮询，可用性
+      // 不依赖这份数据（src/expiring.js）。按账号取最早到期日（latest）。
+      // 概览失败的账号走 keepIds 保留旧条目——「查不到」不等于「无临期」
+      const fefoMin = new Map();
+      for (const x of expiringPoints) {
+        const p = fefoMin.get(x.accountId);
+        if (p == null || x.latest < p) fefoMin.set(x.accountId, x.latest);
+      }
+      expiringSnap.update('dumate',
+        [...fefoMin].map(([accountId, nearest]) => ({ accountId, nearest })),
+        { keepIds: [...byId.values()].filter((d) => d.error).map((d) => d.id) });
 
       return sendJSON(res, 200, {
         // 顶部卡片
@@ -1139,6 +1160,8 @@ const routes = [
           expiring_points: Number(expiringPoints.reduce((s, x) => s + x.points, 0).toFixed(4)),
           expiring_days: 30,
         },
+        // FEFO 快照的新鲜度（排障用：网关有没有在按临期优先选号）
+        fefo: expiringSnap.info('dumate'),
         // 即将过期的积分明细（账号 × 到期日）。空数组 = 30 天内无损失
         expiring_points_rows: expiringPoints,
         // 上游/池状态

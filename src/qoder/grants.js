@@ -125,4 +125,43 @@ function expired({ accountId = null, now = Date.now() } = {}) {
   }).sort((a, b) => b.expiresAt - a.expiresAt);
 }
 
-module.exports = { FILE, filePath, record, readAll, hasGrant, fromClaim, expiring, expired };
+/**
+ * 按「先领先扣」把账号总余额分配回各批次，得每批的**推算剩余**。
+ *
+ * 为什么是推算而不是上游数据：上游扣费不按批次扣（扣的是 addOnQuota 总池），
+ * 批次只是发放记录 + 有效期标签。但「领取后 30 天作废」的产品设计必然配
+ * 「先到先用」——老批次先扣，余额留在最新批次上（这也是积分系统的标准
+ * 行为，与网关自己的 FEFO 选号同序）。
+ *
+ * 分配规则：从最新批次往回分 remaining，每批最多拿满领取额，分完为止，
+ * 更老的批次推算剩余 0。amount=null 的批次按 0 参与（领取额未知，
+ * 不凭空给它余额）。调用方负责只传**未过期**批次——已过期批次已作废，
+ * 不再持有余额，混进来会抢走本属于未过期批次的份额。
+ *
+ * 账本外批次（功能启用前领的）没有 grantId、不参与分配——remaining 分给
+ * 账本批次后剩下的量就是它们的（端点层用它对账）。
+ *
+ * @param {Array} batches 批次列表（任意顺序，须带 grantId）
+ * @param {number} remaining 账号 addOnQuota.remaining（上游权威总余额）
+ * @returns {Map<string, number>} grantId → 推算剩余
+ */
+function estimateRemaining(batches, remaining) {
+  const out = new Map();
+  if (!Array.isArray(batches)) return out;
+  const sorted = batches.filter((b) => b && b.grantId)
+    .sort((a, b) => (b.grantedAt || 0) - (a.grantedAt || 0)); // 新 → 老
+  let r = Number(remaining);
+  if (!Number.isFinite(r) || r <= 0) {
+    for (const b of sorted) out.set(b.grantId, 0);
+    return out;
+  }
+  for (const b of sorted) {
+    const cap = typeof b.amount === 'number' && b.amount > 0 ? b.amount : 0;
+    const take = Math.min(cap, r);
+    out.set(b.grantId, take);
+    r -= take;
+  }
+  return out;
+}
+
+module.exports = { FILE, filePath, record, readAll, hasGrant, fromClaim, expiring, expired, estimateRemaining };

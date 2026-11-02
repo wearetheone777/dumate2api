@@ -76,6 +76,12 @@ export interface QoderCreditRow {
   isQuotaExceeded: boolean | null
   error: string
   /**
+   * 签到状态查询的失败原因，与 `error`（额度查询）**分开**。
+   * 额度查得到、签到查不到时不能混成一条「查询失败」——否则用户
+   * 不知道自己点的签到到底成没成。
+   */
+  checkinError: string
+  /**
    * 今日是否已签到。来自**只读**的 /campaigns（claimStatus），不触发领取。
    * null = 查不出来（上游没给活动），不猜成已签/未签。
    */
@@ -94,21 +100,25 @@ export interface QoderCreditRow {
  * **为什么是本地账本**：Qoder 没有逐批积分余额接口，唯一带到期信息的是
  * 领取响应本身（签到后 30 天有效），所以每次签到落一条本地记录。
  *
- * **诚实边界**：`amount` 是**领取额**（这批领到多少），**不是剩余额**——
- * 上游不告诉我们每批还剩多少。界面必须说清，当成剩余额会高估。
+ * **口径**：`amount` 是**领取额**（这批领到多少），不随消耗变；
+ * `estimatedRemaining` 是按「先领先扣」从账号总余额（上游权威值）分配
+ * 回批次的**推算剩余**——这才是「这批还剩多少」的可用读数。上游不按
+ * 批次扣费，推算值不是上游数据；null = 总余额没查到，推不了。
  */
 export interface QoderGrant {
   grantId: string
   accountId: number | null
   accountName: string
   campaignKey: string
-  /** **领取额**，不是剩余额（上游不给逐批余额） */
+  /** **领取额**，不是剩余额（上游不给逐批余额），仅作对照 */
   amount: number | null
+  /** **推算剩余**（先领先扣模拟）。null = 余额没查到，不是 0 */
+  estimatedRemaining: number | null
   grantedAt: number
   expiresAt: number
   validityDays: number | null
   modelScope: { modelSeries?: { key?: string } } | null
-  /** 距到期天数（已过期时为 0） */
+  /** 距到期天数（向上取整；已过期时为 0） */
   daysLeft: number | null
   expired: boolean
 }
@@ -236,8 +246,15 @@ export const qoderApi = {
       exceeded: number
       /** 7 天内到期的批次数 */
       expiringCount: number
-      /** 这些批次的**领取额**合计（不是剩余额） */
+      /**
+       * 快过期积分：7 天窗口内批次的**推算剩余**合计（先领先扣模拟，
+       * 余额来自上游额度接口）。estimated=false 时是领取额口径（降级）。
+       */
       expiringAmount: number
+      /** expiringAmount 是否推算口径（false = 余额没查到，回落的领取额） */
+      expiringEstimated: boolean
+      /** 领取额合计（对照口径，不随消耗变） */
+      expiringGrantedAmount: number
     }
     note: string
   }>('/qoder/credits'),
@@ -256,7 +273,7 @@ export const qoderApi = {
       /** 账本涵盖的请求数（不是全部请求数） */
       recorded: number
     }>(`/qoder/credits/records?limit=${limit}`),
-  /** 积分过期明细（本地账本，不打上游） */
+  /** 积分过期明细（本地账本 + 上游总余额的先领先扣推算） */
   grants: (days = 30) => client.get<{
     windowDays: number
     rows: QoderGrant[]
@@ -264,8 +281,12 @@ export const qoderApi = {
     total: number
     /** 账本最早一条的时刻（null = 账本为空，本功能上线前领的无法追溯） */
     since: number | null
-    /** 窗口内批次的**领取额**合计，不是剩余额 */
+    /** 窗口内批次的**推算剩余**合计（先领先扣）；estimated=false 时是领取额 */
     expiringAmount: number
+    /** 领取额合计（对照口径） */
+    expiringGrantedAmount: number
+    /** expiringAmount 是否推算口径 */
+    estimated: boolean
     note: string
   }>(`/qoder/grants?days=${days}`),
   checkin: (id?: number) => client.post('/qoder/checkin', id ? { id } : {}),

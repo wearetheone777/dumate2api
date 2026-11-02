@@ -12,6 +12,8 @@ const login = require('../../traework/login');
 const models = require('../../traework/models');
 const credits = require('../../traework/credits');
 const tw = require('../../traework');
+// 临期积分快照（FEFO 数据源）：写方在 /credits，读方在 traework/index.js
+const expiringSnap = require('../../expiring');
 
 const routes = [
   {
@@ -102,6 +104,9 @@ const routes = [
           // 额度包明细（含各自到期时间）。仪表盘据此回答「哪些积分快过期了」
           // ——签到奖励是一批批到期的，只给总额答不出这个问题。
           packs: u.ok ? (u.packs || []) : [],
+          // usage（额度包）查询是否成功。status 成功但 usage 失败时 error
+          // 是空的，FEFO 快照要单独识别这种「拿不到包明细」的行
+          packsKnown: u.ok,
           // error 只表示「这次状态查询失败」——别把上次签到尝试的失败消息
           // 塞进来。两者是不同的东西：前者是「查不到」，后者是「查到了，
           // 但上一次签到被上游拒了」。混在一起时前端只能显示「查询失败」，
@@ -133,6 +138,19 @@ const routes = [
         }
       }
       expiring.sort((a, b) => a.expireAt - b.expireAt);
+      // 临期快照（FEFO 数据源）：这里本就在构建 7 天窗口的过期明细，顺手
+      // 按账号落盘最早到期时刻（src/expiring.js）；快照陈旧则网关退回普通轮询
+      const fefoMin = new Map();
+      for (const x of expiring) {
+        const p = fefoMin.get(x.accountId);
+        if (p == null || x.expireAt < p) fefoMin.set(x.accountId, x.expireAt);
+      }
+      // 额度包查询失败的账号：保留旧条目而不是当成「无临期」——「查不到」
+      // 与「查到了且没有临期」是两回事，写空会让 FEFO 在一次网络抖动后
+      // 把临期账号忘干净（2026-11-01 设计时定下的口径）
+      expiringSnap.update('traework',
+        [...fefoMin].map(([accountId, nearest]) => ({ accountId, nearest })),
+        { keepIds: rows.filter((r) => !r.packsKnown).map((r) => r.id) });
       // 额度取不到的账号单独计数：它既不算「有效」也不该被当成 0 额度
       const known = rows.filter((r) => r.remain !== null || r.limit !== null);
       return sendJSON(res, 200, {
@@ -151,6 +169,8 @@ const routes = [
         // 7 天内到期且还有剩余的额度包。空数组 = 无风险，界面据此显示「暂无」
         expiring,
         expiringPoints: Number(expiring.reduce((s, x) => s + x.remain, 0).toFixed(4)),
+        // FEFO 快照的新鲜度（排障用：网关有没有在按临期优先选号）
+        fefo: expiringSnap.info('traework'),
       });
     },
   },

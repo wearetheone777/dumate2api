@@ -13,6 +13,22 @@ const login = require('../../qoder/login');
 const constants = require('../../qoder/constants');
 const qoder = require('../../qoder');
 
+/**
+ * 管理端的上游读/写动作要用**新鲜** access token。
+ *
+ * 聊天链路的 send() 会 session.ensureAccount 刷新，管理端此前直接用落盘的
+ * accessToken——token 过期后整页变成「状态未查询」，签到也必然失败。刷新
+ * 失败返回 error 而不抛出：原因交给该账号那一行显示（ensureAccount 已把
+ * 换票失败写进 lastError）。
+ */
+async function fresh(raw) {
+  try {
+    return { account: await session.ensureAccount(authStore, raw) };
+  } catch (e) {
+    return { account: null, error: e.message };
+  }
+}
+
 const routes = [
   {
     // 通道状态 + 账号列表（脱敏：token 只给尾部 6 位）
@@ -45,10 +61,12 @@ const routes = [
     path: '/models',
     handler: async ({ res, req }) => {
       const force = /[?&]refresh=1/.test(req.url || '');
-      const account = authStore.preferred();
-      if (!account) return sendJSON(res, 200, { models: [], total: 0, error: '没有可用账号', fetchedAt: 0 });
+      const pref = authStore.preferred();
+      if (!pref) return sendJSON(res, 200, { models: [], total: 0, error: '没有可用账号', fetchedAt: 0 });
+      const fr = await fresh(pref);
+      if (fr.error) return sendJSON(res, 200, { models: [], total: 0, error: fr.error, fetchedAt: 0 });
       try {
-        const raw = await session.fetchModels(account, { force });
+        const raw = await session.fetchModels(fr.account, { force });
         if (!raw.ok) return sendJSON(res, 200, { models: [], total: 0, error: raw.error || '', fetchedAt: 0 });
         return sendJSON(res, 200, {
           models: raw.models,
@@ -87,13 +105,33 @@ const routes = [
             checkedIn: null, checkinPending: null, checkinNextAt: null,
             lastCheckin: a.lastCheckin || null,
             error: `出站代理配置错误: ${e.message}`,
+            checkinError: `出站代理配置错误: ${e.message}`,
           });
           continue;
         }
-        const q = await session.fetchQuota(raw.accessToken, a.region, { agent });
+        // 管理端读接口不走聊天链路，拿的是落盘的 accessToken——过期不会
+        // 自动刷新，整页会变成「状态未查询」、签到也必然 401。一个账号只
+        // 换一次票（换票会轮换 refresh_token，拿旧对象重复换会失败）。
+        const fr = await fresh(raw);
+        if (fr.error) {
+          rows.push({
+            id: a.id,
+            nickname: a.nickname || a.uid || `账号 ${a.id}`,
+            region: a.region,
+            planName: a.planName || '',
+            userQuota: null, addOnQuota: null, orgResourcePackage: null, isQuotaExceeded: null,
+            checkedIn: null, checkinPending: null, checkinNextAt: null,
+            lastCheckin: a.lastCheckin || null,
+            error: fr.error,
+            checkinError: fr.error,
+          });
+          continue;
+        }
+        const acc = fr.account;
+        const q = await session.fetchQuota(acc.accessToken, a.region, { agent });
         // 签到状态走**只读**的 /campaigns（不领取任何东西），与 TRAE 的
         // checkedIn 同一口径。查失败给 null，不猜成「已签」或「未签」。
-        const ck = await session.checkinStatus(raw.accessToken, a.region, { agent });
+        const ck = await session.checkinStatus(acc.accessToken, a.region, { agent });
         rows.push({
           id: a.id,
           nickname: a.nickname || a.uid || `账号 ${a.id}`,
@@ -115,6 +153,9 @@ const routes = [
           /** 上次签到时刻（本地记录；上游不提供） */
           lastCheckin: a.lastCheckin || null,
           error: q.ok ? '' : (q.error || '查询失败'),
+          // 签到状态单独报：额度查得到、签到查不到时，界面不能把两者混成
+          // 一条「查询失败」，否则用户不知道自己点签到到底成没成。
+          checkinError: ck.ok ? '' : (ck.error || '签到状态查询失败'),
         });
       }
       const known = rows.filter((r) => r.addOnQuota || r.userQuota);
@@ -124,11 +165,33 @@ const routes = [
       // 的剩余额可以求和，混进去会让合计看起来像个有限的数字。
       const orgRows = known.filter((r) => r.orgResourcePackage && r.orgResourcePackage.available && !r.orgResourcePackage.unlimited);
       const sumOrg = orgRows.reduce((s, r) => s + (r.orgResourcePackage.remaining || 0), 0);
-      // 即将过期的批次：本地账本，不打上游（数据源见 /grants 的注释）
+      // 即将过期的批次：本地账本 + **先领先扣推算**（2026-11-01 起）。
+      // 「领取额」不随消耗变——上游无逐批余额，一直显示它就是「都用完了
+      // 还挂着」的假数字。总余额（addOnQuota.remaining）是上游权威值，
+      // 按先领先扣分配回批次后，窗口内批次的推算剩余之和才是「快过期
+      // 积分」的真实口径（grants.estimateRemaining）。
       const grants = require('../../qoder/grants');
       const now = Date.now();
       const SOON_MS = 7 * 86400000;
       const expiring = grants.expiring({ withinMs: SOON_MS, now });
+      const allGrants = grants.readAll();
+      // 每账号：未过期批次 ← 该账号 remaining 的推算分配。
+      // 任一账号 remaining 拿不到就整体回落领取额口径（混合口径更误导）。
+      const estByAccount = new Map();
+      let estOk = rows.length > 0;
+      for (const r of rows) {
+        const rem = r.addOnQuota ? r.addOnQuota.remaining : null;
+        if (!Number.isFinite(rem)) { estOk = false; continue; }
+        const bs = allGrants.filter((g) => g.accountId === r.id && g.expiresAt && g.expiresAt > now);
+        estByAccount.set(r.id, grants.estimateRemaining(bs, rem));
+      }
+      const estOf = (g) => {
+        const m = estByAccount.get(g.accountId);
+        const v = m ? m.get(g.grantId) : null;
+        return v != null ? v : 0;
+      };
+      const grantedSum = expiring.reduce((s, r) => s + (r.amount || 0), 0);
+      const estSum = expiring.reduce((s, r) => s + estOf(r), 0);
       return sendJSON(res, 200, {
         count: rows.length,
         rows,
@@ -146,9 +209,13 @@ const routes = [
           orgTotal: Number(sumOrg.toFixed(4)),
           orgUnlimited: known.some((r) => r.orgResourcePackage && r.orgResourcePackage.unlimited),
           exceeded: rows.filter((r) => r.isQuotaExceeded).length,
-          // 7 天内到期且有记录的批次数与**领取额合计**（不是剩余额，见 note）
+          // 7 天内到期批次：expiringAmount = **推算剩余**合计（先领先扣）；
+          // expiringGrantedAmount = 领取额合计（旧口径，仅作对照）。
+          // estimated=false 说明 remaining 拿不到、推不了，回落了领取额。
           expiringCount: expiring.length,
-          expiringAmount: Number(expiring.reduce((s, r) => s + (r.amount || 0), 0).toFixed(4)),
+          expiringAmount: Number((estOk ? estSum : grantedSum).toFixed(4)),
+          expiringEstimated: estOk,
+          expiringGrantedAmount: Number(grantedSum.toFixed(4)),
         },
         // 免费用户实际能用的就是 addOnQuota（签到/赠送）。写清楚避免误读。
         note: 'addOnQuota 是签到/赠送得到的积分（免费用户实际可用）；userQuota 是订阅套餐内的额度（Free 套餐恒为 0）。两者不可相加。',
@@ -208,7 +275,12 @@ const routes = [
           rows.push({ id: a.id, nickname: a.nickname || a.uid || `账号 ${a.id}`, region: a.region, usage: null, error: `出站代理配置错误: ${e.message}` });
           continue;
         }
-        const u = await session.fetchCreditUsage(raw.accessToken, a.region, { agent, force });
+        const fr = await fresh(raw);
+        if (fr.error) {
+          rows.push({ id: a.id, nickname: a.nickname || a.uid || `账号 ${a.id}`, region: a.region, usage: null, error: fr.error });
+          continue;
+        }
+        const u = await session.fetchCreditUsage(fr.account.accessToken, a.region, { agent, force });
         rows.push({
           id: a.id,
           nickname: a.nickname || a.uid || `账号 ${a.id}`,
@@ -345,7 +417,12 @@ const routes = [
           rows.push({ ...base, eligible: null, error: `出站代理配置错误: ${e.message}` });
           continue;
         }
-        const r = await session.fetchProEligibility(raw.accessToken, a.region, { agent });
+        const fr = await fresh(raw);
+        if (fr.error) {
+          rows.push({ ...base, eligible: null, error: fr.error });
+          continue;
+        }
+        const r = await session.fetchProEligibility(fr.account.accessToken, a.region, { agent });
         rows.push({
           ...base,
           // null = 查不出来，不猜成「不能领」
@@ -382,15 +459,20 @@ const routes = [
         try { agent = proxyAgent.getAgentFor(raw); } catch (e) {
           results.push({ ...base, ok: false, error: `出站代理配置错误: ${e.message}` }); continue;
         }
+        // 先换票再动上游：token 过期时资格查询会 401，用户看到的就是
+        // 「查询失败」，而账号本身完全正常。
+        const fr = await fresh(raw);
+        if (fr.error) { results.push({ ...base, ok: false, error: fr.error }); continue; }
+        const acc = fr.account;
         // 先查资格：不可领就不打领取接口（已领过的账号不会有副作用，但少一次请求）
-        const el = await session.fetchProEligibility(raw.accessToken, a.region, { agent });
+        const el = await session.fetchProEligibility(acc.accessToken, a.region, { agent });
         if (!el.ok) { results.push({ ...base, ok: false, error: el.error }); continue; }
         if (!el.eligible) { results.push({ ...base, ok: true, skipped: true, reason: el.gone ? '活动已下线' : '不可领取（可能已领过）' }); continue; }
-        const before = await session.fetchQuota(raw.accessToken, a.region, { agent });
-        const r = await session.claimProBenefit(raw.accessToken, a.region, { agent });
+        const before = await session.fetchQuota(acc.accessToken, a.region, { agent });
+        const r = await session.claimProBenefit(acc.accessToken, a.region, { agent });
         let gained = null;
         if (r.ok && !r.already) {
-          const after = await session.fetchQuota(raw.accessToken, a.region, { agent });
+          const after = await session.fetchQuota(acc.accessToken, a.region, { agent });
           if (before.ok && after.ok && before.addOnQuota && after.addOnQuota) {
             gained = Number((after.addOnQuota.remaining - before.addOnQuota.remaining).toFixed(4));
           }
@@ -414,8 +496,11 @@ const routes = [
     // 唯一带到期信息的是**领取响应本身**（benefit.validity = 30 天 + grantedAt），
     // 所以每次签到落一条本地记录（src/qoder/grants.js），过期信息才不会丢。
     //
-    // **诚实边界**：上游只告诉我们「领了多少」，不告诉我们「这批还剩多少」。
-    // 所以 amount 是**领取额**不是剩余额——界面上必须说清，当成剩余额会高估。
+    // **推算剩余（2026-11-01 起）**：amount 是领取额、不随消耗变——一直
+    // 显示它就是「都用完了还挂着」的假数字。总余额（addOnQuota.remaining）
+    // 是上游权威值，按「先领先扣」分配回批次（grants.estimateRemaining）
+    // 得每批推算剩余。这是推算口径（上游不按批次扣费，先到先用是其标准
+    // 消耗顺序），每行带 estimatedRemaining，推不出的给 null 不编数。
     method: 'GET',
     path: '/grants',
     handler: async ({ req, res }) => {
@@ -426,22 +511,66 @@ const routes = [
       const withinMs = days * 86400000;
       const rows = grants.expiring({ withinMs, now });
       const all = grants.readAll();
-      // 每批补上派生字段（剩余天数 / 是否已过期），前端直接渲染
-      const decorate = (g) => ({
-        grantId: g.grantId,
-        accountId: g.accountId,
-        accountName: g.accountName,
-        campaignKey: g.campaignKey,
-        // **领取额**，不是剩余额（上游不给逐批余额）
-        amount: g.amount,
-        grantedAt: g.grantedAt,
-        expiresAt: g.expiresAt,
-        validityDays: g.validityDays,
-        modelScope: g.modelScope,
-        daysLeft: g.expiresAt ? Math.max(0, Math.ceil((g.expiresAt - now) / 86400000)) : null,
-        expired: !!(g.expiresAt && g.expiresAt <= now),
+      // 窗口内批次涉及的账号各打一次上游拿总余额（单 GET，快）。
+      // 查不到（网络/账号缺失）记 null——该账号批次推不出，如实 null。
+      const proxyAgent = require('../../proxy-agent');
+      const remainingByAccount = new Map();
+      for (const id of new Set(rows.map((g) => g.accountId))) {
+        if (id == null) continue;
+        const raw = authStore.get(id);
+        if (!raw) { remainingByAccount.set(id, null); continue; }
+        try {
+          const agent = proxyAgent.getAgentFor(raw);
+          const fr = await fresh(raw);
+          if (fr.error) { remainingByAccount.set(id, null); continue; }
+          const q = await session.fetchQuota(fr.account.accessToken, raw.region || 'cn', { agent });
+          remainingByAccount.set(id, q.ok && q.addOnQuota ? q.addOnQuota.remaining : null);
+        } catch (e) {
+          remainingByAccount.set(id, null);
+        }
+      }
+      // 每账号做先领先扣分配（只用未过期批次——已过期批次已作废）
+      const estByAccount = new Map();
+      for (const [id, rem] of remainingByAccount) {
+        if (!Number.isFinite(rem)) continue;
+        const bs = all.filter((g) => g.accountId === id && g.expiresAt && g.expiresAt > now);
+        estByAccount.set(id, grants.estimateRemaining(bs, rem));
+      }
+      // 每批补上派生字段（剩余天数 / 是否已过期 / 推算剩余），前端直接渲染
+      const decorate = (g) => {
+        const m = estByAccount.get(g.accountId);
+        const est = m ? m.get(g.grantId) : null;
+        return {
+          grantId: g.grantId,
+          accountId: g.accountId,
+          accountName: g.accountName,
+          campaignKey: g.campaignKey,
+          // **领取额**，不是剩余额（上游不给逐批余额）
+          amount: g.amount,
+          // **推算剩余**（先领先扣模拟）。null = 总余额拿不到/账号不在
+          // 推算范围，不是 0——0 是「按消耗顺序已用完」，两者不能混淆。
+          estimatedRemaining: est != null ? est : null,
+          grantedAt: g.grantedAt,
+          expiresAt: g.expiresAt,
+          validityDays: g.validityDays,
+          modelScope: g.modelScope,
+          daysLeft: g.expiresAt ? Math.max(0, Math.ceil((g.expiresAt - now) / 86400000)) : null,
+          expired: !!(g.expiresAt && g.expiresAt <= now),
+        };
+      };
+      const totalGranted = rows.reduce((s, r) => s + (r.amount || 0), 0);
+      const estOf = (g) => {
+        const m = estByAccount.get(g.accountId);
+        const v = m ? m.get(g.grantId) : null;
+        return v != null ? v : 0;
+      };
+      const totalEst = rows.reduce((s, r) => s + estOf(r), 0);
+      // 推算完整性：窗口内批次是否**全部**拿到了推算值（有账号查询失败时
+      // 整体不可信——部分推算+部分领取额的混合口径比单一口径更误导）
+      const estimated = rows.length > 0 && rows.every((g) => {
+        const m = estByAccount.get(g.accountId);
+        return !!(m && m.get(g.grantId) != null);
       });
-      const totalAmount = rows.reduce((s, r) => s + (r.amount || 0), 0);
       // 覆盖范围：账本从功能启用时开始记，**之前领的批次查不到**（上游无回填接口）。
       // 如实报出起点，否则「账本里没有」会被读成「没有积分」。
       const since = all.length ? Math.min(...all.map((r) => r.ts || r.grantedAt || 0)) : null;
@@ -453,10 +582,14 @@ const routes = [
         total: all.length,
         // 账本最早一条的时刻（null = 账本为空）。界面据此说明覆盖范围。
         since,
-        // 合计是**领取额之和**，不是剩余额。界面必须标注这点。
-        expiringAmount: Number(totalAmount.toFixed(4)),
-        note: 'Qoder 不提供逐批积分余额，这里的「领取额」是该批次**领到的数量**，不是剩余量。'
-          + '实际剩余以额度卡的总余额为准。到期时间来自领取响应（签到后 30 天）。'
+        // 合计是**推算剩余**（先领先扣）；expiringGrantedAmount 保留领取额
+        // 口径做对照。estimated=false 时界面要标「领取额」而不是推算值。
+        expiringAmount: Number(totalEst.toFixed(4)),
+        expiringGrantedAmount: Number(totalGranted.toFixed(4)),
+        estimated,
+        note: '「快过期积分」= 7 天窗口内批次按**先领先扣**模拟分到的余额（总余额来自上游额度接口）。'
+          + '上游不按批次扣费，逐批剩余是推算值不是上游数据；amount（领取额）是该批次领到的数量，仅作对照。'
+          + (estimated ? '' : '（本次有账号总余额查询失败，界面显示的是领取额口径。）')
           + (since ? '' : '账本为空——本功能上线前领的批次无法追溯（上游没有回填接口）。'),
       });
     },

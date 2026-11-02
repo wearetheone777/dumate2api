@@ -102,6 +102,19 @@ const QODER_QUOTA = [
 ];
 
 /**
+ * TRAE 业务码（2026-11-02 实测补充）。3004 的真实文案是**限流**
+ * （"We're sorry, your requests have exceeded the rate limit"）——码表里
+ * 「权益不可用」的旧注释与实测不符（见 upstream-errors.js 的 traeCodeKind）。
+ * 这些码的上游 message 是整段英文，不翻译的话账号卡上读不出重点：
+ * 它不是账号坏了，是瞬时限流/额度状态，稍后自动恢复。
+ */
+const TRAE_ERROR = [
+  [/traework\s+3004\b/i, '上游限流（traework 3004），稍后自动恢复；网关已按软冷却处置并换号重试'],
+  [/traework\s+3003\b/i, 'TRAE 额度/权益不足（traework 3003），换其他账号可用'],
+  [/traework\s+4008\b/i, 'TRAE 额度耗尽（traework 4008，国际版）'],
+];
+
+/**
  * 内容审核拒绝（2026-11-01，判据同 upstream-errors 的 CONTENT_POLICY_TEXT，
  * 词表取自 qoder2api-hub 实测：InternalError.Algo.DataInspectionFailed 家族）。
  * 放在最前判——比网络错误更具体，且这类错误不该被翻译成「上游故障」：
@@ -144,6 +157,11 @@ function explainError(msg) {
   for (const [re, text] of QODER_QUOTA) {
     if (s.includes(text)) continue;
     if (re.test(unescaped)) return `${text}（${s}）`;
+  }
+  // TRAE 业务码：`traework <code>:` 前缀形态（index.js 写入时的样式）。
+  for (const [re, text] of TRAE_ERROR) {
+    if (s.includes(text)) continue;
+    if (re.test(s)) return `${text}（${s}）`;
   }
   for (const [re, text] of NET_ERRORS) {
     if (s.includes(text)) continue;

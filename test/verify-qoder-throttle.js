@@ -462,6 +462,47 @@ check('expiring 为空/null 时无感（普通选号）', () => {
   assert.ok(pool.pick(['qoder:e1', 'qoder:e2'], {}));
 });
 
+// 3f. fefoUidSet 端到端（2026-11-01）：账本字段是 accountId（grants.fromClaim
+// 写入的驼峰命名），曾写成 account_id → find 恒失败 → 集合恒空 → FEFO 从未
+// 生效。用**真实形状**的账本记录回归：字段名再写错，集合恒 null，下面必红。
+console.log('');
+console.log('== 3f. fefoUidSet：从真实账本形状推导临期账号 ==');
+{
+  const tmpData = path.join(os.tmpdir(), `dumate-qoder-fefo-${process.pid}`);
+  fs.rmSync(tmpData, { recursive: true, force: true });
+  const prevData = process.env.DUMATE_ADMIN_DATA;
+  const prevFefoDays = process.env.DUMATE_QODER_FEFO_DAYS;
+  process.env.DUMATE_ADMIN_DATA = tmpData;
+  process.env.DUMATE_QODER_FEFO_DAYS = '3';
+  try {
+    const grants = require('../src/qoder/grants');
+    const now = Date.now();
+    // 901：一条 1 天内到期（进窗口）+ 一条 10 天（窗口外，不参与）
+    // 902：无账本批次 → 即使在 usable 里也不进集合
+    grants.record({ grantId: 'fe1', accountId: 901, amount: 100, grantedAt: now - 29 * 86400000, expiresAt: now + 1 * 86400000, ts: now });
+    grants.record({ grantId: 'fe2', accountId: 901, amount: 100, grantedAt: now, expiresAt: now + 10 * 86400000, ts: now });
+    check('临期批次推导出正确 uid（account_id→accountId 字段名回归）', () => {
+      const set = qoderIndex.fefoUidSet([{ id: 901 }, { id: 902 }]);
+      assert.ok(set, '集合应非空（null = 推导失败，FEFO 退回普通选号）');
+      assert.ok(set.has('qoder:901'), '901 有 1 天内到期批次，应在集合内');
+      assert.ok(!set.has('qoder:902'), '902 账本无批次，不应在集合内');
+    });
+    check('窗口外的批次不参与（临期窗口语义）', () => {
+      // 只有 902 在 usable 且账本无批次 → 集合空 → null（退回普通选号）
+      const set = qoderIndex.fefoUidSet([{ id: 902 }]);
+      assert.strictEqual(set, null);
+    });
+    check('临期号不在 usable 里时自然缺席，不报错', () => {
+      const set = qoderIndex.fefoUidSet([{ id: 902 }]);
+      assert.strictEqual(set, null);
+    });
+  } finally {
+    if (prevData === undefined) delete process.env.DUMATE_ADMIN_DATA; else process.env.DUMATE_ADMIN_DATA = prevData;
+    if (prevFefoDays === undefined) delete process.env.DUMATE_QODER_FEFO_DAYS; else process.env.DUMATE_QODER_FEFO_DAYS = prevFefoDays;
+    fs.rmSync(tmpData, { recursive: true, force: true });
+  }
+}
+
 console.log('');
 console.log('== 4. 通道层：换号 + 下游拿到 429 ==');
 

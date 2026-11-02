@@ -109,6 +109,25 @@
               </div>
             </div>
 
+            <!-- 查询失败要分两条说：额度和签到状态是两次独立请求，
+                 混成一条「查询失败」会让用户不知道自己点的签到到底成没成 -->
+            <a-alert
+              v-if="creditOf(a.id)?.checkinError"
+              type="warning"
+              show-icon
+              class="mt-2"
+              style="padding: 4px 8px"
+              :message="'签到状态查询失败：' + creditOf(a.id)!.checkinError"
+            />
+            <a-alert
+              v-if="creditOf(a.id)?.error"
+              type="warning"
+              show-icon
+              class="mt-2"
+              style="padding: 4px 8px"
+              :message="'额度查询失败：' + creditOf(a.id)!.error"
+            />
+
             <!-- 额度：userQuota（订阅内）与 addOnQuota（签到/赠送）**分开显示**，
                  不能相加——Free 套餐的 userQuota 恒为 0。 -->
             <div v-if="creditOf(a.id)" class="mt-3 grid grid-cols-2 gap-2">
@@ -141,12 +160,14 @@
             <div v-else class="mt-3 text-xs text-slate-500">额度未查询（点「刷新」）</div>
 
             <!-- 该账号的积分到期情况。签到积分**领取后 30 天作废**，
-                 所以这里报最早的到期批次。数据来自本地账本（上游没有逐批余额接口）。 -->
+                 所以这里报最早的到期批次。剩余是**推算值**（先领先扣，
+                 总余额来自上游额度接口）；领取额仅对照。 -->
             <div v-if="grantOf(a.id)" class="mt-2 text-xs">
               <span class="text-slate-500">最早到期：</span>
-              <span :class="grantOf(a.id)!.daysLeft <= 3 ? 'text-red-600' : grantOf(a.id)!.daysLeft <= 7 ? 'text-orange-700' : 'text-slate-400'">
+              <span :class="remainColor(grantOf(a.id)!.expiresAt) === 'red' ? 'text-red-600' : remainColor(grantOf(a.id)!.expiresAt) === 'orange' ? 'text-orange-700' : 'text-slate-400'">
                 {{ new Date(grantOf(a.id)!.expiresAt).toLocaleDateString('zh-CN') }}
-                （剩 {{ grantOf(a.id)!.daysLeft }} 天，领取额 {{ fmtQ(grantOf(a.id)!.amount) }}）
+                （{{ remainText(grantOf(a.id)!.expiresAt) }}，推算剩余
+                {{ grantOf(a.id)!.estimatedRemaining == null ? '—' : fmtQ(grantOf(a.id)!.estimatedRemaining) }}）
               </span>
             </div>
             <div v-else-if="creditOf(a.id) && (creditOf(a.id)!.addOnQuota?.remaining ?? 0) > 0" class="mt-2 text-xs text-slate-500">
@@ -246,6 +267,7 @@ import { channelStore, isQoder } from '@/stores/channel'
 import { qoderApi } from '@/api/qoder'
 import type { QoderAccount, QoderCreditRow, QoderGrant } from '@/api/qoder'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
+import { remainText, remainColor } from '@/utils/remain'
 
 // message 走 App.useApp() 的实例，App.vue 已包 <a-app>（静态 import 会拿不到上下文主题）
 const { message } = App.useApp()
@@ -271,13 +293,13 @@ const subText = computed(() => 'Qoder 多账号池（凭证自持，device flow 
 const creditOf = (id: number) => credits.value.find((c) => c.id === id) || null
 // 该账号**最早到期**的批次。签到积分领取后 30 天作废，所以「最早到期」才是
 // 需要提醒的那个——给全部批次会淹没在列表里。
-// 数据来自本地账本（/qoder/grants），上游没有逐批余额接口。
+// 数据来自本地账本 + 上游总余额的先领先扣推算（/qoder/grants）。
 // 返回归一化对象（daysLeft 保证是数字），避免模板里到处判 null。
-const grantOf = (id: number): { daysLeft: number; expiresAt: number; amount: number | null } | null => {
+const grantOf = (id: number): { daysLeft: number; expiresAt: number; amount: number | null; estimatedRemaining: number | null } | null => {
   const list = grants.value.filter((g) => g.accountId === id)
   if (!list.length) return null
   const g = list.reduce((m, x) => (x.expiresAt < m.expiresAt ? x : m), list[0])
-  return { daysLeft: g.daysLeft ?? 0, expiresAt: g.expiresAt, amount: g.amount }
+  return { daysLeft: g.daysLeft ?? 0, expiresAt: g.expiresAt, amount: g.amount, estimatedRemaining: g.estimatedRemaining }
 }
 const fmtQ = (n: number | null | undefined) =>
   n == null ? '—' : n.toLocaleString('zh-CN', { maximumFractionDigits: 4 })
@@ -446,13 +468,20 @@ async function checkinOne(a: QoderAccount) {
   try {
     const { data } = await qoderApi.checkin(a.id)
     const r = (data.results || [])[0] || {}
-    // 报**实际到账差值**，不是总额——上游从不直接告诉发了多少
-    if (r.gained != null) {
+    const name = a.nickname || a.id
+    // 只有 ok === true 才算签到完成。早先不看 ok，token 过期的 401 也被
+    // 报成「签到完成」——用户因此完全无法判断到底成没成。
+    if (r.ok === false) {
+      message.error(`${name} 签到失败：${r.error || '未知错误'}`)
+    } else if (r.gained != null) {
+      // 报**实际到账差值**，不是总额——上游从不直接告诉发了多少
       message.success(r.gained > 0
-        ? `${a.nickname || a.id} 签到到账 ${r.gained} credits`
-        : `${a.nickname || a.id} 今日已签到（到账 0）`)
+        ? `${name} 签到到账 ${r.gained} credits`
+        : `${name} 今日已签到（到账 0）`)
+    } else if (r.alreadyChecked) {
+      message.info(`${name} 今日已签到`)
     } else {
-      message.info(`${a.nickname || a.id} 签到完成`)
+      message.info(`${name} 签到完成（上游未回报到账数量）`)
     }
     await load()
   } catch (e: any) {
@@ -486,9 +515,18 @@ async function checkinAll() {
   checkinLoading.value = true
   try {
     const { data } = await qoderApi.checkin()
-    const results = (data.results || []) as Array<{ nickname: string; gained?: number; ok?: boolean }>
+    const results = (data.results || []) as Array<{ nickname: string; ok?: boolean; gained?: number; error?: string }>
+    const failed = results.filter((r) => r.ok === false)
     const total = results.reduce((s, r) => s + (r.gained || 0), 0)
-    message.success(`签到完成：${results.length} 个账号，合计到账 ${total.toFixed(4)} credits`)
+    // 部分失败也必须说出来：一律报 success 会把失败账号藏在成功里
+    if (failed.length) {
+      message.warning(
+        `签到完成：成功 ${results.length - failed.length}/${results.length}，合计到账 ${total.toFixed(4)} credits；` +
+        `${failed[0].nickname || ''} ${failed[0].error || '失败'}`,
+      )
+    } else {
+      message.success(`签到完成：${results.length} 个账号，合计到账 ${total.toFixed(4)} credits`)
+    }
     await load()
   } catch (e: any) {
     message.error(e?.response?.data?.error || '签到失败')

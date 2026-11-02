@@ -124,6 +124,85 @@ check('正好到期的边界：<= now 算已过期', () => {
 });
 
 console.log('');
+console.log('== estimateRemaining：先领先扣推算（真实快过期口径的数据源） ==');
+// 分配规则：从最新批次往回分 remaining，每批最多拿满领取额，分完为止。
+// 这对应上游「先到先用」的消耗顺序（老批次先扣，余额留在最新批次上）。
+// grantedAt 按「30 天有效期、越早领的越早到期」派生——排序键是 grantedAt，
+// 全部相同会让「谁新谁老」无从判断。
+const batch = (id, daysFromNow, amount) => ({
+  grantId: id, accountId: 1, amount,
+  grantedAt: NOW - (30 - daysFromNow) * 86400000,
+  expiresAt: NOW + daysFromNow * 86400000, ts: NOW,
+});
+
+check('老批次先扣完：余额全留在最新批次上', () => {
+  // 总发放 300、余额 150 ⇒ 消耗了 150，先领先扣吃掉 old(100)+mid(50)
+  const bs = [batch('old', 1, 100), batch('mid', 5, 100), batch('new', 20, 100)];
+  const est = grants.estimateRemaining(bs, 150);
+  assert.strictEqual(est.get('old'), 0, '最老的批次应被消耗光');
+  assert.strictEqual(est.get('mid'), 50, '中间批次被吃掉一半');
+  assert.strictEqual(est.get('new'), 100, '最新批次持满');
+  assert.strictEqual(est.get('old') + est.get('mid') + est.get('new'), 150, '合计 = 总余额');
+});
+
+check('余额充足时每批都拿满领取额', () => {
+  const bs = [batch('x', 2, 100), batch('y', 10, 200)];
+  const est = grants.estimateRemaining(bs, 1000);
+  assert.strictEqual(est.get('x'), 100);
+  assert.strictEqual(est.get('y'), 200);
+});
+
+check('余额为 0 → 全部批次推算剩余 0（都用完了）', () => {
+  const est = grants.estimateRemaining([batch('a', 1, 100), batch('b', 9, 100)], 0);
+  assert.strictEqual(est.get('a'), 0);
+  assert.strictEqual(est.get('b'), 0);
+});
+
+check('amount=null 的批次按 0 参与（领取额未知，不凭空持有余额）', () => {
+  const bs = [batch('n', 2, null), batch('m', 9, 100)];
+  const est = grants.estimateRemaining(bs, 50);
+  assert.strictEqual(est.get('n'), 0);
+  assert.strictEqual(est.get('m'), 50);
+});
+
+check('remaining 缺失/非法（null/负数）→ 全 0，不编数', () => {
+  for (const rem of [null, -5, NaN, undefined]) {
+    const est = grants.estimateRemaining([batch('a', 1, 100)], rem);
+    assert.strictEqual(est.get('a'), 0, `remaining=${rem} 应得 0`);
+  }
+});
+
+check('输入顺序无关（内部按 grantedAt 新→老排序）', () => {
+  const bs = [batch('new', 20, 100), batch('old', 1, 100), batch('mid', 5, 100)];
+  const est = grants.estimateRemaining(bs, 150);
+  assert.strictEqual(est.get('old'), 0);
+  assert.strictEqual(est.get('mid'), 50);
+  assert.strictEqual(est.get('new'), 100);
+});
+
+check('返回 Map，不改动输入批次对象', () => {
+  const bs = [batch('a', 3, 100)];
+  const before = JSON.stringify(bs);
+  grants.estimateRemaining(bs, 30);
+  assert.strictEqual(JSON.stringify(bs), before, '纯函数不改输入');
+});
+
+check('端到端口径：复现 2026-11-01 真实场景，老批次推 0、快过期合计如实为 0', () => {
+  // 10-02 领的 100（1 天后到期）早已被消耗吃掉，总余额由最新批次持有——
+  // 快过期合计必须如实为 0，而不是「领取额 100」一直挂着。
+  const bs = [
+    batch('oct02', 1, 100), batch('m1', 5, 100), batch('m2', 10, 100),
+    batch('m3', 15, 100), batch('m4', 20, 100), batch('nov01', 30, 100),
+  ];
+  const est = grants.estimateRemaining(bs, 250);
+  const soon = bs.filter((b) => b.expiresAt - NOW <= 7 * 86400000);
+  const sum = soon.reduce((s, b) => s + (est.get(b.grantId) || 0), 0);
+  assert.strictEqual(sum, 0, '快过期的老批次已按消耗顺序用完');
+  assert.strictEqual(est.get('m3'), 50, '消耗停在中段批次（250 = 100×2 + 50）');
+  assert.strictEqual(est.get('nov01'), 100, '最新批次持满');
+});
+
+console.log('');
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (e) {}
 if (failures) { console.log(`${failures} 项失败`); process.exit(1); }
 console.log('全部通过');
