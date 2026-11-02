@@ -71,10 +71,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 账本从功能启用时开始记，界面要如实标出覆盖范围（`/grants` 的 `since` 字段），
 否则「账本里没有」会被读成「没有积分」。
 
-**「领取额」不是「剩余额」**——这是本通道的数据缺口，必须如实标注。上游只告诉
-我们这批领了多少，不告诉我们还剩多少。千问（每包有独立余额）与 TRAE（每包有
-`remain`）都没有这个问题，**不要照搬它们的措辞**。界面一律写「领取额」，
-并注明「实际剩余以额度卡总余额为准」。
+**「领取额」不是「剩余额」，但界面显示的是**推算剩余**（2026-11-01 改口径）**。
+上游只告诉我们这批领了多少，不告诉我们还剩多少（千问每包有独立余额、TRAE 每包有
+`remain`，都没有这个问题，**不要照搬它们的措辞**）。领取额不随消耗变——一直显示它
+就是「都用完了还挂着」的假数字（用户实测被误导：10-02 领的 100 早已用完，界面还挂着
+「快过期 100」）。改法：`grants.estimateRemaining(batches, remaining)` 按**先领先扣**
+把上游权威总余额（addOnQuota.remaining）从最新批次往回分配（与「30 天作废」产品
+设计和 FEFO 消耗顺序一致），得每批推算剩余；`/qoder/credits` 与 `/qoder/grants` 的
+`expiringAmount` 由此而来，领取额保留在 `expiringGrantedAmount` / 行内 `amount`
+仅作对照。推算是**模拟口径**（上游按总池扣费不按批次扣），每行带
+`estimatedRemaining`，推不出（余额查询失败）给 null 不编数；任一账号余额拿不到时
+整体回落领取额口径并标 `estimated/expiringEstimated=false`。amount=null 的批次按 0
+参与分配（领取额未知，不凭空持有余额）。
 
 **签到积分领取后 30 天作废，每日 10:00 (UTC+8) 刷新**——注意**不是 00:00**
 （千问是 00:00 重置，两者不同）。`/qoder/grants` 与仪表盘的过期明细按此展示。
@@ -299,6 +307,34 @@ e2e 用例与 rr 游标位置无关——轮转两轮、A 起手轮才断言）+
    `expiring` 过滤——集合非空时候选**限制**在临期账号内；临期号不健康时池自动
    退回全量候选。已知缺口如实存在：领取额≠剩余额，FEFO 可能把流量打向已花完
    的号——代价只是一次快速失败 + 换号，比让积分作废划算。
+   **2026-11-01 修：FEFO 自落地起从未生效**——`fefoUidSet` 里读的是
+   `g.account_id`，而账本写入的字段是 `accountId`（grants.fromClaim 的驼峰
+   命名），`usable.find` 恒失败 → 集合恒空 → 恒返回 null → 流量一直是普通
+   轮询，临期批次从未被优先消耗。测试此前只覆盖了池层的 expiring 过滤
+   （直接传构造的 Set），没有从账本推导这步——现在 `fefoUidSet` 已导出，
+   verify-qoder-throttle.js 的 3f 节用真实形状账本回归（字段名再写错必红）。
+   **三家通道的 FEFO（2026-11-01，`src/expiring.js`）**：搭子/TRAE/千问的临期数据
+   只能打上游才有，而选号在请求热路径上——所以不现查，改用**落盘快照**
+   `data/expiring-snapshot.json`：管理端三处刷新（`/web-accounts`、`/credits`、
+   `/accounts`）本就在拉这些数据，顺手 `update(channel, entries)` 落盘；网关三处
+   选号（`web-pool.pick`、`qwenwork/index.js` 与 `traework/index.js` 的 `fefoUidSet`）
+   只读文件、零上游调用。四条口径：
+   - **陈旧退回普通轮询，不报错**：快照缺失/超 TTL（默认 6h）时 `accountIds` 返回
+     null，上层不传 expiring——行为退回加这功能之前，可用性不依赖快照。
+   - **窗口按通道不同**（`DUMATE_{DUMATE,TRAEWORK,QWENWORK}_FEFO_DAYS`，`0` 关）：
+     搭子 30 天（额度包天然落在 25~30 天区间，窗口小了会恒空）、TRAE 7 天（与管理端
+     `/credits` 的 `SOON_MS` 同窗）、千问 30 天兜底（上游 `expiring_soon` 本身即信号）。
+   - **「查不到」≠「没有临期」**：本轮查询失败的账号走 `update` 的 `keepIds` 保留旧条目，
+     且 `at` 不推进（部分旧数据不能让快照冒充新鲜）。写空会在一次网络抖动后把临期
+     账号忘干净。
+   - **id 形式两族不同**（易错点）：channel-pool 的键位是 `${channel}:${id}`，千问/TRAE
+     的 `fefoUidSet` 要经 `uidOf` 转换；搭子 web-pool 直接给 `pool.pick` 数字 id，快照的
+     字符串 id 需 `map(Number)`——形式错了 `has` 恒 false，就是 Qoder 字段名 bug 的复刻。
+   离线验证：`node --test test/unit/expiring-fefo.test.js`（14 项：写读形状咬合、窗口、
+   TTL、通道隔离、keepIds、at 不推进）+ `node test/verify-expiring-fefo.js`（7 项端到端：
+   喂真实形状快照调**通道自己的** `fefoUidSet`，uid 前缀/id 形式写错当场红——
+   这是 3f 教训的应用：内部推导不导出就等于没测到）。三个管理端响应新增 `fefo` 字段
+   （`info()` 的新鲜度），FEFO 没生效要能在管理端看出来而不是静默退化。
 4. **流式 `: ping` 保活帧**（server.js 直连通道流式桥）：上游首字实测可长达
    40~70 秒（高思考档位 + 长上下文），期间 Codex / Claude Code 或中间代理会
    因空闲超时断连。每 5s 写一个 SSE 注释帧——三套翻译器与 OpenAI 直通都按
@@ -737,6 +773,52 @@ Qoder P1 的思考档位透传想同样接到 TRAE，实测（11 次真实请求
 CustomModel 声明决定」自洽。想提升推理深度只能靠提示词。**与千问通道「调参数无效」
 同款结论**（见下文「is_reasoning 是硬编码的 false」），Qoder 是四条通道里唯一支持
 请求级档位的。
+
+**TRAE 宝已接入（2026-11-03，`traebao/` 前缀，不是第五个通道）。**
+「TRAE 宝」是官方 2026-10-20（v3.4.5）上线的开发者个人助理（桌面悬浮球），
+官方 11 月活动**用它问答/下达任务全部不消耗积分**。接入方式对齐 `qianfan/`
+模式：`traebao/auto` 与 `traebao/deepseek-v4.1-flash` 路由到 **traework 通道**
+（同账号池、同 Cloud-IDE-JWT 凭证、同后端网关），只换对话身份
+`function=personal_assistant`（TRAE 宝）。四条实测定案：
+
+1. **免费豁免绑定在 function 上**（对照实验，同一账号同一请求）：
+   `personal_assistant` 消耗 0 credits、`solo_agent_lite` 0.05。OAuth 自取
+   账号同样享受（快照前后 consumed 不变）。活动期后豁免是否延续未知，
+   `traework-credits.jsonl` 照记，豁免消失会自动体现在 credits 里。
+2. **明文链路，不碰 agent/v3 加密**。TRAE 客户端对 agent/v3 的
+   create_agent_task 等走 aha 桥接 AES-GCM 加密（请求密文、响应明文 SSE），
+   但 `llm_utils_chat` 明文即可——body 必带 `app_id`（UUID）与
+   `app_version_code`（数字），缺哪个服务端按序报
+   `expr_path=<字段> missing required parameter`；带了
+   `x-bridge-transport: aha` 头反而触发服务端解密路径（`base64 decode failed`）。
+3. **模型白名单只有一个**：2026-11-03 对 20 个 remote 模型逐个实测，
+   persona 身份下只有 `deepseek-v4.1-flash` 可通（其余全部上游 4001），
+   与抓包一致（TRAE 宝的 model_config 事件就是 `deepseek-v4.1-flash__dev`）。
+   白名单前置校验在 send()（`traebao/` + 其它模型 → 400 明确报错），
+   `/v1/models` 只透 `traebao/auto` + `traebao/deepseek-v4.1-flash` 两条。
+4. **上下文窗口实测 1M，auto 与显式模型一致**（2026-11-03，逐级加压）：
+   1,021,270 token 通过（auto 与显式各验一次）、~1,080,000 token 拒
+   **4026** `context length has exceeded the maximum limit`（确定性请求
+   错误，已在 traeCodeKind 不惩罚清单）。边界区间 [1.02M, 1.08M] 与模型表
+   标称 1,048,576 吻合。**抓包 model_config 的 `prompt_max_tokens:168000`
+   不是输入硬限**——那只是自动档的会话预算参数（服务端内部处理/压缩
+   预算），别把它当窗口配给客户端；cc-switch 按 1M 配
+   （`model_context_window: 1000000` + `model_auto_compact_token_limit: 900000`）。
+5. **身份标记经 opts 传**：网关侧 `reqBody.model = route.model` 把前缀剥掉，
+   send() 靠 payload.model 认不出身份——`handleDirectChannel` 把
+   `route.personalAssistant` 放进 providerOpts；模块直调（不带网关）则靠
+   payload.model 前缀识别。两条来源都接。
+
+**逐轮账单的会话键是主动生成的 session_id**（ObjectId 形状）：persona 的
+buildBody 生成并记录到 `meta.sessionId`，上游按它记账，
+`get_session_usage` 查它返回真实 credits（**与 solo_work_lite 不同**——
+那条链路不传 session_id，上游自分配的查出来是全零骨架，见
+`chat.turnIdOf` 注释）。例外：**OAuth 自取账号打 commercial 域 401**（code
+1001，token 签发体系不被 commercial 域认）——计费自检探针 best-effort
+退回 consumed 差值口径，不阻塞主链路；客户端解密账号（bluechonk
+byteCrypto → storage.json）则精确口径可用。离线验证：
+`node --test test/unit/router-traebao.test.js`（4 项）；真机：四入口冒烟
+（OpenAI/Anthropic/流式/白名单 400）全过。
 
 **TRAE Remote 链路已通（2026-11-01，P2-16 最小版，默认关）。**
 `DUMATE_TRAEWORK_REMOTE=1` 时 **auto 档纯文本请求**走 remote
@@ -1687,7 +1769,7 @@ per-key 限流（低价值场景）。
 | `DUMATE_QWENWORK_USE_WASM` | 未设（本地签名） | 设 `1` 切回官方 wasm 签名（本地签名被上游拒时的退路；需要装千问办公客户端） |
 | `DUMATE_QWENWORK_INSTALL` | 自动探测 | 千问办公安装根（**仅 wasm 模式用**；wasm 探测失败时手动指定） |
 | `CB_QWENWORK_WASM` | 自动探测 | 直接指定 `qoder_auth_wasm_bg.wasm` 的完整路径（**仅 wasm 模式用**） |
-| `DUMATE_QWENWORK_DAILY_CREDITS` | `100` | 千问每日免费额度的**配置兜底下限**（接口不返回上限，只作推断的下界） |
+| ~~`DUMATE_QWENWORK_DAILY_CREDITS`~~ | 已停用 | 千问每日免费额度的配置兜底。**2026-11-01 起上游不再发放每日额度**（实测 `daily_credits` 恒 0），整套「观测峰值 + 配置兜底推断上限」已删除，该变量不再被读取 |
 | `DUMATE_QWENWORK_MIN_MAX_TOKENS` | `16384` | 千问输出预算下限（与搭子的 `DUMATE_MIN_MAX_TOKENS` 分开） |
 | `DUMATE_QWENWORK_DEFAULT_MAX_TOKENS` | `131072` | 千问**默认**输出预算（客户端未给 `max_tokens` 时；搭子用 `DEFAULT_BUDGET=32768`，但会被 FLOOR 抬到 65536——**下限优先于默认值**）。取上游上限，见上文实测 |
 | `DUMATE_QWENWORK_AGENT_DISCIPLINE` | 未设（注入） | 设 `0` 关闭「执行纪律」注入（见上文「千问通道必须给带工具的请求注入执行纪律」） |
@@ -1712,6 +1794,7 @@ per-key 限流（低价值场景）。
 | `DUMATE_QODER_OS_HEADERS` | 未设（发送） | 设 `0` 关闭 `cosy-machineos` / `cosy-machinehostname` 两个身份头（见上文 2026-10-30 段） |
 | `DUMATE_QODER_INTL_GATEWAY` | 未设（候选链） | 钉死国际版推理主机（替代 api3→api2→api1 候选链）。上游服务端「选举」导流端点时用它 |
 | `DUMATE_QODER_FEFO_DAYS` | `3` | FEFO 选号的临期窗口（天）：账号有 N 天内到期的积分批次时优先接流量。`0` 关闭 |
+| `DUMATE_DUMATE_FEFO_DAYS` / `DUMATE_TRAEWORK_FEFO_DAYS` / `DUMATE_QWENWORK_FEFO_DAYS` | `30` / `7` / `30` | 另外三条通道的 FEFO 窗口（天），`0` 关闭。数据源是管理端刷新的临期快照 `data/expiring-snapshot.json`（`DUMATE_EXPIRING_SNAPSHOT_TTL_MS` 默认 6 小时陈旧退回普通轮询；`DUMATE_EXPIRING_SNAPSHOT_FILE` 改路径，测试用） |
 | `DUMATE_QODER_QUEUE_POLL` | 未设（开启） | 设 `0` 关闭官方排队轮询协议（信封型限流按 `retryAfterSeconds` 睡眠后重发 + queue/status 放行信号），回到纯快速轮询（429 交还客户端） |
 | `DUMATE_QODER_QUEUE_POLL_BUDGET_MS` | `60000` | 排队等待的**整次请求**预算（ms，所有账号共享）。耗尽后 throttle 错误按旧路交回（429） |
 | `DUMATE_QODER_QUEUE_POLL_INTERVAL_MS` | 按 `retryAfterSeconds`（夹 [5s, 20s]） | 每轮排队等待的睡眠时长。仅供测试注入短间隔，生产别调小——上游明说的等待要尊重 |
@@ -1754,10 +1837,11 @@ per-key 限流（低价值场景）。
 | `task-runs.jsonl` / `task-scheduler.json` | 任务执行历史 / 轮询配置 |
 | `auto-checkin.json` | 自动签到配置 |
 | `qwenwork-credits.jsonl` | 千问积分归因（每请求一条，带 `req_id` 与请求日志配对） |
-| `qwenwork-daypeak.json` | 千问每日额度的观测峰值，用于推断「每日上限」 |
+| `qwenwork-daypeak.json` | 千问每日额度观测峰值的**历史遗留文件**（用于推断「每日上限」）。2026-11-02 起不再读写——上游已停发每日额度，峰值法的前提不成立。文件可安全删除 |
 | `qwenwork-accounts.json` | 千问自持凭证账号池（**含 refresh token，等同密码**） |
 | `qoder-accounts.json` | Qoder 自持凭证账号池（device flow 换取，含 refresh token） |
 | `qoder-grants.jsonl` | Qoder 积分批次账本（**签到领取记录**，用于过期提醒；上游无逐批余额接口） |
+| `expiring-snapshot.json` | 三家通道（搭子/TRAE/千问）的临期积分快照：管理端 /credits 顺带写、网关选号读（FEFO）。陈旧即退回普通轮询，进程间靠它通信，不通过 IPC（`src/expiring.js`） |
 | `dumate-caps.json` | 搭子按模型 max_tokens 上限的自学习记录（7 天 TTL，`src/dumate-caps.js`；静态实测表在代码里） |
 | `traework-accounts.json` | TRAE 自持凭证账号池（OAuth 换取，含轮换的 refreshToken） |
 | `traework-credits.jsonl` | TRAE 逐请求积分归因（按账号的 consumed 游标，见 `traework/credits.js`） |
@@ -1856,28 +1940,29 @@ Vue 3 + Vite + ant-design-vue 4 + Tailwind + ECharts（按需引入，不用全�
 
 **各页面必须 `watch` 通道变化并重新拉数据**，不能只在 `onMounted` 读一次——否则顶栏切了、页面还是旧通道的内容。两个数据源结构不同的页面（登录态、积分明细、账号管理、模型管理、API Key）用 `v-if="isQw"` / `<template v-else>` 分开两套模板，共用同一个路由；只差筛选条件的页面（用量统计、请求日志、聊天测试台）同一套模板，只换请求参数。
 
-**千问办公的账与搭子完全不同，界面必须分开显示**：搭子靠上游账单 + 余额游标（`points-cursor.js`），千问是三个积分池（`daily` 免费 / `monthly` 订阅 / `longterm` 充值）按 `req_id` 归因。两边数字**不能相加**。千问的「每日上限」接口不返回，由「观测峰值 + 配置兜底」推断（`credits.js` 的 `dailyUsageFromBalance`），界面要标出 `limitSource` 是 `observed` 还是 `config-lower-bound`。
+**千问办公的账与搭子完全不同，界面必须分开显示**：搭子靠上游账单 + 余额游标（`points-cursor.js`），千问是三个积分池按 `req_id` 归因。两边数字**不能相加**。
 
-**千问的每日额度是账号级的，池子卡的余额与分母都必须是全账号合计**（2026-09-30 修）。用户报「两个账号每日额度应该是 200，今天都还没用」——根因是 `/api/admin/qwenwork/credits` 只读**主账号**（`authStore.preferred()`），池子卡显示单个账号的 100；而同一页顶部「积分余额」卡读 `/accounts` 的 `summary.pointsTotal`，**本来就是全账号合计** = 200。同页两个数字口径不同，被读成「少算了一个账号」。
+**千问的积分体系 2026-11-01 变过一次，代码与界面都已按新体系重写**（当天实测：`daily_credits.total_balance` 两个账号都恒为 0，`monthly_credits` 从 0 变成 100 左右、`active_wallets` 只剩一条且 `valid_to = 2026-12-01`；归因账本一致——11-01 起每条请求 `free=0`、`paid>0`，10-31 之前大量 `free>0`）：
 
-三条不变量，改动时别破坏：
+| 池子 | 现状 | 界面口径 |
+|---|---|---|
+| `daily_credits` | **上游已停止发放**，恒 0 | **已从接口与界面整体移除**（用户 2026-11-02 明确要求「可以删除，不要再显示」）。留一张永远显示 0 的卡会被读成「今天用光了」，进而被当故障排查 |
+| `monthly_credits` | **唯一有余额的池**，Free 号月初刷新（`active_wallet` 的 `valid_to`，实测 12-01） | 「月度额度 · 按有效期（N 月 N 日刷新）」 |
+| `longterm_credits` | 充值/赠送，按有效期 | 「长期积分」 |
 
-- **分子与分母同口径**。每个账号各有一份每日免费额度（各自 00:00 重置），所以池子卡的余额是合计、分母也必须是合计（`dailyCap = 单账号上限 × 账号数`）。只把分子改成合计会得到「200 / 100」这种读不出来的数。
-- **`/credits` 与 `/accounts` 的账号范围必须同源**（都走 `authStore.list()` 全量，不只 `usable`），否则「顶部合计」与「池子合计」还是会差。余额查询失败的账号不计入合计，但必须在 `failedAccounts` 里如实报出——否则部分和被读成全量。
-- **两个分母分开给**：`dailyCap`（合计，池子卡用）与 `dailyCapPerAccount`（单账号，账号健康快照每张卡用）。账号快照问的是「这一个号今天还能用多少」，那里**不能**用合计分母。
+`/credits` 的 `wallets` 数组现在只有两项（monthly / longterm）；`today` 只有 `total` 与 `requests`（不再拆 `free`/`paid`）；`/credits/records` 只有 `total`（不再透出 `free`/`paid`/`pool`）；`/credits/daily` 只有 `total`（图上一条线）。归因账本 `qwenwork-credits.jsonl` 里 `free`/`paid`/`pool` **仍然照写**——那是历史与当时的事实，只是不再对外透出。
 
-每个账号的 `limit`/`freeUsed` 仍按**各自**的观测峰值算（峰值文件按账号分桶），再相加；只要有一个账号没校准，`freeUsed` 整体给 `null`——部分求和会低估消耗，比不给数字更容易被误读。聚合值统一 4 位小数（与归因记录口径一致），否则浮点累加会外传 `199.99349999999998` 这种噪声。离线验证：`node test/verify-qwen-daily-aggregate.js`。
+随之**整体删除**的东西（别再翻出来做）：`credits.dailyUsageFromBalance` 的观测峰值推断、`DUMATE_QWENWORK_DAILY_CREDITS`、`data/qwenwork-daypeak.json` 的读写、响应里的 `limit` / `limitSource` / `peak` / `calibrated` / `freeUsed` / `dailyCap` / `dailyCapPerAccount` / `daily` / `free`，以及界面上的「每日额度 x / 100」「今日已用 N / 上限」「免费/付费」两列。「今日全部消耗（含客户端内对话）」也一并删除——它靠「上限 − 余额」，没有上限就推不出来，**宁可不出这个数也不编**。
 
-**每日额度是「每天 00:00 自动重置」，不需要当天先使用一次**（2026-09-30 实测确认）。重置时刻就是 wallet 的 `valid_to`（`2026-10-01T00:00:00+08:00`）。证据：账号 2 当天**零请求**，前一日收尾 `4.9657`，次日读到满额 `100`——中间没有任何请求。所以「必须先跑一次才刷新」这个说法不成立。
+现在**唯一有实测依据的消耗口径是「经本网关」**（`today`，按 `req_id` 逐条前后余额差值）。界面上要写清「客户端/网页里直接对话的消耗不经过本网关，这里看不到」。
 
-但用户看到的那个「0」是**真实存在**的，成因不是「没刷新」，而是 `/user/wallets` 偶尔返回坏读——它会把**每日免费额度读成 0**（付费池仍准确）。`fetchWallets` 现在有两层纠错：
+**余额未知（`null`）不等于 0，这是改版后最容易写错的一条**。`fetchWallets` 在「三池全 0 且重试也没恢复」时会去打 `account-context` 的 `quota.remaining`（权威总数），校正成功后 `daily/monthly/longterm` 一律 `null`、`total` 用权威值、标 `misread` + `poolsUnknown`——`remaining` 分不出池子分配，硬拆回某个池就是编数字（旧实现正是这么做的，daily 版）。聚合时 `(a.total || 0)` 或 `n(null)=0` 会把「不知道」写成「没有」，所以合计只累加已知值，并给 `partial` / `totalKnown` 让「部分和」看得见。
 
-1. **重试一次**（针对「三池全 0 + `active_wallets` 空」这种最明显的形态）：重试即恢复 → 用重试结果（瞬时抖动，不标任何标记）。
-2. **交叉验证**（2026-10-02 加，针对重试也没恢复、以及更隐蔽的形态）：只要 `daily` 读数为 0，就去 gateway 的 `account-context` 取 `quota.remaining`。它是**权威口径**且**恰好等于三池之和**（实测 `100 + (−4.8222) = 95.1778`），所以 `daily = remaining − monthly − longterm` 能还原出真实的每日额度。还原出的 daily > 0.005 就采用并标 `dailyCorrected: true`（经 `correctedAccounts` 汇总到界面，显示「已校正」而非「已用尽」）。
+**交叉验证的触发条件也从「daily 读数为 0」改成「三池全 0」**：daily 现在常态就是 0，按旧条件每次余额查询都会多打一次 `account-context`（把每条请求的归因从 2 次上游调用放大成 3 次），而它想救的「daily 被谎报成 0」已经不存在了。
 
-**为什么触发条件从 `allZero` 放宽到「daily 读数为 0」**：账号 2 的坏读形态是「`daily=0` 但 `longterm` 为负」，三池不全是 0，**根本不进 `allZero` 分支**，却同样把每日额度显示成了 0——用户 2026-10-02 报的正是这个（界面显示「每日额度 0.00 积分」，而 `account-context` 报 `remaining=95.1778`）。只看 `allZero` 会漏掉它。
+**`/credits` 与 `/accounts` 的账号范围必须同源**（都走 `authStore.list()` 全量，不只 `usable`），否则「顶部合计」与「池子合计」还是会差。余额查询失败的账号不计入合计，但必须在 `failedAccounts` 里如实报出——否则部分和被读成全量。聚合值统一 4 位小数（与归因记录口径一致），否则浮点累加会外传 `90.11019999999999` 这种噪声。离线验证：`node test/verify-qwen-daily-aggregate.js`（含「余额未知不参与求和」「坏读校正的账号池子 null 但 total 可信」两类）。
 
-**不能一律把 0 当读失败**：真·额度耗尽时三池确实都是 0，那时显示 0 是**正确的**（历史上 95 条 `daily=0` 全部伴随付费池 >0，即免费扣完转扣付费）。判据是「还原出的 daily > 0.005」——真耗尽时 `remaining` 也≈0，差值不 > 0.005，于是不校正、如实报 0 + `retried`。**不要**改成「读数为 0 就报错」或「读数为 0 就沿用旧值」，前者会掩盖真实耗尽，后者会长期显示过期数字。`account-context` 取不到（网络错/结构变了）时也不校正，回落成「如实报 0 + `retried`」，不编数字。离线验证：`node test/verify-qwen-wallets-zero.js`（含「谎报 0 被校正」「付费池为负时还原」「真耗尽不误判」「account-context 取不到则回落」四类）。
+**FEFO 的临期数据只认 `expiring_soon`，不要把 `active_wallets` 的 `valid_to` 当临期**：后者是月度额度的**刷新点**（实测 12-01，两账号一致），不是「会作废」。拿它当临期会让 FEFO 常驻开启、天天把流量钉在同几个账号上（`admin/routes/qwenwork.js` 的 `expiringSnap.update` 只喂 `expiringSoon.count > 0` 的账号）。
 
 **模型管理页的三条通道共用一套骨架，但账各自独立**（2026-09-29 对齐）。页面结构固定为「通道元信息行 → 模型信息表 → 该通道的额度卡 → 通道专有区块」：
 
