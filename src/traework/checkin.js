@@ -43,6 +43,27 @@ function agentOf(auth) {
   return require('../proxy-agent').getAgentFor(auth);
 }
 
+// 额度/付费状态的主机与路径按区域走（2026-11-03 国际版接入，证据见
+// constants.js 的国际版段与 hub fetch_entitlement）：国内 ug 族 v2 路径打
+// api.trae.cn；国际 v1 路径打账号落点域（实测回调给 api-sg-central.trae.ai；
+// 没落点信息时回落 hub 美区实测的 grow-normal.traeapi.us）。签到/活动接口
+// 国际版没有（hub 实测 404）。
+function payTargetOf(auth) {
+  if (c.regionOf(auth) === 'intl') {
+    const apiHost = String((auth && auth.apiHost) || '');
+    const host = apiHost && /trae\.ai$|traeapi\.us$|trae\.ai\/|traeapi\.us\//.test(apiHost)
+      ? apiHost.replace(/\/+$/, '')
+      : c.PAY_HOST_INTL;
+    return { host, entUsage: c.EP_ENT_USAGE_V1, payStatus: c.EP_PAY_STATUS_V1 };
+  }
+  return { host: c.UG_HOST, entUsage: c.EP_ENT_USAGE, payStatus: c.EP_PAY_STATUS };
+}
+
+/** 国际版没有 ug 族签到/活动接口——明确报出，不白打一次 404 */
+function intlNoCheckin() {
+  return { ok: false, error: '国际版没有签到/活动接口（上游仅国内版提供，见 trae2api-hub 实测）' };
+}
+
 /**
  * 查签到状态：{ checkedIn, credits, extraCredits, enable }
  *
@@ -52,6 +73,7 @@ function agentOf(auth) {
  * credits 是**签到可得的额度**（不是余额），did_checked_in 是今天是否已领。
  */
 async function status(auth) {
+  if (c.regionOf(auth) === 'intl') return intlNoCheckin();
   let agent;
   try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
   const r = await c.request(c.UG_HOST, c.EP_CHECKIN_STATUS, {
@@ -200,7 +222,8 @@ async function claim(auth) {
 async function usage(auth) {
   let agent;
   try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
-  const r = await c.request(c.UG_HOST, c.EP_ENT_USAGE, {
+  const t = payTargetOf(auth);
+  const r = await c.request(t.host, t.entUsage, {
     method: 'POST', body: {}, headers: ugHeaders(withDevice(auth)), agent,
   });
   if (r.status !== 200 || !r.data) {
@@ -241,7 +264,42 @@ async function usage(auth) {
 
   // 剩余 = 总额 − 已消耗；总额拿不到时如实返回 null
   const remain = limit == null ? null : Math.max(0, limit - consumed);
-  return { ok: true, remain, limit, consumed: anyConsumed ? consumed : null, packs: parsePacks(d), raw: d };
+  // 订阅形态只在**国际账号**上解析（2026-11-03 真机教训：国内额度包里也带
+  // subscription_extra.quota 字段，不按区域分就会把国内号的积分口径误显示
+  // 成「按请求数计」——国内号是有积分账的）
+  const intlPlan = c.regionOf(auth) === 'intl' ? parseIntlPlan(d) : null;
+  return { ok: true, remain, limit, consumed: anyConsumed ? consumed : null, packs: parsePacks(d), intlPlan, raw: d };
+}
+
+/**
+ * 国际版的订阅形态（2026-11-03 真机实测，Free plan）。
+ *
+ * 国际账号没有 usage_summary（国内的 total/consumed 积分口径在订阅制上
+ * 不存在），额度是**请求数限额**：premium fast/slow、advanced、
+ * auto_completion、solo 并行数。积分口径的 remain/limit 对它恒为 null
+ * （不是「额度为零」，是「这个口径不适用」），订阅信息单独走 intlPlan。
+ * 国内的额度包没有 subscription_extra，这里恒返回 null。
+ */
+function parseIntlPlan(d) {
+  const num = (v) => (Number.isFinite(Number(v)) && v != null ? Number(v) : null);
+  const list = (d && Array.isArray(d.user_entitlement_pack_list)) ? d.user_entitlement_pack_list : [];
+  for (const it of list) {
+    if (!it || typeof it !== 'object') continue;
+    const b = it.entitlement_base_info || {};
+    const q = b.product_extra && b.product_extra.subscription_extra
+      && b.product_extra.subscription_extra.quota;
+    if (!q || typeof q !== 'object') continue;
+    return {
+      name: String(it.display_desc || '订阅'),
+      premiumFast: num(q.premium_model_fast_request_limit),
+      premiumSlow: num(q.premium_model_slow_request_limit),
+      advanced: num(q.advanced_model_request_limit),
+      autoCompletion: num(q.auto_completion_limit),
+      soloParallel: num(q.solo_agent_parallel_limit),
+      endAt: b.end_time ? Number(b.end_time) * 1000 : null,
+    };
+  }
+  return null;
 }
 
 /**
@@ -325,7 +383,8 @@ function parsePacks(d) {
 async function payStatus(auth) {
   let agent;
   try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
-  const r = await c.request(c.UG_HOST, c.EP_PAY_STATUS, {
+  const t = payTargetOf(auth);
+  const r = await c.request(t.host, t.payStatus, {
     method: 'POST', body: {}, headers: ugHeaders(withDevice(auth)), agent,
   });
   if (r.status !== 200 || !r.data) {
@@ -484,6 +543,10 @@ function claimVerdict(code, message, workExtra) {
  */
 async function claimActivities(rawAuth) {
   const auth = await withFreshToken(rawAuth);
+  // 国际版没有活动接口（hub 实测 ug 族 404）——明确报出，不白打四条链路
+  if (c.regionOf(auth) === 'intl') {
+    return { ok: false, notes: [], benefit: { state: 'error', error: intlNoCheckin().error }, error: intlNoCheckin().error };
+  }
   const notes = [];
   let hardError = null;
   // 清单：拿 activity_id / type / 有效期。失败时其余链路没有入参，直接返回

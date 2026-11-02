@@ -61,23 +61,35 @@ const routes = [
     path: '/models',
     handler: async ({ res, req }) => {
       const force = /[?&]refresh=1/.test(req.url || '');
-      const pref = authStore.preferred();
-      if (!pref) return sendJSON(res, 200, { models: [], total: 0, error: '没有可用账号', fetchedAt: 0 });
+      // 区域（页面区分两区模型表）：cn（缺省）/ global。取该区域的
+      // 主账号；没有该区域账号时如实报错——不静默拿另一区的表顶上
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'global' || regionRaw === 'intl' ? 'global' : '';
+      let pref;
+      if (region) {
+        const pool = authStore.findUsable().filter((a) => constants.normalizeRegion(a.region) === region);
+        pref = pool.find((a) => a.preferred) || pool[0] || null;
+        if (!pref) return sendJSON(res, 200, { models: [], total: 0, region, error: `没有国际（global）账号，无法拉取国际模型表`, fetchedAt: 0 });
+      } else {
+        pref = authStore.preferred();
+      }
+      if (!pref) return sendJSON(res, 200, { models: [], total: 0, region: region || undefined, error: '没有可用账号', fetchedAt: 0 });
       const fr = await fresh(pref);
-      if (fr.error) return sendJSON(res, 200, { models: [], total: 0, error: fr.error, fetchedAt: 0 });
+      if (fr.error) return sendJSON(res, 200, { models: [], total: 0, region: region || constants.normalizeRegion(pref.region), error: fr.error, fetchedAt: 0 });
       try {
         const raw = await session.fetchModels(fr.account, { force });
-        if (!raw.ok) return sendJSON(res, 200, { models: [], total: 0, error: raw.error || '', fetchedAt: 0 });
+        if (!raw.ok) return sendJSON(res, 200, { models: [], total: 0, region: constants.normalizeRegion(pref.region), error: raw.error || '', fetchedAt: 0 });
         return sendJSON(res, 200, {
           models: raw.models,
           total: raw.models.length,
+          region: constants.normalizeRegion(pref.region),
           error: '',
           fetchedAt: Date.now(),
           // 倍率语义写清楚：相对值，不是积分绝对值
           rateNote: '倍率是相对值（上游字段 price_factor），实际扣费 = 倍率 × 用量。0.1 档最省，适合调试。',
         });
       } catch (e) {
-        return sendJSON(res, 200, { models: [], total: 0, error: e.message, fetchedAt: 0 });
+        return sendJSON(res, 200, { models: [], total: 0, region: region || constants.normalizeRegion(pref.region), error: e.message, fetchedAt: 0 });
       }
     },
   },
@@ -331,13 +343,17 @@ const routes = [
     handler: async ({ req, res }) => {
       const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || '')).replace(/^qoder\//, '').trim();
       if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=qfmodel）' });
+      // 区域（2026-11-03 页面区分）：global 时选号限定国际账号——国际模型
+      // 拿国内账号打必然失败，不让池子随机派
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'global' || regionRaw === 'intl' ? 'global' : (regionRaw === 'cn' ? 'cn' : '');
       const credits = require('../../qoder/credits');
       // 标称倍率从 model-info 的归一化行取（两种上游形状都已摊平）；
       // 表不可用时 expected 如实 null——探针仍然跑，只报实测值
       let expected = null;
       try {
-        const rows = await require('../../model-info').qoderRows();
-        const hit = rows.find((m) => m.key === model);
+        const rows = await require('../../model-info').qoderRows({ region });
+        const hit = rows.find((m) => m.key === model || m.name === model);
         if (hit) {
           if (Number.isFinite(hit.rate) && hit.rate > 0) expected = hit.rate;
           else if (Number.isFinite(hit.rateOriginal) && hit.rateOriginal > 0) expected = hit.rateOriginal;
@@ -351,7 +367,7 @@ const routes = [
           model: `qoder/${model}`,
           messages: [{ role: 'user', content: 'reply with exactly: pong' }],
           max_tokens: 64,
-        }, null, { reqId });
+        }, null, { reqId, region: region === 'global' ? 'intl' : region });
       } catch (e) {
         return sendJSON(res, 200, {
           ok: false, model, expected, error: e.message,

@@ -47,7 +47,7 @@ function soloHeaders(auth, stream = false) {
 }
 
 /**
- * 签到 / 额度（api.trae.cn）。
+ * 签到 / 额度（国内 api.trae.cn；国际 grow-normal.traeapi.us）。
  *
  * **设备指纹敏感**：这三个接口会校验「设备标识是否与该账号匹配」，
  * 所以 deviceId / sessionId / marketUserId 必须是从 uid 派生的那一组
@@ -55,9 +55,13 @@ function soloHeaders(auth, stream = false) {
  *
  * 头的集合对齐 TraeWorkAssistant 的 build_headers（实测有效）。
  * auth 需含 accessToken / deviceId / sessionId / marketUserId。
+ *
+ * 区域差异（2026-11-03 国际版接入，取值对齐 hub REALMS + tnc.js 的 aid 分区）：
+ * 国际版 X-User-Region=US、Package-Type 不带 _cn 后缀、aid 用国际应用号。
  */
 function ugHeaders(auth) {
   const at = (auth && auth.accessToken) || '';
+  const intl = c.regionOf(auth) === 'intl';
   const authVal = at.startsWith('Cloud-IDE-JWT ') ? at : `Cloud-IDE-JWT ${at}`;
   return {
     'Content-Type': 'application/json',
@@ -68,12 +72,12 @@ function ugHeaders(auth) {
     'User-Agent': c.UA_VSCODE,
     'X-Market-Client-Id': c.MARKET_CLIENT_ID,
     'X-Market-User-Id': (auth && auth.marketUserId) || '',
-    'X-User-Region': 'CN',
+    'X-User-Region': intl ? 'US' : 'CN',
     'X-Device-Id': (auth && auth.deviceId) || '',
     'X-Lgw-Req-Sdk-Type': '3',
-    'Package-Type': 'stable_cn',
+    'Package-Type': intl ? 'stable' : 'stable_cn',
     'X-Request-Id': crypto.randomBytes(16).toString('hex'),
-    'X-Lscbd-Aid': '787976',
+    'X-Lscbd-Aid': intl ? '677332' : '787976',
     'X-Lscbd-Platform': 'windows',
     'App-Version': c.APP_VERSION,
     'X-Tt-Trace-Id': `00-${crypto.randomBytes(8).toString('hex')}-01`,

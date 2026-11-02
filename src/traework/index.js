@@ -24,13 +24,15 @@ function fefoUidSet() {
   return out;
 }
 
-/** 通道是否可用：至少有一个启用且凭证完整的账号 */
+/** 通道是否可用：至少有一个启用且凭证完整的账号。按区域分别计数（2026-11-03 国际版） */
 function status() {
   const usable = authStore.findUsable();
+  const cn = usable.filter((a) => c.regionOf(a) === 'cn').length;
+  const intl = usable.filter((a) => c.regionOf(a) === 'intl').length;
   if (!usable.length) {
-    return { ready: false, loggedIn: false, error: '没有可用账号（需先登录）', accounts: 0 };
+    return { ready: false, loggedIn: false, error: '没有可用账号（需先登录）', accounts: 0, cnAccounts: 0, intlAccounts: 0 };
   }
-  return { ready: true, loggedIn: true, error: '', accounts: usable.length };
+  return { ready: true, loggedIn: true, error: '', accounts: usable.length, cnAccounts: cn, intlAccounts: intl };
 }
 
 /**
@@ -73,9 +75,12 @@ function listModelEntries() {
   return models.cachedModelEntries();
 }
 
-/** 预热模型表（进程启动时调一次，让 /v1/models 拿到完整列表） */
+/** 预热模型表（进程启动时调一次，让 /v1/models 拿到完整列表）。两区各自有账号就各预热一份 */
 function warmupModels() {
-  return models.fetchModels().catch(() => null);
+  return Promise.all([
+    models.fetchModels({ region: 'cn' }).catch(() => null),
+    models.fetchModels({ region: 'intl' }).catch(() => null),
+  ]);
 }
 
 /**
@@ -181,9 +186,9 @@ function upstreamError(streamErr) {
  * 模型）时，网关直接 400 并列出可用模型；表没就绪或名字已知则放行，
  * 让上游当唯一的真相源（在表但不可见的模型照样透传）。
  */
-function assertModelKnown(payload, model) {
-  if (models.isKnownModel(model)) return;
-  const usable = models.cachedModelIds();
+function assertModelKnown(payload, model, region = '') {
+  if (models.isKnownModel(model, region)) return;
+  const usable = models.cachedModelIds(region || 'cn');
   const err = new Error(
     `模型 ${model} 不在 TRAE 模型表中。可用模型（部分）：${usable.slice(0, 8).join('、')}`
     + `${usable.length > 8 ? ' 等' : ''}`,
@@ -202,13 +207,13 @@ function assertModelKnown(payload, model) {
  *
  * 必须在选号之前：模型能力与账号无关，没必要为注定失败的请求占用池。
  */
-async function assertImageSupport(payload, model) {
+async function assertImageSupport(payload, model, region = 'cn') {
   const msgs = Array.isArray(payload && payload.messages) ? payload.messages : [];
   const hasImage = msgs.some((m) => m && m.role === 'user' && images.hasImageContent(m.content));
   if (!hasImage) return;
-  const meta = models.cachedMetaById(model);
+  const meta = models.cachedMetaById(model, region);
   if (!meta || meta.multimodal) return;
-  const mm = models.multimodalIds();
+  const mm = models.multimodalIds(region);
   const err = new Error(
     `模型 ${model} 不支持图像输入。可用多模态模型：${mm.slice(0, 6).join('、') || '（模型表暂不可用）'}`
     + `${mm.length > 6 ? ' 等' : ''}`,
@@ -240,6 +245,9 @@ async function send(payload, onChunk, opts = {}) {
   // 已把前缀剥成 route.model（reqBody.model = route.model），标记走 opts 传。
   const persona = rawModel.startsWith('traebao/') || !!opts.personalAssistant;
   if (persona) opts.personalAssistant = true;
+  // TRAE 宝是国内身份（personal_assistant 的免费豁免与活动都在国内活动域），
+  // 不让区域未限定的请求把它派给国际账号白撞一次上游 4001
+  if (persona && opts.region !== 'cn') opts.region = 'cn';
   let model = rawModel.replace(/^(traework|traebao)\//, '');
   if (persona && (model === 'auto' || !model)) {
     // TRAE 宝自动档：**不传 config_name**，服务端自选（实测默认
@@ -262,20 +270,36 @@ async function send(payload, onChunk, opts = {}) {
   } else if (model === 'auto' || !model) {
     model = c.DEFAULT_MODEL;
   }
-  if (model) assertModelKnown(payload, model);
-  await assertImageSupport(payload, model);
+  // 前置校验按请求的区域限定走（'' = 未限定，两区任一命中即放行）。
+  // 模型能力校验同因：区域未限定时按国内表判（与 /v1/models 的默认口径一致）。
+  const region = opts.region === 'intl' ? 'intl' : (opts.region === 'cn' ? 'cn' : '');
+  if (model) assertModelKnown(payload, model, region);
+  await assertImageSupport(payload, model, region || 'cn');
   // 选号经池状态机：冷却/熔断/禁用/暂停/在途满跳过 + 会话粘性。
   // traework 单账号时代不做故障转移；多账号后由池提供「跳过坏号」能力，
   // 换号重试仍交给上层（一次会话内修不动模型行为问题）。
   const sessionKey = channelPool.sessionKeyOf(payload, opts);
-  // 区域约束（API Key 的 region，2026-11-01）：traework 账号目前全部是国内
-  // （region 字段缺省按 'cn'）；intl key 会在这里拿到明确的「未接入」报错，
-  // 而不是被派给国内账号静默跑错区域。
-  const usable = accountsForRegion(authStore.findUsable(), opts.region);
+  // 区域约束（API Key 的 region，2026-11-01）：'intl' → 只用国际账号。
+  // 国际版已接入（2026-11-03）：没有国际账号时明确报出，而不是静默派给国内。
+  let poolRegion = opts.region === 'intl' ? 'intl' : (opts.region === 'cn' ? 'cn' : '');
+  // 模型-区域亲和（混合区域池的正确性）：glm-5.2 只在国内表、GPT 系只在
+  // 国际表——不约束的话池子可能把国内模型派给国际账号，白撞一次上游。
+  // 只在「有正据」时约束：该区域的模型表已就绪且**不含**此模型才算缺席；
+  // 表没就绪（缓存空）不猜，维持普通轮询。deepseek-v4.1-flash 两区都有，
+  // 两边都命中 → 不约束，池子按健康度选。
+  if (!poolRegion && model) {
+    const cnKnown = models.isKnownModel(model, 'cn');
+    const intlKnown = models.isKnownModel(model, 'intl');
+    if (cnKnown && !intlKnown) poolRegion = 'cn';
+    else if (!cnKnown && intlKnown) poolRegion = 'intl';
+  }
+  const usable = accountsForRegion(authStore.findUsable(), poolRegion);
   if (!usable.length) {
-    const e = opts.region === 'intl'
-      ? new Error('TRAE 国际版未接入（没有国际账号；国际链路也未实测）。该 API Key 限定国际区域，请换国内 key 或等待国际通道接入')
-      : new Error('traework 没有可用的国内账号');
+    const e = poolRegion === 'intl'
+      ? new Error('TRAE 没有可用的国际账号（先到账号管理 → 添加账号 → 选「国际版」登录）。该请求的模型或 API Key 限定国际区域')
+      : poolRegion === 'cn'
+        ? new Error('traework 没有可用的国内账号')
+        : new Error('traework 没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
     e.statusCode = 503;
     throw e;
   }
@@ -318,7 +342,9 @@ async function send(payload, onChunk, opts = {}) {
     const remoteEnabled = process.env.DUMATE_TRAEWORK_REMOTE === '1';
     const hasTools = Array.isArray(payload && payload.tools) && payload.tools.length > 0;
     const isAuto = !payload || !payload.model || payload.model === 'auto';
-    const result = (remoteEnabled && !hasTools && isAuto)
+    // remote 链路是纯国内的（remoteBaseOf 对 intl 如实拒绝）——国际账号不走
+    const remoteEligible = remoteEnabled && !hasTools && isAuto && c.regionOf(auth) !== 'intl';
+    const result = remoteEligible
       ? await runRemoteConversation(auth, payload, onChunk, opts, model)
       : await runConversation(auth, payload, onChunk, opts, model);
     // 成功喂池：清熔断/软退避/防误杀计数（修复重试属于模型行为，不算失败）

@@ -22,6 +22,8 @@ export interface TraeworkAccount {
   uid: string
   nickname: string
   email: string
+  /** 区域（2026-11-03 国际版接入）：国内 trae.cn / 国际 trae.ai，账号不通用 */
+  region: 'cn' | 'intl'
   enabled: boolean
   expiresAt: number | null
   refreshExpiresAt: number | null
@@ -51,6 +53,10 @@ export interface TraeworkStatus {
   ready: boolean
   error: string
   accounts: number
+  /** 国内可用账号数 */
+  cnAccounts: number
+  /** 国际可用账号数 */
+  intlAccounts: number
   /** multi = 凭证自持，可多账号增删；与千问的 single 不同 */
   mode: 'multi' | 'single'
   modeNote: string
@@ -70,10 +76,22 @@ export interface TraeworkPack {
   status: number | null
 }
 
+/** 国际版订阅形态（2026-11-03 实测 Free plan）：额度是请求数限额，不是积分 */
+export interface TraeworkIntlPlan {
+  name: string
+  premiumFast: number | null
+  premiumSlow: number | null
+  advanced: number | null
+  autoCompletion: number | null
+  soloParallel: number | null
+  endAt: number | null
+}
+
 export interface TraeworkCreditRow {
   id: number
   nickname: string
   uid: string
+  region: 'cn' | 'intl'
   credits: number | null
   checkedIn: boolean | null
   /** 额度接口的实时剩余值 = 总额 − 已消耗。取不到为 null（不补 0） */
@@ -88,6 +106,8 @@ export interface TraeworkCreditRow {
   lastCheckin: number | null
   /** 额度包明细（含到期时间），按到期时间升序 */
   packs: TraeworkPack[]
+  /** 国际版订阅形态（请求数限额）。国内账号为 null */
+  intlPlan: TraeworkIntlPlan | null
   error: string
 }
 
@@ -146,6 +166,7 @@ export interface TraeworkDashAccount {
   id: number
   name: string
   uid: string
+  region: 'cn' | 'intl'
   phone: string
   phoneSource: string
   enabled: boolean
@@ -251,14 +272,16 @@ export const traeworkApi = {
       rows: TraeworkCreditRecord[]
       window: { cost: number; requests: number; exact: number }
     }>(`/traework/credits/records?limit=${limit}`),
-  models: (opts: { visibleOnly?: boolean; refresh?: boolean } = {}) => {
+  models: (opts: { visibleOnly?: boolean; refresh?: boolean; region?: 'cn' | 'intl' } = {}) => {
     const q: string[] = []
     if (opts.visibleOnly) q.push('visible=1')
     if (opts.refresh) q.push('refresh=1')
+    if (opts.region) q.push(`region=${opts.region}`)
     const qs = q.length ? '?' + q.join('&') : ''
     return client.get<{
       models: TraeworkModel[]
       total: number
+      region?: 'cn' | 'intl'
       error: string
       fetchedAt: number
       rateNote: string
@@ -277,10 +300,17 @@ export const traeworkApi = {
    * 计费自检探针：按模型发一个小请求（消耗真实积分），比对实测倍率与标称。
    * 探针含「发请求 + 8 秒结算轮询」，用比默认 30s 更长的超时。
    */
-  billingCheck: (model: string) =>
-    client.get<TraeworkBillingCheck>(`/traework/billing-check?model=${encodeURIComponent(model)}`, { timeout: 120000 }),
-  loginUrl: () => client.post<{ ok: boolean; url: string; deviceId: string; machineId: string; hint: string }>('/traework/login/url'),
-  loginCallback: (payload: { callback: string; deviceId: string; machineId: string }) =>
+  billingCheck: (model: string, region?: 'cn' | 'intl') =>
+    client.get<TraeworkBillingCheck>(
+      `/traework/billing-check?model=${encodeURIComponent(model)}${region ? `&region=${region}` : ''}`,
+      { timeout: 120000 },
+    ),
+  loginUrl: (region: 'cn' | 'intl' = 'cn') =>
+    client.post<{ ok: boolean; region: 'cn' | 'intl'; url: string; deviceId: string; machineId: string; hint: string }>(
+      '/traework/login/url',
+      { region },
+    ),
+  loginCallback: (payload: { callback: string; deviceId: string; machineId: string; region: 'cn' | 'intl' }) =>
     client.post<{ ok: boolean; account?: TraeworkAccount; error?: string }>('/traework/login/callback', payload),
   removeAccount: (id: number) => client.delete(`/traework/accounts/${id}`),
   patchAccount: (id: number, fields: { enabled?: boolean }) =>

@@ -34,9 +34,15 @@ function newDeviceIds() {
  * 标准参数会被 Trae 判为非法客户端，页面永远卡在「认证中…」。
  * 必须带 x_device_* / x_app_* 这组前缀参数，且 auth_callback_url 才是回调字段。
  *
+ * region（2026-11-03 国际版接入）：国内 www.trae.cn / 国际 www.trae.ai，
+ * 两区账号不通用。client_id 与参数集两区一致（hub 的 ExchangeToken 同一
+ * LOGIN_CLIENT_ID 打两个区域的 account host）。
+ *
  * @param {{deviceId:string, machineId:string}} ids
+ * @param {string} [region] 'cn'（缺省）| 'intl'
  */
-function buildAuthUrl(ids) {
+function buildAuthUrl(ids, region) {
+  const consoleHost = c.regionOf(region) === 'intl' ? c.CONSOLE_HOST_INTL : c.CONSOLE_HOST;
   const params = {
     login_version: '1',
     auth_from: 'solo',
@@ -57,7 +63,7 @@ function buildAuthUrl(ids) {
     x_app_version: c.IDE_VERSION,
     x_app_type: 'stable',
   };
-  return `${c.CONSOLE_HOST}/authorization?${new URLSearchParams(params).toString()}`;
+  return `${consoleHost}/authorization?${new URLSearchParams(params).toString()}`;
 }
 
 /**
@@ -66,6 +72,11 @@ function buildAuthUrl(ids) {
  *
  * 字段名是逆向出来的：userInfo 里 uid 叫 UserID、昵称叫 ScreenName。
  * refreshToken 缺失时回落到 userJwt.RefreshToken（参考实现也这么做）。
+ *
+ * **host 参数是回调自带的账号域**（2026-11-03 国际版真机实测发现）：
+ * 国际版回调带 `host=https://api-sg-central.trae.ai`（新加坡落点）——换票
+ * 必须打这个主机，而不是我们预置的候选链（grow-normal.trae.ai 是 hub 的
+ * 美区实测值，落点在 SG 的账号不认）。回调值优先于区域候选。
  */
 function parseCallback(text) {
   const s = String(text || '').trim();
@@ -88,6 +99,11 @@ function parseCallback(text) {
     uid: String(userInfo.UserID || ''),
     nickname: String(userInfo.ScreenName || ''),
     tenantId: String(userInfo.TenantID || ''),
+    // 回调自带的账号域主机（国内回调没有这个参数，取出来是空串）
+    host: String(qs.get('host') || '').trim(),
+    // 上游给的区域串（实测国际版是 'sg'/'us' 这类落点名）——只作展示，
+    // 本地区域字段仍用 cn/intl 两值
+    userRegion: String(qs.get('userRegion') || '').trim(),
     // 回调里有时直接带 access token，省一次 ExchangeToken（但我们仍会换，
     // 因为 refreshToken 轮换后必须落盘新的，不能只存回调给的这个）
     jwtToken: String(userJwt.Token || ''),
@@ -96,13 +112,19 @@ function parseCallback(text) {
 
 /**
  * 用 refreshToken 换 access token 并落盘。
- * @param {{refreshToken:string, deviceId:string, machineId:string, nickname?:string, uid?:string, apiHost?:string}} opts
+ * @param {{refreshToken:string, deviceId:string, machineId:string, nickname?:string, uid?:string, apiHost?:string, region?:string}} opts
  */
 async function exchangeAndSave(opts) {
   const { refreshToken, deviceId, machineId } = opts || {};
   if (!refreshToken) return { ok: false, error: '缺少 refreshToken' };
+  const region = c.normalizeRegion(opts.region);
 
-  const host = opts.apiHost || c.OAUTH_HOST;
+  // 国际版带候选回落：连接级失败换下一家；拿到响应（含 4xx）就交上层处置。
+  // 主机优先级：回调自带的 host（账号落点，实测 api-sg-central.trae.ai）>
+  // 显式 apiHost > 区域候选链
+  const hosts = opts.host ? [opts.host]
+    : opts.apiHost ? [opts.apiHost]
+      : c.oauthHostCandidates(region);
   // body 形状是逆向出来的：ClientSecret 必须是 "-"，UserID 空串
   const body = {
     ClientID: c.CLIENT_ID,
@@ -116,12 +138,18 @@ async function exchangeAndSave(opts) {
   try { agent = require('../proxy-agent').getAgentFor(null); } catch (e) {
     return { ok: false, error: e.message };
   }
-  const r = await c.request(host, c.EP_EXCHANGE, {
-    method: 'POST', body, headers: oauthHeaders(), agent,
-  });
-  if (r.status !== 200 || !r.data) {
-    return { ok: false, error: `换票失败 HTTP ${r.status} ${String(r.raw).slice(0, 160)}` };
+  let r = null;
+  for (const host of hosts) {
+    r = await c.request(host, c.EP_EXCHANGE, {
+      method: 'POST', body, headers: oauthHeaders(), agent,
+    });
+    if (r.status === 200 && r.data) { r.__host = host; break; }
+    if (r.status !== 0) break;   // HTTP 层有响应，主机没问题
   }
+  if (!r || r.status !== 200 || !r.data) {
+    return { ok: false, error: `换票失败 HTTP ${r ? r.status : 0} ${String((r && r.raw) || '').slice(0, 160)}` };
+  }
+  const host = r.__host || hosts[0];
   const res = (r.data && r.data.Result) || r.data || {};
   const accessToken = res.Token || res.token;
   if (!accessToken) return { ok: false, error: '换票响应里没有 Token' };
@@ -137,6 +165,8 @@ async function exchangeAndSave(opts) {
     deviceId,
     machineId,
     apiHost: host,
+    // 区域随登录落盘（2026-11-03 国际版）：换票、对话基址、额度查询都按它分流
+    region,
     // 回调里已经带了 uid / 昵称，直接落盘（GetUserInfo 只作补充）
     uid: opts.uid || '',
     nickname: opts.nickname || '',

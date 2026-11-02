@@ -53,13 +53,16 @@ export interface ModelInfoRow {
 }
 
 export const modelInfoApi = {
-  list: (opts: { channel?: string; refresh?: boolean; all?: boolean } = {}) => {
+  list: (opts: { channel?: string; refresh?: boolean; all?: boolean; region?: string } = {}) => {
     const q: string[] = []
     if (opts.channel) q.push(`channel=${opts.channel}`)
     if (opts.refresh) q.push('refresh=1')
     // all=1 看 TRAE 上游表全量（subagent / custom_model 占位 / summary）；
     // 默认只返回可用对话模型（与 /v1/models 的 usableIds 同口径）
     if (opts.all) q.push('all=1')
+    // 区域（2026-11-03 国际版）：qoder → cn|global，traework → cn|intl；
+    // 只有这两条通道有区域概念，其余通道忽略该参数
+    if (opts.region) q.push(`region=${opts.region}`)
     const qs = q.length ? '?' + q.join('&') : ''
     return client.get<{
       channel: string

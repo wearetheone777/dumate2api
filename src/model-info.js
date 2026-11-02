@@ -230,17 +230,25 @@ const fmtCtx = (n) => {
  * **自己拉而不是读快照**：快照由网关进程写入，管理端进程看不到。
  * 取不到时回落静态表（rate 给 null，如实标「无此数据」，不估算）。
  */
-async function qoderRows() {
+async function qoderRows({ region = '' } = {}) {
   const constants = require('./qoder/constants');
   const budget = require('./budget');
-  let list = qoderCachedModels();
+  // 区域视图（2026-11-03 页面区分）：指定区域时**跳过快照直接拉**——
+  // 快照由网关进程按它的主账号写入，区域不保证与本次请求一致
+  let list = region ? null : qoderCachedModels();
   let fromUpstream = !!list;
   if (!list) {
     // 直接问上游（进程内），与 traeworkRows 同一策略
     try {
       const authStore = require('./qoder/auth');
       const session = require('./qoder/session');
-      const acc = authStore.preferred();
+      let acc = null;
+      if (region) {
+        const pool = authStore.findUsable().filter((a) => constants.normalizeRegion(a.region) === region);
+        acc = pool.find((a) => a.preferred) || pool[0] || null;
+      } else {
+        acc = authStore.preferred();
+      }
       if (acc) {
         const r = await session.fetchModels(acc);
         if (r.ok && r.models.length) { list = r.models; fromUpstream = true; }
@@ -342,9 +350,9 @@ async function qoderRows() {
  * 「哪个模型花多少」答不上来（这些条目的倍率/上下文全是 null）。
  * 排查「为什么某个名字调不通」时传 { all: true } 看全量。
  */
-async function traeworkRows({ visibleOnly = false, all = false, force = false } = {}) {
+async function traeworkRows({ visibleOnly = false, all = false, force = false, region = 'cn' } = {}) {
   const models = require('./traework/models');
-  const r = await models.fetchModels({ force });
+  const r = await models.fetchModels({ force, region: region || 'cn' });
   let list = r.models;
   if (!all) list = list.filter(models.isUsableRow);
   else if (visibleOnly) list = list.filter((m) => m.visible);
@@ -416,7 +424,7 @@ async function rowsFor(channel, opts = {}) {
     const rows = await qwenRows();
     return { rows, error: '' };
   }
-  if (channel === 'qoder') return { rows: await qoderRows(), error: '' };
+  if (channel === 'qoder') return { rows: await qoderRows(opts), error: '' };
   if (channel === 'traework') {
     const r = await traeworkRows(opts);
     return { rows: r.rows, error: r.error };

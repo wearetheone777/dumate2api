@@ -67,6 +67,9 @@ function list() {
     uid: a.uid || '',
     nickname: a.nickname || '',
     email: a.email || '',
+    // 区域（2026-11-03 国际版接入）：cn / intl，存量记录缺省按国内。
+    // 界面据此打「国内/国际」徽标，登录时也按它选授权页。
+    region: c.normalizeRegion(a.region),
     // 手机号：只给脱敏形式。完整值只留在账号文件里（PII）
     phone: maskPhone(a.phone),
     // 来源必须一起给——TRAE 这个号是从昵称推断的，不是接口下发的真手机号。
@@ -194,30 +197,39 @@ async function exchangeOnce(a) {
   try { agent = require('../proxy-agent').getAgentFor(a); } catch (e) {
     return { ok: false, error: `出站代理配置错误: ${e.message}` };
   }
-  const host = a.apiHost || c.OAUTH_HOST;
+  // 主机按账号区域走（国际版账号换票打 grow-normal.trae.ai，不是国内
+  // api.trae.com.cn）。国际版带候选回落：连接级失败换下一家（拿到响应
+  // 含 4xx 就交上层按状态码处置——凭证失效换主机也没用）。
   const body = {
     ClientID: c.CLIENT_ID,
     RefreshToken: a.refreshToken,
     ClientSecret: '-',
     UserID: '',
   };
-  const r = await c.request(host, c.EP_EXCHANGE, {
-    method: 'POST', body, headers: oauthHeaders(), agent,
-  });
-  if (r.status !== 200 || !r.data) {
-    return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+  const hosts = a.apiHost ? [a.apiHost] : c.oauthHostCandidates(a);
+  let last = null;
+  for (const host of hosts) {
+    const r = await c.request(host, c.EP_EXCHANGE, {
+      method: 'POST', body, headers: oauthHeaders(), agent,
+    });
+    if (r.status === 200 && r.data) {
+      const res = (r.data && r.data.Result) || r.data || {};
+      const token = res.Token || res.token;
+      if (!token) return { ok: false, error: '响应里没有 Token' };
+      const out = { accessToken: token };
+      if (res.RefreshToken) out.refreshToken = res.RefreshToken;
+      // 到期时间：优先用 JWT 的 exp，其次用接口给的毫秒时间戳
+      const exp = jwtExp(token);
+      if (exp) out.expiresAt = exp;
+      else if (res.ExpiresAt) out.expiresAt = Number(res.ExpiresAt);
+      if (res.RefreshExpireAt) out.refreshExpiresAt = Number(res.RefreshExpireAt);
+      return { ok: true, patch: out };
+    }
+    last = { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+    // 连接级失败才换下一家；HTTP 层有响应（含 401/403）主机没问题
+    if (r.status !== 0) break;
   }
-  const res = (r.data && r.data.Result) || r.data || {};
-  const token = res.Token || res.token;
-  if (!token) return { ok: false, error: '响应里没有 Token' };
-  const out = { accessToken: token };
-  if (res.RefreshToken) out.refreshToken = res.RefreshToken;
-  // 到期时间：优先用 JWT 的 exp，其次用接口给的毫秒时间戳
-  const exp = jwtExp(token);
-  if (exp) out.expiresAt = exp;
-  else if (res.ExpiresAt) out.expiresAt = Number(res.ExpiresAt);
-  if (res.RefreshExpireAt) out.refreshExpiresAt = Number(res.RefreshExpireAt);
-  return { ok: true, patch: out };
+  return last || { ok: false, error: '换票失败：无可用主机' };
 }
 
 /**
@@ -353,7 +365,7 @@ function rotateDevice(a) {
 async function fetchUserInfo(a) {
   let agent = null;
   try { agent = require('../proxy-agent').getAgentFor(a); } catch (e) { return null; }
-  const r = await c.request(a.apiHost || c.OAUTH_HOST, c.EP_USER_INFO, {
+  const r = await c.request(a.apiHost || c.oauthHostOf(a), c.EP_USER_INFO, {
     method: 'POST', body: {}, headers: { ...oauthHeaders(), Authorization: `Cloud-IDE-JWT ${a.accessToken}` }, agent,
   });
   if (r.status !== 200 || !r.data) return null;
@@ -382,7 +394,7 @@ async function fetchUserInfo(a) {
 async function checkLogin(rawAuth) {
   let agent;
   try { agent = require('../proxy-agent').getAgentFor(rawAuth); } catch (e) { return { ok: false, error: e.message }; }
-  const r = await c.request(rawAuth.apiHost || c.OAUTH_HOST, c.EP_CHECK_LOGIN, {
+  const r = await c.request(rawAuth.apiHost || c.oauthHostOf(rawAuth), c.EP_CHECK_LOGIN, {
     method: 'POST',
     body: { uid: rawAuth.uid, IDEVersion: '1.107.1', ReqSource: 'Lite' },
     headers: {

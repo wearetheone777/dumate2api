@@ -193,10 +193,14 @@ const routes = [
       // all=1 看 TRAE 上游表全量（含 subagent / custom_model 占位 / summary）。
       // 默认收窄到可用对话模型——排查「为什么某个名字调不通」才需要全量
       const all = /[?&]all=1/.test(req.url || '');
+      // 区域（2026-11-03 国际版）：qoder → cn|global；traework → cn|intl。
+      // 只有 qoder/traework 有区域概念，其余通道忽略
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = ['cn', 'global', 'intl'].includes(regionRaw) ? regionRaw : '';
       try {
         if (ch) {
-          const r = await require('../../model-info').rowsFor(ch, { force, all });
-          return sendJSON(res, 200, { channel: ch, rows: r.rows, error: r.error });
+          const r = await require('../../model-info').rowsFor(ch, { force, all, region });
+          return sendJSON(res, 200, { channel: ch, rows: r.rows, error: r.error, region: region || undefined });
         }
         const r = await require('../../model-info').allRows({ force });
         return sendJSON(res, 200, { channel: '', rows: r.rows, errors: r.errors });

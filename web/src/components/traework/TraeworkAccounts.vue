@@ -35,6 +35,10 @@
           与千问办公的差别：TRAE 登录后要<b>把回调地址粘回来</b>（千问是程序自动取票）；
           TRAE 也<b>拿不到手机号</b>——它的用户信息接口已失效，只能从昵称碰运气抽。
         </div>
+        <div class="mt-1 text-xs">
+          <b>国内（trae.cn）与国际（trae.ai）是两套独立账号，不通用</b>，登录时先选区域；
+          国际版没有签到/活动接口（上游不提供），额度查询与对话不受影响。
+        </div>
       </template>
     </a-alert>
 
@@ -51,6 +55,8 @@
           <span class="section-title">账号列表</span>
           <span class="hint-text ml-2">
             共 {{ rows.length }} 个 · 启用 {{ enabledCount }} 个
+            <template v-if="cnCount"> · 国内 {{ cnCount }}</template>
+            <template v-if="intlCount"> · 国际 {{ intlCount }}</template>
           </span>
         </div>
       </div>
@@ -68,6 +74,9 @@
               <div class="min-w-0">
                 <div class="font-medium truncate">
                   {{ a.nickname || a.uid || '未命名' }}
+                  <a-tag :color="a.region === 'intl' ? 'purple' : 'blue'" class="ml-1" size="small">
+                    {{ a.region === 'intl' ? '国际' : '国内' }}
+                  </a-tag>
                   <a-tag v-if="!a.enabled" color="default" class="ml-1">已停用</a-tag>
                 </div>
                 <div class="text-xs text-slate-400 font-mono mt-1 truncate">
@@ -97,11 +106,18 @@
             />
 
             <!-- 每个账号的额度：credits 是落盘值（上次签到时刷的），
-                 remain 是本次实时查的。两个都给，因为落盘值可能过期。 -->
+                 remain 是本次实时查的。两个都给，因为落盘值可能过期。
+                 国际版是订阅制（按请求数计），积分口径恒 null——显示
+                 套餐名而不是 0，0 会被读成「额度用完了」 -->
             <div class="mt-3 grid grid-cols-2 gap-2 text-sm">
               <div>
                 <div class="text-xs text-slate-400">剩余额度</div>
-                <div class="num">
+                <div class="num" v-if="creditOf(a.id)?.intlPlan"
+                  :title="intlPlanTitle(creditOf(a.id)!.intlPlan!)">
+                  {{ creditOf(a.id)!.intlPlan!.name }}
+                  <span class="text-xs text-slate-400">按请求数计</span>
+                </div>
+                <div class="num" v-else>
                   {{ creditOf(a.id)?.remain ?? a.credits ?? '—' }}
                   <span v-if="creditOf(a.id)?.limit" class="text-xs text-slate-400 num">
                     / {{ creditOf(a.id)!.limit }}
@@ -177,6 +193,15 @@
       </a-steps>
 
       <template v-if="loginStep === 0">
+        <a-form-item label="账号区域" class="mb-3">
+          <a-radio-group v-model:value="loginRegion">
+            <a-radio-button value="cn">国内 trae.cn</a-radio-button>
+            <a-radio-button value="intl">国际 trae.ai</a-radio-button>
+          </a-radio-group>
+          <div class="text-xs text-slate-400 mt-1">
+            两套账号不通用。国际版没有签到/活动接口，对话与额度查询不受影响。
+          </div>
+        </a-form-item>
         <a-alert type="info" show-icon class="mb-3">
           <template #message>点下面的按钮生成一次登录所需的链接</template>
           <template #description>
@@ -247,7 +272,7 @@ import { App } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { channelStore, isTraework } from '@/stores/channel'
 import { traeworkApi } from '@/api/traework'
-import type { TraeworkAccount, TraeworkCreditRow, TraeworkStatus } from '@/api/traework'
+import type { TraeworkAccount, TraeworkCreditRow, TraeworkIntlPlan, TraeworkStatus } from '@/api/traework'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
 
 // message 走 App.useApp() 的实例（App.vue 已包 <a-app>），静态 import 拿不到上下文
@@ -295,6 +320,9 @@ const busy = reactive<Record<number, boolean>>({})
 // 登录弹窗
 const loginOpen = ref(false)
 const loginStep = ref(0)
+// 账号区域（2026-11-03 国际版接入）：国内 www.trae.cn / 国际 www.trae.ai，
+// 两套账号不通用。回调地址本身不携带区域，生成链接与提交回调必须用同一个值
+const loginRegion = ref<'cn' | 'intl'>('cn')
 const loginUrl = ref('')
 const callbackText = ref('')
 const loginError = ref('')
@@ -315,9 +343,23 @@ const subText = computed(() => {
 })
 
 const enabledCount = computed(() => rows.value.filter((a) => a.enabled).length)
+const cnCount = computed(() => rows.value.filter((a) => a.region !== 'intl').length)
+const intlCount = computed(() => rows.value.filter((a) => a.region === 'intl').length)
 
 function creditOf(id: number): TraeworkCreditRow | undefined {
   return credits.value?.rows.find((r) => r.id === id)
+}
+
+/** 国际版订阅限额的悬停说明（premium fast/slow / advanced / 自动补全） */
+function intlPlanTitle(p: TraeworkIntlPlan) {
+  const f = (v: number | null, label: string) => (v == null ? '' : `${label} ${v}`)
+  return [
+    f(p.premiumFast, '高级模型·快'),
+    f(p.premiumSlow, '高级模型·慢'),
+    f(p.advanced, '高级请求'),
+    f(p.autoCompletion, '自动补全'),
+    f(p.soloParallel, 'SOLO 并行'),
+  ].filter(Boolean).join(' · ')
 }
 
 function checkinColor(a: TraeworkAccount) {
@@ -440,6 +482,7 @@ function reportCheckin(data: any) {
 
 function openLogin() {
   loginStep.value = 0
+  loginRegion.value = 'cn'
   loginUrl.value = ''
   callbackText.value = ''
   loginError.value = ''
@@ -452,7 +495,7 @@ async function genLoginUrl() {
   urlLoading.value = true
   loginError.value = ''
   try {
-    const { data } = await traeworkApi.loginUrl()
+    const { data } = await traeworkApi.loginUrl(loginRegion.value)
     loginUrl.value = data.url
     deviceIds.deviceId = data.deviceId
     deviceIds.machineId = data.machineId
@@ -476,6 +519,7 @@ async function submitCallback() {
       callback: callbackText.value.trim(),
       deviceId: deviceIds.deviceId,
       machineId: deviceIds.machineId,
+      region: loginRegion.value,
     })
     if (!data.ok) {
       loginError.value = data.error || '换票失败'

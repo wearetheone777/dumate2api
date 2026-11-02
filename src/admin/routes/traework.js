@@ -27,9 +27,12 @@ const routes = [
         ready: st.ready,
         error: st.error || '',
         accounts: st.accounts || 0,
+        // 区域计数（2026-11-03 国际版接入）：前端据此显示「国内 N / 国际 N」
+        cnAccounts: st.cnAccounts || 0,
+        intlAccounts: st.intlAccounts || 0,
         // 明确告诉前端这条通道的结构：可增删，与千问的 single 模式不同
         mode: 'multi',
-        modeNote: 'TRAE Work 的凭证由本项目自行 OAuth 换取并保存，可多账号并存、可增删。',
+        modeNote: 'TRAE Work 的凭证由本项目自行 OAuth 换取并保存，可多账号并存、可增删。国内（trae.cn）与国际（trae.ai）账号不通用。',
         rows: authStore.list(),
       });
     },
@@ -43,9 +46,12 @@ const routes = [
     handler: async ({ res, req }) => {
       const onlyVisible = /[?&]visible=1/.test(req.url || '');
       const force = /[?&]refresh=1/.test(req.url || '');
+      // 区域（2026-11-03 国际版）：cn（缺省）/ intl——两区模型表不同，分开看
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' ? 'intl' : 'cn';
       let out = { ok: false, error: '', models: [], fetchedAt: 0 };
       try {
-        out = await models.fetchModels({ force });
+        out = await models.fetchModels({ force, region });
       } catch (e) {
         out = { ok: false, error: e.message, models: [], fetchedAt: 0 };
       }
@@ -54,6 +60,7 @@ const routes = [
       return sendJSON(res, 200, {
         models: list,
         total: (out.models || []).length,
+        region,
         // 取不到时如实报错，前端显示错误而不是一张空表
         error: out.error || '',
         fetchedAt: out.fetchedAt || 0,
@@ -81,6 +88,7 @@ const routes = [
           id: a.id,
           nickname: a.nickname || '',
           uid: a.uid || '',
+          region: a.region === 'intl' ? 'intl' : 'cn',
           credits: a.credits == null ? null : a.credits,
           checkedIn: st.ok ? st.checkedIn : null,
           // 额度接口的实时值。remain/limit 取不到时给 null——
@@ -107,12 +115,13 @@ const routes = [
           // usage（额度包）查询是否成功。status 成功但 usage 失败时 error
           // 是空的，FEFO 快照要单独识别这种「拿不到包明细」的行
           packsKnown: u.ok,
-          // error 只表示「这次状态查询失败」——别把上次签到尝试的失败消息
-          // 塞进来。两者是不同的东西：前者是「查不到」，后者是「查到了，
-          // 但上一次签到被上游拒了」。混在一起时前端只能显示「查询失败」，
-          // 把「今天还没签」这个已经查到的事实盖掉了（真踩过）。
-          // 上次签到的结果由 /status 的 lastError 单独报，账号卡上已有告警位。
-          error: st.ok ? '' : st.error,
+          // 国际版订阅形态（Free plan 等）：额度是请求数限额，积分口径的
+          // remain/limit 恒 null——界面据此显示「按请求数计」而不是 0
+          intlPlan: u.ok ? (u.intlPlan || null) : null,
+          // error 只表示「这次状态查询失败」。国际版没有签到接口（status
+          // 必失败），但 usage 能查到时这不算行级错误——不然国际账号的
+          // 卡片永远挂着一块「查询失败」，把「额度已查到」这个事实盖掉
+          error: st.ok ? '' : (u.ok ? '' : st.error),
         });
       }
       // 顶部指标卡用。**在这里算而不是 /dashboard**：到期数据要打上游才有，
@@ -151,8 +160,10 @@ const routes = [
       expiringSnap.update('traework',
         [...fefoMin].map(([accountId, nearest]) => ({ accountId, nearest })),
         { keepIds: rows.filter((r) => !r.packsKnown).map((r) => r.id) });
-      // 额度取不到的账号单独计数：它既不算「有效」也不该被当成 0 额度
-      const known = rows.filter((r) => r.remain !== null || r.limit !== null);
+      // 额度取不到的账号单独计数：它既不算「有效」也不该被当成 0 额度。
+      // 国际版订阅账号没有积分口径（remain/limit 恒 null 但 intlPlan 有值）
+      // ——算「已知」，不然每次进仪表盘都多一块「查询失败」的假警报
+      const known = rows.filter((r) => r.remain !== null || r.limit !== null || r.intlPlan);
       return sendJSON(res, 200, {
         count: rows.length,
         rows,
@@ -197,6 +208,7 @@ const routes = [
           id: a.id,
           name: a.nickname || a.uid || `账号 ${a.id}`,
           uid: a.uid || '',
+          region: a.region || 'cn',
           phone: a.phone || '',
           phoneSource: a.phoneSource || '',
           enabled: a.enabled !== false,
@@ -285,12 +297,15 @@ const routes = [
       const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || ''))
         .replace(/^traework\//, '').trim();
       if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=glm-5.2）' });
+      // 区域（2026-11-03 国际版）：intl 时选号与标称倍率都按国际模型表走
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' ? 'intl' : '';
       const billing = require('../../traework/billing');
 
       // 标称倍率：模型表可用的就取归一化行；取不到如实 null，探针仍然跑
       let expected = null;
       try {
-        const r = await models.fetchModels({});
+        const r = await models.fetchModels({ region: region || 'cn' });
         const meta = (r.models || []).find((m) => m.id === model) || null;
         expected = billing.expectedRate(meta);
       } catch (e) { /* 表不可用按 null */ }
@@ -327,6 +342,7 @@ const routes = [
           max_tokens: 4096,
         }, null, {
           reqId,
+          region,
           onAccount: (name, id) => { servedName = name || ''; if (id != null) servedId = id; },
           // 逐轮账单的 turn id（非流式路径在聚合出口上报）
           onTurnId: (tid, auth) => { turnId = tid; servedAuth = auth; },
@@ -468,6 +484,7 @@ const routes = [
     path: '/login/url',
     handler: async ({ res, body }) => {
       const wantId = body && body.accountId;
+      const region = (body && body.region === 'intl') ? 'intl' : 'cn';
       const existing = wantId ? authStore.get(wantId) : null;
       let ids;
       let reused = false;
@@ -479,7 +496,9 @@ const routes = [
       }
       return sendJSON(res, 200, {
         ok: true,
-        url: login.buildAuthUrl(ids),
+        // 国际版走 www.trae.ai 的授权页（2026-11-03），账号与国内不通用
+        region,
+        url: login.buildAuthUrl(ids, region),
         deviceId: ids.deviceId,
         machineId: ids.machineId,
         // 复用旧指纹时前端要提示「这是重登，不会换设备」
@@ -508,6 +527,11 @@ const routes = [
         refreshToken: parsed.refreshToken,
         deviceId, machineId,
         uid: parsed.uid, nickname: parsed.nickname,
+        // 回调自带的账号域主机（国际版实测 api-sg-central.trae.ai，按账号
+        // 落点给）——换票与后续续期都必须打它，不能猜
+        host: parsed.host,
+        // 区域与 /login/url 同源：回调本身不携带区域信息，必须由调用方显式给
+        region: (body && body.region === 'intl') ? 'intl' : 'cn',
       });
       if (!r.ok) return sendJSON(res, 200, { ok: false, error: r.error });
       // 审计（Q4）：callback 成功即凭据（refresh token）落盘的时刻

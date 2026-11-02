@@ -23,6 +23,39 @@ const UG_HOST = 'https://api.trae.cn';
 const OAUTH_HOST = 'https://api.trae.com.cn';
 const CONSOLE_HOST = 'https://www.trae.cn';
 
+// ---- 国际版（2026-11-03 接入，端点证据来自 trae2api-hub 的 PROTOCOL 实测）----
+// hub 的 REALMS.intl（trae_client.py / trae_accounts.py）：
+//   account（OAuth 换票）→ grow-normal.trae.ai，回落 grow-normal.traeapi.us
+//   pay（ent_usage/pay_status）→ grow-normal.traeapi.us 200（api.trae.ai 是 404）
+//   ug（签到）→ 国际版实测 404，**签到仅国内版可用**
+// 登录页走国际版控制台 www.trae.ai（与国内 www.trae.cn 同一套授权参数）。
+const CONSOLE_HOST_INTL = 'https://www.trae.ai';
+const ACCOUNT_HOST_INTL = 'https://grow-normal.trae.ai';
+const ACCOUNT_HOST_INTL_FALLBACK = 'https://grow-normal.traeapi.us';
+const PAY_HOST_INTL = 'https://grow-normal.traeapi.us';
+const PAY_HOST_INTL_FALLBACK = 'https://grow-normal.trae.ai';
+
+/** 归一化区域：只有明确 intl 才是国际，其余（含缺省）一律国内。
+ *  与 keys.js 的 'cn'|'intl' 术语一致；存量账号没有 region 字段按国内。 */
+function normalizeRegion(raw) {
+  return String(raw || '').trim().toLowerCase() === 'intl' ? 'intl' : 'cn';
+}
+/** 账号（或 region 串）的区域 */
+function regionOf(x) {
+  if (x === 'intl' || x === 'cn') return x;
+  return normalizeRegion(x && x.region);
+}
+/** OAuth/账号域基址：换票、用户信息、登录态查询 */
+function oauthHostOf(regionOrAuth) {
+  return regionOf(regionOrAuth) === 'intl' ? ACCOUNT_HOST_INTL : OAUTH_HOST;
+}
+/** 国际版账号域的候选链（连接级失败换下一家；国内单主机不轮转） */
+function oauthHostCandidates(regionOrAuth) {
+  return regionOf(regionOrAuth) === 'intl'
+    ? [ACCOUNT_HOST_INTL, ACCOUNT_HOST_INTL_FALLBACK]
+    : [OAUTH_HOST];
+}
+
 // ---- 端点 ----
 const EP_CHAT = '/api/agent/v3/llm_utils_chat';
 const EP_MODELS = '/api/ide/v1/get_detail_param';
@@ -35,6 +68,9 @@ const EP_CHECK_LOGIN = '/cloudide/api/v3/trae/CheckLogin';
 const EP_CHECKIN_STATUS = '/trae/api/v2/ug/checkin_credits/status';
 const EP_CHECKIN_CLAIM = '/trae/api/v2/ug/checkin_credits/claim';
 const EP_ENT_USAGE = '/trae/api/v2/pay/ide_user_ent_usage';
+// v1 路径（hub 实测国际版只有 v1 注册：fetch_entitlement 对 intl 走
+// PATH_ENT_USAGE_V1 / PATH_PAY_STATUS v1；国内 v2 正常，保持不动）
+const EP_ENT_USAGE_V1 = '/trae/api/v1/pay/ide_user_ent_usage';
 // 付费状态 / 套餐身份 / 活动资格（2026-10-31 实测）。
 //
 // **v1 与 v2 都返回 200 且字段不同**——v2 多 `can_purchase_pro_oneweek` 与
@@ -49,6 +85,7 @@ const EP_ENT_USAGE = '/trae/api/v2/pay/ide_user_ent_usage';
 // 实测 send_message_reward 的 work_extra 带 `general_credits: 500` 且
 // eligible=true——这是**清单里「活动/邀请积分」那一项的数据源**。
 const EP_PAY_STATUS = '/trae/api/v2/pay/ide_user_pay_status';
+const EP_PAY_STATUS_V1 = '/trae/api/v1/pay/ide_user_pay_status';
 // 逐轮账单（2026-10-31，Trae2api-cn 实测）：body {session_id: <本轮 turn id>}，
 // 回 data.user_usage_group_by_session.credits_float。turn id 取自流里的
 // reply_to_message_id / user_message_id。这是 TRAE 唯一能拿到「单请求扣了多少」
@@ -166,8 +203,12 @@ function request(host, path, { method = 'POST', body = null, headers = {}, timeo
 
 module.exports = {
   AGENT_HOST, AGENT_HOST_INTL, UG_HOST, OAUTH_HOST, CONSOLE_HOST,
+  CONSOLE_HOST_INTL, ACCOUNT_HOST_INTL, ACCOUNT_HOST_INTL_FALLBACK,
+  PAY_HOST_INTL, PAY_HOST_INTL_FALLBACK,
+  normalizeRegion, regionOf, oauthHostOf, oauthHostCandidates,
   EP_CHAT, EP_MODELS, EP_EXCHANGE, EP_USER_INFO, EP_CHECK_LOGIN,
-  EP_CHECKIN_STATUS, EP_CHECKIN_CLAIM, EP_ENT_USAGE, EP_SESSION_USAGE, EP_PAY_STATUS,
+  EP_CHECKIN_STATUS, EP_CHECKIN_CLAIM, EP_ENT_USAGE, EP_ENT_USAGE_V1,
+  EP_SESSION_USAGE, EP_PAY_STATUS, EP_PAY_STATUS_V1,
   EP_ACTIVITY_INFO, EP_ACTIVITY_ACTION, EP_FISSION_GRANT, EP_GRANT_BENEFIT,
   REMOTE_BASE_CN, REMOTE_ORIGIN, REMOTE_UA,
   CLIENT_ID, APP_ID, IDE_VERSION, IDE_VERSION_CODE,

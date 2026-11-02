@@ -190,6 +190,9 @@
             <div class="account-card">
               <div class="account-card-header">
                 <span class="account-card-name">{{ a.name }}</span>
+                <a-tag :color="a.region === 'intl' ? 'purple' : 'blue'" class="ml-1" size="small">
+                  {{ a.region === 'intl' ? '国际' : '国内' }}
+                </a-tag>
                 <a-tag :color="a.lastError ? 'red' : a.refreshExpired ? 'orange' : a.enabled ? 'green' : 'default'">
                   {{ a.lastError ? '异常' : a.refreshExpired ? '待重登' : a.enabled ? '在线' : '停用' }}
                 </a-tag>

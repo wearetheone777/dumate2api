@@ -21,6 +21,12 @@
         </span>
       </template>
       <template #extra>
+        <!-- 区域视图（2026-11-03 国际版接入）：两区模型表不同，分开拉。
+             国际版没有签到/活动接口，但模型表与对话可用 -->
+        <a-radio-group v-model:value="twRegion" size="small" class="mr-2" @change="() => loadTwModels(false)">
+          <a-radio-button value="cn">国内</a-radio-button>
+          <a-radio-button value="intl">国际</a-radio-button>
+        </a-radio-group>
         <a-button size="small" class="ghost-btn mr-2" :loading="twBillingChecking" @click="runTwBillingCheck">
           计费自检
         </a-button>
@@ -294,6 +300,11 @@
         </span>
       </template>
       <template #extra>
+        <!-- 区域视图：cn（qoder.com.cn）/ global（qoder.sh）两套账号与模型表，分开拉 -->
+        <a-radio-group v-model:value="qdRegion" size="small" class="mr-2" @change="() => loadQd(false)">
+          <a-radio-button value="cn">国内</a-radio-button>
+          <a-radio-button value="global">国际</a-radio-button>
+        </a-radio-group>
         <a-button size="small" class="ghost-btn mr-2" :loading="billingChecking" @click="runBillingCheck">计费自检</a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="loadQd(true)">刷新</a-button>
       </template>
@@ -692,6 +703,8 @@ const isQd = computed(() => isQoder())
 // Qoder 模型表（上游下发，带倍率）与额度
 const qdModels = ref<QoderModel[]>([])
 const qdError = ref('')
+// 区域视图（2026-11-03）：cn（qoder.com.cn）/ global（qoder.sh），两套账号与模型表
+const qdRegion = ref<'cn' | 'global'>('cn')
 const qdCredits = ref<QoderCreditRow[]>([])
 // 计费自检：对最低倍率模型发探针，比对实测倍率与标称（上游改路由的可见性）
 const billingChecking = ref(false)
@@ -712,7 +725,8 @@ async function runBillingCheck() {
   }
   billingChecking.value = true
   try {
-    const r = await qoderApi.billingCheck(target)
+    // 探针按当前区域走（global 的模型拿国内账号打必然失败）
+    const r = await qoderApi.billingCheck(target, qdRegion.value)
     billingResult.value = r.data
   } catch (e: any) {
     billingResult.value = { ok: false, model: target, account: null, expected: null, billed: null, ratio: null, credits: null, error: e?.message || '请求失败' }
@@ -737,10 +751,11 @@ const qdTotals = computed(() => {
 async function loadQd(force = false) {
   try {
     // 三份并行：/qoder/models（倍率 + 上下文，顶部计数用）、
-    // /models/info?channel=qoder（统一形状，表格与倍率排序用）、额度
+    // /models/info?channel=qoder（统一形状，表格与倍率排序用）、额度。
+    // 模型两份都带区域——两区模型表不同，切换区域时整页重拉
     const [m, info, c] = await Promise.all([
-      qoderApi.models({ refresh: force }),
-      modelInfoApi.list({ channel: 'qoder', refresh: force })
+      qoderApi.models({ refresh: force, region: qdRegion.value }),
+      modelInfoApi.list({ channel: 'qoder', refresh: force, region: qdRegion.value })
         .catch(() => ({ data: { rows: [] as ModelInfoRow[], error: '' } })),
       qoderApi.credits().catch(() => ({ data: { rows: [] as QoderCreditRow[] } })),
     ])
@@ -757,6 +772,8 @@ async function loadQd(force = false) {
 
 // TRAE 模型表与额度
 const twModels = ref<TraeworkModel[]>([])
+// 区域视图（2026-11-03 国际版接入）：国内（trae.cn）/ 国际（trae.ai）模型表分开拉
+const twRegion = ref<'cn' | 'intl'>('cn')
 // 上游模型表的拉取时间（/traework/models 的 fetchedAt）。缓存命中时是上次
 // 实际拉取的时刻，正好用来判断「刷新有没有真的打到上游」
 const twFetchedAt = ref(0)
@@ -819,7 +836,8 @@ async function runTwBillingCheck() {
   }
   twBillingChecking.value = true
   try {
-    const r = await traeworkApi.billingCheck(target)
+    // 探针按当前区域走（国际模型拿国内账号打必然失败）
+    const r = await traeworkApi.billingCheck(target, twRegion.value)
     twBillingResult.value = r.data
   } catch (e: any) {
     twBillingResult.value = {
@@ -1032,12 +1050,12 @@ const twShowAll = ref(false)
 
 async function loadTwModels(force = false) {
   const [m, credits, usage, info] = await Promise.all([
-    traeworkApi.models({ refresh: force })
+    traeworkApi.models({ refresh: force, region: twRegion.value })
       .catch((e: any) => ({ data: { models: [], total: 0, error: e?.message || '取模型列表失败', fetchedAt: 0, rateNote: '' } })),
     traeworkApi.credits().catch(() => ({ data: { count: 0, rows: [] } })),
     client.get('/reqlogs?days=7&status=all&channel=traework&limit=200&offset=0')
       .catch(() => ({ data: { rows: [] } })),
-    modelInfoApi.list({ channel: 'traework', refresh: force, all: twShowAll.value })
+    modelInfoApi.list({ channel: 'traework', refresh: force, all: twShowAll.value, region: twRegion.value })
       .catch(() => ({ data: { rows: [], error: '' } })),
   ])
   twModels.value = m.data.models || []

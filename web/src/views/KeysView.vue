@@ -178,7 +178,8 @@
           <div class="text-xs text-slate-500 mt-1">
             留空 = 不限区域。「国内/国际」只对 Qoder 与 TRAE 有区分度（按账号池
             过滤）；搭子与千问是纯国内产品，国际 key 打它们会被 403 拒绝。
-            TRAE 国际通道尚未接入，国际 key 会拿到明确的「未接入」报错。
+            Qoder 与 TRAE 的国际版均已接入（国际 key 需先添加对应区域的账号，
+            没有该区域账号时会拿到明确的报错而不是静默跑错区域）。
           </div>
         </a-form-item>
         <a-form-item label="模型白名单">

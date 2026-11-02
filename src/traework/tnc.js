@@ -31,10 +31,9 @@ const NEGATIVE_MS = 60 * 1000;        // 拉表失败的负缓存（别每个请
 
 const cache = new Map(); // region → { at, hosts: string[]|null }
 
-/** 账号的地域：auth 记录的 region 字段（缺省 cn）；也接受直接的 region 串 */
+/** 账号的地域：auth 记录的 region 字段（缺省 cn）。实现收敛到 constants（单一来源） */
 function regionOf(x) {
-  if (x === 'intl' || x === 'cn') return x;
-  return x && x.region === 'intl' ? 'intl' : 'cn';
+  return c.regionOf(x);
 }
 
 /** 拉一区的域名表；解析不出候选返回 null */

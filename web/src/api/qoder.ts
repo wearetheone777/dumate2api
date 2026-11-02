@@ -200,7 +200,7 @@ export const qoderApi = {
   status: () => client.get<QoderStatus>('/qoder/status'),
   /** 计费自检探针：按模型发一个小请求，比对「实测倍率 vs 模型表标称」。
    *  ratio≠1 不一定是改路由（错峰优惠/倍率元数据过期都是合法偏差）——判读看 note。 */
-  billingCheck: (model: string) =>
+  billingCheck: (model: string, region?: 'cn' | 'global') =>
     client.get<{
       ok: boolean
       model: string
@@ -212,7 +212,7 @@ export const qoderApi = {
       elapsedMs?: number
       error?: string
       note?: string
-    }>(`/qoder/billing-check?model=${encodeURIComponent(model)}`),
+    }>(`/qoder/billing-check?model=${encodeURIComponent(model)}${region ? `&region=${region}` : ''}`, { timeout: 120000 }),
   dashboard: () => client.get<{
     accounts: QoderDashboardAccount[]
     summary: { total: number; enabled: number; refreshExpired: number; errored: number }
@@ -222,14 +222,21 @@ export const qoderApi = {
   chatlabModels: () => client.get<{
     models: Array<{ id: string; name: string; prefixed: string }>
   }>('/chatlab/qoder-models'),
-  models: (opts: { refresh?: boolean } = {}) =>
-    client.get<{
+  models: (opts: { refresh?: boolean; region?: 'cn' | 'global' } = {}) => {
+    const q: string[] = []
+    if (opts.refresh) q.push('refresh=1')
+    if (opts.region) q.push(`region=${opts.region}`)
+    const qs = q.length ? '?' + q.join('&') : ''
+    return client.get<{
       models: QoderModel[]
       total: number
+      /** 本次模型表实际来自的区域（按所选账号归一化） */
+      region?: 'cn' | 'global'
       error: string
       fetchedAt: number
       rateNote: string
-    }>(`/qoder/models${opts.refresh ? '?refresh=1' : ''}`),
+    }>(`/qoder/models${qs}`)
+  },
   credits: () => client.get<{
     count: number
     rows: QoderCreditRow[]

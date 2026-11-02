@@ -820,6 +820,64 @@ byteCrypto → storage.json）则精确口径可用。离线验证：
 `node --test test/unit/router-traebao.test.js`（4 项）；真机：四入口冒烟
 （OpenAI/Anthropic/流式/白名单 400）全过。
 
+**TRAE 国际版已接入（2026-11-03，全链路真机验证过，区域术语 `cn`/`intl`）。**
+账号管理登录弹窗选「国际 trae.ai」→ `www.trae.ai/authorization`（同一套
+client_id 与参数集，真机确认接受）→ 回调粘回。真机实测推翻/补齐了 hub
+的几个结论：
+
+1. **换票主机按账号落点给，回调里自带**：国际版回调 URL 带
+   `host=https://api-sg-central.trae.ai`（新加坡落点）与 `userRegion=sg`——
+   **解析回调的 `host` 参数优先于一切预置候选**（hub 的 grow-normal.trae.ai
+   是美区实测值，SG 落点账号不认；候选链只作没有 host 时的回落）。
+   `login.parseCallback` 取 host、`exchangeAndSave` 存进账号 `apiHost`，
+   之后换票/用户信息/CheckLogin/usage/payStatus 全部优先打账号自己的域。
+2. **国际版模型表可用**：utils_chat 链路的 `get_detail_param` 在国际主机
+   实测 200（22 个模型）——hub 记载的「国际版 model_list 403」是 **raw
+   链路**的 `/api/ide/v1/model_list`，别混。国际表 GPT-6.1 系/Kimi-K3/
+   GPT-5.2 多数 `is_invisible_to_user=true`（订阅档隐藏模型），Free 账号
+   实际可对话的是 `deepseek-v4.1-flash` / `deepseek-v4-pro-0813`；
+   国际表**没有 consumption_rate**（倍率如实「无此数据」）。
+   模型表按区域分缓存（`models.caches`），`/traework/models?region=intl`。
+3. **国际版是订阅制「按请求数计」，不是积分**（真机 Free plan）：
+   没有 `usage_summary`（国内 total/consumed 口径不存在），额度形态是
+   `product_extra.subscription_extra.quota` 的请求数限额（premium fast 10 /
+   slow 50 / advanced 1000 / auto_completion 5000 / solo 并行 2）。解析在
+   `checkin.parseIntlPlan`，落 `/credits` 行的 `intlPlan` 字段——界面显示
+   套餐名 +「按请求数计」。**坑：国内额度包里也带 subscription_extra 字段**，
+   parseIntlPlan 必须只在 `regionOf(auth)==='intl'` 时调用，否则国内号的
+   积分口径会被误显示成「按请求数计」（真机踩过当场修）。
+4. **国际版没有签到/活动接口**（与 hub 实测一致，ug 族 404）：`status`/
+   `claim`/`claimActivities` 对 intl 直接明确报出；`/credits` 行的 error
+   在「usage 成功、仅签到不可用」时为空（否则国际账号永远挂「查询失败」）；
+   `known` 口径把有 intlPlan 的行算「已知额度」。
+5. **模型-区域亲和（混合池的正确性）**：`send()` 里模型只存在于某一区的
+   表时（cnKnown && !intlKnown）把选号约束到该区——否则池子会把 glm-5.2
+   派给国际账号白撞上游。只认「正据」：某区表没就绪不猜，维持普通轮询；
+   两区都有的模型（deepseek-v4.1-flash）不约束。真机验证：不带 region 打
+   glm-5.2 实际派给国内账号。TRAE 宝（persona）恒限国内；Remote 链路
+   intl 账号不走（remoteBaseOf 对 intl 如实拒绝）。
+6. **pay 族走 v1 路径**：国际版 `ide_user_ent_usage`/`ide_user_pay_status`
+   只有 v1（`/trae/api/v1/pay/...`），国内保持 v2；ugHeaders 的区域身份
+   （X-User-Region/Package-Type/X-Lscbd-Aid）按区域出值。
+
+真机验证记录（2026-11-03）：国际账号 wearetheone777（id=3，SG 落点）登录
+落盘；`/traework/models?region=intl` 22 个模型；billing-check
+`region=intl` + deepseek-v4.1-flash 真实出流（output 1866 token，国际版无
+credits 口径 → delta 如实 null）；glm-5.2 不带 region 派给国内账号
+（ratio 0.954 正常）。前端：账号卡区域徽标 + 登录区域选择（TraeworkAccounts）、
+模型页区域切换（ModelsView，两通道）、仪表盘徽标、登录态表区域列、
+KeysView 文案更新。区域约束的运行时过滤（`accountsForRegion`）与
+keys.js 的 region 绑定自 2026-11-01 就位，本次补齐的是「国际账号本身」。
+
+**Qoder 国际版（2026-11-03 页面区分收尾——通道本身早已支持 cn/global）。**
+Qoder 的登录区域选择、per-region 端点、`accountsForRegion`（intl key →
+global 池）都是既有能力；本次补的是**页面层**：模型页 Qoder 卡加区域切换
+（国内/国际，`/qoder/models?region=` 按区域选主账号拉表，没有该区域账号时
+明确报「没有国际（global）账号」**不静默回落国内表**）、计费自检带 region
+（国际模型不再可能被国内账号接走）。库内当前两个账号都是 cn——添加国际
+账号走账号管理 → 添加账号 → 选「国际 qoder.sh」（device flow，需登录
+qoder.com），链接生成已真机验证指向国际域。
+
 **TRAE Remote 链路已通（2026-11-01，P2-16 最小版，默认关）。**
 `DUMATE_TRAEWORK_REMOTE=1` 时 **auto 档纯文本请求**走 remote
 （`trae-api-cn.mchost.guru/api/remote/v1`），带 tools 与显式模型名继续走
@@ -1739,11 +1797,13 @@ discovery；鉴权固定 `Bearer nokey`。排障第一入口是
 **2026-10-31 调研缓办清单（每项都有明确的阻塞原因，别翻出来重做）**：
 `/algo/api/v3/user/status` 订阅周期端点与「新版推理协议解锁隐藏模型」（两者都
 要官方**机器身份** machine_id/machine_token——device flow 账号不带，需真实
-指纹；EchoPing07 实现里 userType 是 AES 签进 bearer 的）；TRAE 国际版直连的
-活验证（region 管道已铺，utils_chat 国际基址未实测，需国际账号）；ASR 语音
+指纹；EchoPing07 实现里 userType 是 AES 签进 bearer 的）；~~TRAE 国际版直连的
+活验证~~（**2026-11-03 已完成**，见上文「TRAE 国际版已接入」——全链路真机
+验证过，从缓办清单移除）；ASR 语音
 转写（搭子要 BOS AK/SK 证据、千问要 WS 协议逆向）；飞书推送（要 webhook
 配置与产品设计）；账号级限额护栏（要存储与界面设计）；remote 端点备选链路
-（要 Max 账号）；Qoder intl 活动域 center.qoder.sh（要国际账号）；多时段签到、
+（要 Max 账号）；Qoder intl 活动域 center.qoder.sh（要国际账号——添加
+Qoder 国际账号走登录弹窗「国际 qoder.sh」）；多时段签到、
 per-key 限流（低价值场景）。
 
 ## 环境变量
