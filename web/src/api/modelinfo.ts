@@ -53,10 +53,13 @@ export interface ModelInfoRow {
 }
 
 export const modelInfoApi = {
-  list: (opts: { channel?: string; refresh?: boolean } = {}) => {
+  list: (opts: { channel?: string; refresh?: boolean; all?: boolean } = {}) => {
     const q: string[] = []
     if (opts.channel) q.push(`channel=${opts.channel}`)
     if (opts.refresh) q.push('refresh=1')
+    // all=1 看 TRAE 上游表全量（subagent / custom_model 占位 / summary）；
+    // 默认只返回可用对话模型（与 /v1/models 的 usableIds 同口径）
+    if (opts.all) q.push('all=1')
     const qs = q.length ? '?' + q.join('&') : ''
     return client.get<{
       channel: string

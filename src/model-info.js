@@ -333,12 +333,21 @@ async function qoderRows() {
   }));
 }
 
-/** TRAE 的行：唯一有完整上游元信息的通道 */
-async function traeworkRows({ visibleOnly = false, force = false } = {}) {
+/**
+ * TRAE 的行：唯一有完整上游元信息的通道。
+ *
+ * 默认只列**可用对话模型**（与网关 /v1/models 的 usableIds 同一份判定，
+ * traework/models.isUsableRow）——上游表全量 51 条里有 subagent、
+ * custom_model_* 占位、summary 这类非对话条目，混进模型信息表只会让
+ * 「哪个模型花多少」答不上来（这些条目的倍率/上下文全是 null）。
+ * 排查「为什么某个名字调不通」时传 { all: true } 看全量。
+ */
+async function traeworkRows({ visibleOnly = false, all = false, force = false } = {}) {
   const models = require('./traework/models');
   const r = await models.fetchModels({ force });
   let list = r.models;
-  if (visibleOnly) list = list.filter((m) => m.visible);
+  if (!all) list = list.filter(models.isUsableRow);
+  else if (visibleOnly) list = list.filter((m) => m.visible);
   return {
     ok: r.ok,
     error: r.error,

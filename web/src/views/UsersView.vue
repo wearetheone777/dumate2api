@@ -16,7 +16,14 @@
       <template #extra>
         <a-button type="primary" size="small" @click="openCreate">新建账户</a-button>
       </template>
-      <a-table size="small" :pagination="false" :data-source="users" row-key="username" :loading="loading">
+      <a-table
+        size="small"
+        :pagination="false"
+        :columns="columns"
+        :data-source="users"
+        row-key="username"
+        :loading="loading"
+      >
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'username'">
             <span>{{ record.username }}</span>
@@ -86,7 +93,10 @@ import PageHeader from '@/components/PageHeader.vue'
 import client from '@/api/client'
 import { auth } from '@/stores/auth'
 
-const { message } = AntApp
+// message 走 App.useApp() 的上下文实例（App.vue 已包 <a-app>）。
+// 不能解构 App 组件对象本身——那是 undefined，调用 message.success()
+// 会 TypeError，把成功路径（关弹窗、刷新列表）整个打断
+const { message } = AntApp.useApp()
 
 interface AdminUser {
   username: string
@@ -98,6 +108,16 @@ const users = ref<AdminUser[]>([])
 const me = ref('')
 const loading = ref(false)
 const saving = ref(false)
+
+// **必须显式给 columns**：a-table 靠 dataSource 非空时自动生成列，
+// loading 阶段 users=[] 时列不存在，bodyCell 里读 column.key 直接
+// TypeError——整个渲染树崩掉，之后数据到了也不再渲染（页面永远空表）
+const columns = [
+  { title: '用户名', key: 'username' },
+  { title: '角色', key: 'role', width: 100 },
+  { title: '创建时间', key: 'created_at', width: 170 },
+  { title: '操作', key: 'ops', width: 280 },
+]
 
 const createOpen = ref(false)
 const createForm = reactive({ username: '', password: '', role: 'viewer' })

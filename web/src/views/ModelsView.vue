@@ -12,7 +12,7 @@
         <span class="section-title">TRAE Work 模型</span>
         <a-tag class="ml-2" color="cyan">只读</a-tag>
         <span v-if="twModels.length" class="text-xs text-slate-500 ml-2">
-          共 {{ twModels.length }} 个 · 可见 {{ twVisible.length }} 个
+          上游表 {{ twModels.length }} 个 · 对话可用 {{ twChat.length }} 个
         </span>
         <!-- 上游拉取时间：模型表有 5 分钟缓存，没有这个时间戳就分不清
              「刷新后还是旧的」到底是缓存命中还是上游没变 -->
@@ -24,6 +24,17 @@
         <a-button size="small" class="ghost-btn mr-2" :loading="twBillingChecking" @click="runTwBillingCheck">
           计费自检
         </a-button>
+        <!-- 排查「为什么某个名字调不通」时才看上游全量（subagent / 占位条目）；
+             默认收窄到可用对话模型，与下方表格口径一致。
+             **必须从事件对象取值**：@change 触发时 v-model 还没把新值写回
+             twShowAll，直接读 ref 会拿旧值（实测勾上后表格仍是 20 行） -->
+        <a-checkbox
+          v-model:checked="twShowAll"
+          class="mr-2 text-xs"
+          @change="(e: any) => { twShowAll = e.target.checked; loadTwModels(false); }"
+        >
+          含内部模型
+        </a-checkbox>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="loadTwModels(true)">
           刷新
         </a-button>
@@ -170,7 +181,7 @@
               每千 token {{ qwBillingResult.billed ?? '—' }}
               <span class="text-slate-500">
                 （{{ qwBillingResult.account || '账号未知' }}，tokens {{ qwBillingResult.tokens?.total ?? '—' }}，
-                免费池 {{ qwBillingResult.pools?.free ?? '—' }} · 付费池 {{ qwBillingResult.pools?.paid ?? '—' }}，{{ qwBillingResult.elapsedMs }}ms）
+                付费池 {{ qwBillingResult.pools?.paid ?? '—' }}，{{ qwBillingResult.elapsedMs }}ms）
               </span>
             </template>
             <template v-else>计费自检失败：{{ qwBillingResult.error }}</template>
@@ -205,7 +216,7 @@
                 <span class="font-medium num">{{ record.usage.requests }}</span>
                 <span class="text-xs text-slate-400 ml-1">次</span>
                 <div class="text-xs text-slate-500">
-                  免费 {{ fmtQw(record.usage.free) }} · 付费 {{ fmtQw(record.usage.paid) }} 积分
+                  {{ fmtQw(record.usage.total) }} 积分
                 </div>
               </div>
               <span v-else class="text-xs text-slate-400">—</span>
@@ -245,21 +256,16 @@
             <div class="qw-pool">
               <div class="qw-pool-head">
                 <span class="qw-pool-label">{{ w.label }}</span>
-                <a-tag :color="w.kind === 'free' ? 'cyan' : 'blue'" class="qw-mini">
-                  {{ w.kind === 'free' ? '免费' : '付费' }}
-                </a-tag>
+                <a-tag color="blue" class="qw-mini">付费</a-tag>
               </div>
               <div class="qw-pool-value num">
                 {{ fmtQw(w.balance) }}
-                <!-- 分母与分子同口径：分子是全账号合计余额，分母就是合计上限。
-                     两账号各 100 时这里显示「200 / 200」，不是「200 / 100」 -->
-                <span v-if="w.id === 'daily'" class="qw-pool-cap">/ {{ qw.dailyCap }}</span>
               </div>
               <div class="qw-pool-sub">
-                <template v-if="w.id === 'daily'">
-                  <template v-if="qw.accountCount > 1">{{ qw.accountCount }} 个账号合计 · </template>每日 00:00 重置
+                <template v-if="w.id === 'monthly'">
+                  <template v-if="qw.accountCount > 1">{{ qw.accountCount }} 个账号合计 · </template>
+                  按有效期<template v-if="w.resetAt"> · {{ fmtReset(w.resetAt) }} 刷新</template>
                 </template>
-                <template v-else-if="w.id === 'monthly'">订阅套餐内</template>
                 <template v-else>充值 / 赠送</template>
               </div>
             </div>
@@ -271,10 +277,7 @@
                 <a-tag class="qw-mini">经本网关</a-tag>
               </div>
               <div class="qw-pool-value num">{{ fmtQw(qw.today.total) }}</div>
-              <div class="qw-pool-sub">
-                免费 {{ fmtQw(qw.today.free) }} · 付费 {{ fmtQw(qw.today.paid) }} ·
-                {{ qw.today.requests }} 次
-              </div>
+              <div class="qw-pool-sub">{{ qw.today.requests }} 次请求</div>
             </div>
           </a-col>
         </a-row>
@@ -617,7 +620,12 @@
 
     <a-card title="网关实际返回" :bordered="false">
       <div class="flex items-center justify-between mb-2">
-        <span class="text-xs text-slate-500">直接读取网关的 /v1/models，确认改动已生效</span>
+        <span class="text-xs text-slate-500">
+          直接读取网关的 /v1/models，确认改动已生效
+          <template v-if="gatewayViaKey">
+            · 网关按 key 通道过滤，当前为 key「{{ gatewayViaKey }}」的视角
+          </template>
+        </span>
         <a-button size="small" :loading="loadingGateway" @click="loadGateway">刷新</a-button>
       </div>
       <a-table
@@ -629,7 +637,16 @@
       >
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'owned'">
-            <a-tag :color="record.owned_by === 'dumate' ? 'green' : 'default'">
+            <!-- TRAE 宝 / 千帆是**同一份凭证下的另一种对话身份**，不是普通
+                 代理转换——笼统标「代理转换」会让它们看起来像 TRAE/搭子
+                 的普通别名，分不清免费豁免与 JSON mode 的边界 -->
+            <a-tag v-if="String(record.id || '').startsWith('traebao/')" color="geekblue">
+              TRAE 宝（免费）
+            </a-tag>
+            <a-tag v-else-if="String(record.id || '').startsWith('qianfan/')" color="purple">
+              千帆透传
+            </a-tag>
+            <a-tag v-else :color="record.owned_by === 'dumate' ? 'green' : 'default'">
               {{ record.owned_by === 'dumate' ? '上游原生' : '代理转换' }}
             </a-tag>
           </template>
@@ -842,7 +859,9 @@ const dumateOnWebFallback = computed(() => {
   return !!ch && !ch.ready && !!ch.fallback?.available
 })
 
-const twVisible = computed(() => twModels.value.filter((m) => m.visible))
+// 「对话可用」与网关 /v1/models 的 usableIds 同口径（可见 + chat_completion）——
+// 不是简单 visible：custom_model_* 占位与 summary 是可见的但不是对话模型
+const twChat = computed(() => twModels.value.filter((m) => m.visible && (m.usage === 'chat_completion' || !m.usage)))
 
 const twTotals = computed(() => {
   let remain: number | null = null
@@ -932,6 +951,8 @@ const loading = ref(false)
 const loadingGateway = ref(false)
 const probeMap = ref<Record<string, ProbeResult>>({})
 const gatewayList = ref<Array<{ id: string; owned_by: string }>>([])
+// 「网关实际返回」用的 key（网关按 key 通道过滤模型，列表是这把 key 的视角）
+const gatewayViaKey = ref('')
 const upstreamModels = ref<string[]>([])
 const exposed = ref<string[]>([])
 
@@ -956,6 +977,13 @@ const targetOptions = computed(() =>
 // 千问积分保留 4 位：实测单次消耗 0.0025，按 2 位显示会变成 0
 const fmtQw = (n: number | null | undefined) =>
   n == null ? '—' : Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 4 })
+/** 额度刷新时刻（上游 active_wallet 的 valid_to）。空值显示 —，不编日期 */
+const fmtReset = (iso?: string | null) => {
+  const t = Date.parse(iso || '')
+  return Number.isFinite(t)
+    ? new Date(t).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+    : '—'
+}
 const fmtTime = (ts: number) => new Date(ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 
 // 千问通道下，每个模型的「近 7 天调用次数与积分消耗」。
@@ -963,9 +991,10 @@ const fmtTime = (ts: number) => new Date(ts).toLocaleString('zh-CN', { hour12: f
 // 两个文件按 req_id 配对：每个模型对应一组 req_id，对每组取 credit.total 求和。
 // 直接在前端算——数据量小（百行级），不必走后端聚合。
 const modelRows = computed(() => {
-  const map: Record<string, { id: string; name: string; prefixed: string; requests: number; last: number | null; free: number; paid: number }> = {}
+  // 只统计合计消耗：上游停发每日免费额度后，free/paid 分列恒为 0 与全额
+  const map: Record<string, { id: string; name: string; prefixed: string; requests: number; last: number | null; total: number }> = {}
   for (const m of qwModels.value) {
-    map[m.id] = { id: m.id, name: m.name, prefixed: m.prefixed, requests: 0, last: null, free: 0, paid: 0 }
+    map[m.id] = { id: m.id, name: m.name, prefixed: m.prefixed, requests: 0, last: null, total: 0 }
   }
   // 调用次数与最近一次
   const since = Date.now() - 7 * 86400000
@@ -979,16 +1008,15 @@ const modelRows = computed(() => {
     if (r.ts < since) continue
     m.requests++
     if (!m.last || r.ts > m.last) m.last = r.ts
-    if (r.qw_free) m.free += r.qw_free
-    if (r.qw_paid) m.paid += r.qw_paid
+    if (r.qw_total) m.total += r.qw_total
   }
   return Object.values(map).map((m) => ({
     ...m,
-    usage: m.requests > 0 ? { requests: m.requests, free: m.free, paid: m.paid } : null,
+    usage: m.requests > 0 ? { requests: m.requests, total: m.total } : null,
   })).sort((a, b) => b.requests - a.requests)
 })
 
-const qwUsage = ref<Array<{ model: string; ts: number; qw_free?: number; qw_paid?: number }>>([])
+const qwUsage = ref<Array<{ model: string; ts: number; qw_total?: number }>>([])
 
 const modelColumns = [
   { title: '显示名', key: 'name', width: '22%' },
@@ -998,6 +1026,10 @@ const modelColumns = [
   { title: '最近调用', key: 'last', width: '16%' },
 ]
 
+// 上游全量表是否包含内部模型（subagent / custom_model 占位 / summary）。
+// 默认关：模型信息表只列可用对话模型，排查个别名字时才打开
+const twShowAll = ref(false)
+
 async function loadTwModels(force = false) {
   const [m, credits, usage, info] = await Promise.all([
     traeworkApi.models({ refresh: force })
@@ -1005,7 +1037,7 @@ async function loadTwModels(force = false) {
     traeworkApi.credits().catch(() => ({ data: { count: 0, rows: [] } })),
     client.get('/reqlogs?days=7&status=all&channel=traework&limit=200&offset=0')
       .catch(() => ({ data: { rows: [] } })),
-    modelInfoApi.list({ channel: 'traework', refresh: force })
+    modelInfoApi.list({ channel: 'traework', refresh: force, all: twShowAll.value })
       .catch(() => ({ data: { rows: [], error: '' } })),
   ])
   twModels.value = m.data.models || []
@@ -1087,6 +1119,9 @@ async function loadGateway() {
   try {
     const { data } = await client.get('/models/gateway-list')
     gatewayList.value = data.data || []
+    // 网关按 key 的通道绑定过滤模型（2026-11-01 起）：列表是这把 key 的
+    // 视角，不是全量——不标出来会被读成「模型丢了」
+    gatewayViaKey.value = data.via_key || ''
   } finally {
     loadingGateway.value = false
   }

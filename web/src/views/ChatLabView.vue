@@ -206,13 +206,17 @@ const qwModelsLoading = ref(false)
 
 // TRAE 模型：同样从管理端拿。与千问分开存——两者前缀不同（qwen/ vs
 // traework/），混在一份里会让「切通道后下拉还留着上一个通道的模型名」，
-// 而那个名字在新通道下根本不存在。
+// 而那个名字在新通道下根本不存在。内容是**可用对话模型 + TRAE 宝两条**
+// （loadTwModels 里过滤），不是上游表全量——全量里 subagent / 占位条目
+// 只会让下拉错乱。
 const twModels = ref<Array<{ id: string; name: string; prefixed: string }>>([])
 const twModelsLoading = ref(false)
 
 // Qoder 模型：同样从管理端拿，且**必须带 `qoder/` 前缀**。
 // 不带前缀的名字会被网关判成搭子——「选了 Qoder 模型却跑搭子」正是这么来的。
-const qdModels = ref<Array<{ id: string; name: string; prefixed: string }>>([])
+// rate 用来挑默认模型（倍率最低档）；上游模型表已从内部代号改成显示名，
+// 按名字硬编码的「便宜档清单」匹配不到任何条目。
+const qdModels = ref<Array<{ id: string; name: string; prefixed: string; rate?: number | null }>>([])
 const qdModelsLoading = ref(false)
 
 async function loadQdModels() {
@@ -231,7 +235,24 @@ async function loadTwModels() {
   twModelsLoading.value = true
   try {
     const { data } = await traeworkApi.models()
-    twModels.value = data.models || []
+    // 与网关 /v1/models 的 usableIds 同口径（可见 + 对话用途）——上游全量表
+    // 里混着 computer_use_subagent 这类内部模型、custom_model_* 占位与
+    // summary，全列出来下拉就是「错乱」的；模型名调不通的也不该出现
+    const chat = (data.models || []).filter(
+      (m) => m.visible && (m.usage === 'chat_completion' || !m.usage),
+    )
+    const list = chat.map((m) => ({ id: m.id, name: m.name, prefixed: m.prefixed }))
+    // TRAE 宝（traebao/ 前缀 → personal_assistant 身份，当前免费豁免）。
+    // 实测白名单只有 deepseek-v4.1-flash（其余上游 4001），不列调不通的
+    list.push({ id: 'auto', name: 'TRAE 宝自动档（免费）', prefixed: 'traebao/auto' })
+    if (chat.some((m) => m.id === 'deepseek-v4.1-flash')) {
+      list.push({
+        id: 'deepseek-v4.1-flash',
+        name: 'TRAE 宝 · DeepSeek-V4.1-Flash（免费）',
+        prefixed: 'traebao/deepseek-v4.1-flash',
+      })
+    }
+    twModels.value = list
   } catch { /* 拿不到就空列表，不阻断 */ } finally {
     twModelsLoading.value = false
   }
@@ -257,12 +278,19 @@ async function applyChannel(id: string) {
     model.value = qwModels.value[0]?.prefixed || ''
   } else if (id === 'traework') {
     if (!twModels.value.length) await loadTwModels()
-    model.value = twModels.value[0]?.prefixed || ''
+    // 默认 TRAE 宝自动档：当前免费豁免，试调不该默认烧积分（与 Qoder
+    // 分支默认挑 0.1 档同一逻辑）；活动结束或列表异常时退第一个
+    model.value = twModels.value.find((m) => m.prefixed === 'traebao/auto')?.prefixed
+      || twModels.value[0]?.prefixed || ''
   } else if (id === 'qoder') {
     if (!qdModels.value.length) await loadQdModels()
-    // 默认挑 0.1 档的便宜模型：档位差 14 倍，试调不该默认烧最贵的那个
-    model.value = qdModels.value.find((m) => /^qoder\/(qfmodel|qmodel|q37fmodel|dfmodel|gfmodel)$/.test(m.prefixed))?.prefixed
-      || qdModels.value[0]?.prefixed || ''
+    // 默认挑**倍率最低**的：档位差 14 倍，试调不该默认烧最贵的那个。
+    // rate>0 才参与（price_factor=0 是错峰免费档，窗口外按原价计费，
+    // 拿它当「默认便宜」会误导）；倍率全缺失退列表第一个
+    const cheapest = qdModels.value
+      .filter((m) => m.rate != null && m.rate > 0)
+      .sort((a, b) => (a.rate as number) - (b.rate as number))[0]
+    model.value = cheapest?.prefixed || qdModels.value[0]?.prefixed || ''
   } else {
     if (!models.value) await loadModels()
     model.value = models.value?.exposed?.[0]?.id || models.value?.aliases?.[0]?.id || ''

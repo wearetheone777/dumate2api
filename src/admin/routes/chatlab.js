@@ -65,15 +65,25 @@ function traeworkModels() {
 }
 
 /**
- * Qoder 的模型清单（**带前缀**）。
+ * Qoder 的模型清单（**带前缀** + 倍率）。
  *
  * **必须是 `qoder/gfmodel` 这种完整前缀名**，不能只给 `gfmodel`——前端把选中值
  * 原样回传，网关靠前缀分流；不带前缀的名字会被 `resolve()` 判成搭子，
  * 于是「明明选了 Qoder 模型，跑的却是搭子」，而且两侧都返回 200，看不出来。
  *
+ * 倍率从模型信息行拿（model-info.qoderRows 在管理端进程内自己拉模型表）：
+ * 试调台的默认模型要按「倍率最低」挑。**名字硬编码的清单已经失效**——
+ * 上游模型表从内部代号（qfmodel/gfmodel）改成了显示名（Fast/DeepSeek-Flash），
+ * 按旧名单匹配不到任何条目，默认就落到列表第一个（Auto，倍率未知）。
+ *
  * 上游拿不到时回落静态表（含 0.1 档的便宜模型），避免下拉框空着。
  */
 async function qoderModels() {
+  const rates = new Map();
+  try {
+    const rows = await require('../../model-info').qoderRows();
+    for (const r of rows) rates.set(r.prefixed, r.rate);
+  } catch (e) { /* 倍率拿不到就 null，前端退回列表第一个 */ }
   try {
     const qd = require('../../qoder');
     const entries = await qd.listModelEntries();
@@ -81,10 +91,11 @@ async function qoderModels() {
       id: e.id.replace(/^qoder\//, ''),
       name: e.name || e.id,
       prefixed: e.id,
+      rate: rates.has(e.id) ? rates.get(e.id) : null,
     }));
   } catch (e) {
     return require('../../qoder/constants').FALLBACK_MODELS.map((k) => ({
-      id: k, name: k, prefixed: `qoder/${k}`,
+      id: k, name: k, prefixed: `qoder/${k}`, rate: null,
     }));
   }
 }
@@ -156,7 +167,7 @@ function costOf(accountId, before, after) {
  * 4. **账号名由 provider 上报**（onAccount）：多账号轮询下只有它知道选中的是哪个。
  */
 async function handleDirect(req, res, ctx) {
-  const { provider, payload, channel, model, mapped, stream, startedAt } = ctx;
+  const { provider, payload, channel, model, mapped, stream, startedAt, personalAssistant } = ctx;
   const messageCount = Array.isArray(payload && payload.messages) ? payload.messages.length : 0;
   const reqId = reqlog.newReqId();
   let accountName = '';
@@ -183,10 +194,16 @@ async function handleDirect(req, res, ctx) {
 
   const costNote = `${channel === 'qoder' ? 'Qoder' : channel === 'traework' ? 'TRAE' : '千问'} 的计费不在搭子余额里，本条消耗请到该通道的额度页看`;
 
+  // TRAE 宝身份走 opts（payload.model 已去前缀，provider 认不出）；
+  // 千问/Qoder 的 send 不认识这个字段，多传无害。
+  // **必须在流式/非流式两个分支之外**——流式分支也用它，定义进分支
+  // 里就是 ReferenceError: sendOpts is not defined（实测踩过）
+  const sendOpts = { reqId, onAccount, personalAssistant: !!personalAssistant };
+
   // ---- 非流式 ----
   if (!stream) {
     try {
-      const out = await provider.send(payload, undefined, { reqId, onAccount });
+      const out = await provider.send(payload, undefined, sendOpts);
       const choice = (out.choices || [])[0] || {};
       const msg = choice.message || {};
       const u = reqlog.pickUsage(out.usage);
@@ -267,7 +284,7 @@ async function handleDirect(req, res, ctx) {
           if (d.content) send({ type: 'delta', text: d.content });
         } catch (e) { /* 非 JSON 帧跳过 */ }
       }
-    }, { reqId, onAccount });
+    }, sendOpts);
     const scanned = reqlog.usageFromSSE(seen);
     if (scanned && scanned.total) usage = scanned;
   } catch (e) {
@@ -379,6 +396,11 @@ const routes = [
         return handleDirect(req, res, {
           provider: direct, payload, channel, model, mapped: route.model,
           stream, startedAt, before, messages,
+          // TRAE 宝身份（traebao/ 前缀 → function=personal_assistant）：
+          // 前缀在 payload.model 里已被剥掉，provider 靠这个标记认身份。
+          // 漏传的话 traebao/auto 会静默走 solo 链路并正常计费——界面选了
+          // 「免费」跑的却是扣积分的，比报错更难察觉。
+          personalAssistant: route.personalAssistant,
         });
       }
 

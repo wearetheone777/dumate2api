@@ -156,21 +156,29 @@ async function fetchModels({ force = false } = {}) {
 }
 
 /**
- * 可调用模型 id 列表（给网关 /v1/models 用）。
+ * 单条目是不是「可用对话模型」。usableIds 与管理端模型信息表共用这一份判定——
+ * 口径写两份必然漂移（测试台/模型页已经吃过全量 51 条的亏：subagent、
+ * custom_model 占位、summary 全混在对话模型里）。
  *
  * 过滤条件是「对话模型 + 客户端可见」：上游的 usage 字段把 27 个标成
  * chat_completion，但其中 9 个是**内部模型**（computer_use_subagent、
  * browser_use_subagent、file_search_agent、explore_sub_agent_v2 这类
- * 子代理，以及种子模型的历史版本），它们 is_invisible_to_user=true。
- * 全列出来会让客户端下拉里塞满用户根本不该选的名字。
+ * 子代理，以及种子模型的历史版本），它们 is_invisible_to_user=true；
+ * 另有 custom_model_* 占位与 summary（usage 不是 chat_completion），
+ * 全列出来会让下拉里塞满用户根本不该选的名字。
+ */
+function isUsableRow(m) {
+  return !!m && m.visible && (m.usage === 'chat_completion' || !m.usage);
+}
+
+/**
+ * 可调用模型 id 列表（给网关 /v1/models 用）。
  *
  * 取不到时回落静态表里的 DEFAULT_MODEL——网关的模型列表空了会让客户端
  * 直接报「没有可用模型」，比少列几个严重。
  */
 function usableIds(list) {
-  return list
-    .filter((m) => m.visible && (m.usage === 'chat_completion' || !m.usage))
-    .map((m) => m.id);
+  return list.filter(isUsableRow).map((m) => m.id);
 }
 
 async function listModelIds() {
@@ -248,4 +256,4 @@ function cachedModelEntries() {
   return [{ id: c.DEFAULT_MODEL, name: c.DEFAULT_MODEL, contextWindow: null, maxContextWindow: null }];
 }
 
-module.exports = { fetchModels, listModelIds, cachedModelIds, cachedModelEntries, cachedMetaById, multimodalIds, hasCache, isKnownModel, usableIds, normalize, CACHE_MS, MEASURED_HARD_CONTEXT };
+module.exports = { fetchModels, listModelIds, cachedModelIds, cachedModelEntries, cachedMetaById, multimodalIds, hasCache, isKnownModel, isUsableRow, usableIds, normalize, CACHE_MS, MEASURED_HARD_CONTEXT };

@@ -190,9 +190,12 @@ const routes = [
       const chRaw = decodeURIComponent((req.url.match(/[?&]channel=([^&]*)/) || [])[1] || '');
       const ch = require('../../channels').normalize(chRaw);
       const force = /[?&]refresh=1/.test(req.url || '');
+      // all=1 看 TRAE 上游表全量（含 subagent / custom_model 占位 / summary）。
+      // 默认收窄到可用对话模型——排查「为什么某个名字调不通」才需要全量
+      const all = /[?&]all=1/.test(req.url || '');
       try {
         if (ch) {
-          const r = await require('../../model-info').rowsFor(ch, { force });
+          const r = await require('../../model-info').rowsFor(ch, { force, all });
           return sendJSON(res, 200, { channel: ch, rows: r.rows, error: r.error });
         }
         const r = await require('../../model-info').allRows({ force });
@@ -243,28 +246,60 @@ const routes = [
         process.env.DUMATE_ADMIN_GATEWAY_PORT || process.env.DUMATE2API_PORT || '9080',
         10,
       );
+      // 网关鉴权强制（2026-11-01）后 /v1/models 一律要求 key。管理端自己
+      // 签发的 key 挑一把带上：优先**不限通道**的（绑了通道的 key 只能看到
+      // 本通道的模型，「网关实际返回」就不再是全量视图）；都没有时退回第一把。
+      let auth = process.env.DUMATE2API_KEY || '';
+      let viaKey = 'DUMATE2API_KEY';
+      if (!auth) {
+        try {
+          const keys = require('../../keys').list()
+            .filter((k) => k.enabled !== false && k.plain);
+          const pick = keys.find((k) => !k.channel) || keys[0];
+          if (pick) { auth = pick.plain; viaKey = pick.name || `key-${pick.id}`; }
+        } catch (e) { /* keys.json 读不到就裸发，由下面的状态码检查如实报错 */ }
+      }
       const out = await new Promise((resolve) => {
         const req = http.request(
           // 超时放宽到 15s：本机在负载高时 /v1/models 实测出现过 1.7s 的响应，
           // 原先 4s 的窗口会偶发超时，界面就显示成「网关不可用」——而网关
           // 其实活着。宁可多等，也不要报一个假的故障。
-          { host: '127.0.0.1', port, path: '/v1/models', method: 'GET', timeout: 15000 },
+          {
+            host: '127.0.0.1', port, path: '/v1/models', method: 'GET', timeout: 15000,
+            headers: auth ? { Authorization: `Bearer ${auth}` } : {},
+          },
           (r) => {
             let data = '';
             r.setEncoding('utf8');
             r.on('data', (c) => { data += c; });
             r.on('end', () => {
-              try { resolve({ ok: true, data: JSON.parse(data) }); }
-              catch (e) { resolve({ ok: false, error: 'invalid json' }); }
+              // **必须检查状态码**：网关鉴权拒绝时 body 是 {error:...}，
+              // 不看状态码就会把它当模型列表 200 转给前端——表格永远
+              // 「暂无数据」却看不出原因（实测踩过：强制鉴权上线后此表恒空）
+              try {
+                resolve({
+                  ok: r.statusCode >= 200 && r.statusCode < 300,
+                  status: r.statusCode,
+                  data: JSON.parse(data),
+                });
+              } catch (e) { resolve({ ok: false, status: r.statusCode, error: 'invalid json' }); }
             });
           }
         );
-        req.on('error', (e) => resolve({ ok: false, error: e.message }));
-        req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+        req.on('error', (e) => resolve({ ok: false, status: 0, error: e.message }));
+        req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, error: 'timeout' }); });
         req.end();
       });
-      if (!out.ok) return sendJSON(res, 502, { error: out.error });
-      return sendJSON(res, 200, out.data);
+      if (!out.ok) {
+        const detail = (out.data && (out.data.error || out.data.message)) || out.error || '';
+        return sendJSON(res, 502, {
+          error: `网关 ${port} /v1/models 返回 ${out.status || '无响应'}：${String(detail).slice(0, 120)}`,
+        });
+      }
+      // 网关按 key 的通道绑定过滤模型列表（2026-11-01 起），列表是**这把 key
+      // 的视角**而不是全量——如实带给前端展示，不标会被读成「模型丢了」
+      const body = { ...out.data, via_key: viaKey };
+      return sendJSON(res, 200, body);
     },
   },
 ];
