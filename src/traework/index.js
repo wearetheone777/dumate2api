@@ -12,6 +12,17 @@ const images = require('../images');
 // 通道在池里的 uid 键位 = 'traework:<id>'（channel-pool.js 统一裁决）。
 const channelPool = require('../channel-pool');
 const CHANNEL = 'traework';
+// FEFO（临期积分优先）：数据源 expiring.js（写方是管理端 /credits）
+const expiringSnap = require('../expiring');
+
+// 临期账号的池 uid 集合（pool 键位 'traework:<id>'）。null = 走普通轮询。
+function fefoUidSet() {
+  const ids = expiringSnap.accountIds(CHANNEL);
+  if (!ids) return null;
+  const out = new Set();
+  for (const id of ids) out.add(channelPool.uidOf(CHANNEL, id));
+  return out;
+}
 
 /** 通道是否可用：至少有一个启用且凭证完整的账号 */
 function status() {
@@ -219,13 +230,39 @@ function accountsForRegion(usable, region) {
  * @param {object} [opts] { reqId } 请求埋点的 id，用于把积分归因与日志精确配对
  */
 async function send(payload, onChunk, opts = {}) {
-  let model = payload && payload.model ? String(payload.model).replace(/^traework\//, '') : c.DEFAULT_MODEL;
-  // model=auto 兜底：搭子路径有 mapModel 兜底（auto → model-text），直连通道
-  // 此前没有——`traework/auto` 会撞 assertModelKnown 的 400，客户端配 auto
-  // 直接不可用。映射到通道默认模型；不做 Trae2api-cn 的「按请求内容智能
-  // 路由」——隐性替换模型违背显式契约（计费倍率跟着变，用户不知情）。
-  if (model === 'auto' || !model) model = c.DEFAULT_MODEL;
-  assertModelKnown(payload, model);
+  const rawModel = payload && payload.model ? String(payload.model) : '';
+  // TRAE 宝身份（2026-11-03）：`traebao/` 前缀 → function=personal_assistant。
+  // 与 traework/ **同一个账号池、同一份 Cloud-IDE-JWT 凭证、同一个后端**，
+  // 差异只有对话身份——免费豁免（官方 11 月活动）绑定在 personal_assistant
+  // 上（实测对照：同一请求 personal 0 credits / solo_agent_lite 0.05）。
+  // 通道归属仍是 traework：池状态、埋点 channel、管理端账号卡全部复用。
+  // 身份来源两处：模块直调时 payload.model 带前缀；经网关时 handleDirectChannel
+  // 已把前缀剥成 route.model（reqBody.model = route.model），标记走 opts 传。
+  const persona = rawModel.startsWith('traebao/') || !!opts.personalAssistant;
+  if (persona) opts.personalAssistant = true;
+  let model = rawModel.replace(/^(traework|traebao)\//, '');
+  if (persona && (model === 'auto' || !model)) {
+    // TRAE 宝自动档：**不传 config_name**，服务端自选（实测默认
+    // deepseek-v4.1-flash__dev）。传了显式名反而换掉官方默认行为。
+    model = '';
+  } else if (persona) {
+    // TRAE 宝的可用模型白名单（2026-11-03 实测 20 个 remote 模型逐个验证：
+    // 只有 deepseek-v4.1-flash 可通，其余全部上游 4001「param is invalid」——
+    // 与抓包一致：TRAE 宝的 model_config 事件就是 deepseek-v4.1-flash__dev，
+    // 免费豁免绑定这个单一模型）。前置校验不烧上游请求；上游将来放开
+    // 更多模型时白名单会过时——那时上游 4001 仍会兜底如实透传。
+    if (model !== 'deepseek-v4.1-flash') {
+      const e = new Error(
+        `TRAE 宝身份（traebao/）只支持 deepseek-v4.1-flash（2026-11-03 实测，免费豁免绑定该模型）。`
+        + `其他模型请走 traework/ 前缀（同一账号池，正常计费）`
+      );
+      e.statusCode = 400;
+      throw e;
+    }
+  } else if (model === 'auto' || !model) {
+    model = c.DEFAULT_MODEL;
+  }
+  if (model) assertModelKnown(payload, model);
   await assertImageSupport(payload, model);
   // 选号经池状态机：冷却/熔断/禁用/暂停/在途满跳过 + 会话粘性。
   // traework 单账号时代不做故障转移；多账号后由池提供「跳过坏号」能力，
@@ -242,7 +279,11 @@ async function send(payload, onChunk, opts = {}) {
     e.statusCode = 503;
     throw e;
   }
-  const sel = channelPool.pickCandidate(CHANNEL, usable, { sessionKey, model });
+  const sel = channelPool.pickCandidate(CHANNEL, usable, {
+    sessionKey, model,
+    // FEFO：集合非空时候选先限制在临期账号内（快照由管理端 /credits 写）
+    expiring: fefoUidSet(),
+  });
   if (!sel) {
     const err = new Error('traework 没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
     err.statusCode = 503;
@@ -282,6 +323,15 @@ async function send(payload, onChunk, opts = {}) {
       : await runConversation(auth, payload, onChunk, opts, model);
     // 成功喂池：清熔断/软退避/防误杀计数（修复重试属于模型行为，不算失败）
     channelPool.noteSuccess(CHANNEL, auth.id);
+    // lastError 是「最近一次结果」，不是「历史故障」（qwenwork 2026-10-02 同款
+    // 修复，TRAE 当年漏了这条不变量）：成功即清除。不清的话一次瞬时限流会
+    // 永久挂在账号卡上——实测（2026-11-02）：测150 在 09:27 撞一次 3004 限流
+    // 后又有 50 次成功请求，牌子却一直挂着，被读成「当前故障」。
+    // 只在确实有 lastError 时才写盘，避免每次成功都触发一次文件写入。
+    if (auth.lastError) {
+      try { authStore.patch(auth.id, { lastError: '' }); }
+      catch (e) { /* 清标记失败不影响请求结果 */ }
+    }
     return result;
   } catch (e) {
     channelPool.noteError(CHANNEL, auth.id, { status: Number(e.statusCode) || 0, message: e.message, model });
@@ -395,7 +445,12 @@ async function runRemoteConversation(auth, payload, onChunk, opts, model) {
  */
 async function runConversation(auth, payload, onChunk, opts, model) {
   const meta = {};
-  const body = chat.buildBody(payload, model, meta);
+  // persona（TRAE 宝）模式下 model 为空 = 自动档：buildBody 不写 config_name。
+  // 埋点/账本的 model 字段用 'traebao/auto' 占位（空串会让归因行没法归因模型），
+  // 协议体里保持无 config_name——显示名与协议名分开，别混。
+  const persona = !!opts.personalAssistant;
+  const body = chat.buildBody(payload, model, meta, { persona });
+  const ledgerModel = persona && !model ? 'traebao/auto' : model;
   const startedAt = Date.now();
 
   // 账号上报已在 send 里做过（选号完成即上报），这里只管发请求与采集。
@@ -406,7 +461,7 @@ async function runConversation(auth, payload, onChunk, opts, model) {
   // 「池里的第一个」与「实际用的那个」不是一回事。
   const settle = () => {
     require('./credits')
-      .capture(auth, { reqId: opts.reqId, model, startedAt })
+      .capture(auth, { reqId: opts.reqId, model: ledgerModel, startedAt })
       .catch(() => { /* 采集失败绝不影响已发出的响应 */ });
   };
 
@@ -418,12 +473,12 @@ async function runConversation(auth, payload, onChunk, opts, model) {
     let fatal = null;
     let lastEvents = null;
     for (;;) {
-      const r = await runAttempt(curBody, auth, model, null, false);
+      const r = await runAttempt(curBody, auth, ledgerModel, null, false);
       settle();
       if (r.fatal) { fatal = r.fatal; break; }
       if (r.streamErr) { fatal = upstreamError(r.streamErr); break; }
       lastEvents = r.events;
-      agg = chat.aggregate(r.events, model);
+      agg = chat.aggregate(r.events, ledgerModel);
       const msg = (agg.choices && agg.choices[0] && agg.choices[0].message) || {};
       const hasCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
       if (hasCalls || !needsRepair(meta, msg.content) || attempt >= chat.REPAIR_MAX) break;
@@ -436,9 +491,12 @@ async function runConversation(auth, payload, onChunk, opts, model) {
     if (fatal) throw fatal;
     // 逐轮账单的 turn id（计费自检探针用）：取**最终那一轮**的 id，
     // 修复轮的请求已重建，前面几轮的 id 与本次交付内容无关。
+    // TRAE 宝（persona）例外：buildBody 主动生成的 session_id 会被上游
+    // 按它记账（2026-11-03 实测 get_session_usage 查它返回真实 credits），
+    // 直接上报它；utils_chat（solo_work_lite）链路没有可用 id，走差值口径。
     if (opts.onTurnId) {
       try {
-        const tid = chat.turnIdOf(lastEvents);
+        const tid = persona && meta.sessionId ? meta.sessionId : chat.turnIdOf(lastEvents);
         if (tid) opts.onTurnId(tid, auth);
       } catch (e) { /* 上报失败不影响响应 */ }
     }
@@ -451,7 +509,7 @@ async function runConversation(auth, payload, onChunk, opts, model) {
   let curBody = body;
   let res = null;
   for (;;) {
-    res = await runAttempt(curBody, auth, model, onChunk, needsRepair(meta, ''));
+    res = await runAttempt(curBody, auth, ledgerModel, onChunk, needsRepair(meta, ''));
     settle();
     if (res.fatal || res.streamErr) break;
     if (!res.gate) break;
@@ -480,6 +538,11 @@ async function runConversation(auth, payload, onChunk, opts, model) {
   }
   if (res && res.fatal) throw res.fatal;
   if (res && res.streamErr) throw upstreamError(res.streamErr);
+  // TRAE 宝流式同样上报 session_id（见非流式分支的注释——上游按它记账，
+  // 计费自检的精确口径靠它）。utils_chat（solo_work_lite）链路维持不报。
+  if (persona && meta.sessionId && opts.onTurnId) {
+    try { opts.onTurnId(meta.sessionId, auth); } catch (e) { /* 上报失败不影响响应 */ }
+  }
   return { streamed: true };
 }
 
@@ -501,5 +564,7 @@ function logRepair(reqId, attempt, text) {
 
 module.exports = {
   status, send, listModels, listModelEntries, warmupModels, pickAccount,
+  // FEFO 集合推导导出：端到端回归用（verify-expiring-fefo.js）
+  fefoUidSet,
   DEFAULT_MODEL: c.DEFAULT_MODEL,
 };

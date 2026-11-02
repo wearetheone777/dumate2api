@@ -37,6 +37,20 @@ const QODER_PREFIX = 'qoder';
  */
 const QIANFAN_PREFIX = 'qianfan';
 /**
+ * TRAE 宝（开发者个人助理，2026-11-03 接入）的前缀。
+ *
+ * 它不是第五个通道：与 traework **同一个账号池、同一份 Cloud-IDE-JWT 凭证、
+ * 同一个后端网关**（trae-api-cn.mchost.guru / agent/v3），区别只有对话身份——
+ * `function: "personal_assistant"`（TRAE 宝）而不是 `solo_work_lite`（SOLO）。
+ * 2026-11-03 实测：同一账号同一请求，personal_assistant 消耗 0 credits、
+ * solo_agent_lite 消耗 0.05——TRAE 宝的 11 月免费活动（官方公告至 11.08）
+ * 豁免绑定在这个 function 上。活动结束后豁免是否延续未知，账本照记。
+ *
+ * 模型空间：`traebao/auto`（默认，服务端自选 deepseek-v4.1-flash__dev）或
+ * `traebao/<remote 模型名>`；**不带 config_name 时上游走 TRAE 宝自动档**。
+ */
+const TRAEBAO_PREFIX = 'traebao';
+/**
  * 搭子自动档的前缀：`dm-auto-model/text.L0` 的**档位编码在模型名里**，
  * 斜杠不是通道分隔符（2026-10-31 真机实证：L0/L1/L2 分别实跑
  * DeepSeek-V4.1-Flash-Low-Latency / Kimi-K3 / Qwen3.8-Max）。整个名字
@@ -186,6 +200,17 @@ function resolve(model) {
         return { channel: up.id, target: targetOf(up), model: rest };
       }
     }
+    // TRAE 宝：通道归属 traework（同账号池/池状态/埋点），但对话身份换成
+    // personal_assistant。模式同 qianfan/（无独立 UPSTREAMS 条目）。
+    if (head === TRAEBAO_PREFIX) {
+      const t = targetOf(UPSTREAMS.traework);
+      return {
+        channel: 'traework',
+        model: rest,
+        personalAssistant: true,
+        target: { ...t, personalAssistant: true },
+      };
+    }
     return { error: `unknown_channel: ${head}` };
   }
   return { channel: 'dumate', target: targetOf(UPSTREAMS.dumate), model: name };
@@ -282,6 +307,7 @@ module.exports = {
   TRAEWORK_PREFIX,
   QODER_PREFIX,
   QIANFAN_PREFIX,
+  TRAEBAO_PREFIX,
   DUMATE_AUTO_PREFIX,
   UPSTREAMS,
   resolve,

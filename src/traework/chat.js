@@ -48,14 +48,29 @@ function withAgentDiscipline(system, hasTools) {
 }
 
 /** 把 OpenAI 请求体改写成 SOLO 的形状。meta（可选）会被填入过滤后的工具数量 */
-function buildBody(payload, model, meta) {
+function buildBody(payload, model, meta, opts = {}) {
   const obj = JSON.parse(JSON.stringify(payload || {}));
   obj.stream = true;
-  obj.function = c.FUNCTION;
+  // 对话身份（2026-11-03）：默认 solo_work_lite（SOLO 轻通道）；TRAE 宝
+  // （`traebao/` 前缀，opts.persona）用 personal_assistant——开发者个人助理，
+  // 11 月免费活动的豁免绑定在这个 function 上（实测对照 0 vs 0.05 credits）。
+  obj.function = opts.persona ? c.FUNCTION_ASSISTANT : c.FUNCTION;
 
-  const modelName = String(model || obj.model || c.DEFAULT_MODEL).trim() || c.DEFAULT_MODEL;
-  obj.model = modelName;
-  obj.config_name = modelName;
+  if (opts.persona && !model) {
+    // TRAE 宝自动档：不写 model/config_name，服务端自选官方默认
+    // （实测 deepseek-v4.1-flash__dev）。其余清理照走。
+    delete obj.model;
+    // 主动生成并记录 session_id（ObjectId 形状，与客户端生成的一致）：
+    // 上游按它记账，管理端计费自检靠它查 get_session_usage 的精确口径。
+    // 修复轮（withRepairNudge）复用同一 body → 同一 session_id——同一段
+    // 对话的下一句，账单也归到同一会话。
+    if (!meta.sessionId) meta.sessionId = oidSessionId();
+    obj.session_id = meta.sessionId;
+  } else {
+    const modelName = String(model || obj.model || c.DEFAULT_MODEL).trim() || c.DEFAULT_MODEL;
+    obj.model = modelName;
+    obj.config_name = modelName;
+  }
 
   // messages：content 字符串 → 数组；assistant 的 tool_calls → function_call
   if (Array.isArray(obj.messages)) {
@@ -383,6 +398,17 @@ function normalizeToolCall(tc) {
  * 后面的是本轮最终 id。取不到就返回 null，调用方据此跳过逐轮账单、退回过
  * consumed 差值口径，不编一个 id。
  */
+/** 24-hex ObjectId 形态 id（时间戳 4B + 随机 8B）。TRAE 宝模式的 session_id
+ *  用它生成：**主动传入的 session_id 会被上游按它记账**（2026-11-03 实测
+ *  get_session_usage 查它返回真实 credits_float），与 solo_work_lite 不传
+ *  session_id 时上游自分配、查询回全零骨架的行为不同。 */
+function oidSessionId() {
+  const ts = Math.floor(Date.now() / 1000).toString(16).padStart(8, '0');
+  let r = '';
+  for (let i = 0; i < 16; i++) r += Math.floor(Math.random() * 16).toString(16);
+  return ts + r;
+}
+
 function turnIdOf(events) {
   let id = null;
   for (const e of Array.isArray(events) ? events : []) {

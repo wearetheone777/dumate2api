@@ -190,9 +190,13 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   const onModel = (name) => { if (name) req._mappedModel = String(name); };
 
   try {
+    // TRAE 宝身份标记（2026-11-03）：resolve() 把 `traebao/` 前缀剥掉后才到
+    // provider 手里，send() 靠 payload.model 认不出身份——显式经 opts 传。
+    if (route.personalAssistant) req._personalAssistant = true;
+    const providerOpts = { reqId, onAccount, onModel, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
-      const result = await provider.send(payload, undefined, { reqId, onAccount, onModel, region: ctx.region || '' });
+      const result = await provider.send(payload, undefined, providerOpts);
       const out = kind === 'openai' ? result : result;
       if (kind === 'anthropic') {
         const anth = openAIToAnthropic(out, payload.model);
@@ -332,7 +336,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
           seen += `data: ${inner}\n`;
           if (seen.length > TAIL) seen = seen.slice(-TAIL);
           shim.write(`data: ${inner}\n\n`);
-        }, { reqId, onAccount, onModel, region: ctx.region || '' });
+        }, { ...providerOpts });
         // traework 的 provider 回调不发 [DONE]（事件流用 event:done 收尾，
         // 已在 readStream 里吃掉），所以这里补一个再关流。
         // **顺序关键**：先补 [DONE]、再 end——直接 end 会让翻译器在
@@ -804,6 +808,35 @@ async function handleOpenAIModels(req, res) {
         for (const m of tw.listModelEntries()) {
           data.push({
             id: `traework/${m.id}`,
+            object: 'model',
+            created,
+            owned_by: 'traework',
+            name: m.name,
+            ...(m.contextWindow ? { contextWindow: m.contextWindow, maxContextWindow: m.maxContextWindow } : {}),
+          });
+        }
+        // TRAE 宝（开发者个人助理，2026-11-03）：免费豁免（官方 11 月活动）
+        // 绑定 function=personal_assistant，且**实测只有 deepseek-v4.1-flash
+        // 一个模型可通**（20 个 remote 模型逐个验证，其余上游 4001）。
+        // 所以这里只透 auto（服务端自选，即官方默认 deepseek-v4.1-flash__dev）
+        // 与 deepseek-v4.1-flash 两条，不把模型表整体换前缀——列出去调不通
+        // 的模型等于给客户端埋坑。
+        data.push({
+          id: 'traebao/auto',
+          object: 'model',
+          created,
+          owned_by: 'traework',
+          name: 'TRAE 宝自动档（deepseek-v4.1-flash，免费）',
+          // 窗口实测 1M（2026-11-03：1,021,270 token 通过、~1.08M 拒 4026），
+          // 与模型表标称一致。抓包 model_config 的 prompt_max_tokens:168000
+          // 只是会话预算参数，不是输入硬限——别按它声明。
+          contextWindow: 1000000,
+          maxContextWindow: 1000000,
+        });
+        for (const m of tw.listModelEntries()) {
+          if (m.id !== 'deepseek-v4.1-flash') continue;
+          data.push({
+            id: `traebao/${m.id}`,
             object: 'model',
             created,
             owned_by: 'traework',

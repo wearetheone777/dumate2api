@@ -101,6 +101,12 @@ const DEVICE_BRAND = '83DG';
 const OS_VERSION = 'Windows 11 Pro';
 // 对话必须带这个 function，否则上游不认（等同千问的 business 字段）
 const FUNCTION = 'solo_work_lite';
+// TRAE 宝（开发者个人助理）的对话身份（2026-11-03 实测打通）：
+// `traebao/` 前缀路由到这里。与 solo_work_lite 同一后端/同一账号，
+// 免费豁免（官方 11 月活动）绑定此 function——同一请求实测
+// personal_assistant 0 credits、solo_agent_lite 0.05。活动结束后是否
+// 延续未知；账本照记，豁免消失会自动体现在 credits 里。
+const FUNCTION_ASSISTANT = 'personal_assistant';
 // 默认模型：实测可用
 const DEFAULT_MODEL = 'glm-5.2';
 
@@ -165,7 +171,7 @@ module.exports = {
   EP_ACTIVITY_INFO, EP_ACTIVITY_ACTION, EP_FISSION_GRANT, EP_GRANT_BENEFIT,
   REMOTE_BASE_CN, REMOTE_ORIGIN, REMOTE_UA,
   CLIENT_ID, APP_ID, IDE_VERSION, IDE_VERSION_CODE,
-  DEVICE_BRAND, OS_VERSION, FUNCTION, DEFAULT_MODEL,
+  DEVICE_BRAND, OS_VERSION, FUNCTION, FUNCTION_ASSISTANT, DEFAULT_MODEL,
   USER_AGENT, UA_VSCODE, MARKET_CLIENT_ID, APP_VERSION,
   TIMEOUT_MS, STREAM_TIMEOUT_MS, CONNECT_TIMEOUT_MS,
   request,
