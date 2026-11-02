@@ -32,11 +32,11 @@ export interface ReqLogRow {
   // ---- 千问办公通道的积分明细（与上面的搭子游标是两套账）----
   // 按 req_id 与归因记录精确配对；归因要等结算，所以刚发出的请求可能还没有
   // 这些字段，界面遇到缺省显示「—」而不是补 0。
-  qw_free?: number
-  qw_paid?: number
+  //
+  // **只有 qw_total**：不再带 qw_free / qw_paid / qw_pool（2026-11-02）——
+  // 上游已停止发放每日免费额度，新记录 free 恒 0、pool 恒 paid，那三列
+  // 只会显示一排零和同一个标签。历史行里的字段仍在账本里，只是不再透出。
   qw_total?: number
-  /** 扣的是哪个池：daily=每日免费额度，paid=月度/长期（付费） */
-  qw_pool?: 'daily' | 'paid' | 'none'
   /** true = 与相邻请求并发，差值可能含别人消耗 */
   qw_concurrent?: boolean
   qw_balance?: { daily: number; monthly: number; longterm: number } | null

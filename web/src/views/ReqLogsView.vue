@@ -114,16 +114,14 @@
           </template>
           <template v-else-if="column.key === 'points'">
             <!-- 千问通道：扣的是千问自己的积分池，与搭子的余额游标是两套账。
-                 按 req_id 精确配对，归因要等结算，刚发出的请求可能还没值 -->
+                 按 req_id 精确配对，归因要等结算，刚发出的请求可能还没值。
+                 不再标扣费池——上游停发每日免费额度后只剩付费池一个来源 -->
             <template v-if="record.channel === 'qwenwork'">
               <div v-if="record.qw_total !== undefined" class="text-xs">
-                <span class="num" :class="record.qw_pool === 'daily' ? 'text-cyan-700' : 'text-blue-600'">
-                  {{ fmtQw(record.qw_total) }}
-                </span>
-                <div class="text-xs text-slate-500">
-                  {{ poolLabel(record.qw_pool) }}
-                  <a-tooltip v-if="record.qw_concurrent" title="与相邻请求并发，差值可能含其它请求的消耗">
-                    <span class="text-orange-700">· 并发</span>
+                <span class="num text-blue-600">{{ fmtQw(record.qw_total) }}</span>
+                <div v-if="record.qw_concurrent" class="text-xs text-slate-500">
+                  <a-tooltip title="与相邻请求并发，差值可能含其它请求的消耗">
+                    <span class="text-orange-700">并发</span>
                   </a-tooltip>
                 </div>
               </div>
@@ -276,28 +274,19 @@
 
           <div class="detail-label">实际扣费</div>
           <div class="detail-value">
-            <!-- 千问：扣的是千问自己的池子（免费每日额度 / 付费月度长期），
-                 与搭子的余额游标是两套账，必须分开显示 -->
+            <!-- 千问：扣的是千问自己的付费池，与搭子的余额游标是两套账，
+                 必须分开显示 -->
             <template v-if="detail.channel === 'qwenwork'">
               <template v-if="detail.qw_total !== undefined">
                 {{ fmtQw(detail.qw_total) }} 积分
-                <a-tag :color="detail.qw_pool === 'daily' ? 'cyan' : 'blue'" class="ml-1">
-                  {{ detail.qw_pool === 'daily' ? '每日免费额度' : (detail.qw_pool === 'paid' ? '付费积分' : '未扣费') }}
-                </a-tag>
-                <!-- 「每日免费额度」vs「付费积分」是用户明确要看的区分 -->
-                <div class="text-xs mt-1">
-                  <span class="text-cyan-700">免费 {{ fmtQw(detail.qw_free) }}</span>
-                  <span class="mx-1 text-slate-400">·</span>
-                  <span class="text-blue-600">付费 {{ fmtQw(detail.qw_paid) }}</span>
-                </div>
+                <a-tag color="blue" class="ml-1">付费池</a-tag>
                 <!-- 千问是单账号直连，但显示出来便于核对「这条是不是我的号」 -->
                 <div v-if="detail.qw_account" class="text-xs text-slate-500 mt-1">
                   账号：{{ detail.qw_account.name || '—' }}
                   <span v-if="detail.qw_account.tier">（{{ detail.qw_account.tier }}）</span>
                 </div>
                 <div v-if="detail.qw_balance" class="text-xs text-slate-500">
-                  请求后余额：每日 {{ fmtQw(detail.qw_balance.daily) }} ·
-                  月度 {{ fmtQw(detail.qw_balance.monthly) }} ·
+                  请求后余额：月度 {{ fmtQw(detail.qw_balance.monthly) }} ·
                   长期 {{ fmtQw(detail.qw_balance.longterm) }}
                 </div>
                 <div v-if="detail.qw_concurrent" class="text-xs text-orange-700">
@@ -494,9 +483,8 @@ const fmtNum = (n: number) => (n || 0).toLocaleString('zh-CN')
 // 千问积分保留 4 位：实测单次消耗 0.0025，按 2 位显示会变成 0
 const fmtQw = (n: number | null | undefined) =>
   n == null ? '—' : Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 4 })
-// 扣费池的中文名：区分「每日免费额度」与「付费积分」是用户明确要看的
-const poolLabel = (p?: string) =>
-  p === 'daily' ? '每日免费' : p === 'paid' ? '付费积分' : p === 'none' ? '未扣费' : '—'
+// 千问不再区分扣费池：上游停发每日免费额度后只剩付费池一个来源，
+// 「每日免费 / 付费」两栏恒为 0 与全额。
 const fmtMs = (ms: number | null | undefined) =>
   typeof ms !== 'number' ? '—' : ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`
 const compact = (n: number) => (n >= 10000 ? `${(n / 1000).toFixed(1)}k` : String(n ?? 0))

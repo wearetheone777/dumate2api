@@ -78,11 +78,14 @@ function check(label, cond, detail) {
   if (withCredits.length) {
     const sample = withCredits[0];
     console.log('  样本:', JSON.stringify({
-      req_id: sample.req_id, model: sample.model,
-      qw_total: sample.qw_total, qw_pool: sample.qw_pool,
-      qw_free: sample.qw_free, qw_paid: sample.qw_paid,
+      req_id: sample.req_id, model: sample.model, qw_total: sample.qw_total,
     }));
-    check('积分明细区分了免费/付费池', ['daily', 'paid', 'none'].includes(sample.qw_pool));
+    // 2026-11-02：不再透出 qw_free / qw_paid / qw_pool——上游停发每日免费额度后
+    // 新记录恒为 free=0、pool=paid，那三列只会显示一排零。历史行里的字段仍在
+    // 账本里，只是不经接口外传。
+    check('只透出 qw_total（不再拆免费/付费池）',
+      sample.qw_free === undefined && sample.qw_paid === undefined && sample.qw_pool === undefined,
+      `free=${sample.qw_free}, paid=${sample.qw_paid}, pool=${sample.qw_pool}`);
   } else {
     console.log('  （暂无配对样本：归因要等结算，或该请求在改动前发出）');
   }

@@ -296,9 +296,11 @@ function builtinAdapters() {
       async balance(a) {
         const { fetchWallets } = require('./qwenwork/credits');
         const r = await fetchWallets({ account: a, force: true });
-        // 三池之和即权威口径（fetchWallets 内部已对 account-context 交叉验证）
-        const parts = [r.daily, r.monthly, r.longterm].filter((v) => typeof v === 'number' && Number.isFinite(v));
-        return { ok: !!r.ok && parts.length > 0, remain: parts.length ? parts.reduce((s, v) => s + v, 0) : null, error: r.error || '' };
+        // 合计以 total 为准：它是三池之和（上游坏读时已用 account-context 的
+        // 权威值校正过）。**不要自己把三池加起来**——坏读时池子是 null，
+        // 当成 0 相加会得出「余额 0」，保活会把它当「额度耗尽」报出去。
+        const t = r.ok && typeof r.total === 'number' && Number.isFinite(r.total) ? r.total : null;
+        return { ok: !!r.ok && t != null, remain: t, error: r.error || '' };
       },
     },
     {

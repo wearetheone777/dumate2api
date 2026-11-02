@@ -1,147 +1,52 @@
 // src/qwenwork/credits.js - 千问办公积分：余额读取 + 按请求归因
 //
 // 积分不在凭证里，要问站点：GET https://qwenwork.cn/user/wallets
-// （同一个 Bearer token 可用）。返回三个独立池子：
+// （同一个 Bearer token 可用）。上游返回三个池子的余额：
 //
-//   daily_credits     免费，每天 00:00 (+08:00) 重置
-//   monthly_credits   订阅套餐内 → 付费
-//   longterm_credits  充值/赠送 → 付费
+//   daily_credits     每日免费额度（**2026-11-01 起上游已不再发放**，实测恒 0）
+//   monthly_credits   月度额度 → 付费，月初刷新（active_wallet 的 valid_to）
+//   longterm_credits  充值/赠送 → 付费，按有效期
 //
-// 归因方法：请求前后各读一次余额，**哪个池减少就是消耗的哪种**。
-// 实测结算延迟 < 1 秒，所以响应发出后等一小会儿再读即可。
+// **积分体系已随上游政策改过一次，不要再按「每日 100 免费额度」写代码**：
+// 实测（2026-11-01 / 11-02，两个账号）daily_credits.total_balance 恒为 0，
+// 而 monthly_credits 从 11-01 起从 0 变成 100 左右、active_wallets 只剩一条
+// 且 valid_to = 12-01（月初）。归因账本也一致：11-01 起每条请求 free=0、
+// paid>0，10-31 之前则大量 free>0。
 //
-// 一个必须诚实的地方：接口只返回**余额**，不返回「每日上限」。
-// 「今日已用 = 上限 − 余额」里的上限来自配置（默认 100），不是接口给的，
-// 界面上必须标注来源，否则额度政策一变就没人知道数字是错的。
+// 因此下面这套「观测峰值推断每日上限 + 今日消耗 = 上限 − 余额」的机制
+// **已整体删除**：
+//   · 上限不再存在（没有每日发放，配置里的 100 是过期政策），
+//     `DUMATE_QWENWORK_DAILY_CREDITS` 一并停用；
+//   · 峰值法的前提是「每天重置到上限、之后只减不增」，daily 恒 0 时它只会
+//     产出 limit=配置兜底 / peak=0 / calibrated=false 这种全无信息量的组合，
+//     界面上表现为「每日额度 0 / 100 · 今日已用 —（未观测到满额）」——
+//     用户看到的就是一堆读不懂的数。
+//   · 「今日全部消耗」（含客户端内对话）本来就依赖「上限 − 余额」，
+//     没有上限就推不出来。**宁可不出这个数，也不编一个**（项目一贯口径）。
+//     真实的消耗数字改用归因账本（经本网关的请求逐条实测），并在界面上
+//     明确标注口径。
+//
+// 仍然保留的两件事：
+//   1. **余额读失败的重试 + 权威口径交叉验证**（见 fetchWallets）。上游
+//      `/user/wallets` 偶发返回「三池全 0」的坏读，这时 account-context 的
+//      `quota.remaining` 是权威值（按定义等于各池之和）。原来的交叉验证只
+//      纠正 daily，现在 generalized 成纠正 total——daily 不再是重点，
+//      「余额是不是真的没了」才是。
+//   2. **按请求归因**（前后两次余额差值），口径不变；free/paid 两栏保留，
+//      因为历史账本里它们是真数据，只是现在 free 恒 0。
 //
 // **三处状态都按账号隔离**（账号池化之后）：余额缓存、归因基准、串行队列。
 // 混在一起会算出「A 请求扣了 B 账号的钱」——多账号下这是最要紧的一条。
 const https = require('https');
-const fs = require('fs');
 const path = require('path');
 const constants = require('./constants');
-const filelock = require('../filelock');
 
 const SITE_ORIGIN = 'https://qwenwork.cn';
 const WALLETS_PATH = '/user/wallets';
-// 权威余额（免费额度是否已刷新）在 gateway 的 account-context 上。
-// 它的 quota.remaining **等于三池之和**（实测：100 + (−4.8222) = 95.1778），
-// 所以当 wallets 报 daily=0 时，remaining 减去付费池即可还原真实的 daily。
+// 权威余额在 gateway 的 account-context 上。它的 quota.remaining **等于三池之和**，
+// 所以当 wallets 谎报全 0 时，remaining 能证明「其实是读失败」。
 // 注意它在 gateway 域名，不在 qwenwork.cn——两者不可互换。
 const ACCOUNT_CONTEXT_HOST = 'gateway.qwenwork.cn';
-
-// ---------------------------------------------------------------------------
-// 每日额度上限的推断
-//
-// 接口只给余额、不给上限（实测 /user/wallets 的 data 里没有 limit/quota
-// 字段）。但「今日消耗 = 上限 − 余额」是用户真正想看的数，所以这里用
-// **观测峰值**推断：每日额度每天 00:00 重置到上限、之后只减不增，
-// 因此当天观测到的最大值就是最接近上限的真实值。
-//
-// 峰值法有两个已知弱点，都在返回值里如实标注：
-//   1. 首次观测若在当天中途（本例 81.13），峰值就是偏小的，推断值会小于
-//      真实消耗——要等次日重置后才能校准到 100
-//   2. 若当天有过补充（充值/赠送），余额会回升，峰值反而偏大
-// 所以额外接受配置值作兜底：取「配置值」与「观测峰值」的较大者，
-// 并把来源标出来，让用户知道这个数是怎么来的。
-//
-// 峰值是**账号级**的：两个账号的每日额度互不相干，混在一个桶里会
-// 把 A 的峰值当成 B 的上限。文件按账号 id 分桶。
-// ---------------------------------------------------------------------------
-const PEAK_FILE = 'qwenwork-daypeak.json';
-
-/** 每日免费额度的配置上限。接口不给，作为峰值的兜底下界。0 = 不设兜底 */
-function dailyLimit() {
-  const n = Number(process.env.DUMATE_QWENWORK_DAILY_CREDITS);
-  return Number.isFinite(n) && n > 0 ? n : 100;
-}
-
-function dataDir() {
-  return process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', '..', 'data');
-}
-
-function peakPath() {
-  return path.join(dataDir(), PEAK_FILE);
-}
-
-function dayKey() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-/**
- * 读峰值文件。两种形状都接受：
- *   {'2026-09-25': 81.13}              ← 单账号时期的旧格式
- *   {'1': {'2026-09-25': 81.13}, ...}  ← 按账号分桶
- *
- * 旧格式归到账号 0（历史数据确实是单账号，归属明确）。这样升级后
- * 老用户的「今日已用」不会凭空归零。
- */
-function readPeak() {
-  try { return JSON.parse(fs.readFileSync(peakPath(), 'utf8')); } catch (e) { return {}; }
-}
-
-function writePeak(o) {
-  try {
-    fs.mkdirSync(dataDir(), { recursive: true });
-    const tmp = peakPath() + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(o));
-    filelock.renameAtomic(tmp, peakPath());
-  } catch (e) { /* 峰值写不进不影响主流程 */ }
-}
-
-/** 取某账号的 {day: peak} 桶。旧格式里非对象的值视作账号 0 的桶 */
-function peakBucketOf(root, accountKey) {
-  const cur = root[accountKey];
-  if (cur && typeof cur === 'object') return cur;
-  return null;
-}
-
-/**
- * 记录本次观测，返回今日消耗的真实口径。
- * @param {number} balance 该账号当前每日额度余额
- * @param {string} accountKey 账号 id（字符串）
- * @returns {{limit:number, limitSource:string, freeUsed:number, peak:number, calibrated:boolean}}
- */
-function dailyUsageFromBalance(balance, accountKey) {
-  const k = dayKey();
-  const accKey = String(accountKey == null ? 0 : accountKey);
-  const st = readPeak();
-  let bucket = peakBucketOf(st, accKey);
-  if (!bucket) {
-    bucket = {};
-    st[accKey] = bucket;
-  }
-  const prev = bucket[k] || 0;
-  const peak = Math.max(prev, balance || 0);
-  if (peak !== prev) {
-    bucket[k] = Number(peak.toFixed(4));
-    // 只保留最近 30 天，避免文件无限增长
-    const keys = Object.keys(bucket).sort();
-    while (keys.length > 30) delete bucket[keys.shift()];
-    writePeak(st);
-  }
-  // 上限：配置值兜底 + 观测峰值，取较大者
-  const configured = dailyLimit();
-  const limit = Math.max(configured || 0, peak);
-  // calibrated=true 表示峰值已经追平或超过配置值（说明已观测到接近满额的状态）
-  const calibrated = peak >= (configured || 0);
-  // 今日消耗 = 上限 − 余额。**但未校准时这个差值不可信**：
-  // limit 此时是配置兜底（100），若余额为 0（账号欠费 / 额度被扣穿），
-  // 差值会算出「今日已用 100」——而真相是「没观测到满额，推不出消耗」。
-  // 实测账号 示例账号 就是这样：一次请求都没走，却报已用 100。
-  // 所以未校准一律给 null，界面显示 — 并注明无法推算，而不是编一个数。
-  const freeUsed = calibrated
-    ? Math.max(0, Number((limit - (balance || 0)).toFixed(4)))
-    : null;
-  return {
-    limit,
-    limitSource: calibrated ? 'observed' : 'config-lower-bound',
-    freeUsed,
-    peak: Number(peak.toFixed(4)),
-    calibrated,
-  };
-}
 
 // 余额缓存按账号分开：A 的余额不能回答「B 还剩多少」
 const CACHE_MS = parseInt(process.env.DUMATE_QWENWORK_CREDIT_CACHE_MS || '30000', 10);
@@ -189,8 +94,8 @@ function num(v) {
 /**
  * 读 gateway 的 account-context，取 `quota.remaining`。
  *
- * 这是余额的**权威口径**：它等于三池之和（实测 100 + (−4.8222) = 95.1778）。
- * 只在 wallets 报可疑的 0 时才调用——正常路径不该为一次查询多打一个上游。
+ * 这是余额的**权威口径**：按定义等于各池之和（历史实测 100 + (−4.8222) = 95.1778）。
+ * **只在 wallets 看起来全 0 时才调用**——正常路径不该为一次查询多打一个上游。
  * 取不到（网络错 / 结构变了）返回 null，调用方据此回落，不编数字。
  */
 async function fetchQuotaRemaining(token, opts = {}) {
@@ -208,6 +113,11 @@ async function fetchQuotaRemaining(token, opts = {}) {
  * @param {object|string} [opts.account] 账号对象或裸 token。**必填**：余额是
  *   账号级的，没有账号就不知道该查谁。
  * @param {boolean} [opts.force] 跳过缓存
+ *
+ * 返回形状（`daily/monthly/longterm` 在**坏读校正**后可能是 null——见下）：
+ *   { ok, daily, monthly, longterm, total, paid,
+ *     refreshAt, activeWallets, expiringSoon, fetchedAt,
+ *     retried?, misread?, poolsUnknown? }
  */
 async function fetchWallets(opts = {}) {
   const token = tokenOf(opts.account);
@@ -238,11 +148,9 @@ async function fetchWallets(opts = {}) {
   // 为什么不能直接当成「用完了」：实测（2026-09-30）同一时刻打两个接口，
   // `/user/wallets` 报全 0 而 `account-context` 的 quota.remaining 报 100——
   // 两者矛盾，说明那次是**读失败**（上游/边缘节点的一次瞬时状态）。
-  // 而界面把 0 读成「今天用光了」，于是用户以为「每天得用一下才刷新」。
   //
   // 为什么也不能一律当成读失败：真·额度耗尽时三池确实都是 0，那种情况
-  // 显示 0 是**正确的**。历史归因里没有全 0 记录只是因为还没遇到过真的耗尽
-  // （95 条 daily=0 都伴随付费池 >0，即免费扣完转扣付费）。
+  // 显示 0 是**正确的**。
   const walletBalances = (x) => {
     const dd = x && x.data && x.data.data;
     if (!dd) return null;
@@ -272,64 +180,69 @@ async function fetchWallets(opts = {}) {
   }
 
   const d = r.data.data || {};
-  const wallets = (d.active_wallets && Array.isArray(d.active_wallets.wallets))
+  const activeWallets = (d.active_wallets && Array.isArray(d.active_wallets.wallets))
     ? d.active_wallets.wallets : [];
   const monthlyVal = num((d.monthly_credits || {}).total_balance);
   const longtermVal = num((d.longterm_credits || {}).total_balance);
-  const walletsDaily = num((d.daily_credits || {}).total_balance);
+  const dailyVal = num((d.daily_credits || {}).total_balance);
 
-  // 交叉验证（2026-10-02 加）：wallets 报 daily=0 时，拿 gateway 的
-  // `account-context` 的 `quota.remaining` 核对——它是**权威口径**，且恰好
-  // 等于三池之和，所以 `daily = remaining − monthly − longterm` 能还原真实值。
+  // 交叉验证（2026-10-02 加 daily 版，2026-11-02 改成 total 版）：
+  // wallets 报「三池全 0」且重试也没恢复时，拿 account-context 的
+  // `quota.remaining` 核对——它是权威口径。
   //
-  // 触发条件是「**daily 读数为 0**」，比 allZero 更宽：账号 2 的坏读形态是
-  // 「daily=0 但 longterm 为负」（三池不全是 0），根本不进 allZero 分支，
-  // 却同样把每日额度显示成了 0——用户报的正是这个。
+  // **为什么触发条件从「daily 读数为 0」改成「三池全 0」**：2026-11-01 起上游
+  // 不再发放每日免费额度，daily 常态就是 0。按旧条件，**每一次余额查询都会
+  // 多打一次 account-context**（把每条请求的归因从 2 次上游调用放大成 3 次），
+  // 而它想救的那个「daily 被谎报成 0」已经不存在了。现在只在真的可疑
+  // （全 0）时才验证。
   //
-  // 判据：还原出的 daily > 0.005 才认定是 wallets 坏读并采用。
-  //   - remaining 也≈0（真·耗尽）→ 差值不 > 0.005 → 不校正，如实报 0
-  //   - remaining 取不到（account-context 失败）→ 不校正，如实报 0 + retried
-  // 这样既能纠错，又不会把真实的「用光」粉饰成「还有额度」。
-  let authoritativeDaily = null;
-  let dailyCorrected = false;
-  if (walletsDaily === 0) {
+  // 判据：remaining > 0.005 才认定是坏读。真耗尽时 remaining 也≈0，不校正，
+  // 如实报 0 + retried。取不到 remaining 时也不校正，回落成「如实报 0 + retried」。
+  //
+  // **校正时不编造池分配**：remaining 只给总数，分不出是哪个池。所以
+  // `daily/monthly/longterm` 一律 null（未知），`total` 用权威值，标 misread。
+  // 编一个「daily = remaining − paid」正是旧实现做的事——现在 daily 不再是
+  // 重点，把总数硬拆进池子只会又造一个假数字。
+  let authoritativeTotal = null;
+  let misread = false;
+  if (dailyVal === 0 && monthlyVal === 0 && longtermVal === 0) {
     const remaining = await fetchQuotaRemaining(token, agentOpts);
-    if (remaining != null && Number.isFinite(remaining)
-        && remaining - (monthlyVal + longtermVal) > 0.005) {
-      authoritativeDaily = remaining - (monthlyVal + longtermVal);
-      dailyCorrected = true;
+    if (remaining != null && Number.isFinite(remaining) && remaining > 0.005) {
+      authoritativeTotal = remaining;
+      misread = true;
       // 已校正 ⇒ 这次的 0 已解释清楚，不是「无法判定的异常」，不标 retried
       retried = false;
     }
   }
 
-  // daily 以交叉验证为准（当 wallets 谎报 0 而 account-context 给出正数时）。
-  const dailyVal = dailyCorrected
-    ? Number(authoritativeDaily.toFixed(4))
-    : walletsDaily;
+  // 月度额度的刷新时刻：取 active_wallet 里最早的那个 valid_to。
+  // 这是**上游唯一给出的「额度什么时候变」的时间点**（实测 2026-12-01T00:00+08:00，
+  // 两个账号一致）——Free 号的月度额度月初刷新，界面上要让用户看得到，
+  // 否则「还剩 74.45」会被读成「永久可用」。
+  const refreshAt = activeWallets
+    .map((w) => String(w.valid_to || ''))
+    .filter((s) => s && Number.isFinite(Date.parse(s)))
+    .sort()[0] || null;
+
   const out = {
     ok: true,
-    daily: dailyVal,
-    monthly: monthlyVal,
-    longterm: longtermVal,
+    // 坏读校正后池子余额未知（null），不是 0——0 会被读成「用完了」
+    daily: misread ? null : dailyVal,
+    monthly: misread ? null : monthlyVal,
+    longterm: misread ? null : longtermVal,
     // 只有「重试过且仍是全 0」才标出来——那才是值得排查的状态
     // （可能真耗尽，也可能上游持续异常）。抖动后恢复的不算异常，不标。
     ...(retried && !retryRecovered ? { retried: true } : {}),
-    // 交叉验证纠正了 wallets 的谎报 0。界面据此显示「已校正」，
-    // 而不是把一次坏读的 0 当成「今日已用光」。
-    ...(dailyCorrected ? { dailyCorrected: true } : {}),
-    // 最近到期的钱包。**注意这不是「积分要作废」**：daily 池每天 00:00 重置，
-    // 所以 valid_to 就是明天的重置时刻——它每天都「即将到期」，不是风险。
-    // 真正会作废的是 expiring_soon 那段（付费积分按有效期，过期即消失），
-    // 两者语义不同，界面上必须分开说，否则会天天误报「积分要过期了」。
-    expiring: wallets.slice(0, 5).map((w) => ({
+    // wallets 报全 0 而 account-context 给出正数：这是坏读，已用权威总数校正
+    ...(misread ? { misread: true, poolsUnknown: true, authoritativeTotal } : {}),
+    // 上游 active_wallets 原样透出（balance + valid_to），排障与界面都要用
+    activeWallets: activeWallets.map((w) => ({
       balance: num(w.balance),
       valid_to: String(w.valid_to || ''),
-      // 标注来源：reset = 每日额度重置（不是损失），expire = 真要作废
-      kind: 'reset',
     })),
-    // 上游自己给的「即将过期」列表——这才是会作废的那部分。
-    // count/total_balance 为 0 时是空数组，界面据此判断「有无风险」。
+    refreshAt,
+    // 上游自己给的「即将过期」列表——**这才是会作废的那部分**（付费积分
+    // 按有效期，过期即消失）。count/total_balance 为 0 时是空数组。
     expiringSoon: (() => {
       const es = d.expiring_soon || {};
       const ws = Array.isArray(es.wallets) ? es.wallets : [];
@@ -344,16 +257,9 @@ async function fetchWallets(opts = {}) {
     })(),
     fetchedAt: Date.now(),
   };
-  out.total = out.daily + out.monthly + out.longterm;
-  out.paid = out.monthly + out.longterm;
-  // 今日真实消耗：上限由「观测峰值 + 配置兜底」得出（见 dailyUsageFromBalance），
-  // 余额是接口的真实值，两者相减即当天全部消耗——包含不经网关的对话。
-  const u = dailyUsageFromBalance(out.daily, (opts.account && opts.account.id));
-  out.limit = u.limit;
-  out.limitSource = u.limitSource;
-  out.freeUsed = u.freeUsed;
-  out.peak = u.peak;
-  out.calibrated = u.calibrated;
+  // 合计：坏读时用权威总数，否则是三池之和。未知就如实 null，不补 0。
+  out.total = misread ? authoritativeTotal : (out.daily + out.monthly + out.longterm);
+  out.paid = misread ? null : (out.monthly + out.longterm);
   caches.set(key, { at: Date.now(), data: out });
   return out;
 }
@@ -389,6 +295,13 @@ function queueKeyOf(account) {
   return String((account && account.id) || tokenOf(account).slice(-8) || 'unknown');
 }
 
+/** 余额快照只留三个数字；坏读（null）时整份给 null——不能与 0 混为一谈 */
+function snapOf(w) {
+  if (!w || !w.ok) return null;
+  if (w.daily == null || w.monthly == null || w.longterm == null) return null;
+  return { daily: w.daily, monthly: w.monthly, longterm: w.longterm };
+}
+
 /**
  * 采集一次请求的积分消耗。**必须在请求完成之后调用**——请求本身要几秒
  * （实测 4s），若在发出前调用，等待 1.2s 就读余额会读到请求还没结算的状态。
@@ -414,21 +327,27 @@ function capture(opts = {}) {
     // 首次没有基准，只建立它，不产出归因（否则会把历史消耗算到这次请求上）
     if (!baselines.has(key)) {
       const w = await fetchWallets({ account, force: true });
-      if (!w.ok) return null;
-      baselines.set(key, { daily: w.daily, monthly: w.monthly, longterm: w.longterm });
+      const s = snapOf(w);
+      if (!s) return null;
+      baselines.set(key, s);
       return null;
     }
     const before = baselines.get(key);
     // 等结算。实测延迟 < 1s，留 1.5s 余量
     await new Promise((s) => setTimeout(s, 1500));
     const after = await fetchWallets({ account, force: true });
-    if (!after.ok) return null;
-    baselines.set(key, { daily: after.daily, monthly: after.monthly, longterm: after.longterm });
+    const s = snapOf(after);
+    // 坏读（余额未知）时**不更新基准也不落记录**：把 null 当 0 写进基准，
+    // 下一条请求的差值会把整份额度算成一次消耗。
+    if (!s) return null;
+    baselines.set(key, s);
 
-    const free = Math.max(0, num(before.daily) - num(after.daily));
+    const free = Math.max(0, num(before.daily) - num(s.daily));
     const paid = Math.max(0, (num(before.monthly) + num(before.longterm))
-      - (num(after.monthly) + num(after.longterm)));
-    // 哪个池减少就是消耗的哪种；实测顺序是先用免费额度
+      - (num(s.monthly) + num(s.longterm)));
+    // 哪个池减少就是消耗的哪种。**2026-11-01 起 free 恒 0**（上游不再发放
+    // 每日免费额度），实测消耗全部落 paid；这个判据保留是因为历史数据里
+    // free 是真值，且额度政策随时可能回来。
     const pool = free > 0 ? 'daily' : (paid > 0 ? 'paid' : 'none');
     const entry = {
       ts: Date.now(),
@@ -441,7 +360,7 @@ function capture(opts = {}) {
       paid: Number(paid.toFixed(6)),
       total: Number((free + paid).toFixed(6)),
       pool,
-      balance: { daily: after.daily, monthly: after.monthly, longterm: after.longterm },
+      balance: s,
       // 扣的是哪个千问账号。多账号下「哪个账号花了多少」正是这条通道最要紧的
       // 信息。
       //
@@ -478,11 +397,12 @@ async function primeBaseline(accounts) {
   for (const a of list) {
     if (!a) continue;
     const w = await fetchWallets({ account: a, force: true });
-    if (w.ok) {
-      baselines.set(queueKeyOf(a), { daily: w.daily, monthly: w.monthly, longterm: w.longterm });
+    const s = snapOf(w);
+    if (s) {
+      baselines.set(queueKeyOf(a), s);
       out.push({ id: a.id, ok: true });
     } else {
-      out.push({ id: a.id, ok: false, error: w.error });
+      out.push({ id: a.id, ok: false, error: w.error || '余额未知（上游坏读）' });
     }
   }
   return out;
@@ -544,5 +464,5 @@ function record(entry) {
 
 module.exports = {
   fetchWallets, capture, primeBaseline, forget, readHistory, indexByReqId, record,
-  dailyLimit, SITE_ORIGIN, WALLETS_PATH,
+  SITE_ORIGIN, WALLETS_PATH,
 };

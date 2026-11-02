@@ -42,20 +42,19 @@
 
       <a-col :xs="24" :sm="12" :xl="6">
         <a-card :bordered="false" class="h-full">
-          <!-- 三条通道三种账：搭子是上游账单（今日实付）、千问是免费额度余额、
+          <!-- 三条通道三种账：搭子是上游账单（今日实付）、千问是剩余积分、
                TRAE 是按账号独立的剩余额度。同一张卡按通道换语义，
                但都要标出数字来源，否则额度政策一变没人知道数字错在哪 -->
           <a-spin v-if="(isQw && loading && !qw) || (isTw && loading && !twLoaded) || (!isQw && !isTw && loading && !data)" size="small" />
           <template v-else>
             <a-statistic
-              :title="isTw ? '剩余额度' : isQw ? '免费额度余额' : '今日实付'"
+              :title="isTw ? '剩余额度' : isQw ? '剩余积分' : '今日实付'"
               :value="isTw
                 ? (twTotals.remain ?? '—')
                 : isQw
-                  ? (qw?.ok ? fmtQw(qw.free) : '—')
+                  ? (qw?.ok ? fmtQw(qw.total) : '—')
                   : (data?.cards.today.consumed_points ?? '—')"
               :precision="isQw || isTw || data?.cards.today.consumed_points == null ? undefined : 2"
-              :suffix="isQw && qw?.ok ? `/ ${qw.dailyCap}` : ''"
               :value-style="isQw || isTw ? 'color:var(--lab-primary)' : undefined"
             />
             <div class="text-xs text-slate-500 mt-2">
@@ -69,10 +68,11 @@
               </template>
               <template v-else-if="isQw">
                 <template v-if="qw?.ok">
-                  <a-tag :color="qw.calibrated ? 'cyan' : 'default'" class="qw-mini">
-                    {{ qw.calibrated ? '实测' : '配置兜底' }}
-                  </a-tag>
-                  每日 00:00 重置 · 上限 {{ qw.limitSource === 'observed' ? '按观测峰值' : '取自配置' }}
+                  <!-- 2026-11-01 起上游不再发放每日免费额度（daily 池恒 0），
+                       所以这里不再有「每日上限」的分母可标——只剩付费余额与刷新时刻 -->
+                  <a-tag color="blue" class="qw-mini">付费</a-tag>
+                  月度 + 长期
+                  <template v-if="qw.resetAt"> · {{ fmtReset(qw.resetAt) }} 刷新</template>
                 </template>
                 <span v-else>{{ qw?.error || '取不到千问积分' }}</span>
               </template>
@@ -265,7 +265,7 @@
     </a-row>
 
     <!-- 千问办公的积分池。与搭子的「按账号积分消耗」是两套账：
-         千问是单账号直连，积分在 qwenwork.cn 的三个池子里 -->
+         千问的积分在 qwenwork.cn 的付费池里（每日免费额度上游已停发） -->
     <a-card v-if="isQw" title="千问办公积分" :bordered="false" class="mt-4">
       <a-spin v-if="loading && !qw" size="small" />
       <a-empty v-else-if="!qw || !qw.ok" :description="qw?.error || '取不到千问积分'" />
@@ -275,19 +275,15 @@
             <div class="qw-pool">
               <div class="qw-pool-head">
                 <span class="qw-pool-label">{{ w.label }}</span>
-                <a-tag :color="w.kind === 'free' ? 'cyan' : 'blue'" class="qw-mini">
-                  {{ w.kind === 'free' ? '免费' : '付费' }}
-                </a-tag>
+                <a-tag color="blue" class="qw-mini">付费</a-tag>
               </div>
               <div class="qw-pool-value num">
                 {{ fmtQw(w.balance) }}
-                <span v-if="w.id === 'daily'" class="qw-pool-cap">/ {{ qw.dailyCap }}</span>
               </div>
               <div class="qw-pool-sub">
-                <template v-if="w.id === 'daily'">
-                  每日 00:00 重置<template v-if="w.resetAt"> · {{ fmtReset(w.resetAt) }}</template>
+                <template v-if="w.id === 'monthly'">
+                  按有效期<template v-if="w.resetAt"> · {{ fmtReset(w.resetAt) }} 刷新</template>
                 </template>
-                <template v-else-if="w.id === 'monthly'">订阅套餐内</template>
                 <template v-else>充值 / 赠送</template>
               </div>
             </div>
@@ -299,30 +295,24 @@
                 <a-tag class="qw-mini">经本网关</a-tag>
               </div>
               <div class="qw-pool-value num">{{ fmtQw(qw.today.total) }}</div>
-              <div class="qw-pool-sub">
-                免费 {{ fmtQw(qw.today.free) }} · 付费 {{ fmtQw(qw.today.paid) }} ·
-                {{ qw.today.requests }} 次
-              </div>
+              <div class="qw-pool-sub">{{ qw.today.requests }} 次请求</div>
             </div>
           </a-col>
         </a-row>
 
-        <!-- 两套口径必须分开写清楚，否则用户会把它们相加 -->
+        <!-- 消耗口径：只有「经本网关」这一套是实测的。
+             「今日全部消耗（含客户端内对话）」需要「每日上限 − 余额」，
+             而上游已不再发放每日额度（2026-11-01 起 daily 恒 0），推不出来。 -->
         <a-alert type="info" show-icon class="mt-3">
-          <template #message>
-            两套口径，<b>不要相加</b>
-          </template>
+          <template #message>消耗口径</template>
           <template #description>
             <div>
-              「今日消耗（经本网关）」= {{ fmtQw(qw.today.total) }} —— 只统计经过本网关转发的请求。
+              「今日消耗」= {{ fmtQw(qw.today.total) }} —— 只统计经过本网关转发的请求，
+              按 req_id 逐条实测（前后余额差值）。
             </div>
-            <div>
-              「今日全部消耗」= {{ fmtQw(qw.freeUsed) }} —— 上限减余额得出，
-              含在客户端 / 网页里直接对话的部分。
-              <span class="text-slate-400">
-                （上限 {{ fmtQw(qw.limit) }}，来源：
-                {{ qw.limitSource === 'observed' ? '观测峰值' : '配置兜底' }}）
-              </span>
+            <div class="text-slate-400">
+              在客户端 / 网页里直接对话的消耗不经过本网关，这里看不到；
+              上游已停止发放每日免费额度，也无法再用「上限 − 余额」推算全天消耗。
             </div>
           </template>
         </a-alert>
@@ -464,7 +454,7 @@ const twTotals = computed(() => {
 const fmtQw = (n: number | null | undefined) =>
   n == null ? '—' : Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 4 })
 
-// 免费额度的重置时刻（接口给的是 wallet 的 valid_to）
+// 额度刷新时刻（上游 active_wallet 的 valid_to = 月度额度刷新点）
 const fmtReset = (s: string) => {
   const d = new Date(s)
   return Number.isFinite(d.getTime())

@@ -26,6 +26,18 @@ const crypto = require('crypto');
 // 通道在池里的 uid 键位 = 'qwenwork:<id>'（channel-pool.js 统一裁决）。
 const channelPool = require('../channel-pool');
 const CHANNEL = 'qwenwork';
+// FEFO（临期积分优先）：数据源 expiring.js（写方是管理端 /accounts）
+const expiringSnap = require('../expiring');
+
+// 临期账号的池 uid 集合（accountIds 给 Set<string>，池键位是 'qwenwork:<id>'）。
+// null = FEFO 关闭 / 快照陈旧 / 窗口内无临期——走普通轮询，不报错。
+function fefoUidSet() {
+  const ids = expiringSnap.accountIds(CHANNEL);
+  if (!ids) return null;
+  const out = new Set();
+  for (const id of ids) out.add(channelPool.uidOf(CHANNEL, id));
+  return out;
+}
 // 出站代理工厂（E 包接线）：runOnce 按账号解析 agent
 const proxyAgent = require('../proxy-agent');
 
@@ -310,7 +322,9 @@ async function send(payload, onChunk, opts = {}) {
 
   // 选号经池状态机：冷却/熔断/禁用/暂停/在途满的账号直接跳过（不再作为
   // 主账号去撞一次失败）；全池不可用时报 503 而不是拿冷却账号空转。
-  let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model });
+  // FEFO：集合非空时候选先限制在临期账号内（快照由管理端 /accounts 写）
+  const fefo = fefoUidSet();
+  let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring: fefo });
   if (!sel) {
     const err = new Error('千问办公没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
     err.statusCode = 503;
@@ -360,7 +374,7 @@ async function send(payload, onChunk, opts = {}) {
       if (e.sent) throw e;
       if (!retryable(code, e.message)) throw e;
       // 下一个候选仍经池选：刚失败的账号若进了冷却，这里自然跳过
-      sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model });
+      sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring: fefo });
       if (!sel) break;
     } finally {
       // 每次尝试结束必须放还在途名额（pickCandidate 命中即占用）
@@ -511,6 +525,9 @@ async function listModelEntries(force = false) {
 module.exports = {
   warmup, status, send, listModels, listModelEntries, pickAccount,
   normalizeModelRow, parseModelsResponse,
+  // FEFO 集合推导导出：端到端回归用（verify-expiring-fefo.js）。
+  // Qoder 3f 的教训——没导出的内部推导就是没测到的内部推导
+  fefoUidSet,
   chatCompletion: (p, opts) => send(p, undefined, opts),
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
 };

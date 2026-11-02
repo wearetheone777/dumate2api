@@ -208,16 +208,14 @@
               <a-statistic
                 :title="w.label"
                 :value="fmtQw(w.balance)"
-                :value-style="w.kind === 'free' ? 'color:var(--lab-primary)' : 'color:var(--lab-info)'"
+                value-style="color:var(--lab-info)"
               />
               <div class="text-xs text-slate-500 mt-2">
-                <a-tag :color="w.kind === 'free' ? 'cyan' : 'blue'">
-                  {{ w.kind === 'free' ? '免费' : '付费' }}
-                </a-tag>
-                <template v-if="w.id === 'daily'">
-                  <template v-if="qwCredits.accountCount > 1">{{ qwCredits.accountCount }} 个账号合计 · </template>每日 00:00 重置 · 上限 <span class="num">{{ fmt(qwCredits.dailyCap) }}</span>
+                <a-tag color="blue">付费</a-tag>
+                <template v-if="w.id === 'monthly'">
+                  <template v-if="qwCredits.accountCount > 1">{{ qwCredits.accountCount }} 个账号合计 · </template>
+                  按有效期<template v-if="w.resetAt"> · {{ fmtReset(w.resetAt) }} 刷新</template>
                 </template>
-                <template v-else-if="w.id === 'monthly'">订阅套餐内</template>
                 <template v-else>充值 / 赠送</template>
               </div>
             </a-card>
@@ -230,39 +228,34 @@
                 value-style="color:var(--lab-warn)"
               />
               <div class="text-xs text-slate-500 mt-2">
-                免费 {{ fmtQw(qwCredits.today.free) }} · 付费 {{ fmtQw(qwCredits.today.paid) }} ·
-                {{ qwCredits.today.requests }} 次
+                经本网关 · {{ qwCredits.today.requests }} 次请求
               </div>
             </a-card>
           </a-col>
         </a-row>
 
-        <!-- 两套口径分开写：经网关的 vs 全部（含客户端内对话） -->
+        <!-- 消耗口径：只有「经本网关」这一套是实测的。
+             「今日全部消耗（含客户端内对话）」需要「每日上限 − 余额」，
+             而上游已不再发放每日额度（2026-11-01 起 daily 恒 0），推不出来——
+             与其编一个数，不如如实说明缺什么。 -->
         <a-alert type="info" show-icon class="mt-4">
-          <template #message>两套口径，<b>不要相加</b></template>
+          <template #message>消耗口径</template>
           <template #description>
             <div>
-              「今日消耗（经本网关）」= {{ fmtQw(qwCredits.today.total) }}
-              —— 只统计经过本网关转发的请求。
+              「今日消耗」= {{ fmtQw(qwCredits.today.total) }}
+              —— 只统计经过本网关转发的请求，按 req_id 逐条实测（前后余额差值）。
             </div>
-            <div v-if="qwCredits.freeUsed != null">
-              「今日全部消耗」= {{ fmtQw(qwCredits.freeUsed) }}
-              —— 上限减余额得出，含在千问客户端 / 网页里直接对话的部分。
-              <span class="text-slate-400">
-                （上限 {{ fmtQw(qwCredits.limit) }}，来源：
-                {{ qwCredits.limitSource === 'observed' ? '观测峰值' : '配置兜底' }}）
-              </span>
+            <div class="text-slate-400">
+              在千问客户端 / 网页里直接对话的消耗**不经过本网关**，这里看不到。
+              上游已停止发放每日免费额度（2026-11-01 起 daily 池恒 0），
+              因此也无法再用「上限 − 余额」推算全天消耗。
             </div>
-            <!-- 未校准（有账号没观测到满额状态）时不给数字：差值会变成
-                 「配置上限 − 当前余额」，余额被扣穿时会算出编造值。
-                 后端此时返回 null，这里如实说明推不出来。 -->
-            <div v-else>
-              「今日全部消耗」= <span class="text-slate-400">无法推算</span>
-              —— 尚有账号未观测到满额状态，上限只能取配置值，差值不可信。
+            <div v-if="qwCredits.partial" class="text-orange-700">
+              注意：{{ qwCredits.accountCount - qwCredits.totalKnown }} 个账号余额未知，
+              上面各池合计只含余额已知的 {{ qwCredits.totalKnown }} 个账号。
             </div>
             <div v-if="qwCredits.failedAccounts > 0" class="text-orange-700">
-              注意：{{ qwCredits.failedAccounts }} 个账号余额查询失败，上面各池合计
-              只含查询成功的 {{ qwCredits.accountCount }} 个账号。
+              另有 {{ qwCredits.failedAccounts }} 个账号余额查询失败。
             </div>
           </template>
         </a-alert>
@@ -291,17 +284,6 @@
             <template v-else-if="column.key === 'model'">
               <span class="font-mono text-xs">{{ record.model }}</span>
             </template>
-            <template v-else-if="column.key === 'pool'">
-              <a-tag :color="record.pool === 'daily' ? 'cyan' : (record.pool === 'paid' ? 'blue' : 'default')">
-                {{ poolText(record.pool) }}
-              </a-tag>
-            </template>
-            <template v-else-if="column.key === 'free'">
-              <span class="text-cyan-700">{{ fmtQw(record.free) }}</span>
-            </template>
-            <template v-else-if="column.key === 'paid'">
-              <span class="text-blue-600">{{ fmtQw(record.paid) }}</span>
-            </template>
             <template v-else-if="column.key === 'total'">
               <span class="font-medium">{{ fmtQw(record.total) }}</span>
               <a-tooltip v-if="record.concurrent" title="与相邻请求并发，差值可能含其它请求的消耗">
@@ -309,8 +291,9 @@
               </a-tooltip>
             </template>
             <template v-else-if="column.key === 'balance'">
+              <!-- 余额快照只给两个付费池：daily 池上游已停发，不再展示 -->
               <span v-if="record.balance" class="text-xs text-slate-400">
-                日 {{ fmtQw(record.balance.daily) }} · 月 {{ fmtQw(record.balance.monthly) }} · 长 {{ fmtQw(record.balance.longterm) }}
+                月 {{ fmtQw(record.balance.monthly) }} · 长 {{ fmtQw(record.balance.longterm) }}
               </span>
               <span v-else class="text-slate-400">—</span>
             </template>
@@ -394,8 +377,10 @@
               上游分两个池子返回，合起来没有意义。
             </div>
             <div v-if="qdExpiring.count" class="text-orange-700">
-              {{ qdExpiring.count }} 个批次将在 7 天内到期，合计领取额
-              {{ fmtQw(qdExpiring.amount) }}（<b>领取额不是剩余额</b>——上游不给逐批余额）。
+              {{ qdExpiring.count }} 个批次将在 7 天内到期，按先领先扣推算还剩
+              {{ fmtQw(qdExpiring.amount) }}
+              <template v-if="qdExpiring.estimated === false">（余额没查到，此为领取额口径）</template>
+              <template v-else-if="qdExpiring.amount === 0">——这些批次按消耗顺序已用完，到期不损失余额</template>
             </div>
           </template>
         </a-alert>
@@ -1085,8 +1070,8 @@ const qdUsed = computed(() => {
   return { addOn, user }
 })
 
-/** 7 天内到期的批次（本地账本，领取额口径） */
-const qdExpiring = ref({ count: 0, amount: 0 })
+/** 7 天内到期的批次（推算剩余口径，先领先扣；estimated=false = 领取额降级） */
+const qdExpiring = ref<{ count: number; amount: number; estimated?: boolean }>({ count: 0, amount: 0 })
 
 // 占用百分比：上游 percentage 是 0~1 的小数；拿不到时显示 —，不编 0
 const pctWidth = (p: number | null) => {
@@ -1144,7 +1129,7 @@ async function loadQd() {
         data: {
           count: 0,
           rows: [] as QoderCreditRow[],
-          summary: { total: 0, valid: 0, unknown: 0, checkedIn: 0, addOnTotal: 0, userTotal: 0, exceeded: 0, expiringCount: 0, expiringAmount: 0 },
+          summary: { total: 0, valid: 0, unknown: 0, checkedIn: 0, addOnTotal: 0, userTotal: 0, exceeded: 0, expiringCount: 0, expiringAmount: 0, expiringEstimated: false, expiringGrantedAmount: 0 },
           note: '',
         },
       })),
@@ -1156,6 +1141,7 @@ async function loadQd() {
     qdExpiring.value = {
       count: c.data.summary?.expiringCount || 0,
       amount: c.data.summary?.expiringAmount || 0,
+      estimated: c.data.summary?.expiringEstimated,
     }
     qdRecords.value = rec.data.rows || []
     qdWindow.value = rec.data.window || { cost: 0, requests: 0, exact: 0 }
@@ -1174,21 +1160,17 @@ async function loadQd() {
 const isQw = computed(() => isQwenwork())
 const qwCredits = ref<QwCredits | null>(null)
 const qwRecords = ref<QwCreditRecord[]>([])
-const qwWindow = ref({ free: 0, paid: 0, total: 0, requests: 0 })
+const qwWindow = ref({ total: 0, requests: 0 })
 
+// 千问逐笔消耗的列。不再有「扣费池 / 免费 / 付费」三列：上游已停发
+// 每日免费额度，新记录恒为 free=0、pool=paid，那三列只会显示一排零。
 const qwRecordColumns = [
-  { title: '时间', key: 'ts', width: '17%' },
-  { title: '模型', key: 'model', width: '12%' },
-  { title: '扣费池', key: 'pool', width: '10%' },
-  { title: '免费', key: 'free', width: '11%' },
-  { title: '付费', key: 'paid', width: '11%' },
-  { title: '合计', key: 'total', width: '13%' },
-  { title: '请求后余额', key: 'balance', width: '16%' },
-  { title: '账号', key: 'account', width: '10%' },
+  { title: '时间', key: 'ts', width: '20%' },
+  { title: '模型', key: 'model', width: '16%' },
+  { title: '消耗', key: 'total', width: '16%' },
+  { title: '请求后余额', key: 'balance', width: '22%' },
+  { title: '账号', key: 'account', width: '14%' },
 ]
-
-const poolText = (p: string) =>
-  p === 'daily' ? '每日免费' : p === 'paid' ? '付费积分' : p === 'none' ? '未扣费' : '—'
 
 // ---- 操作流水（签到 / 任务 / 抽奖 / 自动发放）----
 // 原来是一个独立的「任务记录」页，并入本页的理由见模板里的注释。
@@ -1293,11 +1275,11 @@ async function loadQw() {
   try {
     const [credits, records] = await Promise.all([
       qwenworkApi.credits().catch((e: any) => ({ data: { ok: false, error: e?.message || '取不到千问积分' } })),
-      qwenworkApi.creditRecords(200).catch(() => ({ data: { rows: [], window: { free: 0, paid: 0, total: 0, requests: 0 } } })),
+      qwenworkApi.creditRecords(200).catch(() => ({ data: { rows: [], window: { total: 0, requests: 0 } } })),
     ])
     qwCredits.value = credits.data as QwCredits
     qwRecords.value = records.data.rows || []
-    qwWindow.value = records.data.window || { free: 0, paid: 0, total: 0, requests: 0 }
+    qwWindow.value = records.data.window || { total: 0, requests: 0 }
   } finally {
     loading.value = false
   }
@@ -1404,6 +1386,11 @@ const fmt = (n: number) => n.toLocaleString('zh-CN', { maximumFractionDigits: 2 
 // 千问积分保留 4 位：实测单次消耗 0.0025，按 2 位显示会变成 0
 const fmtQw = (n: number | null | undefined) =>
   n == null ? '—' : Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 4 })
+/** 额度刷新时刻（上游 active_wallet 的 valid_to）。空值显示 —，不编日期 */
+const fmtReset = (iso?: string | null) => {
+  const t = Date.parse(iso || '')
+  return Number.isFinite(t) ? new Date(t).toLocaleString('zh-CN', { hour12: false }) : '—'
+}
 const dateText = (ts: number | null) =>
   ts ? new Date(ts).toLocaleDateString('zh-CN') : '—'
 // 发放/到期时间精确到秒：同一天会发多笔（实测一天 61 笔），只到日期的话

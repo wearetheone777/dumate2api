@@ -8,7 +8,7 @@
 // 结论分两半：
 //
 // 1. **「必须使用才刷新」不成立**。实测账号 2 当天零请求，昨日收尾 4.9657，
-//    次日读到满额 100；重置时刻是 wallet 的 valid_to（每天 00:00 +08:00）。
+//    次日读到满额 100；重置时刻是 wallet 的 valid_to。
 //
 // 2. 但用户看到的那个「0」是**真实存在**的，成因不是「没刷新」，而是
 //    `/user/wallets` 偶尔返回「三池全 0 + active_wallets 空」的**瞬时响应**。
@@ -20,8 +20,13 @@
 //   - 瞬时抖动：重试即恢复 → 用重试的结果
 //   - 真实归零：重试仍是 0 → 如实上报 0（并标 retried，便于排查）
 //
-// 早先的实现把瞬时 0 直接当成 ok=true 的余额 0 返回 → 界面显示「每日额度 0」
-// → 被读成「今天用光了」。这就是用户报的现象。
+// **2026-11-02 口径变更**（上游已停止发放每日免费额度，daily 池实测恒 0）：
+//
+//   · 交叉验证的触发条件从「daily 读数为 0」改成「三池全 0」——否则每次查询
+//     都会多打一次 account-context（daily 常态就是 0）。
+//   · 校正的是 **total**（`quota.remaining` 是权威总数），不再拆回 daily：
+//     remaining 分不出池子分配，硬拆就是编数字。校正时三个池子一律 null，
+//     标 misread + poolsUnknown，total 用权威值。
 const https = require('https');
 
 // 拦截 https.request：按队列依次返回预设响应体，不打网络。
@@ -140,12 +145,12 @@ function newAcc() { ACC_N++; return { id: 9000 + ACC_N, accessToken: `tok-${ACC_
   check('ok=true（无法判定不是错误）', w.ok === true, String(w.ok));
   check('daily 如实为 0', w.daily === 0, String(w.daily));
   check('标 retried 便于排查', w.retried === true, String(w.retried));
-  check('不标 dailyCorrected（没校正出值）', !w.dailyCorrected, String(w.dailyCorrected));
+  check('不标 misread（没校正出值）', !w.misread, String(w.misread));
 
   console.log('');
-  console.log('== wallets 谎报 0 但 account-context 给出权威值：交叉验证还原 daily ==');
-  // 这是 2026-10-02 用户报的场景：免费额度其实已刷新（remaining=100），
-  // wallets 却持续报 daily=0。修法：daily = remaining − monthly − longterm。
+  console.log('== wallets 谎报全 0 但 account-context 给出权威总数：校正 total ==');
+  // 2026-11-02 起校正的是**总数**而不是拆回某个池子：remaining 只给总和，
+  // 分不出池子分配，硬拆就是编数字。所以池子一律 null，total 用权威值。
   acc = newAcc();
   CALLS = 0; CTX_CALLS = 0;
   RESPONSES = [BODY_ZERO]; // wallets 一直是全 0
@@ -153,14 +158,17 @@ function newAcc() { ACC_N++; return { id: 9000 + ACC_N, accessToken: `tok-${ACC_
   w = await credits.fetchWallets({ account: acc, force: true });
   check('打了 2 次 wallets', CALLS === 2, `CALLS=${CALLS}`);
   check('ok=true', w.ok === true, String(w.ok));
-  check('daily=100（校正为真实值，不是 0）', w.daily === 100, String(w.daily));
-  check('标 dailyCorrected', w.dailyCorrected === true, String(w.dailyCorrected));
+  check('total=100（校正为权威总数）', w.total === 100, String(w.total));
+  check('daily 是 null（未知，不是 0）', w.daily === null, String(w.daily));
+  check('标 misread', w.misread === true, String(w.misread));
+  check('标 poolsUnknown（池子分配未知）', w.poolsUnknown === true, String(w.poolsUnknown));
   check('不标 retried（已校正，不是异常）', !w.retried, String(w.retried));
-  check('freeUsed 不再被误算成「已用 100」', w.freeUsed !== 100, String(w.freeUsed));
 
   console.log('');
-  console.log('== 付费池为负 + 免费已刷新：remaining=95.1778 → daily=100 ==');
-  // 实测账号 2：longterm = −4.8222，remaining = 95.1778，还原 daily = 100。
+  console.log('== 付费池为负 + 全 0：remaining=95.1778 → total 用权威值，池子如实保留 ==');
+  // 实测账号 2 的历史形态：longterm = −4.8222，remaining = 95.1778。
+  // 注意这个形态三池**不全为 0**（longterm 非 0），所以不进交叉验证分支——
+  // 池子余额是上游直给的真值，不该被校正覆盖。
   acc = newAcc();
   CALLS = 0; CTX_CALLS = 0;
   RESPONSES = [JSON.stringify({
@@ -175,9 +183,10 @@ function newAcc() { ACC_N++; return { id: 9000 + ACC_N, accessToken: `tok-${ACC_
   })];
   CONTEXT_RESPONSES = [bodyCtx(95.1778)];
   w = await credits.fetchWallets({ account: acc, force: true });
-  check('daily=100（remaining − (−4.8222)）', w.daily === 100, String(w.daily));
   check('longterm 如实为 −4.8222', w.longterm === -4.8222, String(w.longterm));
-  check('标 dailyCorrected', w.dailyCorrected === true, String(w.dailyCorrected));
+  check('daily 如实为 0（不是 null）', w.daily === 0, String(w.daily));
+  check('不标 misread（三池不全为 0，不是坏读）', !w.misread, String(w.misread));
+  check('没打 account-context（不需要验证）', CTX_CALLS === 0, `CTX=${CTX_CALLS}`);
 
   console.log('');
   console.log('== 真·额度耗尽：remaining 也约等于 0，不误判成「刷新了」 ==');
@@ -189,7 +198,7 @@ function newAcc() { ACC_N++; return { id: 9000 + ACC_N, accessToken: `tok-${ACC_
   CONTEXT_RESPONSES = [bodyCtx(0)];
   w = await credits.fetchWallets({ account: acc, force: true });
   check('daily 如实为 0（未误判）', w.daily === 0, String(w.daily));
-  check('不标 dailyCorrected', !w.dailyCorrected, String(w.dailyCorrected));
+  check('不标 misread', !w.misread, String(w.misread));
   check('标 retried（无法区分真耗尽/持续坏读）', w.retried === true, String(w.retried));
 
   console.log('');

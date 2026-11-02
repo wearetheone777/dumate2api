@@ -38,11 +38,11 @@ function attachQwCredits(rows) {
     if (!c) return r; // 还没结算完 / 采集失败：字段缺省，界面显示「—」
     return {
       ...r,
-      qw_free: c.free,
-      qw_paid: c.paid,
+      // **不再带 qw_free / qw_paid / qw_pool**（2026-11-02）：上游已停止发放
+      // 每日免费额度，新记录 free 恒 0、pool 恒 paid，界面按这两列展示只会
+      // 显示一排零和同一个标签。历史行里的字段仍在账本里（那是当时的真数据），
+      // 只是不再通过接口透出。
       qw_total: c.total,
-      // 哪个池子被扣的：daily=每日免费额度，paid=月度/长期（付费）
-      qw_pool: c.pool,
       // 与相邻请求并发时差值可能含别人消耗，界面要标出来
       qw_concurrent: !!c.concurrent,
       // 请求结束后的余额快照，便于核对

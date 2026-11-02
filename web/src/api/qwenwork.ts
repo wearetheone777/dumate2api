@@ -2,11 +2,17 @@
 import client from '@/api/client'
 
 export interface QwWallet {
-  id: 'daily' | 'monthly' | 'longterm'
+  /** 只剩两个付费池：monthly（订阅套餐）/ longterm（充值赠送）。
+   *  daily 池已移除——上游 2026-11-01 起停止发放每日免费额度，恒 0。 */
+  id: 'monthly' | 'longterm'
   label: string
-  kind: 'free' | 'paid'
+  kind: 'paid'
+  /**
+   * 余额。**null = 未知**（上游坏读，已用 account-context 的权威总数校正过），
+   * 界面显示「—」。显示 0 会被读成「用完了」，两者不能混。
+   */
   balance: number | null
-  /** 免费额度每天 00:00 重置，接口给出该时刻；付费池按有效期，为 null */
+  /** 该池额度刷新的时刻（上游 active_wallet 的 valid_to）；无则为 null */
   resetAt: string | null
 }
 
@@ -14,34 +20,16 @@ export interface QwCredits {
   ok: boolean
   error: string
   /**
-   * 三个池子平级返回，不合并——月度与长期性质不同。
-   * **余额是全账号合计**：每个账号各有一份每日免费额度（各自 00:00 重置），
-   * 两账号各 100 就是 200。与顶部「积分余额」（/accounts 的 summary.pointsTotal）
-   * 同源，同一页两个数字必须对得上。
+   * 两个付费池平级返回，不合并——月度来自订阅套餐、长期来自充值赠送，
+   * 性质不同。**余额是全账号合计**，与顶部「积分余额」
+   * （/accounts 的 summary.pointsTotal）同源，同一页两个数字必须对得上。
    */
   wallets: QwWallet[]
-  /** 免费额度余额（每日 00:00 重置）——全账号合计 */
-  free: number
   /** 付费余额 = monthly + longterm */
   paid: number
   monthly: number
   longterm: number
-  total: number
-  /**
-   * 每日上限，**由观测峰值 + 配置兜底得出**（接口本身不给上限），
-   * 再按账号相加。每日额度每天 00:00 重置，当天观测到的最大值即最接近
-   * 上限的真实值。
-   */
-  limit: number
-  limitSource: 'observed' | 'config-lower-bound'
-  /**
-   * 每日免费额度的**合计上限** = 单账号上限 × 账号数（默认单账号 100）。
-   * 接口不返回分母，这个值来自配置——三个池子卡标注「/ N」时用这个，
-   * 且必须说明来源，否则额度政策一变就没人知道数字是错的。
-   */
-  dailyCap: number
-  /** 单账号的每日上限（账号健康快照每张卡的分母用这个，不是合计） */
-  dailyCapPerAccount: number
+  total: number | null
   /** 参与合计的账号数（余额查询成功的） */
   accountCount: number
   /** 余额查询失败的账号数。>0 时合计是**部分和**，界面要说明 */
@@ -52,39 +40,33 @@ export interface QwCredits {
    */
   retriedAccounts: number
   /**
-   * 其中 daily 已由 account-context 交叉验证**还原出真实值**的账号数
-   * （wallets 偶尔谎报 0，但 account-context 的 quota.remaining 是权威的）。
-   * 这些账号的 0 已确认是上游坏读，不是「今日已用光」——界面要说「已校正」，
-   * 不要与 retriedAccounts 一起说成「可能已用尽」。
+   * 其中已被 account-context 的权威总数校正过的账号数（池子分配未知，
+   * total 可信）。这些账号的 0 已确认是上游坏读，不是「已用光」——
+   * 界面要说「已校正」，不要与 retriedAccounts 一起说成「可能已用尽」。
    */
-  correctedAccounts: number
-  /** 合计由哪些账号构成（每账号的三池余额与上限） */
+  misreadAccounts: number
+  /** 合计里余额**已知**的账号数。小于 accountCount 时合计是部分和 */
+  totalKnown: number
+  /** true = 有账号余额未知，上面各池合计只含已知的部分 */
+  partial: boolean
+  /** 合计由哪些账号构成（每账号的池子余额） */
   accounts: Array<{
     id: string
     name: string
-    daily: number
-    monthly: number
-    longterm: number
-    total: number
-    limit: number
-    peak: number
-    freeUsed: number | null
-    calibrated: boolean
-    /** 该账号的 daily 是交叉验证校正出来的（wallets 谎报 0） */
-    dailyCorrected?: boolean
+    monthly: number | null
+    longterm: number | null
+    total: number | null
+    refreshAt: string | null
+    /** 该账号余额是上游坏读、已用权威总数校正（池子分配未知） */
+    misread: boolean
+    /** 重试后仍为全 0（可能真耗尽，也可能上游持续异常） */
+    retried: boolean
   }>
-  /** 当天观测到的每日额度峰值（各账号相加） */
-  peak: number
-  /** true = **每个**账号都已观测到接近满额状态，消耗值可信 */
-  calibrated: boolean
-  /** 今日全部消耗 = 上限 − 余额（含客户端/网页里的对话）。有账号未校准时为 null */
-  freeUsed: number | null
   /**
-   * 最近到期的钱包。**注意这不是「积分要作废」**：daily 池每天 00:00 重置，
-   * 所以 valid_to 就是明天的重置时刻——每天都「即将到期」，不是风险。
-   * kind='reset' 标出这一点，界面不要把它渲染成风险。
+   * 额度刷新时刻（上游 active_wallet 的 valid_to，实测月初）。
+   * **不是「每日重置」**：Free 号的月度额度按这个时刻刷新。
    */
-  expiring: Array<{ balance: number; valid_to: string; kind?: 'reset' | 'expire' }>
+  resetAt: string | null
   /**
    * 上游自己给的「即将过期」列表——**这才是会作废的那部分**（付费积分
    * 按有效期，过期即消失）。count 为 0 表示无风险。
@@ -92,18 +74,18 @@ export interface QwCredits {
   expiringSoon: { count: number; total: number; wallets: Array<{ balance: number; valid_to: string }> }
   fetchedAt: number
   /**
-   * 今日消耗。**仅统计经本网关的请求**——客户端/网页里的对话不经网关，
-   * 不计入这里。与「当天总消耗」是两套口径，不要把两者相加或对比。
+   * 今日消耗。**仅统计经本网关的请求**——这是唯一有实测依据的口径。
+   * 不再提供「今日全部消耗（含客户端内对话）」：那需要「每日上限 − 余额」，
+   * 而上游已不再发放每日额度，推不出来。
    */
-  today: { free: number; paid: number; total: number; requests: number; scope: 'gateway' }
+  today: { total: number; requests: number; scope: 'gateway' }
   /** 主账号名（保留字段）。合计口径下它不再代表全体，改用 accountCount */
   account?: string
 }
 
 export interface QwDailyRow {
   day: string
-  free: number
-  paid: number
+  /** 当日经本网关的消耗合计。不再拆 free/paid——上游停发每日额度后 free 恒 0 */
   total: number
   requests: number
   concurrent: number
@@ -164,10 +146,8 @@ export interface QwCreditRecord {
   req_id: string
   model: string
   ms: number | null
-  free: number
-  paid: number
+  /** 本次消耗合计。不再有 free/paid/pool 分列——上游停发每日额度后它们恒为 0/paid */
   total: number
-  pool: 'daily' | 'paid' | 'none'
   concurrent: boolean
   balance: { daily: number; monthly: number; longterm: number } | null
   account: QwAccountInfo | null
@@ -205,7 +185,16 @@ export interface QwAccount {
   lastErrorAt: number | null
   /** refresh token 尾 6 位，供人工核对是哪个账号。全量不外传 */
   refreshTail: string
-  wallets: { daily: number; monthly: number; longterm: number; total: number } | null
+  wallets: {
+    daily: number | null
+    monthly: number | null
+    longterm: number | null
+    total: number | null
+    /** 上游 active_wallet 的到期时刻 = 月度额度刷新点（实测月初） */
+    refreshAt: string | null
+    /** 该账号余额是上游坏读、已用权威总数校正：池子分配未知，total 可信 */
+    misread: boolean
+  } | null
   /** 该账号即将过期的积分（上游 expiring_soon）。count=0 表示无风险 */
   expiringSoon: { count: number; total: number; wallets: Array<{ balance: number; valid_to: string }> }
 }
@@ -294,7 +283,7 @@ export const qwenworkApi = {
     client.get<{
       limit: number
       rows: QwCreditRecord[]
-      window: { free: number; paid: number; total: number; requests: number }
+      window: { total: number; requests: number }
     }>(`/qwenwork/credits/records?limit=${limit}`),
   // 账号列表（多账号池，mode='multi'）
   accounts: () => client.get<{
