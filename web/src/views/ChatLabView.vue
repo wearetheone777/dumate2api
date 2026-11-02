@@ -110,17 +110,12 @@
               :options="channelOptions"
               @change="onChannelChange"
             />
-            <!-- 区域（2026-11-03 国际版）：TRAE/Qoder 两区账号与模型表不同，
-                 试调请求随区域约束选号——否则国际模型可能被国内账号接走 -->
-            <a-radio-group
-              v-if="labChannel === 'traework' || labChannel === 'qoder'"
-              v-model:value="labRegion"
-              size="small"
-              @change="onRegionChange"
-            >
-              <a-radio-button value="cn">国内</a-radio-button>
-              <a-radio-button value="intl">国际</a-radio-button>
-            </a-radio-group>
+            <!-- 区域切换在顶栏（国内版/国际版），这里只读当前区域——
+                 模型表与试调请求都按它走，两区账号与模型不同 -->
+            <a-tag v-if="labChannel === 'traework' || labChannel === 'qoder' || labChannel === 'workbuddy'"
+              :color="regionStore.current === 'intl' ? 'purple' : 'blue'" size="small">
+              {{ regionStore.current === 'intl' ? '国际' : '国内' }}
+            </a-tag>
             <a-select
               v-model:value="model"
               class="model-select"
@@ -230,29 +225,37 @@ const twModelsLoading = ref(false)
 const qdModels = ref<Array<{ id: string; name: string; prefixed: string; rate?: number | null }>>([])
 const qdModelsLoading = ref(false)
 
-// 区域（2026-11-03 国际版）：traework 用 cn/intl、qoder 用 cn/global，
-// 单选器统一用 'cn'|'intl'，发请求时按通道映射。切区域重拉模型表
-const labRegion = ref<'cn' | 'intl'>('cn')
+// WorkBuddy 模型（第五通道，双区域目录）
+const wbModels = ref<Array<{ id: string; name: string; prefixed: string; rate?: number | null }>>([])
+const wbModelsLoading = ref(false)
+
+async function loadWbModels() {
+  if (wbModelsLoading.value) return
+  wbModelsLoading.value = true
+  try {
+    const { data } = await client.get(`/chatlab/workbuddy-models?region=${regionStore.current}`)
+    wbModels.value = data.models || []
+  } catch { /* 拿不到就空列表，不阻断 */ } finally {
+    wbModelsLoading.value = false
+  }
+}
+
+// 区域（2026-11-03）：顶栏统一切换（国内版/国际版），测试台只读。
+// 单选器统一用 'cn'|'intl'，发请求时按通道映射（qoder/workbuddy 的后端都认 intl）
+import { regionStore } from '@/stores/region'
+import { watch as vueWatch } from 'vue'
 
 function regionParam(): 'cn' | 'intl' | 'global' | undefined {
-  if (labChannel.value === 'traework') return labRegion.value
-  if (labChannel.value === 'qoder') return labRegion.value === 'intl' ? 'global' : 'cn'
+  if (labChannel.value === 'traework' || labChannel.value === 'workbuddy') return regionStore.current
+  if (labChannel.value === 'qoder') return regionStore.current === 'intl' ? 'global' : 'cn'
   return undefined
 }
 
-async function onRegionChange() {
+// 区域切换后重拉当前通道的模型表（顶栏切换不经过本页的 change 事件）
+vueWatch(() => regionStore.current, () => {
   model.value = ''
-  if (labChannel.value === 'traework') {
-    await loadTwModels()
-    model.value = twModels.value[0]?.prefixed || ''
-  } else if (labChannel.value === 'qoder') {
-    await loadQdModels()
-    const cheapest = qdModels.value
-      .filter((m) => m.rate != null && m.rate > 0)
-      .sort((a, b) => (a.rate as number) - (b.rate as number))[0]
-    model.value = cheapest?.prefixed || qdModels.value[0]?.prefixed || ''
-  }
-}
+  applyChannel(labChannel.value)
+})
 
 async function loadQdModels() {
   if (qdModelsLoading.value) return
@@ -269,7 +272,7 @@ async function loadTwModels() {
   if (twModelsLoading.value) return
   twModelsLoading.value = true
   try {
-    const { data } = await traeworkApi.models({ region: labRegion.value })
+    const { data } = await traeworkApi.models({ region: regionParam() as 'cn' | 'intl' | undefined })
     // 与网关 /v1/models 的 usableIds 同口径（可见 + 对话用途）——上游全量表
     // 里混着 computer_use_subagent 这类内部模型、custom_model_* 占位与
     // summary，全列出来下拉就是「错乱」的；模型名调不通的也不该出现
@@ -280,7 +283,7 @@ async function loadTwModels() {
     // TRAE 宝（traebao/ 前缀 → personal_assistant 身份，当前免费豁免）。
     // 实测白名单只有 deepseek-v4.1-flash（其余上游 4001），不列调不通的。
     // **国内身份**：国际区域不列（personal_assistant 的豁免绑国内活动域）
-    if (labRegion.value === 'cn') {
+    if (regionStore.current === 'cn') {
       list.push({ id: 'auto', name: 'TRAE 宝自动档（免费）', prefixed: 'traebao/auto' })
       if (chat.some((m) => m.id === 'deepseek-v4.1-flash')) {
         list.push({
@@ -329,6 +332,14 @@ async function applyChannel(id: string) {
       .filter((m) => m.rate != null && m.rate > 0)
       .sort((a, b) => (a.rate as number) - (b.rate as number))[0]
     model.value = cheapest?.prefixed || qdModels.value[0]?.prefixed || ''
+  } else if (id === 'workbuddy') {
+    if (!wbModels.value.length) await loadWbModels()
+    // 默认挑**免费档**（credits x0.00 的模型），没有免费再挑倍率最低的
+    const free = wbModels.value.find((m) => (m.rate ?? 1) === 0)
+    const cheapest = wbModels.value
+      .filter((m) => m.rate != null && m.rate > 0)
+      .sort((a, b) => (a.rate as number) - (b.rate as number))[0]
+    model.value = free?.prefixed || cheapest?.prefixed || wbModels.value[0]?.prefixed || ''
   } else {
     if (!models.value) await loadModels()
     model.value = models.value?.exposed?.[0]?.id || models.value?.aliases?.[0]?.id || ''
@@ -370,6 +381,12 @@ const modelOptions = computed(() => {
     }
     return out
   }
+  if (labChannel.value === 'workbuddy') {
+    for (const m of wbModels.value) {
+      out.push({ label: `${m.name} (${m.prefixed})`, value: m.prefixed })
+    }
+    return out
+  }
   for (const m of models.value?.exposed ?? []) {
     out.push({ label: `${m.id}（上游）`, value: m.id })
   }
@@ -404,6 +421,7 @@ function refreshModels() {
   if (labChannel.value === 'qwenwork') return loadQwModels()
   if (labChannel.value === 'traework') return loadTwModels()
   if (labChannel.value === 'qoder') return loadQdModels()
+  if (labChannel.value === 'workbuddy') return loadWbModels()
   return loadModels()
 }
 

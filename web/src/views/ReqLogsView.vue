@@ -73,14 +73,11 @@
             <a-tag v-if="record.channel === 'qwenwork'" color="cyan">千问</a-tag>
             <a-tag v-else-if="record.channel === 'traework'" color="purple">TRAE</a-tag>
             <a-tag v-else-if="record.channel === 'qoder'" color="orange">Qoder</a-tag>
+            <a-tag v-else-if="record.channel === 'workbuddy'" color="geekblue">WorkBuddy</a-tag>
             <a-tag v-else-if="record.channel === 'dumate'" color="blue">搭子</a-tag>
             <a-tooltip v-else title="分通道埋点上线前的记录">
               <a-tag color="default">搭子*</a-tag>
             </a-tooltip>
-            <!-- 区域（2026-11-03 国际版）：traework/qoder 随实际服务账号记录。
-                 旧数据与纯国内通道没有这个字段，不显示——空串不能读成国内 -->
-            <a-tag v-if="record.region === 'intl'" color="purple" class="ml-1">国际</a-tag>
-            <a-tag v-else-if="record.region === 'cn'" color="blue" class="ml-1">国内</a-tag>
           </template>
           <template v-else-if="column.key === 'model'">
             <div class="text-xs">{{ record.model || '—' }}</div>
@@ -238,10 +235,9 @@
             <a-tag v-if="detail.channel === 'qwenwork'" color="cyan">千问办公</a-tag>
             <a-tag v-else-if="detail.channel === 'traework'" color="purple">TRAE Work</a-tag>
             <a-tag v-else-if="detail.channel === 'qoder'" color="orange">Qoder</a-tag>
+            <a-tag v-else-if="detail.channel === 'workbuddy'" color="geekblue">WorkBuddy</a-tag>
             <a-tag v-else-if="detail.channel === 'dumate'" color="blue">百度搭子</a-tag>
             <span v-else class="text-slate-400">百度搭子（分通道前的记录）</span>
-            <a-tag v-if="detail.region === 'intl'" color="purple" class="ml-1">国际</a-tag>
-            <a-tag v-else-if="detail.region === 'cn'" color="blue" class="ml-1">国内</a-tag>
           </div>
 
           <div class="detail-label">账号</div>
@@ -391,6 +387,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import client from '@/api/client'
 import { channelStore, CHANNELS, isDirectChannel, channelParam } from '@/stores/channel'
+import { regionParam } from '@/stores/region'
 import type { ReqLogRow, ReqLogsData, PointsRecord, PointsRecordsData } from '@/api/reqlogs'
 
 const data = ref<ReqLogsData | null>(null)
@@ -542,6 +539,9 @@ async function load() {
       limit: String(pageSize),
       offset: String((page.value - 1) * pageSize),
     })
+    // 区域视图（顶栏切换）：TRAE/Qoder 的日志按当前区域过滤
+    const r = regionParam()
+    if (r) params.set('region', r)
     const { data: d } = await client.get('/reqlogs?' + params.toString())
     data.value = d
   } finally {

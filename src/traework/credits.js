@@ -173,13 +173,28 @@ function dayKey(ts) {
  * **成本取差值而不是 consumed**：consumed 是累计值，直接按天求和等于把
  * 历史总量重复计入每一天。差值才是「这一天花了多少」。
  * 每个账号的首条没有参照点，不计入任何一天——宁可少算也不编。
+ *
+ * region（2026-11-03）：'cn'/'intl' 按账号区域过滤（国内/国际视图各自的
+ * 曲线）；'' 不过滤。行没有 account_id 或账号已删除的，按国内归——
+ * 国际版上线前只有国内账号。
  */
-function dailyUsage(days) {
+function dailyUsage(days, region) {
   const { rows, delta, inexact } = computeCosts();
+  let regions = null;
+  if (region) {
+    try {
+      const authStore = require('./auth');
+      regions = new Map(authStore.list().map((a) => [a.id, a.region || 'cn']));
+    } catch (e) { regions = null; }
+  }
   const since = Date.now() - days * 86400000;
   const byDay = new Map();
   for (const r of rows) {
     if (!r || r.ts < since) continue;
+    if (regions) {
+      const reg = r.account_id != null ? (regions.get(r.account_id) || 'cn') : 'cn';
+      if (reg !== region) continue;
+    }
     const key = dayKey(r.ts);
     const cur = byDay.get(key) || { day: key, cost: 0, requests: 0, concurrent: 0 };
     if (r.req_id in delta) cur.cost += delta[r.req_id];

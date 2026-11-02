@@ -76,6 +76,25 @@
               {{ c.label }}
             </button>
           </div>
+          <!-- 区域切换器（2026-11-03）：TRAE/Qoder 有国内、国际两套独立账号，
+               页面按区域整体切换——这是「两个不同的页面」，不是一页里打标签。
+               纯国内通道（搭子/千问）没有区域概念，切换器隐藏 -->
+          <div v-if="regionVisible" class="ch-switch region-switch">
+            <button
+              class="ch-btn region-btn"
+              :class="{ on: regionStore.current === 'cn' }"
+              @click="regionStore.set('cn')"
+            >
+              国内版
+            </button>
+            <button
+              class="ch-btn region-btn intl"
+              :class="{ on: regionStore.current === 'intl' }"
+              @click="regionStore.set('intl')"
+            >
+              国际版
+            </button>
+          </div>
           <div class="lab-crumb">
             <span class="crumb-root">控制台</span>
             <span class="crumb-sep">/</span>
@@ -101,10 +120,14 @@ import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, W
 import AppLogo from '@/components/AppLogo.vue'
 import { auth, isAdmin } from '@/stores/auth'
 import { channelStore, CHANNELS } from '@/stores/channel'
+import { regionStore, hasRegion } from '@/stores/region'
 
 const collapsed = ref(false)
 const router = useRouter()
 const route = useRoute()
+
+// 区域切换器只在有区域概念的通道显示（TRAE / Qoder）
+const regionVisible = computed(() => hasRegion())
 
 // 选中态跟着路由走，否则点进模型管理后侧边栏仍高亮仪表盘
 const selectedKeys = computed(() => [String(route.meta.key || 'dashboard')])
@@ -322,6 +345,20 @@ onMounted(() => { channelStore.load() })
   background: var(--lab-primary-dim);
   color: var(--lab-primary);
   font-weight: 600;
+}
+/* 区域切换器：与通道切换器同构但视觉上低一档（它是通道内的二级维度），
+   国际版选中态用紫色——与账号卡「国际」徽标同色系，两处看到的是同一个语义 */
+.region-switch {
+  padding: 2px;
+}
+.region-btn {
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.region-btn.intl.on {
+  background: rgba(147, 51, 234, 0.14);
+  color: #c084fc;
 }
 .ch-dot {
   width: 6px;

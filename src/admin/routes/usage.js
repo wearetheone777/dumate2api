@@ -82,14 +82,21 @@ function clampInt(raw, def, min, max) {
 // 按通道取行。**历史记录（channel 未标注）归入搭子**——分通道埋点上线前
 // 只有搭子一条通道，把它们算到「未标注」里，用户切到搭子会看到数字凭空变小，
 // 反而比默认成搭子更像在编数据。只有「查看全部」时才单列未标注。
+// region（2026-11-03）：'cn'/'intl' 区域视图（只对 traework/qoder 有意义）——
+// 「国内」包含 region 缺失的历史行，「国际」只看明确 intl 的行
 const CH = require('../../channels');
-function loadRows(days, ch) {
+function loadRows(days, ch, region) {
   const since = Date.now() - days * 86400000;
   const { rows } = reqlog.read({
     limit: 0,
     filter: (r) => {
       if (r.ts < since) return false;
-      return CH.belongs(r, ch);
+      if (!CH.belongs(r, ch)) return false;
+      if (region && (ch === 'traework' || ch === 'qoder')) {
+        const reg = r.region === 'intl' ? 'intl' : 'cn';
+        if (reg !== region) return false;
+      }
+      return true;
     },
   });
   return rows;
@@ -124,7 +131,10 @@ const routes = [
       // 通道筛选：dumate / qwenwork / traework；缺省或未知值 = 全部通道
       const chRaw = decodeURIComponent((req.url.match(/[?&]channel=([^&]*)/) || [])[1] || '');
       const ch = normalize(chRaw);
-      const rows = loadRows(days, ch);
+      // 区域筛选（2026-11-03）：国内/国际独立视图
+      const regionRaw = decodeURIComponent((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '').toLowerCase();
+      const region = regionRaw === 'cn' || regionRaw === 'intl' ? regionRaw : '';
+      const rows = loadRows(days, ch, region);
       const today = dayKey(Date.now());
       const todayRows = rows.filter((r) => dayKey(r.ts) === today);
       // 本周 = 最近 7 天（含今天）
@@ -237,6 +247,8 @@ const routes = [
         days,
         // 当前通道筛选（'' = 全部）。前端据此决定是否显示「按通道」与积分卡片
         channel: ch,
+        // 当前区域筛选（2026-11-03，'' = 未按区域）
+        region: region || undefined,
         cards: {
           today: todayDetail,
           week: sum(weekRows),

@@ -53,10 +53,9 @@
           </a-col>
           <a-col :span="8">
             <a-card :bordered="false" class="h-full">
-              <a-statistic title="今日已签到" :value="`${twTotals.checked} / ${twTotals.checkinable}`" />
+              <a-statistic title="今日已签到" :value="`${twTotals.checked} / ${twRows.length}`" />
               <div class="text-xs text-slate-500 mt-2">
-                签到每日一次，幂等——重复点不会多领。
-                <template v-if="twTotals.intlCount">国际账号没有签到接口，不计入分母。</template>
+                签到每日一次，幂等——重复点不会多领
               </div>
             </a-card>
           </a-col>
@@ -84,9 +83,7 @@
                 <div class="text-xs text-slate-400 font-mono">UID {{ record.uid || '—' }}</div>
               </template>
               <template v-else-if="column.key === 'region'">
-                <a-tag :color="record.region === 'intl' ? 'purple' : 'blue'">
-                  {{ record.region === 'intl' ? '国际' : '国内' }}
-                </a-tag>
+                <span class="text-xs text-slate-400">—</span>
               </template>
               <template v-else-if="column.key === 'remain'">
                 <!-- 国际版是订阅制（按请求数计），积分口径恒 null——显示套餐名，
@@ -166,11 +163,6 @@
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'ts'">
                 <span class="text-xs">{{ dateTimeText(record.ts) }}</span>
-              </template>
-              <template v-else-if="column.key === 'region'">
-                <a-tag v-if="record.region === 'intl'" color="purple">国际</a-tag>
-                <a-tag v-else-if="record.region === 'cn'" color="blue">国内</a-tag>
-                <span v-else class="text-xs text-slate-400">—</span>
               </template>
               <template v-else-if="column.key === 'model'">
                 <span class="font-mono text-xs">{{ record.model || '—' }}</span>
@@ -539,11 +531,6 @@
             <template #bodyCell="{ column, record }">
               <template v-if="column.key === 'ts'">
                 <span class="text-xs">{{ dateTimeText(record.ts) }}</span>
-              </template>
-              <template v-else-if="column.key === 'region'">
-                <a-tag v-if="record.region === 'intl'" color="purple">国际</a-tag>
-                <a-tag v-else-if="record.region === 'cn'" color="blue">国内</a-tag>
-                <span v-else class="text-xs text-slate-400">—</span>
               </template>
               <template v-else-if="column.key === 'model'">
                 <span class="font-mono text-xs">{{ record.model || '—' }}</span>
@@ -970,6 +957,7 @@ import PageHeader from '@/components/PageHeader.vue'
 import CheckinDetailCard from '@/components/CheckinDetailCard.vue'
 import client from '@/api/client'
 import { channelStore, isTraework, isQwenwork, isQoder } from '@/stores/channel'
+import { regionParam } from '@/stores/region'
 import { traeworkApi } from '@/api/traework'
 import type { TraeworkCreditRow, TraeworkStatus, TraeworkCreditRecord } from '@/api/traework'
 import { qwenworkApi } from '@/api/qwenwork'
@@ -1009,12 +997,11 @@ const twRows = ref<TraeworkCreditRow[]>([])
 
 const twColumns = [
   { title: '账号', key: 'name', width: '18%' },
-  { title: '区域', key: 'region', width: '8%' },
-  { title: '剩余额度', key: 'remain', width: '12%' },
-  { title: '额度上限', key: 'limit', width: '12%' },
-  { title: '已消耗', key: 'consumed', width: '12%' },
-  { title: '签到可得', key: 'checkinCredits', width: '12%' },
-  { title: '今日签到', key: 'checkin', width: '10%' },
+  { title: '剩余额度', key: 'remain', width: '13%' },
+  { title: '额度上限', key: 'limit', width: '13%' },
+  { title: '已消耗', key: 'consumed', width: '13%' },
+  { title: '签到可得', key: 'checkinCredits', width: '13%' },
+  { title: '今日签到', key: 'checkin', width: '12%' },
   { title: '上次签到', key: 'last', width: '16%' },
   { title: '错误', key: 'err' },
 ]
@@ -1023,33 +1010,26 @@ const twRecords = ref<TraeworkCreditRecord[]>([])
 const twWindow = ref({ cost: 0, requests: 0, exact: 0 })
 
 const twRecordColumns = [
-  { title: '时间', key: 'ts', width: '19%' },
-  { title: '区域', key: 'region', width: '8%' },
-  { title: '模型', key: 'model', width: '15%' },
-  { title: '消耗', key: 'cost', width: '14%' },
-  { title: '耗时', key: 'ms', width: '10%' },
-  { title: '请求后剩余', key: 'remain', width: '17%' },
-  { title: '账号', key: 'account', width: '17%' },
+  { title: '时间', key: 'ts', width: '20%' },
+  { title: '模型', key: 'model', width: '16%' },
+  { title: '消耗', key: 'cost', width: '15%' },
+  { title: '耗时', key: 'ms', width: '11%' },
+  { title: '请求后剩余', key: 'remain', width: '18%' },
+  { title: '账号', key: 'account', width: '20%' },
 ]
 
 // TRAE 的账与千问不同：单一 credits，数值是「次」不是积分小数
 const fmtTw = (n: number | null) => (n == null ? '—' : Number(n).toFixed(2))
 
 // 合计只对**取到值**的账号求和：把 null 当 0 会让「一个账号取不到」
-// 表现成「总额度变少了」，而真相是没测到
+// 表现成「总额度变少了」，而真相是没测到。区域视图下整页只有当前区域的账号
 const twTotals = computed(() => {
   let remain = 0
   let limit = 0
   let checked = 0
   let anyRemain = false
   let anyLimit = false
-  // 分母只数**国内**账号：国际版没有签到接口，把它们算进去会出现
-  // 「今日已签 2 / 3」却永远签不满的假象
-  let checkinable = 0
-  let intlCount = 0
   for (const r of twRows.value) {
-    if (r.region === 'intl') intlCount++
-    else checkinable++
     if (r.remain != null) { remain += r.remain; anyRemain = true }
     if (r.limit != null) { limit += r.limit; anyLimit = true }
     if (r.checkedIn) checked++
@@ -1058,24 +1038,23 @@ const twTotals = computed(() => {
     remain: anyRemain ? remain : null,
     limit: anyLimit ? limit : null,
     checked,
-    checkinable,
-    intlCount,
   }
 })
 
 async function loadTw() {
   loading.value = true
   try {
+    const r = regionParam() as 'cn' | 'intl' | undefined
     const [s, c] = await Promise.all([
-      traeworkApi.status().catch((e: any) => ({
+      traeworkApi.status(r).catch((e: any) => ({
         data: { ready: false, error: e?.message || '读取失败', accounts: 0, mode: 'multi', modeNote: '', rows: [] },
       })),
-      traeworkApi.credits().catch(() => ({ data: { count: 0, rows: [] } })),
+      traeworkApi.credits(r).catch(() => ({ data: { count: 0, rows: [] } })),
     ])
     twStatus.value = s.data as TraeworkStatus
     twRows.value = c.data.rows || []
     // 逐笔明细单独拉：额度表与明细是两个端点，一个失败不该拖垮另一个
-    const rec = await traeworkApi.creditRecords(200)
+    const rec = await traeworkApi.creditRecords(200, r)
       .catch(() => ({ data: { rows: [], window: { cost: 0, requests: 0, exact: 0 } } }))
     twRecords.value = rec.data.rows || []
     twWindow.value = rec.data.window || { cost: 0, requests: 0, exact: 0 }
@@ -1140,28 +1119,27 @@ const qdTotals = computed(() => {
 
 const qdColumns = [
   { title: '账号', key: 'name', width: '18%' },
-  { title: '区域', key: 'region', width: '8%' },
-  { title: '已消耗（上游真值）', key: 'used', width: '24%' },
-  { title: '剩余（签到）', key: 'addOn', width: '11%' },
-  { title: '剩余（订阅）', key: 'user', width: '11%' },
-  { title: '今日签到', key: 'checkin', width: '11%' },
+  { title: '已消耗（上游真值）', key: 'used', width: '26%' },
+  { title: '剩余（签到）', key: 'addOn', width: '12%' },
+  { title: '剩余（订阅）', key: 'user', width: '12%' },
+  { title: '今日签到', key: 'checkin', width: '12%' },
   { title: '状态', key: 'err' },
 ]
 
 const qdRecordColumns = [
-  { title: '时间', key: 'ts', width: '21%' },
-  { title: '区域', key: 'region', width: '9%' },
-  { title: '模型', key: 'model', width: '18%' },
-  { title: '消耗', key: 'cost', width: '17%' },
-  { title: '耗时', key: 'ms', width: '12%' },
-  { title: '账号', key: 'account', width: '23%' },
+  { title: '时间', key: 'ts', width: '24%' },
+  { title: '模型', key: 'model', width: '20%' },
+  { title: '消耗', key: 'cost', width: '18%' },
+  { title: '耗时', key: 'ms', width: '13%' },
+  { title: '账号', key: 'account', width: '25%' },
 ]
 
 async function loadQd() {
   loading.value = true
   try {
+    const r = regionParam() as 'cn' | 'intl' | undefined
     const [c, rec] = await Promise.all([
-      qoderApi.credits().catch(() => ({
+      qoderApi.credits(r).catch(() => ({
         data: {
           count: 0,
           rows: [] as QoderCreditRow[],
@@ -1169,7 +1147,7 @@ async function loadQd() {
           note: '',
         },
       })),
-      qoderApi.creditRecords(200).catch(() => ({
+      qoderApi.creditRecords(200, r).catch(() => ({
         data: { rows: [] as QoderCreditRecord[], window: { cost: 0, requests: 0, exact: 0 }, since: null, recorded: 0 },
       })),
     ])

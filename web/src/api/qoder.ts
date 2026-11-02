@@ -197,7 +197,8 @@ export interface QoderLoginPoll {
 }
 
 export const qoderApi = {
-  status: () => client.get<QoderStatus>('/qoder/status'),
+  status: (region?: 'cn' | 'intl') =>
+    client.get<QoderStatus>(`/qoder/status${region ? `?region=${region}` : ''}`),
   /** 计费自检探针：按模型发一个小请求，比对「实测倍率 vs 模型表标称」。
    *  ratio≠1 不一定是改路由（错峰优惠/倍率元数据过期都是合法偏差）——判读看 note。 */
   billingCheck: (model: string, region?: 'cn' | 'global') =>
@@ -213,11 +214,13 @@ export const qoderApi = {
       error?: string
       note?: string
     }>(`/qoder/billing-check?model=${encodeURIComponent(model)}${region ? `&region=${region}` : ''}`, { timeout: 120000 }),
-  dashboard: () => client.get<{
-    accounts: QoderDashboardAccount[]
-    summary: { total: number; enabled: number; refreshExpired: number; errored: number }
-    note: string
-  }>('/qoder/dashboard'),
+  dashboard: (region?: 'cn' | 'intl') =>
+    client.get<{
+      accounts: QoderDashboardAccount[]
+      region?: string
+      summary: { total: number; enabled: number; refreshExpired: number; errored: number }
+      note: string
+    }>(`/qoder/dashboard${region ? `?region=${region}` : ''}`),
   /** 聊天测试台用的模型清单：**带 qoder/ 前缀**（网关靠前缀分流） */
   chatlabModels: (region?: 'cn' | 'global') => client.get<{
     models: Array<{ id: string; name: string; prefixed: string; rate?: number | null }>
@@ -239,8 +242,9 @@ export const qoderApi = {
       rateNote: string
     }>(`/qoder/models${qs}`)
   },
-  credits: () => client.get<{
+  credits: (region?: 'cn' | 'intl') => client.get<{
     count: number
+    region?: string
     rows: QoderCreditRow[]
     summary: {
       total: number
@@ -266,11 +270,12 @@ export const qoderApi = {
       expiringGrantedAmount: number
     }
     note: string
-  }>('/qoder/credits'),
+  }>(`/qoder/credits${region ? `?region=${region}` : ''}`),
   /** 最近 N 条逐笔消耗明细（本地归因账本，不打上游） */
-  creditRecords: (limit = 200) =>
+  creditRecords: (limit = 200, region?: 'cn' | 'intl') =>
     client.get<{
       limit: number
+      region?: string
       rows: QoderCreditRecord[]
       window: { cost: number; requests: number; exact: number }
       /**
@@ -281,7 +286,7 @@ export const qoderApi = {
       since: number | null
       /** 账本涵盖的请求数（不是全部请求数） */
       recorded: number
-    }>(`/qoder/credits/records?limit=${limit}`),
+    }>(`/qoder/credits/records?limit=${limit}${region ? `&region=${region}` : ''}`),
   /** 积分过期明细（本地账本 + 上游总余额的先领先扣推算） */
   grants: (days = 30) => client.get<{
     windowDays: number

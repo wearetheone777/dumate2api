@@ -68,6 +68,14 @@ export const CHANNELS = [
     // 单一 credits 结构。签名纯本地，不需要任何客户端。
     menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts'],
   },
+  {
+    id: 'workbuddy',
+    label: 'WorkBuddy',
+    // WorkBuddy：第五通道（2026-11-03），标准 OpenAI 协议 + 双区域账号
+    // （国内 copilot.tencent.com / 国际 workbuddy.ai）。凭证自持（登录流程
+    // 后置期从客户端认证文件导入），有签到（仅国内版）。
+    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts'],
+  },
 ] as const
 
 export function channelLabel(id: string): string {
@@ -83,7 +91,7 @@ export function channelLabel(id: string): string {
  * 都用这个判定而不是逐个比对 id——否则加一条通道就要改八个页面。
  */
 export function isDirectChannel(id: string = channelStore.current): boolean {
-  return id === 'qwenwork' || id === 'traework' || id === 'qoder'
+  return id === 'qwenwork' || id === 'traework' || id === 'qoder' || id === 'workbuddy'
 }
 
 /**
@@ -106,13 +114,18 @@ export function isQoder(id: string = channelStore.current): boolean {
   return id === 'qoder'
 }
 
+/** 当前是不是 WorkBuddy（第五通道，双区域） */
+export function isWorkBuddy(id: string = channelStore.current): boolean {
+  return id === 'workbuddy'
+}
+
 /**
  * 服务端通道筛选参数。usage / reqlogs / keys 三个接口都按它过滤，
  * 默认搭子——不传就返回全通道，卡片与表格会对不上。
  */
-export function channelParam(): 'dumate' | 'qwenwork' | 'traework' | 'qoder' {
+export function channelParam(): 'dumate' | 'qwenwork' | 'traework' | 'qoder' | 'workbuddy' {
   const id = channelStore.current
-  if (id === 'qwenwork' || id === 'traework' || id === 'qoder') return id
+  if (id === 'qwenwork' || id === 'traework' || id === 'qoder' || id === 'workbuddy') return id
   return 'dumate'
 }
 

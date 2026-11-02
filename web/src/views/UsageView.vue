@@ -337,11 +337,6 @@
               {{ record.nickname || record.uid || '未命名' }}
               <div v-if="record.error" class="text-xs text-red-600">{{ record.error }}</div>
             </template>
-            <template v-else-if="column.key === 'region'">
-              <a-tag :color="record.region === 'intl' ? 'purple' : 'blue'">
-                {{ record.region === 'intl' ? '国际' : '国内' }}
-              </a-tag>
-            </template>
             <template v-else-if="column.key === 'remain'">
               <!-- 国际版订阅制：积分口径恒 null，显示套餐名而不是 0 -->
               <span v-if="record.intlPlan" class="font-medium">
@@ -411,6 +406,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import client from '@/api/client'
 import { channelStore, CHANNELS, isTraework, isQwenwork, channelParam } from '@/stores/channel'
+import { regionParam } from '@/stores/region'
 import { qwenworkApi } from '@/api/qwenwork'
 import { traeworkApi } from '@/api/traework'
 import type { TraeworkCreditRow } from '@/api/traework'
@@ -509,10 +505,9 @@ const accountColumns = [
 // 逐笔账单，只有存量快照
 const twColumns = [
   { title: '账号', key: 'name' },
-  { title: '区域', key: 'region', width: '12%' },
-  { title: '剩余额度', key: 'remain', width: '22%' },
-  { title: '额度上限', key: 'limit', width: '22%' },
-  { title: '今日签到', key: 'checkin', width: '18%' },
+  { title: '剩余额度', key: 'remain', width: '24%' },
+  { title: '额度上限', key: 'limit', width: '24%' },
+  { title: '今日签到', key: 'checkin', width: '20%' },
 ]
 
 const fmt = (n: number) => n.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
@@ -574,12 +569,14 @@ async function load() {
   twLoaded.value = false
   try {
     // 服务端按通道过滤。TRAE 走 channelParam() 而不是硬编码——
-    // 加第四条通道时不该再来改这里
+    // 加第四条通道时不该再来改这里。区域视图（顶栏切换）也一并传给后端
     const ch = channelParam()
+    const r = regionParam()
+    const rQ = r ? `&region=${r}` : ''
     // 额度与用量并行拉：两者互不依赖，串行只会白等一个来回
     const [usage, credits] = await Promise.all([
-      client.get(`/usage/overview?days=${days.value}&channel=${ch}`),
-      isTw.value ? traeworkApi.credits().catch(() => ({ data: { count: 0, rows: [] } }))
+      client.get(`/usage/overview?days=${days.value}&channel=${ch}${rQ}`),
+      isTw.value ? traeworkApi.credits(r as 'cn' | 'intl').catch(() => ({ data: { count: 0, rows: [] } }))
         : isQw.value ? qwenworkApi.credits() : Promise.resolve(null),
     ])
     data.value = usage.data

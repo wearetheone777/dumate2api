@@ -24,6 +24,8 @@ const QWEN_PREFIX = 'qwen';
 const TRAEWORK_PREFIX = 'traework';
 /** Qoder 通道的前缀。`qoder/gfmodel` → 上游模型 `gfmodel` */
 const QODER_PREFIX = 'qoder';
+/** WorkBuddy 通道的前缀。`workbuddy/glm-5.3` → 上游模型 `glm-5.3` */
+const WORKBUDDY_PREFIX = 'workbuddy';
 /**
  * 千帆原生透传的前缀（2026-10-31）。`qianfan/qwen3.5-35b-a3b` → 千帆原生
  * `qwen3.5-35b-a3b`。
@@ -134,6 +136,25 @@ const UPSTREAMS = {
     // 与千问/TRAE 同理：reasoning 与正文抢预算，小 max_tokens 会截断正文
     needsBudget: true,
     budgetKind: 'qoder',
+  },
+  // WorkBuddy（腾讯 Copilot 系）：进程内直连，**标准 OpenAI 协议**（SSE），
+  // 凭证自持（登录流程后置期从官方客户端认证文件导入，见 src/workbuddy/auth.js）。
+  // 双区域：cn（copilot.tencent.com，billing 在 codebuddy.cn）/
+  // global（www.workbuddy.ai），账号各自独立。
+  workbuddy: {
+    id: 'workbuddy',
+    label: 'WorkBuddy',
+    host: null,
+    portEnv: null,
+    defaultPort: null,
+    prefix: WORKBUDDY_PREFIX,
+    direct: true,
+    basePath: null,
+    auth: () => null,
+    needsModelMap: false,
+    // reasoning 与正文抢预算（国际版 Claude/GPT 系同样吃 reasoning）
+    needsBudget: true,
+    budgetKind: 'workbuddy',
   },
 };
 
@@ -291,6 +312,14 @@ function availability(channel) {
       return { ok: false, reason: e.message };
     }
   }
+  if (channel === 'workbuddy') {
+    try {
+      const st = require('./workbuddy').status();
+      return st.ready ? { ok: true } : { ok: false, reason: st.error || 'not_ready' };
+    } catch (e) {
+      return { ok: false, reason: e.message };
+    }
+  }
   return { ok: true };
 }
 
@@ -299,6 +328,7 @@ function exposedFor(channel, models) {
   if (channel === 'qwenwork') return models.map((m) => `${QWEN_PREFIX}/${m}`);
   if (channel === 'traework') return models.map((m) => `${TRAEWORK_PREFIX}/${m}`);
   if (channel === 'qoder') return models.map((m) => `${QODER_PREFIX}/${m}`);
+  if (channel === 'workbuddy') return models.map((m) => `${WORKBUDDY_PREFIX}/${m}`);
   return models.slice();
 }
 

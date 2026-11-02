@@ -264,16 +264,21 @@ export interface TraeworkBillingCheck {
 }
 
 export const traeworkApi = {
-  status: () => client.get<TraeworkStatus>('/traework/status'),
-  dashboard: () => client.get<TraeworkDashboard>('/traework/dashboard'),
-  daily: (days = 14) =>
-    client.get<{ days: number; rows: TraeworkDailyRow[] }>(`/traework/credits/daily?days=${days}`),
-  creditRecords: (limit = 100) =>
+  status: (region?: 'cn' | 'intl') =>
+    client.get<TraeworkStatus>(`/traework/status${region ? `?region=${region}` : ''}`),
+  dashboard: (region?: 'cn' | 'intl') =>
+    client.get<TraeworkDashboard>(`/traework/dashboard${region ? `?region=${region}` : ''}`),
+  daily: (days = 14, region?: 'cn' | 'intl') =>
+    client.get<{ days: number; region?: 'cn' | 'intl'; rows: TraeworkDailyRow[] }>(
+      `/traework/credits/daily?days=${days}${region ? `&region=${region}` : ''}`,
+    ),
+  creditRecords: (limit = 100, region?: 'cn' | 'intl') =>
     client.get<{
       limit: number
+      region?: 'cn' | 'intl'
       rows: TraeworkCreditRecord[]
       window: { cost: number; requests: number; exact: number }
-    }>(`/traework/credits/records?limit=${limit}`),
+    }>(`/traework/credits/records?limit=${limit}${region ? `&region=${region}` : ''}`),
   models: (opts: { visibleOnly?: boolean; refresh?: boolean; region?: 'cn' | 'intl' } = {}) => {
     const q: string[] = []
     if (opts.visibleOnly) q.push('visible=1')
@@ -289,14 +294,15 @@ export const traeworkApi = {
       rateNote: string
     }>(`/traework/models${qs}`)
   },
-  credits: () => client.get<{
+  credits: (region?: 'cn' | 'intl') => client.get<{
     count: number
+    region?: 'cn' | 'intl'
     rows: TraeworkCreditRow[]
     summary: TraeworkCreditsSummary
     /** 7 天内到期且还有剩余的额度包，按到期时间升序。空数组 = 无风险 */
     expiring: TraeworkExpiring[]
     expiringPoints: number
-  }>('/traework/credits'),
+  }>(`/traework/credits${region ? `?region=${region}` : ''}`),
   checkin: (id?: number) => client.post('/traework/checkin', id ? { id } : {}),
   /**
    * 计费自检探针：按模型发一个小请求（消耗真实积分），比对实测倍率与标称。

@@ -209,15 +209,14 @@
 
       <template v-if="loginStep === 0">
         <a-alert type="info" show-icon class="mb-3">
-          <template #message>先选区域，再生成登录链接</template>
+          <template #message>
+            将登录{{ regionStore.current === 'intl' ? '国际版（qoder.sh）' : '国内版（qoder.com.cn）' }}账号
+          </template>
           <template #description>
-            国内（qoder.com.cn）与国际（qoder.sh）是两套独立账号，不通用。
+            区域跟随顶栏切换器（当前{{ regionStore.current === 'intl' ? '国际版' : '国内版' }}视图）。
+            两套账号不通用。
           </template>
         </a-alert>
-        <a-radio-group v-model:value="loginRegion" class="mb-3">
-          <a-radio-button value="cn">国内 qoder.com.cn</a-radio-button>
-          <a-radio-button value="global">国际 qoder.sh</a-radio-button>
-        </a-radio-group>
         <a-button type="primary" block :loading="urlLoading" @click="genLoginUrl">
           生成登录链接
         </a-button>
@@ -264,6 +263,7 @@ import { computed, onMounted, reactive, ref, watch, onUnmounted } from 'vue'
 import { App } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { channelStore, isQoder } from '@/stores/channel'
+import { regionStore } from '@/stores/region'
 import { qoderApi } from '@/api/qoder'
 import type { QoderAccount, QoderCreditRow, QoderGrant } from '@/api/qoder'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
@@ -337,7 +337,8 @@ const dateText = (ts: number) =>
 // ---- 登录 ----
 const loginOpen = ref(false)
 const loginStep = ref(0)
-const loginRegion = ref<'cn' | 'global'>('cn')
+// 区域跟随顶栏切换器（当前区域视图）——两个独立视图各登各区的账号
+const loginRegion = computed<'cn' | 'global'>(() => (regionStore.current === 'intl' ? 'global' : 'cn'))
 const loginUrl = ref('')
 const loginNonce = ref('')
 const loginError = ref('')

@@ -24,12 +24,7 @@
               <template #suffix><span class="text-sm text-slate-400">个</span></template>
             </a-statistic>
             <div class="text-xs text-slate-500 mt-2">
-              <template v-if="twSummary">
-                <!-- 区域拆分（2026-11-03 国际版）：两区账号不通用，混在一个数里
-                     看不出国际账号有没有加进来 -->
-                <template v-if="twIntlCount">国内 {{ twCnCount }} · 国际 {{ twIntlCount }} · </template>
-                今日已签 {{ twSummary.checkedIn }} 个
-              </template>
+              <template v-if="twSummary">今日已签 {{ twSummary.checkedIn }} 个</template>
               <span v-else>—</span>
             </div>
           </a-card>
@@ -71,11 +66,6 @@
             <div class="text-xs text-slate-500 mt-2">
               <template v-if="twSummary?.limitTotal">上限合计 {{ fmt(twSummary.limitTotal) }}</template>
               <span v-else>上游未给出额度上限</span>
-              <template v-if="twIntlCount">
-                <!-- 国际账号是订阅制按请求数计，不进积分合计（把 Free plan
-                     算成 0 积分会被读成「国际额度为零」） -->
-                <div>国际账号按请求数计，不进积分合计</div>
-              </template>
             </div>
           </a-card>
         </a-col>
@@ -191,10 +181,7 @@
             在线 {{ twAccounts.filter(a => a.enabled && !a.refreshExpired).length }}
           </a-tag>
           <a-tag v-if="twDash?.summary.checkedInToday != null" color="blue" class="ml-1">
-            今日已签 {{ twDash.summary.checkedInToday }} / {{ twCheckinable }}
-          </a-tag>
-          <a-tag v-if="twIntlCount" color="purple" class="ml-1">
-            国际 {{ twIntlCount }}（订阅制 · 无签到）
+            今日已签 {{ twDash.summary.checkedInToday }} / {{ twAccounts.length }}
           </a-tag>
         </template>
         <a-empty v-if="!twAccounts.length" description="还没有添加 TRAE Work 账号，到「账号管理」加一个" />
@@ -203,9 +190,6 @@
             <div class="account-card">
               <div class="account-card-header">
                 <span class="account-card-name">{{ a.name }}</span>
-                <a-tag :color="a.region === 'intl' ? 'purple' : 'blue'" class="ml-1" size="small">
-                  {{ a.region === 'intl' ? '国际' : '国内' }}
-                </a-tag>
                 <a-tag :color="a.lastError ? 'red' : a.refreshExpired ? 'orange' : a.enabled ? 'green' : 'default'">
                   {{ a.lastError ? '异常' : a.refreshExpired ? '待重登' : a.enabled ? '在线' : '停用' }}
                 </a-tag>
@@ -312,6 +296,53 @@
             </template>
           </template>
         </a-table>
+      </a-card>
+    </template>
+
+    <!-- ============ WorkBuddy：第五通道（双区域），账号健康 + 用量 ============ -->
+    <template v-else-if="isWb">
+      <a-card :bordered="false" class="mt-1">
+        <template #title>
+          <span>账号健康快照</span>
+          <a-tag v-if="wbAccounts.length" color="green" class="ml-2">
+            在线 {{ wbAccounts.filter(a => a.enabled && !a.refreshExpired).length }}
+          </a-tag>
+          <a-tag :color="regionStore.current === 'intl' ? 'purple' : 'blue'" class="ml-1">
+            {{ regionStore.current === 'intl' ? '国际版（workbuddy.ai）' : '国内版（copilot.tencent.com）' }}
+          </a-tag>
+        </template>
+        <a-empty v-if="!wbAccounts.length"
+          :description="`还没有${regionStore.current === 'intl' ? '国际' : '国内'}版账号，到「账号管理」导入一个`" />
+        <a-row v-else :gutter="[16, 16]">
+          <a-col v-for="a in wbAccounts" :key="a.id" :xs="24" :sm="12" :lg="8">
+            <div class="account-card">
+              <div class="account-card-header">
+                <span class="account-card-name">{{ a.name }}</span>
+                <a-tag :color="a.lastError ? 'red' : a.refreshExpired ? 'orange' : a.enabled ? 'green' : 'default'">
+                  {{ a.lastError ? '异常' : a.refreshExpired ? '待重登' : a.enabled ? '在线' : '停用' }}
+                </a-tag>
+              </div>
+              <div class="flex items-center justify-between text-xs" style="margin-bottom:8px">
+                <span class="text-slate-500">{{ a.refreshTail ? `refresh …${a.refreshTail}` : '—' }}</span>
+                <span class="text-slate-500">{{ a.daysAlive !== null ? a.daysAlive + ' 天' : '天数未知' }}</span>
+              </div>
+              <div class="account-card-footer">
+                <span class="text-slate-500">
+                  token {{ a.expiresAt ? new Date(a.expiresAt).toLocaleDateString('zh-CN') : '—' }}
+                </span>
+                <span :class="a.lastError ? 'text-red-700' : 'text-slate-500'">
+                  {{ a.lastError ? '有错误' : '正常' }}
+                </span>
+              </div>
+              <div v-if="a.lastError" class="account-card-error">{{ a.lastError }}</div>
+            </div>
+          </a-col>
+        </a-row>
+      </a-card>
+
+      <!-- 今日用量：与其它通道同一套指标 -->
+      <a-card title="今日用量" :bordered="false" class="mt-4">
+        <TodayUsageCard :today="usage?.cards.today" />
       </a-card>
     </template>
 
@@ -523,13 +554,6 @@
         <template #title>
           <span>账号健康快照</span>
           <a-tag v-if="qdDashAccounts.length" color="green" class="ml-2">在线 {{ qdOnlineCount }}</a-tag>
-          <!-- 区域拆分（2026-11-03）：两区账号与额度不通用，混在一个数里看不出 -->
-          <a-tag v-if="qdDashAccounts.filter(a => a.region !== 'cn').length" color="blue" class="ml-1">
-            国内 {{ qdDashAccounts.filter(a => a.region === 'cn').length }}
-          </a-tag>
-          <a-tag v-if="qdDashAccounts.filter(a => a.region !== 'cn').length" color="purple" class="ml-1">
-            国际 {{ qdDashAccounts.filter(a => a.region !== 'cn').length }}
-          </a-tag>
         </template>
         <a-empty v-if="!qdDashAccounts.length" description="还没有添加 Qoder 账号，到「账号管理」加一个" />
         <a-row v-else :gutter="[16, 16]">
@@ -1244,12 +1268,15 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import TodayUsageCard from '@/components/TodayUsageCard.vue'
-import { channelStore, isTraework, isQwenwork, isQoder } from '@/stores/channel'
+import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
 import { qoderApi, type QoderDashboardAccount, type QoderCreditRow, type QoderGrant } from '@/api/qoder'
 import { qwenworkApi, type QwCredits, type QwDailyRow, type QwAccount, type QwCreditRecord, type QwAccountsSummary } from '@/api/qwenwork'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
 import { remainText, remainColor } from '@/utils/remain'
 import { traeworkApi } from '@/api/traework'
+import { workbuddyApi, type WorkBuddyDashAccount } from '@/api/workbuddy'
+import { regionStore, regionParam } from '@/stores/region'
+import { watch as vueWatch } from 'vue'
 import type {
   TraeworkCreditRow, TraeworkDashboard, TraeworkCreditRecord, TraeworkDashAccount,
   TraeworkCreditsSummary, TraeworkExpiring,
@@ -1324,6 +1351,11 @@ const lastRefresh = ref('')
 const isTw = computed(() => isTraework())
 const isQw = computed(() => isQwenwork())
 const isQd = computed(() => isQoder())
+const isWb = computed(() => isWorkBuddy())
+
+// ---- WorkBuddy（第五通道，双区域）----
+const wbDash = ref<{ accounts: WorkBuddyDashAccount[]; summary: { total: number; enabled: number; refreshExpired: number; errored: number } | null } | null>(null)
+const wbAccounts = computed(() => wbDash.value?.accounts || [])
 
 // ---- Qoder ----
 // 账号健康快照来自 /qoder/dashboard（本地落盘，不打上游）
@@ -1480,10 +1512,6 @@ const twRecords = ref<TraeworkCreditRecord[]>([])
 const twWindow = ref<{ cost: number; requests: number; exact: number }>({ cost: 0, requests: 0, exact: 0 })
 const twAccounts = computed(() => twDash.value?.accounts || [])
 const twToday = computed(() => twDash.value?.today || null)
-// 区域计数（2026-11-03 国际版）：统计卡与「今日已签」分母的区域拆分
-const twCnCount = computed(() => twAccounts.value.filter((a) => a.region !== 'intl').length)
-const twIntlCount = computed(() => twAccounts.value.filter((a) => a.region === 'intl').length)
-const twCheckinable = computed(() => twCnCount.value)
 // 顶部的汇总与到期数据来自 /credits 的 summary/expiring（见后端注释：
 // 到期数据要打上游，而 /dashboard 刻意不打）。原来的 twTotals 是前端
 // 自己把 rows 加起来算的——现在后端直接给，两边口径统一由后端保证。
@@ -1805,17 +1833,18 @@ async function refreshQd() {
   loading.value = true
   error.value = ''
   try {
+    const r = regionParam() as 'cn' | 'intl' | undefined
     const [d, c, g, u] = await Promise.all([
-      // 账号健康快照：本地落盘，不打上游
-      qoderApi.dashboard().catch(() => ({ data: { accounts: [], summary: null } })),
-      // 额度：打上游。两份额度分开合计，不合并
+      // 账号健康快照：本地落盘，不打上游（按当前区域视图过滤）
+      qoderApi.dashboard(r).catch(() => ({ data: { accounts: [], summary: null } })),
+      // 额度：打上游。两份额度分开合计，不合并（按当前区域视图）
       // 失败返回 null（不是空 rows）：下面的 loaded 只在真拿到数据时才置 true，
       // 否则失败会被渲染成「合计 0.0000」，与「缺失显示 —」的口径相反。
-      qoderApi.credits().catch(() => null),
+      qoderApi.credits(r).catch(() => null),
       // 积分过期明细：本地账本 + 各账号总余额的先领先扣推算（上游侧）
       qoderApi.grants(30).catch(() => ({ data: { rows: [], windowDays: 30 } })),
-      // 今日用量：与其它通道同一数据源
-      client.get(`/usage/overview?days=14&channel=qoder`).catch(() => ({ data: null })),
+      // 今日用量：与其它通道同一数据源（按当前区域过滤）
+      client.get(`/usage/overview?days=14&channel=qoder${r ? `&region=${r}` : ''}`).catch(() => ({ data: null })),
     ])
     qdDashAccounts.value = (d.data.accounts || []) as QoderDashboardAccount[]
     qdSummary.value = d.data.summary || null
@@ -1851,14 +1880,15 @@ async function refreshTw() {
   loading.value = true
   error.value = ''
   try {
-    const [c, u, d, r] = await Promise.all([
-      traeworkApi.credits().catch(() => ({
+    const r = regionParam() as 'cn' | 'intl' | undefined
+    const [c, u, d, rec] = await Promise.all([
+      traeworkApi.credits(r).catch(() => ({
         data: { count: 0, rows: [], summary: null, expiring: [], expiringPoints: 0 },
       })),
-      client.get(`/usage/overview?days=14&channel=traework`).catch(() => ({ data: null })),
-      // 账号健康快照 + 今日消耗：本地数据，不打上游（见后端 /dashboard 注释）
-      traeworkApi.dashboard().catch(() => ({ data: null })),
-      traeworkApi.creditRecords(200).catch(() => ({ data: { rows: [], window: { cost: 0, requests: 0, exact: 0 } } })),
+      client.get(`/usage/overview?days=14&channel=traework${r ? `&region=${r}` : ''}`).catch(() => ({ data: null })),
+      // 账号健康快照 + 今日消耗：本地数据，不打上游（按当前区域视图过滤）
+      traeworkApi.dashboard(r).catch(() => ({ data: null })),
+      traeworkApi.creditRecords(200, r).catch(() => ({ data: { rows: [], window: { cost: 0, requests: 0, exact: 0 } } })),
     ])
     twRows.value = c.data.rows || []
     twSummary.value = c.data.summary || null
@@ -1867,8 +1897,8 @@ async function refreshTw() {
     twCreditsLoaded.value = true
     usage.value = u.data
     twDash.value = d.data
-    twRecords.value = (r.data && r.data.rows) || []
-    twWindow.value = (r.data && r.data.window) || { cost: 0, requests: 0, exact: 0 }
+    twRecords.value = (rec.data && rec.data.rows) || []
+    twWindow.value = (rec.data && rec.data.window) || { cost: 0, requests: 0, exact: 0 }
     await channelStore.load()
     lastRefresh.value = new Date().toLocaleTimeString('zh-CN')
     await nextTick()
@@ -1880,10 +1910,33 @@ async function refreshTw() {
   }
 }
 
+// WorkBuddy 仪表盘：账号健康快照（本地）+ 今日用量（按当前区域过滤）。
+// 签到仅国内版有；国际视图不显示签到统计
+async function refreshWb() {
+  loading.value = true
+  error.value = ''
+  try {
+    const r = regionParam() as 'cn' | 'intl' | undefined
+    const [d, u] = await Promise.all([
+      workbuddyApi.dashboard(r).catch(() => ({ data: { accounts: [], summary: null } })),
+      client.get(`/usage/overview?days=14&channel=workbuddy${r ? `&region=${r}` : ''}`).catch(() => ({ data: null })),
+    ])
+    wbDash.value = d.data
+    usage.value = u.data
+    await channelStore.load()
+    lastRefresh.value = new Date().toLocaleTimeString('zh-CN')
+  } catch (e: any) {
+    error.value = e?.response?.data?.error || e?.message || '未知错误'
+  } finally {
+    loading.value = false
+  }
+}
+
 async function refresh(force = false) {
   if (isTw.value) return refreshTw()
   if (isQw.value) return refreshQw()
   if (isQd.value) return refreshQd()
+  if (isWb.value) return refreshWb()
   loading.value = true
   error.value = ''
   try {
@@ -2092,9 +2145,13 @@ onMounted(() => {
   refresh()
 })
 
-// 切通道要重拉数据：三条通道的数据源不同，不重拉会看到上一个通道的残留。
+// 切通道要重拉数据：四条通道的数据源不同，不重拉会看到上一个通道的残留。
 // 两个 computed 都要 watch——只盯 isQw 的话从搭子切到 TRAE 不触发。
-watch([isQw, isTw, isQd], () => { refresh() })
+watch([isQw, isTw, isQd, isWb], () => { refresh() })
+// 切区域重拉（顶栏统一切换）：TRAE/Qoder/WorkBuddy 的数据按区域走
+vueWatch(() => regionStore.current, () => {
+  if (isTw.value || isQd.value || isWb.value) refresh()
+})
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)

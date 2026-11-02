@@ -107,6 +107,11 @@ const routes = [
       // 通道筛选：dumate / qwenwork / traework；缺省或未知值 = 全部通道
       const chRaw = q('channel') ? decodeURIComponent(q('channel')) : '';
       const ch = require('../../channels').normalize(chRaw);
+      // 区域筛选（2026-11-03）：国内/国际独立视图（只对 traework/qoder 有意义）。
+      // 「国内」包含 region 缺失的历史行（国际版上线前只有国内账号）；
+      // 「国际」只看明确 intl 的行
+      const regionRaw = q('region') ? decodeURIComponent(q('region')).toLowerCase() : '';
+      const region = regionRaw === 'cn' || regionRaw === 'intl' ? regionRaw : '';
 
       // 过滤语义：all=全部；ok=仅成功（2xx/3xx）；err=仅失败（4xx/5xx/0=中断）
       // 通道语义：历史记录没有 channel 字段，归入搭子——分通道埋点上线前
@@ -115,6 +120,10 @@ const routes = [
       const filter = (r) => {
         if (r.ts < since) return false;
         if (!belongs(r, ch)) return false;
+        if (region && (ch === 'traework' || ch === 'qoder')) {
+          const reg = r.region === 'intl' ? 'intl' : 'cn';
+          if (reg !== region) return false;
+        }
         if (type === 'ok') return r.status >= 200 && r.status < 400;
         if (type === 'err') return r.status >= 400 || r.status === 0;
         return true;
@@ -138,6 +147,7 @@ const routes = [
         limit,
         offset,
         channel: ch,
+        region: region || undefined,
         // 提示数据源滚动：日志超 32MB 会轮转，太老的记录可能已被移到 .1
         rotated_file: `${reqlog.LOG_DIR}\\requests.jsonl.1`,
         note: '记录由网关逐条落盘，最多保留 32MB，最老的记录可能已轮转删除。',

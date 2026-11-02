@@ -869,6 +869,45 @@ credits 口径 → delta 如实 null）；glm-5.2 不带 region 派给国内账�
 KeysView 文案更新。区域约束的运行时过滤（`accountsForRegion`）与
 keys.js 的 region 绑定自 2026-11-01 就位，本次补齐的是「国际账号本身」。
 
+**WorkBuddy 通道已接入（2026-11-03，第五通道，`workbuddy/` 前缀，双区域 cn/global）。**
+腾讯 Copilot 系 AI 编程助手（国内 WorkBuddy / 国际 WorkBuddy AI），与 CodeBuddy 同源。
+协议要点移植自 qoder-trae-workbuddy-switch 的 `modules/{upstream,region,account,checkin}.rs`
+与 TraeWorkAssistant 的 `wb_*.rs`（两个参照项目交叉实证）：
+
+1. **标准 OpenAI 协议 + SSE**（`/v2/chat/completions`），但有多条硬校验：
+   强制 stream:true（非流式 11101）；`developer`→`system`（拒 developer 400/11128）；
+   tool_choice 对象扁平化；**首条必须 system**（Go struct 硬校验 400，非 system
+   前置最小 system，两版都做）；**conversation_id 必须注入 body + X-Conversation
+   三头必带**（dsh-xdpool#58 实证：国际版缺任一头即 400 11128 "request illegal"，
+   值不校验只查存在）；prompt_cache_key（`wb-<uid8>-<sha256(uid|conv)[..16]>`）
+   按账号硬隔离前缀缓存。**红线：chat 请求绝不带 X-Refresh-Token**。
+2. **双区域端点不同**：cn chat=copilot.tencent.com / billing=www.codebuddy.cn /
+   模型目录 `/console/enterprises/personal/models`（CLI 形态 UA）；global
+   chat=billing=www.workbuddy.ai / 目录 `/v3/config`（App UA `WorkBuddyAI/<v>`
+   + X-Product: SaaS）。两区账号不通用，`region` 字段存 cn/global。
+3. **失败分类**（classifyStatus）：402/积分标记 → hard_credit；"Offline user
+   session not found"/12153 → session_dead；**11140 → restricted（账号级风控，
+   换号有意义）**——send() 内做受限换号循环（区内轮完一圈），403 明确报错。
+   **码值匹配带负向数字断言**（`"code":11140(?!\d)`）——裸 includes 会误吃 111400。
+4. **登录流程后置**（用户要求）：账号来源是「导入官方客户端认证文件」
+   （`workbuddy-desktop[-ai].info`，实测本机在 CodeBuddyExtension 的 auth 目录，
+   结构 `{account, auth:{accessToken, refreshToken, expiresAt, domain}}`，
+   `POST /workbuddy/import-client {region}`）或「手动粘贴 token」
+   （`/workbuddy/import-token`）。区域红线：凭据 domain 必须与目标区域一致，
+   不符拒绝导入。**刷新单飞 + 到期续期**照 TRAE 同构。
+5. **签到仅国内版**（`/v2/billing/meter/checkin-activity-status` 回退
+   `checkin-status`、领取 `daily-checkin`；幂等，"已签到"按成功）；国际版
+   明确报「该版本暂不支持自动签到」（`unsupported`，界面显示「不支持」不是错误）。
+   额度是 billing 域 `get-user-resource` 的套餐包列表（ProductCode p_tcaca，
+   CycleCapacity 三件套口径），`/workbuddy/credits` 按区域出。
+6. **真机验证（2026-11-03）**：国际账号导入成功（wearetheone777，workbuddy.ai），
+   国际模型目录 22 个直通（含倍率/免费档/上下文上限+默认档/思考档位）；
+   chat 首打 11128（缺会话头）→ 补三头后变 11140（账号风控）= 协议层打通，
+   该账号在上游本身受限（issue #136 同款），账号恢复属登录流程后置。
+   国内客户端登录态 9/18 已死（12153 refresh invalid），待用户重登客户端再导入。
+   离线验证 `node --test test/verify-workbuddy.js`（9 项：规范化/会话注入/
+   缓存键/三头红线/分类含 11140 负向断言/区域表/倍率解析白名单）。
+
 **全页面的国内/国际区分（2026-11-03 同日，bsk 逐页真机验证过）**。用户
 要求「每个页面都区分」，落地清单：
 
@@ -900,6 +939,21 @@ keys.js 的 region 绑定自 2026-11-01 就位，本次补齐的是「国际账�
    累计值」当成本。
 6. **请求日志**：行与详情在通道标签旁显示区域徽标。
 7. **用量统计**：TRAE 额度表加区域列，intl 行显示套餐名 +「按请求数计」。
+
+**区域视图改为整页切换（2026-11-03 同日二次改版，用户明确「两个不同的页面
+可以切换，别放在一起」）**：顶栏新增「国内版/国际版」切换器
+（`stores/region.ts`，localStorage 持久化 `lab-region`；只在有区域概念的
+通道显示——TRAE/Qoder/WorkBuddy；搭子与千问纯国内隐藏）。切到哪个区域，
+**所有页面整体只显示那个区域的数据**：各管理端接口（traework 的
+status/credits/dashboard/credits/daily/credits/records，qoder 的
+status/credits/dashboard，reqlogs，usage/overview，chatlab 模型清单）都认
+`?region=`，**服务端过滤**（日志与账本的「国内」视图包含 region 缺失的历史行，
+「国际」只看明确 intl 的行）；登录弹窗的区域单选全部移除、跟随顶栏。
+上一版混排在单页里的区域徽标/分区小计/分母修正已整体移除。
+两个口径细节：① TRAE `/credits` 的 FEFO 快照**按全量账号更新**（区域视图
+只过滤返回行，不缩窄快照写入范围——否则国内视图会把国际临期条目忘干净）；
+② 纯订阅视图（国际）的 remainTotal/limitTotal 给 **null**（显示 —），
+0.00 会被读成「额度用完了」。WorkBuddy 加入同套切换。
 
 **Qoder 国际版（2026-11-03 页面区分收尾——通道本身早已支持 cn/global）。**
 Qoder 的登录区域选择、per-region 端点、`accountsForRegion`（intl key →

@@ -8,7 +8,7 @@ export interface ReqLogRow {
   mapped_model?: string
   // 上游通道。**历史记录没有这个字段**（分通道之前产生的），
   // 所以是可选的——界面遇到 undefined 显示「—」而不是默认成搭子。
-  channel?: 'dumate' | 'qwenwork' | 'traework' | 'qoder'
+  channel?: 'dumate' | 'qwenwork' | 'traework' | 'qoder' | 'workbuddy'
   stream: boolean
   messages: number
   status: number

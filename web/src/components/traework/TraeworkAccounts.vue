@@ -20,9 +20,10 @@
     </PageHeader>
 
     <!-- 这条通道的结构说明。三条通道现在都是凭证自持，但登录方式不同，
-         不写清楚的话用户会以为 TRAE 也能像千问那样「浏览器登录完自动取票」。 -->
+         不写清楚的话用户会以为 TRAE 也能像千问那样「浏览器登录完自动取票」。
+         文案按当前区域视图出——国际视图下说明国际版的边界（无签到等） -->
     <a-alert type="info" show-icon>
-      <template #message>TRAE Work 的凭证由本项目自己持有</template>
+      <template #message>TRAE {{ isIntlRegion() ? '国际版' : '国内版' }}的凭证由本项目自己持有</template>
       <template #description>
         <div>
           凭证是我们自己走 OAuth 换来的，存在
@@ -32,12 +33,18 @@
           所以这里可以<b>多账号并存、可增删</b>。换账号不用开 TRAE 客户端。
         </div>
         <div class="mt-1 text-xs">
-          与千问办公的差别：TRAE 登录后要<b>把回调地址粘回来</b>（千问是程序自动取票）；
-          TRAE 也<b>拿不到手机号</b>——它的用户信息接口已失效，只能从昵称碰运气抽。
+          <template v-if="isIntlRegion()">
+            当前是<b>国际版（trae.ai）</b>视图。国际版没有签到/活动接口（上游不提供），
+            额度是订阅制按请求数计；对话与额度查询不受影响。要加国内账号请切回「国内版」。
+          </template>
+          <template v-else>
+            当前是<b>国内版（trae.cn）</b>视图，只显示国内账号。与国际版（trae.ai）
+            是两套独立账号，要加国际账号请切到「国际版」。
+          </template>
         </div>
         <div class="mt-1 text-xs">
-          <b>国内（trae.cn）与国际（trae.ai）是两套独立账号，不通用</b>，登录时先选区域；
-          国际版没有签到/活动接口（上游不提供），额度查询与对话不受影响。
+          与千问办公的差别：TRAE 登录后要<b>把回调地址粘回来</b>（千问是程序自动取票）；
+          TRAE 也<b>拿不到手机号</b>——它的用户信息接口已失效，只能从昵称碰运气抽。
         </div>
       </template>
     </a-alert>
@@ -55,13 +62,11 @@
           <span class="section-title">账号列表</span>
           <span class="hint-text ml-2">
             共 {{ rows.length }} 个 · 启用 {{ enabledCount }} 个
-            <template v-if="cnCount"> · 国内 {{ cnCount }}</template>
-            <template v-if="intlCount"> · 国际 {{ intlCount }}</template>
           </span>
         </div>
       </div>
 
-      <a-empty v-if="!rows.length && !loading" description="还没有 TRAE Work 账号">
+      <a-empty v-if="!rows.length && !loading" :description="`还没有${isIntlRegion() ? '国际' : '国内'}版 TRAE 账号`">
         <a-button type="primary" @click="openLogin">添加第一个账号</a-button>
       </a-empty>
 
@@ -74,9 +79,6 @@
               <div class="min-w-0">
                 <div class="font-medium truncate">
                   {{ a.nickname || a.uid || '未命名' }}
-                  <a-tag :color="a.region === 'intl' ? 'purple' : 'blue'" class="ml-1" size="small">
-                    {{ a.region === 'intl' ? '国际' : '国内' }}
-                  </a-tag>
                   <a-tag v-if="!a.enabled" color="default" class="ml-1">已停用</a-tag>
                 </div>
                 <div class="text-xs text-slate-400 font-mono mt-1 truncate">
@@ -193,18 +195,12 @@
       </a-steps>
 
       <template v-if="loginStep === 0">
-        <a-form-item label="账号区域" class="mb-3">
-          <a-radio-group v-model:value="loginRegion">
-            <a-radio-button value="cn">国内 trae.cn</a-radio-button>
-            <a-radio-button value="intl">国际 trae.ai</a-radio-button>
-          </a-radio-group>
-          <div class="text-xs text-slate-400 mt-1">
-            两套账号不通用。国际版没有签到/活动接口，对话与额度查询不受影响。
-          </div>
-        </a-form-item>
         <a-alert type="info" show-icon class="mb-3">
-          <template #message>点下面的按钮生成一次登录所需的链接</template>
+          <template #message>
+            将登录{{ isIntlRegion() ? '国际版（www.trae.ai）' : '国内版（www.trae.cn）' }}账号
+          </template>
           <template #description>
+            区域跟随顶栏切换器（当前{{ isIntlRegion() ? '国际版' : '国内版' }}视图）。
             每次登录会生成一组新的设备标识（device_id / machine_id），
             它们会与这次登录的账号绑定。
           </template>
@@ -271,6 +267,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { App } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { channelStore, isTraework } from '@/stores/channel'
+import { regionStore, regionParam, isIntlRegion } from '@/stores/region'
 import { traeworkApi } from '@/api/traework'
 import type { TraeworkAccount, TraeworkCreditRow, TraeworkIntlPlan, TraeworkStatus } from '@/api/traework'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
@@ -320,9 +317,8 @@ const busy = reactive<Record<number, boolean>>({})
 // 登录弹窗
 const loginOpen = ref(false)
 const loginStep = ref(0)
-// 账号区域（2026-11-03 国际版接入）：国内 www.trae.cn / 国际 www.trae.ai，
-// 两套账号不通用。回调地址本身不携带区域，生成链接与提交回调必须用同一个值
-const loginRegion = ref<'cn' | 'intl'>('cn')
+// 账号区域跟随顶栏切换器（当前区域视图）——两个独立视图各登各区的账号
+const loginRegion = computed<'cn' | 'intl'>(() => regionStore.current)
 const loginUrl = ref('')
 const callbackText = ref('')
 const loginError = ref('')
@@ -337,14 +333,13 @@ const checkinMsgType = ref<'success' | 'warning' | 'error'>('success')
 const checkinDetail = ref<string[]>([])
 
 const subText = computed(() => {
-  if (!status.value) return 'TRAE Work 账号（多账号，可增删）'
-  if (!status.value.ready) return 'TRAE Work 账号 · 通道不可用'
-  return `TRAE Work 账号 · 可用 ${status.value.accounts} 个`
+  const r = isIntlRegion() ? '国际版' : '国内版'
+  if (!status.value) return `TRAE Work ${r}账号（多账号，可增删）`
+  if (!status.value.ready) return `TRAE Work ${r}账号 · 通道不可用`
+  return `TRAE Work ${r}账号 · 可用 ${status.value.accounts} 个`
 })
 
 const enabledCount = computed(() => rows.value.filter((a) => a.enabled).length)
-const cnCount = computed(() => rows.value.filter((a) => a.region !== 'intl').length)
-const intlCount = computed(() => rows.value.filter((a) => a.region === 'intl').length)
 
 function creditOf(id: number): TraeworkCreditRow | undefined {
   return credits.value?.rows.find((r) => r.id === id)
@@ -399,11 +394,12 @@ const errFresh = (a: TraeworkAccount) => lastErrorFresh(a)
 async function load() {
   loading.value = true
   try {
+    const r = regionParam() as 'cn' | 'intl' | undefined
     const [s, c] = await Promise.all([
-      traeworkApi.status().catch((e: any) => ({
+      traeworkApi.status(r).catch((e: any) => ({
         data: { ready: false, error: e?.message || '读取失败', accounts: 0, mode: 'multi', modeNote: '', rows: [] },
       })),
-      traeworkApi.credits().catch(() => ({ data: { count: 0, rows: [] } })),
+      traeworkApi.credits(r).catch(() => ({ data: { count: 0, rows: [] } })),
     ])
     status.value = s.data as TraeworkStatus
     credits.value = c.data
@@ -482,7 +478,6 @@ function reportCheckin(data: any) {
 
 function openLogin() {
   loginStep.value = 0
-  loginRegion.value = 'cn'
   loginUrl.value = ''
   callbackText.value = ''
   loginError.value = ''
@@ -538,4 +533,6 @@ async function submitCallback() {
 // 本页只在 TRAE 通道下有意义——其余通道由 WebAccountsView 的对应分支渲染
 onMounted(() => { if (isTraework()) load() })
 watch(() => channelStore.current, () => { if (isTraework()) load() })
+// 切区域重拉：账号列表与额度都按当前区域视图
+watch(() => regionStore.current, () => { if (isTraework()) load() })
 </script>

@@ -21,12 +21,7 @@
         </span>
       </template>
       <template #extra>
-        <!-- 区域视图（2026-11-03 国际版接入）：两区模型表不同，分开拉。
-             国际版没有签到/活动接口，但模型表与对话可用 -->
-        <a-radio-group v-model:value="twRegion" size="small" class="mr-2" @change="() => loadTwModels(false)">
-          <a-radio-button value="cn">国内</a-radio-button>
-          <a-radio-button value="intl">国际</a-radio-button>
-        </a-radio-group>
+        <!-- 区域切换在顶栏（国内版/国际版）：本页只显示当前区域的模型表 -->
         <a-button size="small" class="ghost-btn mr-2" :loading="twBillingChecking" @click="runTwBillingCheck">
           计费自检
         </a-button>
@@ -50,13 +45,7 @@
       <div v-if="twStatus" class="qw-channel-row">
         <div class="qw-channel-cell">
           <div class="cell-label">可用账号</div>
-          <div class="cell-value num">
-            {{ twStatus.accounts ?? '—' }}
-            <!-- 区域拆分（2026-11-03 国际版）：两区账号不通用 -->
-            <span v-if="twCnCount || twIntlCount" class="text-xs text-slate-400 ml-1">
-              （国内 {{ twCnCount }} · 国际 {{ twIntlCount }}）
-            </span>
-          </div>
+          <div class="cell-value num">{{ twStatus.accounts ?? '—' }}</div>
         </div>
         <div class="qw-channel-cell">
           <div class="cell-label">当前账号</div>
@@ -128,7 +117,7 @@
               </div>
               <div class="qw-pool-sub">
                 按账号独立计算，不共享
-                <template v-if="twIntlCount">；国际 {{ twIntlCount }} 个账号订阅制按请求数计，不进积分合计</template>
+                <template v-if="isIntlRegion()">；国际版订阅制按请求数计，不进积分合计</template>
               </div>
             </div>
           </a-col>
@@ -137,11 +126,10 @@
               <div class="qw-pool-head">
                 <span class="qw-pool-label">今日已签到</span>
               </div>
-              <!-- 分母只数国内账号：国际版没有签到接口，算进去会永远签不满 -->
-              <div class="qw-pool-value num">{{ twTotals.checked }} / {{ twTotals.checkinable }}</div>
+              <div class="qw-pool-value num">{{ twTotals.checked }} / {{ twRows.length }}</div>
               <div class="qw-pool-sub">
                 签到每日一次，幂等
-                <template v-if="twIntlCount">· 国际 {{ twIntlCount }} 个账号订阅制无签到</template>
+                <template v-if="isIntlRegion()">· 国际版无签到接口</template>
               </div>
             </div>
           </a-col>
@@ -313,11 +301,7 @@
         </span>
       </template>
       <template #extra>
-        <!-- 区域视图：cn（qoder.com.cn）/ global（qoder.sh）两套账号与模型表，分开拉 -->
-        <a-radio-group v-model:value="qdRegion" size="small" class="mr-2" @change="() => loadQd(false)">
-          <a-radio-button value="cn">国内</a-radio-button>
-          <a-radio-button value="global">国际</a-radio-button>
-        </a-radio-group>
+        <!-- 区域切换在顶栏（国内版/国际版）：本页只显示当前区域的模型表 -->
         <a-button size="small" class="ghost-btn mr-2" :loading="billingChecking" @click="runBillingCheck">计费自检</a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="loadQd(true)">刷新</a-button>
       </template>
@@ -327,12 +311,7 @@
       <div v-if="qdStatus" class="qw-channel-row">
         <div class="qw-channel-cell">
           <div class="cell-label">可用账号</div>
-          <div class="cell-value num">
-            {{ qdStatus.accounts ?? '—' }}
-            <span v-if="qdCnCount || qdIntlCount" class="text-xs text-slate-400 ml-1">
-              （国内 {{ qdCnCount }} · 国际 {{ qdIntlCount }}）
-            </span>
-          </div>
+          <div class="cell-value num">{{ qdStatus.accounts ?? '—' }}</div>
         </div>
         <div class="qw-channel-cell">
           <div class="cell-label">当前账号</div>
@@ -407,29 +386,119 @@
             </div>
           </a-col>
         </a-row>
-        <!-- 区域拆分（2026-11-03）：两区账号的额度不通用，合计里看不出构成 -->
-        <div v-if="qdCnCount && qdIntlCount" class="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-500">
-          <div>
-            国内（{{ qdCnCount }} 账号）：
-            签到 <span class="num">{{ fmtQw(qdRegionTotals.cn.addOn) }}</span>
-            · 订阅 <span class="num">{{ fmtQw(qdRegionTotals.cn.user) }}</span>
-          </div>
-          <div>
-            国际（{{ qdIntlCount }} 账号）：
-            签到 <span class="num">{{ fmtQw(qdRegionTotals.intl.addOn) }}</span>
-            · 订阅 <span class="num">{{ fmtQw(qdRegionTotals.intl.user) }}</span>
-          </div>
-        </div>
         <div class="text-xs text-slate-500 mt-3">
           两份额度<b>不可相加</b>：前者是签到/赠送，后者是订阅套餐内。
-          <template v-if="qdCnCount && qdIntlCount">国内与国际是两套账号，额度也不通用。</template>
         </div>
+      </template>
+    </a-card>
+
+    <!-- ============ WorkBuddy：第五通道，模型表双区域（credits 标倍率） ============ -->
+    <a-card v-if="isWb" :bordered="false">
+      <template #title>
+        <span class="section-title">WorkBuddy 模型</span>
+        <a-tag class="ml-2" color="cyan">只读</a-tag>
+        <a-tag :color="regionStore.current === 'intl' ? 'purple' : 'blue'" class="ml-1">
+          {{ regionStore.current === 'intl' ? '国际目录' : '国内目录' }}
+        </a-tag>
+        <span v-if="wbModels.length" class="text-xs text-slate-500 ml-2">
+          共 {{ wbModels.length }} 个 · 免费 {{ wbFreeCount }} 个
+        </span>
+      </template>
+      <template #extra>
+        <a-button size="small" class="ghost-btn" :loading="loading" @click="loadWb(true)">刷新</a-button>
+      </template>
+
+      <div v-if="wbStatus" class="qw-channel-row">
+        <div class="qw-channel-cell">
+          <div class="cell-label">可用账号</div>
+          <div class="cell-value num">{{ wbStatus.accounts ?? '—' }}</div>
+        </div>
+        <div class="qw-channel-cell">
+          <div class="cell-label">上游端点</div>
+          <div class="cell-value font-mono text-xs">
+            {{ regionStore.current === 'intl' ? 'www.workbuddy.ai' : 'copilot.tencent.com' }}
+          </div>
+        </div>
+        <div class="qw-channel-cell">
+          <div class="cell-label">协议</div>
+          <div class="cell-value">标准 OpenAI（SSE）</div>
+        </div>
+      </div>
+
+      <a-alert v-if="wbError" type="warning" show-icon class="mt-3" :message="wbError" />
+
+      <a-empty v-if="!wbModels.length && !loading" :description="wbError || '未取到模型列表'" />
+      <a-table v-else size="small" :data-source="wbModels" :columns="wbColumns" row-key="id"
+        :pagination="{ pageSize: 20, size: 'small', showSizeChanger: false }">
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'name'">
+            <span>{{ record.name }}</span>
+            <a-tag v-for="b in record.badges" :key="b" color="orange" class="ml-1" size="small">{{ b }}</a-tag>
+          </template>
+          <template v-else-if="column.key === 'prefixed'">
+            <span class="font-mono text-xs">workbuddy/{{ record.id }}</span>
+          </template>
+          <template v-else-if="column.key === 'rate'">
+            <a-tag v-if="record.free" color="green">免费</a-tag>
+            <span v-else-if="record.rate != null" class="num">×{{ record.rate }}</span>
+            <span v-else class="text-slate-400">—</span>
+          </template>
+          <template v-else-if="column.key === 'ctx'">
+            <span class="num">{{ record.contextWindow ? record.contextWindow.toLocaleString('zh-CN') : '—' }}</span>
+            <span v-if="record.contextWindowDefault" class="text-xs text-slate-400">
+              （默认 {{ record.contextWindowDefault.toLocaleString('zh-CN') }}）
+            </span>
+          </template>
+          <template v-else-if="column.key === 'maxTokens'">
+            <span class="num">{{ record.maxTokens ? record.maxTokens.toLocaleString('zh-CN') : '—' }}</span>
+          </template>
+          <template v-else-if="column.key === 'reasoning'">
+            <span v-if="record.reasoning && record.reasoning.efforts.length" class="text-xs">
+              {{ record.reasoning.efforts.join(' / ') }}
+            </span>
+            <span v-else-if="record.reasoning && record.reasoning.defaultEffort" class="text-xs">
+              默认 {{ record.reasoning.defaultEffort }}
+            </span>
+            <span v-else class="text-slate-400">—</span>
+          </template>
+          <template v-else-if="column.key === 'multimodal'">
+            <a-tag :color="record.multimodal ? 'green' : 'default'">{{ record.multimodal ? '是' : '否' }}</a-tag>
+          </template>
+        </template>
+      </a-table>
+      <div class="text-xs text-slate-500 mt-3">
+        调用时用前缀名（如 <span class="font-mono">workbuddy/glm-5.3</span>）；不带前缀的名字一律走搭子。
+        credits 倍率是上游标注（x0.00 = 免费）；上下文给的是**上限档**（maxInputTokens），
+        括号里是上游默认档——两档别混。
+      </div>
+    </a-card>
+
+    <!-- WorkBuddy 额度：billing 域的套餐包（签到仅国内版） -->
+    <a-card v-if="isWb" title="WorkBuddy 额度" :bordered="false">
+      <a-empty v-if="!wbCredits.length" description="还没有 WorkBuddy 账号" />
+      <template v-else>
+        <a-row :gutter="[16, 16]">
+          <a-col :xs="24" :sm="12" :lg="12">
+            <div class="qw-pool">
+              <div class="qw-pool-head"><span class="qw-pool-label">剩余积分合计</span></div>
+              <div class="qw-pool-value num">{{ fmtQw(wbTotals.remain) }}</div>
+              <div class="qw-pool-sub">billing 套餐包按账号独立，不共享</div>
+            </div>
+          </a-col>
+          <a-col :xs="24" :sm="12" :lg="12">
+            <div class="qw-pool">
+              <div class="qw-pool-head"><span class="qw-pool-label">今日已签到</span></div>
+              <div class="qw-pool-value num">{{ isIntlRegion() ? '—' : `${wbTotals.checked} / ${wbCredits.length}` }}</div>
+              <div class="qw-pool-sub">{{ isIntlRegion() ? '国际版没有签到接口' : '签到每日一次，幂等' }}</div>
+            </div>
+          </a-col>
+        </a-row>
       </template>
     </a-card>
 
     <!-- 以下全部是搭子专用：别名映射、上游原生模型、对外暴露、网关实际返回。
          切到千问时不显示——它们描述的是搭子那条链路。 -->
-    <template v-if="!isQw && !isTw && !isQd">
+    <template v-if="!isQw && !isTw && !isQd && !isWb">
     <!-- 通道元信息行：与 TRAE 模型页同构（上游端口 / 托管 / 登录账号）。
          放在模型表上方是因为这些是**通道级**的，不随模型变 -->
     <div class="qw-channel-row">
@@ -705,10 +774,12 @@ import { computed, onMounted, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { message } from 'ant-design-vue'
 import client from '@/api/client'
-import { channelStore, isTraework, isQwenwork, isQoder } from '@/stores/channel'
+import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
+import { regionStore, regionParam, isIntlRegion } from '@/stores/region'
 import { qwenworkApi } from '@/api/qwenwork'
 import { traeworkApi } from '@/api/traework'
 import { qoderApi, type QoderModel, type QoderCreditRow } from '@/api/qoder'
+import { workbuddyApi } from '@/api/workbuddy'
 import type { TraeworkCreditRow, TraeworkModel } from '@/api/traework'
 import type { QwCredits } from '@/api/qwenwork'
 import type { ModelMapData, ProbeResult } from '@/api/models'
@@ -731,12 +802,60 @@ const map = ref<ModelMapData | null>(null)
 const isTw = computed(() => isTraework())
 const isQw = computed(() => isQwenwork())
 const isQd = computed(() => isQoder())
+const isWb = computed(() => isWorkBuddy())
+
+// WorkBuddy 模型表与额度（第五通道，双区域目录）
+const wbModels = ref<Array<any>>([])
+const wbError = ref('')
+const wbCredits = ref<Array<{ id: number; total: number | null; checkedIn: boolean | null }>>([])
+const wbStatus = ref<{ accounts: number } | null>(null)
+const wbFreeCount = computed(() => wbModels.value.filter((m) => m.free).length)
+const wbTotals = computed(() => {
+  let remain = 0
+  let any = false
+  let checked = 0
+  for (const r of wbCredits.value) {
+    if (r.total != null) { remain += r.total; any = true }
+    if (r.checkedIn) checked++
+  }
+  return { remain: any ? Number(remain.toFixed(2)) : null, checked }
+})
+const wbColumns = [
+  { title: '模型', key: 'name', width: '26%' },
+  { title: '调用前缀', key: 'prefixed', width: '20%' },
+  { title: '倍率', key: 'rate', width: '10%' },
+  { title: '上下文（上限）', key: 'ctx', width: '16%' },
+  { title: '输出上限', key: 'maxTokens', width: '10%' },
+  { title: '思考档位', key: 'reasoning', width: '10%' },
+  { title: '多模态', key: 'multimodal', width: '8%' },
+]
+
+async function loadWb(force = false) {
+  const r = regionParam() as 'cn' | 'intl' | undefined
+  try {
+    const [m, c, s] = await Promise.all([
+      workbuddyApi.models({ refresh: force, region: r }).catch((e: any) => ({
+        data: { models: [], total: 0, error: e?.message || '取模型列表失败', fetchedAt: 0, rateNote: '' },
+      })),
+      workbuddyApi.credits(r).catch(() => ({ data: { count: 0, rows: [] } })),
+      workbuddyApi.status(r).catch(() => ({ data: { ready: false, accounts: 0, rows: [] } })),
+    ])
+    wbModels.value = m.data.models || []
+    wbError.value = m.data.error || ''
+    wbCredits.value = c.data.rows || []
+    wbStatus.value = s.data as any
+  } catch (e: any) {
+    wbModels.value = []
+    wbError.value = e?.message || '读取 WorkBuddy 模型失败'
+  }
+}
 
 // Qoder 模型表（上游下发，带倍率）与额度
 const qdModels = ref<QoderModel[]>([])
 const qdError = ref('')
-// 区域视图（2026-11-03）：cn（qoder.com.cn）/ global（qoder.sh），两套账号与模型表
-const qdRegion = ref<'cn' | 'global'>('cn')
+// 区域视图（2026-11-03）：顶栏统一切换（国内版/国际版），本页只读。
+// 模型表、计费自检、额度全部按当前区域走
+const qdRegion = computed<'cn' | 'global'>(() => (regionStore.current === 'intl' ? 'global' : 'cn'))
 const qdCredits = ref<QoderCreditRow[]>([])
 // 计费自检：对最低倍率模型发探针，比对实测倍率与标称（上游改路由的可见性）
 const billingChecking = ref(false)
@@ -779,30 +898,17 @@ const qdTotals = computed(() => {
   }
   return { addOn, user, known: ok }
 })
-// 区域计数（2026-11-03 国际版）：额度两区不通用，顶部元信息行拆开显示
-const qdCnCount = computed(() => qdCredits.value.filter((r) => r.region === 'cn').length)
-const qdIntlCount = computed(() => qdCredits.value.filter((r) => r.region !== 'cn').length)
-// 按区域拆分的额度小计（只有两区并存时才显示——单区时合计本身就是那个区）
-const qdRegionTotals = computed(() => {
-  const out = { cn: { addOn: 0, user: 0 }, intl: { addOn: 0, user: 0 } }
-  for (const r of qdCredits.value) {
-    const bucket = r.region === 'cn' ? out.cn : out.intl
-    if (r.addOnQuota) bucket.addOn += r.addOnQuota.remaining || 0
-    if (r.userQuota) bucket.user += r.userQuota.remaining || 0
-  }
-  return out
-})
 
 async function loadQd(force = false) {
   try {
     // 三份并行：/qoder/models（倍率 + 上下文，顶部计数用）、
     // /models/info?channel=qoder（统一形状，表格与倍率排序用）、额度。
-    // 模型两份都带区域——两区模型表不同，切换区域时整页重拉
+    // 三份都带区域——顶栏切区域时整页重拉当前区域的数据
     const [m, info, c] = await Promise.all([
       qoderApi.models({ refresh: force, region: qdRegion.value }),
       modelInfoApi.list({ channel: 'qoder', refresh: force, region: qdRegion.value })
         .catch(() => ({ data: { rows: [] as ModelInfoRow[], error: '' } })),
-      qoderApi.credits().catch(() => ({ data: { rows: [] as QoderCreditRow[] } })),
+      qoderApi.credits(regionStore.current).catch(() => ({ data: { rows: [] as QoderCreditRow[] } })),
     ])
     qdModels.value = (m.data.models || []).slice().sort((a, b) => (a.rate ?? 99) - (b.rate ?? 99))
     qdError.value = m.data.error || ''
@@ -817,8 +923,8 @@ async function loadQd(force = false) {
 
 // TRAE 模型表与额度
 const twModels = ref<TraeworkModel[]>([])
-// 区域视图（2026-11-03 国际版接入）：国内（trae.cn）/ 国际（trae.ai）模型表分开拉
-const twRegion = ref<'cn' | 'intl'>('cn')
+// 区域视图（2026-11-03 国际版接入）：顶栏统一切换，本页只读当前区域的模型表
+const twRegion = computed<'cn' | 'intl'>(() => regionStore.current)
 // 上游模型表的拉取时间（/traework/models 的 fetchedAt）。缓存命中时是上次
 // 实际拉取的时刻，正好用来判断「刷新有没有真的打到上游」
 const twFetchedAt = ref(0)
@@ -930,22 +1036,15 @@ const twTotals = computed(() => {
   let remain: number | null = null
   let limit: number | null = null
   let checked = 0
-  // 分母只数国内账号（国际版没有签到接口）；国际订阅账号不进积分合计
-  let checkinable = 0
-  let intlCount = 0
+  // 区域视图下整页只有当前区域的账号：国际视图没有积分口径（remain/limit
+  // 恒 null），合计自然显示 —；国内视图的已签分母就是全部行数
   for (const r of twRows.value) {
-    if (r.region === 'intl') { intlCount++; continue }
-    checkinable++
     if (r.remain != null) remain = (remain ?? 0) + r.remain
     if (r.limit != null) limit = (limit ?? 0) + r.limit
     if (r.checkedIn) checked++
   }
-  return { remain, limit, checked, checkinable, intlCount }
+  return { remain, limit, checked }
 })
-
-// 区域计数（2026-11-03 国际版）：顶部元信息行拆开显示
-const twCnCount = computed(() => twRows.value.filter((r) => r.region !== 'intl').length)
-const twIntlCount = computed(() => twRows.value.filter((r) => r.region === 'intl').length)
 
 // 千问模型：直接问 /qwenwork/models，不再从 /models/map 的 channels 里蹭
 const qwModels = ref<Array<{ id: string; name: string; prefixed: string }>>([])
@@ -1137,6 +1236,11 @@ async function load() {
       await channelStore.load()
       return
     }
+    // WorkBuddy：模型表（双区域目录）+ 额度
+    if (isWb.value) {
+      await loadWb(false)
+      return
+    }
     // 千问通道只取它自己的模型表，不拉搭子的映射——两者数据结构与
     // 可编辑性都不同，混在一起加载只会白打一次接口
     if (isQw.value) {
@@ -1263,11 +1367,17 @@ onMounted(async () => {
   if (!isQw.value && !isTw.value && !isQd.value) await loadGateway()
 })
 
-// 切通道重拉：三条通道的数据源不同，切换时必须换成对应那份，
+// 切通道重拉：四条通道的数据源不同，切换时必须换成对应那份，
 // 否则会停在上一通道的模型表上
 watch(() => channelStore.current, async () => {
   await load()
-  if (!isQw.value && !isTw.value && !isQd.value) await loadGateway()
+  if (!isQw.value && !isTw.value && !isQd.value && !isWb.value) await loadGateway()
+})
+// 切区域重拉：TRAE/Qoder/WorkBuddy 的模型表按区域走（顶栏统一切换）
+watch(() => regionStore.current, async () => {
+  if (isTw.value) await loadTwModels(false)
+  else if (isQd.value) await loadQd(false)
+  else if (isWb.value) await loadWb(false)
 })
 </script>
 

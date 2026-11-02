@@ -173,7 +173,9 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
       ? require('./traework')
       : route.channel === 'qoder'
         ? require('./qoder')
-        : require('./qwenwork');
+        : route.channel === 'workbuddy'
+          ? require('./workbuddy')
+          : require('./qwenwork');
   const wantStream = !!payload.stream;
 
   // 请求 id 在这里就定下来：埋点与积分归因两边都要用同一个值才能配对。
@@ -188,15 +190,16 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   // 的拆分（请求日志、用量）才有数据源。区域解析失败不影响请求。
   const onAccount = (name, id) => {
     if (name) req._upstreamAccount = String(name);
-    if (id != null && (route.channel === 'traework' || route.channel === 'qoder')) {
+    if (id != null && (route.channel === 'traework' || route.channel === 'qoder' || route.channel === 'workbuddy')) {
       try {
-        const store = require(route.channel === 'qoder' ? './qoder/auth' : './traework/auth');
+        const store = route.channel === 'qoder' ? require('./qoder/auth')
+          : route.channel === 'workbuddy' ? require('./workbuddy/auth')
+            : require('./traework/auth');
         const a = store.get(id);
         if (a) {
           const reg = String(a.region || '').toLowerCase();
-          req._upstreamRegion = route.channel === 'qoder'
-            ? (reg === 'cn' ? 'cn' : 'intl')      // qoder 的 global 术语归一成 intl
-            : (reg === 'intl' ? 'intl' : 'cn');
+          // 三通道的区域术语归一：qoder/workbuddy 内部用 global，日志统一 intl
+          req._upstreamRegion = reg === 'cn' ? 'cn' : 'intl';
         }
       } catch (e) { /* 区域解析失败不影响请求 */ }
     }
@@ -889,6 +892,32 @@ async function handleOpenAIModels(req, res) {
       }
     } catch (e) { /* 通道不可用，不列 */ }
   }
+
+  // WorkBuddy（第五通道，2026-11-03）：标准 OpenAI 协议，国内/国际两区账号。
+  // 两区模型表不同，都列出来（前缀同名——调用名即 workbuddy/<id>，
+  // 上游按账号区域路由到对应端点；两区都有的模型（glm-5.3）合并去重）
+  try {
+    const wb = require('./workbuddy');
+    if (wb.status().ready) {
+      const seen = new Set();
+      for (const m of await wb.listModelEntries('cn')) {
+        if (seen.has(m.id)) continue;
+        seen.add(m.id);
+        data.push({
+          id: m.id, object: 'model', created, owned_by: 'workbuddy', name: m.name,
+          ...(m.contextWindow ? { contextWindow: m.contextWindow, maxContextWindow: m.maxContextWindow } : {}),
+        });
+      }
+      for (const m of await wb.listModelEntries('global')) {
+        if (seen.has(m.id)) continue;
+        seen.add(m.id);
+        data.push({
+          id: m.id, object: 'model', created, owned_by: 'workbuddy', name: `${m.name}（国际）`,
+          ...(m.contextWindow ? { contextWindow: m.contextWindow, maxContextWindow: m.maxContextWindow } : {}),
+        });
+      }
+    }
+  } catch (e) { /* 通道不可用，不列 */ }
 
   // 千帆原生透传（qianfan/ 前缀）：只有这个端点支持 response_format。
   // 模型清单**静态**——上游没有模型列表接口（/gateway/v2/models 回 404），
@@ -2061,6 +2090,16 @@ const server = http.createServer(async (req, res) => {
           qoder: (() => {
             try {
               const st = require('./qoder').status();
+              return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+            } catch (e) {
+              return { direct: true, ready: false, needsClient: false, accounts: 0, error: e.message };
+            }
+          })(),
+          // WorkBuddy：第五通道（2026-11-03），标准 OpenAI 协议 + 双区域账号。
+          // 凭证自持（登录流程后置期从客户端认证文件导入）。
+          workbuddy: (() => {
+            try {
+              const st = require('./workbuddy').status();
               return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
             } catch (e) {
               return { direct: true, ready: false, needsClient: false, accounts: 0, error: e.message };

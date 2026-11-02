@@ -26,6 +26,7 @@ const { sendJSON, readBody } = require('../router');
 function providerOf(channel) {
   if (channel === 'traework') return require('../../traework');
   if (channel === 'qoder') return require('../../qoder');
+  if (channel === 'workbuddy') return require('../../workbuddy');
   if (channel === 'qwenwork') return require('../../qwenwork');
   return null;
 }
@@ -39,6 +40,7 @@ function budgetFor(kind, requested) {
   if (kind === 'qoder') return b.resolveQoderMaxTokens(requested);
   if (kind === 'traework') return b.resolveTraeworkMaxTokens(requested);
   if (kind === 'qwenwork') return b.resolveQwenMaxTokens(requested);
+  if (kind === 'workbuddy') return b.resolveWorkBuddyMaxTokens(requested);
   return b.resolveMaxTokens(requested);
 }
 
@@ -348,6 +350,30 @@ const routes = [
       const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
       const r = await qoderModels(regionRaw);
       return sendJSON(res, 200, r);
+    },
+  },
+  {
+    // WorkBuddy 的模型清单（带 `workbuddy/` 前缀）。?region=intl 看国际目录
+    method: 'GET',
+    path: '/workbuddy-models',
+    handler: async ({ res, req }) => {
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const reg = regionRaw === 'intl' || regionRaw === 'global' ? 'global' : 'cn';
+      try {
+        const r = await require('../../workbuddy/models').fetchModels({ region: reg });
+        return sendJSON(res, 200, {
+          region: reg,
+          error: r.error || '',
+          models: (r.models || []).map((m) => ({
+            id: m.id,
+            name: m.free ? `${m.name}（免费）` : m.name,
+            prefixed: `workbuddy/${m.id}`,
+            rate: m.rate,
+          })),
+        });
+      } catch (e) {
+        return sendJSON(res, 200, { region: reg, error: e.message, models: [] });
+      }
     },
   },
   {

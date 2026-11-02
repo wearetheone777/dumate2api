@@ -15,25 +15,44 @@ const tw = require('../../traework');
 // 临期积分快照（FEFO 数据源）：写方在 /credits，读方在 traework/index.js
 const expiringSnap = require('../../expiring');
 
+// 区域过滤（2026-11-03 页面按区域整体切换）：'cn' / 'intl'。账号列表按
+// 区域出——国内/国际是两个独立视图，不是一页里混排打标签
+function regionFilter(rows, url) {
+  const raw = decodeURIComponent(((url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+  if (raw !== 'cn' && raw !== 'intl') return { region: '', rows };
+  return { region: raw, rows: rows.filter((r) => (r.region || 'cn') === raw) };
+}
+
 const routes = [
   {
     // 通道状态 + 账号列表（脱敏：refreshToken 只给尾部 6 位）
     method: 'GET',
     path: '/status',
-    handler: async ({ res }) => {
+    handler: async ({ res, req }) => {
       let st = { ready: false, error: '' };
       try { st = tw.status(); } catch (e) { st = { ready: false, error: e.message }; }
+      const all = authStore.list();
+      const { region, rows } = regionFilter(all, req.url || '');
+      // 区域视图下 ready / 计数按该区域重算——「国内版」页面上的「通道不可用」
+      // 不该被国际账号的存在掩盖，反之亦然
+      let ready = st.ready;
+      let error = st.error || '';
+      if (region) {
+        ready = rows.some((r) => r.enabled);
+        if (!rows.length) error = region === 'intl' ? '没有国际版账号（先到账号管理 → 国际版添加）' : '没有国内账号';
+      }
       return sendJSON(res, 200, {
-        ready: st.ready,
-        error: st.error || '',
-        accounts: st.accounts || 0,
-        // 区域计数（2026-11-03 国际版接入）：前端据此显示「国内 N / 国际 N」
+        ready,
+        error,
+        accounts: rows.length,
+        // 全量计数（切换器徽标用）；rows 是当前区域过滤后的列表
         cnAccounts: st.cnAccounts || 0,
         intlAccounts: st.intlAccounts || 0,
+        region: region || undefined,
         // 明确告诉前端这条通道的结构：可增删，与千问的 single 模式不同
         mode: 'multi',
         modeNote: 'TRAE Work 的凭证由本项目自行 OAuth 换取并保存，可多账号并存、可增删。国内（trae.cn）与国际（trae.ai）账号不通用。',
-        rows: authStore.list(),
+        rows,
       });
     },
   },
@@ -73,7 +92,12 @@ const routes = [
     // 全部账号的签到状态与额度。不落盘——只读快照，避免刷新动作本身触发签到
     method: 'GET',
     path: '/credits',
-    handler: async ({ res }) => {
+    handler: async ({ res, req }) => {
+      // 区域过滤（2026-11-03）：国内/国际两个独立视图。**FEFO 快照仍按全量
+      // 账号更新**——快照是网关选号的数据源，不分区域；区域视图只过滤
+      // 返回的行，不缩窄快照的写入范围（否则国内视图会把国际账号的临期
+      // 条目忘干净，反之亦然）
+      const { region } = regionFilter([], req.url || '');
       const rows = [];
       for (const raw of authStore.findUsable()) {
         // 额度/签到状态接口直接用账号里存的 accessToken——先续期一次，
@@ -164,22 +188,36 @@ const routes = [
       // 国际版订阅账号没有积分口径（remain/limit 恒 null 但 intlPlan 有值）
       // ——算「已知」，不然每次进仪表盘都多一块「查询失败」的假警报
       const known = rows.filter((r) => r.remain !== null || r.limit !== null || r.intlPlan);
+      // 区域视图：返回的行 / 汇总 / 临期明细都按该区域收窄（快照已按全量更新）
+      const shown = region ? rows.filter((r) => r.region === region) : rows;
+      const shownIds = new Set(shown.map((r) => r.id));
+      const shownKnown = shown.filter((r) => r.remain !== null || r.limit !== null || r.intlPlan);
+      const shownExpiring = region ? expiring.filter((x) => shownIds.has(x.accountId)) : expiring;
+      // 积分口径的合计只对**真有 remain 的行**求和：纯订阅视图（国际）没有
+      // 积分口径，合计给 null（显示 —）——0.00 会被读成「额度用完了」
+      const shownRemainRows = shown.filter((r) => r.remain !== null);
+      const shownLimitRows = shown.filter((r) => r.limit !== null);
       return sendJSON(res, 200, {
-        count: rows.length,
-        rows,
+        count: shown.length,
+        region: region || undefined,
+        rows: shown,
         summary: {
-          total: rows.length,
+          total: shown.length,
           // 凭证可用性口径与千问一致（rows 都来自 findUsable，所以这里
           // 等价于「查询没报错」）。留字段是为了两边形状一致。
-          valid: rows.filter((r) => !r.error).length,
-          checkedIn: rows.filter((r) => r.checkedIn).length,
-          unknown: rows.length - known.length,
-          remainTotal: Number(known.reduce((s, r) => s + (r.remain || 0), 0).toFixed(2)),
-          limitTotal: Number(known.reduce((s, r) => s + (r.limit || 0), 0).toFixed(2)),
+          valid: shown.filter((r) => !r.error).length,
+          checkedIn: shown.filter((r) => r.checkedIn).length,
+          unknown: shown.length - shownKnown.length,
+          remainTotal: shownRemainRows.length
+            ? Number(shownRemainRows.reduce((s, r) => s + (r.remain || 0), 0).toFixed(2))
+            : null,
+          limitTotal: shownLimitRows.length
+            ? Number(shownLimitRows.reduce((s, r) => s + (r.limit || 0), 0).toFixed(2))
+            : null,
         },
         // 7 天内到期且还有剩余的额度包。空数组 = 无风险，界面据此显示「暂无」
-        expiring,
-        expiringPoints: Number(expiring.reduce((s, x) => s + x.remain, 0).toFixed(4)),
+        expiring: shownExpiring,
+        expiringPoints: Number(shownExpiring.reduce((s, x) => s + x.remain, 0).toFixed(4)),
         // FEFO 快照的新鲜度（排障用：网关有没有在按临期优先选号）
         fefo: expiringSnap.info('traework'),
       });
@@ -196,8 +234,9 @@ const routes = [
      */
     method: 'GET',
     path: '/dashboard',
-    handler: async ({ res }) => {
-      const all = authStore.list();
+    handler: async ({ res, req }) => {
+      const { region } = regionFilter([], req.url || '');
+      const all = authStore.list().filter((a) => !region || ((a.region || 'cn') === region));
       const now = Date.now();
       const accounts = all.map((a) => {
         // 存活天数：从 createdAt 算到今天。与搭子的「会员剩余天数」语义
@@ -228,6 +267,7 @@ const routes = [
       const today = credits.todayUsage();
       return sendJSON(res, 200, {
         accounts,
+        region: region || undefined,
         summary: {
           total: accounts.length,
           enabled: accounts.filter((a) => a.enabled).length,
@@ -255,7 +295,10 @@ const routes = [
     handler: async ({ req, res }) => {
       const days = Math.min(90, Math.max(1,
         parseInt((req.url.match(/[?&]days=(\d+)/) || [])[1] || '14', 10) || 14));
-      return sendJSON(res, 200, { days, rows: credits.dailyUsage(days) });
+      // 区域过滤（2026-11-03）：国内/国际视图各自的趋势曲线
+      const raw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = raw === 'cn' || raw === 'intl' ? raw : '';
+      return sendJSON(res, 200, { days, region: region || undefined, rows: credits.dailyUsage(days, region) });
     },
   },
   {
@@ -265,12 +308,20 @@ const routes = [
     handler: async ({ req, res }) => {
       const limit = Math.min(1000, Math.max(1,
         parseInt((req.url.match(/[?&]limit=(\d+)/) || [])[1] || '100', 10) || 100));
-      const rows = credits.creditRecords(limit);
+      // 区域过滤（2026-11-03）：行自带 region（creditRecords 已按账号回查）
+      const raw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = raw === 'cn' || raw === 'intl' ? raw : '';
+      let rows = credits.creditRecords(limit);
+      // 「国内」视图包含 region 缺失的历史行（国际版上线前只有国内账号）；
+      // 「国际」视图只看明确 intl 的行
+      if (region === 'intl') rows = rows.filter((r) => r.region === 'intl');
+      else if (region === 'cn') rows = rows.filter((r) => r.region !== 'intl');
       // 汇总只统计本次返回的窗口，且只累加算得出的成本——首条无参照点
       // （cost=null）不计入，界面要写清范围
       const sum = rows.reduce((s, r) => s + (r.cost || 0), 0);
       return sendJSON(res, 200, {
         limit,
+        region: region || undefined,
         rows,
         window: {
           cost: Number(sum.toFixed(4)),

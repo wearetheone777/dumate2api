@@ -99,11 +99,6 @@
               {{ record.enabled ? '启用' : '停用' }}
             </a-tag>
           </template>
-          <template v-else-if="column.key === 'region'">
-            <a-tag :color="record.region === 'intl' ? 'purple' : 'blue'">
-              {{ record.region === 'intl' ? '国际' : '国内' }}
-            </a-tag>
-          </template>
           <template v-else-if="column.key === 'access'">
             <a-tag :color="expired(record.expiresAt) ? 'red' : 'green'">
               {{ expired(record.expiresAt) ? '已过期' : '有效' }}
@@ -192,7 +187,6 @@ const anyRefreshExpired = computed(
 const columns = [
   { title: '账号', key: 'name', width: '20%' },
   { title: '状态', key: 'enabled', width: '10%' },
-  { title: '区域', key: 'region', width: '8%' },
   { title: 'access token', key: 'access', width: '18%' },
   { title: 'refresh token', key: 'refresh', width: '18%' },
   { title: '设备标识', key: 'device', width: '16%' },

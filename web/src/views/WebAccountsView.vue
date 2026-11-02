@@ -9,6 +9,9 @@
     <!-- ============ Qoder：多账号池，凭证自持（device flow，不需要客户端） ============ -->
     <QoderAccounts v-else-if="isQd" />
 
+    <!-- ============ WorkBuddy：第五通道，双区域，登录流程后置期用导入 ============ -->
+    <WorkBuddyAccounts v-else-if="isWb" />
+
     <!-- ============ 百度搭子：原有页面 ============ -->
     <template v-else>
     <PageHeader title="账号管理" sub="网页凭证账号池：签到、抽奖、积分与模型轮询" />
@@ -497,10 +500,11 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { App } from 'ant-design-vue'
 import client from '@/api/client'
-import { channelStore, isTraework, isQwenwork, isQoder } from '@/stores/channel'
+import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
 import TraeworkAccounts from '@/components/traework/TraeworkAccounts.vue'
 import QwenworkAccounts from '@/components/qwenwork/QwenworkAccounts.vue'
 import QoderAccounts from '@/components/qoder/QoderAccounts.vue'
+import WorkBuddyAccounts from '@/components/workbuddy/WorkBuddyAccounts.vue'
 import type { WebAccount, AccountStatus, PoolData, PoolAccount } from '@/api/webaccounts'
 
 // message 走 App.useApp() 的实例（App.vue 已包 <a-app>），静态 import 拿不到上下文
@@ -511,6 +515,7 @@ const { message } = App.useApp()
 const isTw = computed(() => isTraework())
 const isQw = computed(() => isQwenwork())
 const isQd = computed(() => isQoder())
+const isWb = computed(() => isWorkBuddy())
 
 const accounts = ref<WebAccount[]>([])
 const loginUrl = ref('')

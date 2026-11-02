@@ -32,25 +32,37 @@ async function fresh(raw) {
 const routes = [
   {
     // 通道状态 + 账号列表（脱敏：token 只给尾部 6 位）
+    // ?region=（2026-11-03）：cn / global（intl 也认）——国内/国际独立视图
     method: 'GET',
     path: '/status',
-    handler: async ({ res }) => {
+    handler: async ({ res, req }) => {
       // 存量账号补一次脱敏手机号（本功能上线前登录的没有这一项）。
       // 不 await：读路径不该被上游请求拖住，第一次没补上，下次进来自然就有。
       // 幂等 + 每账号只试一次，所以重复调用没有代价。
       authStore.backfillPhone(session).catch(() => {});
 
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' ? 'global' : (regionRaw === 'cn' || regionRaw === 'global' ? regionRaw : '');
+      const all = authStore.list();
+      const rows = region ? all.filter((a) => constants.normalizeRegion(a.region) === region) : all;
       let st = { ready: false, error: '' };
       try { st = qoder.status(); } catch (e) { st = { ready: false, error: e.message }; }
+      // 区域视图下 ready / 计数按该区域重算
+      let ready = st.ready;
+      let error = st.error || '';
+      if (region) {
+        ready = rows.some((r) => r.enabled);
+        if (!rows.length) error = region === 'global' ? '没有国际版账号（先到账号管理 → 国际版添加）' : '没有国内账号';
+      }
       return sendJSON(res, 200, {
-        ready: st.ready,
-        error: st.error || '',
-        accounts: st.accounts || 0,
-        // 明确告诉前端：这条通道**不需要任何客户端**（签名纯本地）
+        ready,
+        error,
+        accounts: rows.length,
         needsClient: false,
+        region: region || undefined,
         mode: 'multi',
         modeNote: 'Qoder 的凭证由本项目走 device flow 自取并保存（data/qoder-accounts.json），可多账号并存、可增删。签名是纯本地算法，不需要安装 Qoder 客户端。',
-        rows: authStore.list(),
+        rows,
       });
     },
   },
@@ -96,10 +108,14 @@ const routes = [
   {
     // 全部账号的额度（打上游，慢）。**userQuota 与 addOnQuota 分开报**，
     // 界面不能相加——前者是订阅套餐内，后者是签到/赠送。
+    // ?region=（2026-11-03）：cn / global（intl 也认）——国内/国际独立视图
     method: 'GET',
     path: '/credits',
-    handler: async ({ res }) => {
-      const list = authStore.list();
+    handler: async ({ res, req }) => {
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' ? 'global' : (regionRaw === 'cn' || regionRaw === 'global' ? regionRaw : '');
+      let list = authStore.list();
+      if (region) list = list.filter((a) => constants.normalizeRegion(a.region) === region);
       const proxyAgent = require('../../proxy-agent');
       const rows = [];
       for (const a of list) {
@@ -203,9 +219,14 @@ const routes = [
         return v != null ? v : 0;
       };
       const grantedSum = expiring.reduce((s, r) => s + (r.amount || 0), 0);
-      const estSum = expiring.reduce((s, r) => s + estOf(r), 0);
+      // 区域视图：临期批次按当前视图内的账号收窄
+      const shownIds = new Set(rows.map((r) => r.id));
+      const shownExpiring = region ? expiring.filter((g) => shownIds.has(g.accountId)) : expiring;
+      const estSumOf = shownExpiring.reduce((s, r) => s + estOf(r), 0);
+      const grantedSumShown = shownExpiring.reduce((s, r) => s + (r.amount || 0), 0);
       return sendJSON(res, 200, {
         count: rows.length,
+        region: region || undefined,
         rows,
         summary: {
           total: rows.length,
@@ -224,10 +245,10 @@ const routes = [
           // 7 天内到期批次：expiringAmount = **推算剩余**合计（先领先扣）；
           // expiringGrantedAmount = 领取额合计（旧口径，仅作对照）。
           // estimated=false 说明 remaining 拿不到、推不了，回落了领取额。
-          expiringCount: expiring.length,
-          expiringAmount: Number((estOk ? estSum : grantedSum).toFixed(4)),
+          expiringCount: shownExpiring.length,
+          expiringAmount: Number((estOk ? estSumOf : grantedSumShown).toFixed(4)),
           expiringEstimated: estOk,
-          expiringGrantedAmount: Number(grantedSum.toFixed(4)),
+          expiringGrantedAmount: Number(grantedSumShown.toFixed(4)),
         },
         // 免费用户实际能用的就是 addOnQuota（签到/赠送）。写清楚避免误读。
         note: 'addOnQuota 是签到/赠送得到的积分（免费用户实际可用）；userQuota 是订阅套餐内的额度（Free 套餐恒为 0）。两者不可相加。',
@@ -246,12 +267,19 @@ const routes = [
       const limit = Math.min(1000, Math.max(1,
         parseInt((req.url.match(/[?&]limit=(\d+)/) || [])[1] || '100', 10) || 100));
       const credits = require('../../qoder/credits');
-      const rows = credits.creditRecords(limit);
+      // 区域过滤（2026-11-03）：行自带 region。「国内」视图包含缺失的历史行
+      // （国际版上线前只有国内账号）；「国际」只看明确 intl 的行
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' || regionRaw === 'global' ? 'intl' : (regionRaw === 'cn' ? 'cn' : '');
+      let rows = credits.creditRecords(limit);
+      if (region === 'intl') rows = rows.filter((r) => r.region === 'intl');
+      else if (region === 'cn') rows = rows.filter((r) => r.region !== 'intl');
       // 汇总只统计本次返回的窗口，且不补 0——cost 为 null（上游没给 credits）
       // 的行不计入，界面要写清范围，否则「合计」会被读成全部请求的总和
       const sum = rows.reduce((s, r) => s + (r.cost || 0), 0);
       return sendJSON(res, 200, {
         limit,
+        region: region || undefined,
         rows,
         window: {
           cost: Number(sum.toFixed(4)),
@@ -614,8 +642,11 @@ const routes = [
     // 仪表盘用：本地快照，不打上游
     method: 'GET',
     path: '/dashboard',
-    handler: async ({ res }) => {
-      const all = authStore.list();
+    handler: async ({ res, req }) => {
+      // 区域过滤（2026-11-03）：国内/国际独立视图
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' ? 'global' : (regionRaw === 'cn' || regionRaw === 'global' ? regionRaw : '');
+      const all = authStore.list().filter((a) => !region || constants.normalizeRegion(a.region) === region);
       const now = Date.now();
       const accounts = all.map((a) => ({
         id: a.id,
@@ -634,6 +665,7 @@ const routes = [
       }));
       return sendJSON(res, 200, {
         accounts,
+        region: region || undefined,
         summary: {
           total: accounts.length,
           enabled: accounts.filter((a) => a.enabled).length,

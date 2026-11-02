@@ -132,11 +132,22 @@ function resolveQoderMaxTokens(requested) {
   return out;
 }
 
+/** WorkBuddy 的预算。同款逻辑，下限独立可配（第五通道，别套用别人的） */
+const WB_FLOOR = Number(process.env.DUMATE_WORKBUDDY_MIN_MAX_TOKENS || 16384) || 16384;
+function resolveWorkBuddyMaxTokens(requested) {
+  const n = Number(requested);
+  let out = Number.isFinite(n) && n > 0 ? n : DEFAULT_BUDGET;
+  if (WB_FLOOR > 0) out = Math.max(out, WB_FLOOR);
+  if (CEIL > 0) out = Math.min(out, CEIL);
+  return out;
+}
+
 module.exports = {
   resolveMaxTokens,
   resolveQwenMaxTokens,
   resolveTraeworkMaxTokens,
   resolveQoderMaxTokens,
+  resolveWorkBuddyMaxTokens,
   FLOOR,
   QW_FLOOR,
   QW_DEFAULT,
