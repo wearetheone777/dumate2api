@@ -42,7 +42,8 @@
         </div>
       </div>
 
-      <a-empty v-if="!rows.length && !loading" description="还没有 Qoder 账号">
+      <a-empty v-if="!rows.length && !loading"
+        :description="`还没有${regionStore.current === 'intl' ? '国际版（qoder.sh）' : '国内版（qoder.com.cn）'} Qoder 账号`">
         <a-button type="primary" @click="openLogin">添加第一个账号</a-button>
       </a-empty>
 
@@ -263,7 +264,7 @@ import { computed, onMounted, reactive, ref, watch, onUnmounted } from 'vue'
 import { App } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { channelStore, isQoder } from '@/stores/channel'
-import { regionStore } from '@/stores/region'
+import { regionStore, regionParam } from '@/stores/region'
 import { qoderApi } from '@/api/qoder'
 import type { QoderAccount, QoderCreditRow, QoderGrant } from '@/api/qoder'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
@@ -423,10 +424,14 @@ async function cancelLogin() {
 async function load() {
   loading.value = true
   try {
+    // 区域视图（2026-11-03）：账号列表/额度/批次都按当前区域出——
+    // 不带 region 时是**全量**，切到国际视图会显示国内账号；
+    // 且切区域必须重拉（下面 watch regionStore），否则页面停在上一区
+    const r = regionParam() as 'cn' | 'intl' | undefined
     const [s, c, g, p] = await Promise.all([
-      qoderApi.status(),
-      qoderApi.credits().catch(() => ({ data: { rows: [] as QoderCreditRow[] } })),
-      qoderApi.grants(365).catch(() => ({ data: { rows: [] as QoderGrant[] } })),
+      qoderApi.status(r),
+      qoderApi.credits(r).catch(() => ({ data: { rows: [] as QoderCreditRow[] } })),
+      qoderApi.grants(365, r).catch(() => ({ data: { rows: [] as QoderGrant[] } })),
       qoderApi.proEligibility().catch(() => ({ data: { rows: [], note: '' } })),
     ])
     rows.value = s.data.rows || []
@@ -539,4 +544,8 @@ async function checkinAll() {
 onMounted(load)
 onUnmounted(stopTimer)
 watch(() => channelStore.current, (v) => { if (isQoder(v)) load() })
+// 切区域重拉：账号列表与额度都按当前区域视图（顶栏国内版/国际版）。
+// 少了这一条，切到国际视图后平台会停在上一区的数据（bsk 真机抓到：
+// Qoder 账号页切国际后整页空白——status 不传 region 且没重拉）
+watch(() => regionStore.current, () => { if (isQoder()) load() })
 </script>

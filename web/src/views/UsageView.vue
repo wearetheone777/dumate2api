@@ -59,7 +59,14 @@
             />
             <div class="text-xs text-slate-500 mt-2">
               <template v-if="isTw">
-                <template v-if="twTotals.remain != null">
+                <!-- 国际版是订阅制（按请求数计）：没有积分口径，remain 恒 null。
+                     「取不到」与「这个口径不适用」是两回事——国际视图里写
+                     「取不到 TRAE 额度」会让人以为上游坏了（bsk 真机点击抓到） -->
+                <template v-if="twIntlPlanName">
+                  <a-tag color="purple" class="mr-1">{{ twIntlPlanName }}</a-tag>
+                  订阅制·按请求数计，无积分口径
+                </template>
+                <template v-else-if="twTotals.remain != null">
                   按账号独立计算<template v-if="twTotals.limit">
                     · 上限合计 <span class="num">{{ twTotals.limit.toLocaleString('zh-CN') }}</span>
                   </template>
@@ -454,6 +461,12 @@ const twTotals = computed(() => {
     if (r.limit != null) limit = (limit ?? 0) + r.limit
   }
   return { remain, limit }
+})
+// 国际版订阅制（按请求数计）没有积分口径：行里有 intlPlan 就说明这是订阅账号，
+// 额度卡要显示套餐名而不是「取不到 TRAE 额度」（两回事）
+const twIntlPlanName = computed(() => {
+  const hit = twRows.value.find((r) => r.intlPlan)
+  return hit ? hit.intlPlan!.name : ''
 })
 
 // 积分保留 2~4 位：实测单次消耗 0.0025，按 2 位显示会变成 0

@@ -66,6 +66,19 @@ function log(...args) {
 }
 
 /**
+ * 从请求 URL 解析区域视图参数（2026-11-03）：'cn' / 'intl'，缺省/未知 = ''（全量）。
+ * 区域视图是**整页切换**（顶栏「国内版/国际版」），各接口据此只返回该区域数据。
+ */
+function regionParamOf(req) {
+  const m = String((req && req.url) || '').match(/[?&]region=([^&]*)/);
+  if (!m) return '';
+  const raw = decodeURIComponent(m[1]).toLowerCase();
+  if (raw === 'cn') return 'cn';
+  if (raw === 'intl' || raw === 'global') return 'intl';
+  return '';
+}
+
+/**
  * 事件循环卡顿监控。
  *
  * **为什么需要**：网关里所有重活都是**同步**的（签名编码、翻译层解析），
@@ -198,8 +211,12 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
         const a = store.get(id);
         if (a) {
           const reg = String(a.region || '').toLowerCase();
-          // 三通道的区域术语归一：qoder/workbuddy 内部用 global，日志统一 intl
-          req._upstreamRegion = reg === 'cn' ? 'cn' : 'intl';
+          // 三通道的区域术语归一：qoder/workbuddy 内部用 global，日志统一 intl。
+          // **缺省/空 region 一律按国内**——存量账号（区域字段上线前建的）没有
+          // region，判成 intl 会把国内流量整批算进国际视图（2026-11-03 实测：
+          // 10927 条国内行的 region 是空串，只有 210 条真是 intl，但……）
+          // 所以「cn 或缺省 → cn」，「只有明确 global/intl → intl」
+          req._upstreamRegion = (reg === 'global' || reg === 'intl') ? 'intl' : 'cn';
         }
       } catch (e) { /* 区域解析失败不影响请求 */ }
     }
@@ -2077,10 +2094,23 @@ const server = http.createServer(async (req, res) => {
           },
           // TRAE Work：凭证自持（OAuth 换取），没有 wasm 依赖。
           // ready 取决于「有没有可用账号」——与千问的 wasm+登录态判定不同。
+          // region（2026-11-03 区域视图）：顶栏切到国内/国际时，通道状态卡
+          // 必须只显示该区域的账号，否则「国际视图里写着测150 等 3 个」
+          // （bsk 真机点击切换时抓到的 bug）。'' = 全量。
           traework: (() => {
             try {
-              const st = require('./traework').status();
-              return { direct: true, ready: st.ready, accounts: st.accounts, error: st.error || '' };
+              const tw = require('./traework');
+              const reg = regionParamOf(req);
+              const st = tw.status();
+              if (!reg) return { direct: true, ready: st.ready, accounts: st.accounts, error: st.error || '' };
+              const rows = require('./traework/auth').list().filter((a) => (a.region || 'cn') === reg);
+              const ready = rows.some((a) => a.enabled && a.hasAccess !== false);
+              return {
+                direct: true, ready,
+                accounts: rows.length,
+                region: reg,
+                error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
+              };
             } catch (e) {
               return { direct: true, ready: false, accounts: 0, error: e.message };
             }
@@ -2089,8 +2119,17 @@ const server = http.createServer(async (req, res) => {
           // （签名是纯本地算法）。needsClient=false 明确表示不依赖任何客户端安装。
           qoder: (() => {
             try {
+              const reg = regionParamOf(req);
               const st = require('./qoder').status();
-              return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+              if (!reg) return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+              const rows = require('./qoder/auth').list()
+                .filter((a) => (String(a.region || 'cn').toLowerCase() === 'cn' ? 'cn' : 'intl') === reg);
+              const ready = rows.some((a) => a.enabled);
+              return {
+                direct: true, ready, needsClient: false,
+                accounts: rows.length, region: reg,
+                error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
+              };
             } catch (e) {
               return { direct: true, ready: false, needsClient: false, accounts: 0, error: e.message };
             }
@@ -2099,8 +2138,17 @@ const server = http.createServer(async (req, res) => {
           // 凭证自持（登录流程后置期从客户端认证文件导入）。
           workbuddy: (() => {
             try {
+              const reg = regionParamOf(req);
               const st = require('./workbuddy').status();
-              return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+              if (!reg) return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+              const rows = require('./workbuddy/auth').list()
+                .filter((a) => (String(a.region || '').toLowerCase() === 'global' ? 'intl' : 'cn') === reg);
+              const ready = rows.some((a) => a.enabled && a.hasAccess && a.hasRefresh);
+              return {
+                direct: true, ready, needsClient: false,
+                accounts: rows.length, region: reg,
+                error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
+              };
             } catch (e) {
               return { direct: true, ready: false, needsClient: false, accounts: 0, error: e.message };
             }

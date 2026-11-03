@@ -56,6 +56,22 @@ async function discoveryTrail() {
   return { trail, cli };
 }
 
+/** 区域视图参数（2026-11-03）：'cn' / 'intl'，缺省 = ''（全量，行为不变） */
+function regionOf(url) {
+  const m = String(url || '').match(/[?&]region=([^&]*)/);
+  if (!m) return '';
+  const raw = decodeURIComponent(m[1]).toLowerCase();
+  if (raw === 'cn') return 'cn';
+  if (raw === 'intl' || raw === 'global') return 'intl';
+  return '';
+}
+
+/** 账号的区域归一：只有明确 global/intl 才是国际，其余（含缺省）一律国内 */
+function normRegion(v) {
+  const s = String(v || '').toLowerCase();
+  return (s === 'global' || s === 'intl') ? 'intl' : 'cn';
+}
+
 const routes = [
   {
     // 热配置读（F5/F6c）。返回当前生效的快照与落盘文件名——界面上
@@ -220,7 +236,11 @@ const routes = [
             const authStore = require('../../traework/auth');
             // TRAE 是多账号自持凭证：报账号数与最早到期的 token，
             // 顶栏徽标与仪表盘据此提示「要不要重新登录」。
-            const usable = authStore.findUsable();
+            // 区域视图（2026-11-03）：顶栏切国内/国际时只报该区域的账号——
+            // 否则国际视图的通道状态卡会写着国内账号名（bsk 真机抓到）
+            const reg = regionOf(req.url || '');
+            const usableAll = authStore.findUsable();
+            const usable = reg ? usableAll.filter((a) => normRegion(a.region) === reg) : usableAll;
             const soonest = usable.reduce((m, a) => {
               const t = a.expiresAt || Infinity;
               return t < m ? t : m;
@@ -231,13 +251,16 @@ const routes = [
             }, Infinity);
             out.traework = {
               id: 'traework', label: 'TRAE Work', kind: 'direct',
-              ready: st.ready, loggedIn: !!st.loggedIn,
-              accounts: st.accounts || 0,
+              // 区域视图下 ready 按该区域重算：该区没账号就是不可用
+              ready: reg ? usable.length > 0 : st.ready,
+              loggedIn: reg ? usable.length > 0 : !!st.loggedIn,
+              accounts: reg ? usable.length : (st.accounts || 0),
+              region: reg || undefined,
               account: usable[0] ? (usable[0].nickname || usable[0].uid || `账号 ${usable[0].id}`) : '',
               tokenExpiresAt: Number.isFinite(soonest) ? new Date(soonest).toISOString() : null,
               refreshExpiresAt: Number.isFinite(refreshSoonest) ? new Date(refreshSoonest).toISOString() : null,
               refreshExpired: Number.isFinite(refreshSoonest) ? Date.now() >= refreshSoonest : false,
-              error: st.error || '',
+              error: reg && !usable.length ? (reg === 'intl' ? '没有国际版账号' : '没有国内账号') : (st.error || ''),
             };
           } catch (e) {
             out.traework = { id: 'traework', label: 'TRAE Work', kind: 'direct', ready: false, error: e.message };
@@ -248,7 +271,10 @@ const routes = [
             const qoder = require('../../qoder');
             const authStore = require('../../qoder/auth');
             const st = qoder.status();
-            const usable = authStore.findUsable();
+            const usableAll = authStore.findUsable();
+            // 区域视图：qoder 内部 global → 日志/界面统一 intl
+            const reg = regionOf(req.url || '');
+            const usable = reg ? usableAll.filter((a) => (String(a.region || 'cn').toLowerCase() === 'cn' ? 'cn' : 'intl') === reg) : usableAll;
             const soonest = usable.reduce((m, a) => {
               const t = a.expiresAt || Infinity;
               return t < m ? t : m;
@@ -259,18 +285,41 @@ const routes = [
             }, Infinity);
             out.qoder = {
               id: 'qoder', label: 'Qoder', kind: 'direct',
-              ready: st.ready, loggedIn: usable.length > 0,
-              accounts: st.accounts || 0,
+              ready: reg ? usable.length > 0 : st.ready,
+              loggedIn: usable.length > 0,
+              accounts: reg ? usable.length : (st.accounts || 0),
+              region: reg || undefined,
               // 明确标记：不需要任何客户端（与千问的 wasm 依赖形成对照）
               needsClient: false,
               account: usable[0] ? (usable[0].nickname || usable[0].uid || `账号 ${usable[0].id}`) : '',
               tokenExpiresAt: Number.isFinite(soonest) ? new Date(soonest).toISOString() : null,
               refreshExpiresAt: Number.isFinite(refreshSoonest) ? new Date(refreshSoonest).toISOString() : null,
               refreshExpired: Number.isFinite(refreshSoonest) ? Date.now() >= refreshSoonest : false,
-              error: st.error || '',
+              error: reg && !usable.length ? (reg === 'intl' ? '没有国际版账号' : '没有国内账号') : (st.error || ''),
             };
           } catch (e) {
             out.qoder = { id: 'qoder', label: 'Qoder', kind: 'direct', ready: false, needsClient: false, error: e.message };
+          }
+          // WorkBuddy：第五通道（双区域）
+          try {
+            const wb = require('../../workbuddy');
+            const authStore = require('../../workbuddy/auth');
+            const st = wb.status();
+            const usableAll = authStore.findUsable();
+            const reg = regionOf(req.url || '');
+            const usable = reg ? usableAll.filter((a) => (String(a.region || '').toLowerCase() === 'global' ? 'intl' : 'cn') === reg) : usableAll;
+            out.workbuddy = {
+              id: 'workbuddy', label: 'WorkBuddy', kind: 'direct',
+              ready: reg ? usable.length > 0 : st.ready,
+              loggedIn: usable.length > 0,
+              accounts: reg ? usable.length : (st.accounts || 0),
+              region: reg || undefined,
+              needsClient: false,
+              account: usable[0] ? (usable[0].nickname || usable[0].uid || `账号 ${usable[0].id}`) : '',
+              error: reg && !usable.length ? (reg === 'intl' ? '没有国际版账号' : '没有国内账号') : (st.error || ''),
+            };
+          } catch (e) {
+            out.workbuddy = { id: 'workbuddy', label: 'WorkBuddy', kind: 'direct', ready: false, needsClient: false, error: e.message };
           }
           return out;
         })(),

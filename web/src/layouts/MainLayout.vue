@@ -114,7 +114,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
@@ -190,6 +190,9 @@ async function onLogout() {
 
 // 拉一次通道状态给顶栏徽标用。失败不阻断——只是徽标不显示颜色。
 onMounted(() => { channelStore.load() })
+// 区域切换（顶栏国内版/国际版）：通道状态卡按区域重报（accounts 数与当前
+// 账号都按区域过滤），不重拉会显示上一个区域的数字
+watch(() => regionStore.current, () => { channelStore.load() })
 </script>
 
 <style scoped>

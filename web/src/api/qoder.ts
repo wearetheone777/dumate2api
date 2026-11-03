@@ -288,7 +288,7 @@ export const qoderApi = {
       recorded: number
     }>(`/qoder/credits/records?limit=${limit}${region ? `&region=${region}` : ''}`),
   /** 积分过期明细（本地账本 + 上游总余额的先领先扣推算） */
-  grants: (days = 30) => client.get<{
+  grants: (days = 30, region?: 'cn' | 'intl') => client.get<{
     windowDays: number
     rows: QoderGrant[]
     expired: QoderGrant[]
@@ -302,7 +302,7 @@ export const qoderApi = {
     /** expiringAmount 是否推算口径 */
     estimated: boolean
     note: string
-  }>(`/qoder/grants?days=${days}`),
+  }>(`/qoder/grants?days=${days}${region ? `&region=${region}` : ''}`),
   checkin: (id?: number) => client.post('/qoder/checkin', id ? { id } : {}),
   /** Pro 福利包资格（只读，一次性 +1800）。eligible=null 表示查不出来，不猜成「不能领」 */
   proEligibility: (id?: number) =>

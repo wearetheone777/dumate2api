@@ -44,7 +44,8 @@
             <a-card :bordered="false" class="h-full">
               <a-statistic title="剩余额度合计" :value="twTotals.remain ?? '—'" />
               <div class="text-xs text-slate-500 mt-2">
-                <template v-if="twTotals.limit">
+                <template v-if="isIntlRegion()">国际版订阅制按请求数计，无积分口径</template>
+                <template v-else-if="twTotals.limit">
                   上限合计 <span class="num">{{ twTotals.limit.toLocaleString('zh-CN') }}</span>
                 </template>
                 <span v-else>上游未给出额度上限</span>
@@ -53,9 +54,12 @@
           </a-col>
           <a-col :span="8">
             <a-card :bordered="false" class="h-full">
-              <a-statistic title="今日已签到" :value="`${twTotals.checked} / ${twRows.length}`" />
+              <a-statistic
+                :title="isIntlRegion() ? '今日已签到（国际版无签到接口）' : '今日已签到'"
+                :value="isIntlRegion() ? '—' : `${twTotals.checked} / ${twRows.length}`"
+              />
               <div class="text-xs text-slate-500 mt-2">
-                签到每日一次，幂等——重复点不会多领
+                {{ isIntlRegion() ? '国际版只有订阅制额度，没有签到' : '签到每日一次，幂等——重复点不会多领' }}
               </div>
             </a-card>
           </a-col>
@@ -957,7 +961,7 @@ import PageHeader from '@/components/PageHeader.vue'
 import CheckinDetailCard from '@/components/CheckinDetailCard.vue'
 import client from '@/api/client'
 import { channelStore, isTraework, isQwenwork, isQoder } from '@/stores/channel'
-import { regionParam } from '@/stores/region'
+import { regionParam, isIntlRegion } from '@/stores/region'
 import { traeworkApi } from '@/api/traework'
 import type { TraeworkCreditRow, TraeworkStatus, TraeworkCreditRecord } from '@/api/traework'
 import { qwenworkApi } from '@/api/qwenwork'

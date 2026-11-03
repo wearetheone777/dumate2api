@@ -82,18 +82,45 @@ function clampInt(raw, def, min, max) {
 // 按通道取行。**历史记录（channel 未标注）归入搭子**——分通道埋点上线前
 // 只有搭子一条通道，把它们算到「未标注」里，用户切到搭子会看到数字凭空变小，
 // 反而比默认成搭子更像在编数据。只有「查看全部」时才单列未标注。
-// region（2026-11-03）：'cn'/'intl' 区域视图（只对 traework/qoder 有意义）——
-// 「国内」包含 region 缺失的历史行，「国际」只看明确 intl 的行
+// region（2026-11-03）：'cn'/'intl' 区域视图（只对 traework/qoder/workbuddy
+// 有意义）——「国内」包含 region 缺失的历史行，「国际」只看明确 intl 的行。
+// **脏数据兜底**：2026-11-03 当天有一段埋点 bug（缺省 region 被判成 intl），
+// 245 条国内账号（测150/测157）的行被写成 intl。这里按**账号名回查真实区域**
+// 纠偏（账号库是权威来源），否则国际视图会一直挂着国内号的 68M token。
 const CH = require('../../channels');
+function accountRegionMap(ch, region) {
+  if (!region) return null;
+  try {
+    const store = ch === 'qoder' ? require('../../qoder/auth')
+      : ch === 'workbuddy' ? require('../../workbuddy/auth')
+        : require('../../traework/auth');
+    const list = store.list();
+    const out = new Map();
+    for (const a of list) {
+      const name = a.nickname || a.uid || `账号 ${a.id}`;
+      const reg = ch === 'traework'
+        ? (String(a.region || '').toLowerCase() === 'intl' ? 'intl' : 'cn')
+        : (String(a.region || '').toLowerCase() === 'global' || a.region === 'intl' ? 'intl' : 'cn');
+      if (name) out.set(name, reg);
+    }
+    return out.size ? out : null;
+  } catch (e) { return null; }
+}
+
 function loadRows(days, ch, region) {
   const since = Date.now() - days * 86400000;
+  // 只有带区域概念的通道需要账号名 → 区域映射
+  const byName = (ch === 'traework' || ch === 'qoder' || ch === 'workbuddy')
+    ? accountRegionMap(ch, region) : null;
   const { rows } = reqlog.read({
     limit: 0,
     filter: (r) => {
       if (r.ts < since) return false;
       if (!CH.belongs(r, ch)) return false;
-      if (region && (ch === 'traework' || ch === 'qoder')) {
-        const reg = r.region === 'intl' ? 'intl' : 'cn';
+      if (region && (ch === 'traework' || ch === 'qoder' || ch === 'workbuddy')) {
+        // 账号库能查到就以它为准（纠埋点脏数据），查不到才用行内字段
+        const fromAccount = byName && r.account ? byName.get(r.account) : undefined;
+        const reg = fromAccount || (r.region === 'intl' ? 'intl' : 'cn');
         if (reg !== region) return false;
       }
       return true;

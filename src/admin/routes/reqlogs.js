@@ -107,11 +107,29 @@ const routes = [
       // 通道筛选：dumate / qwenwork / traework；缺省或未知值 = 全部通道
       const chRaw = q('channel') ? decodeURIComponent(q('channel')) : '';
       const ch = require('../../channels').normalize(chRaw);
-      // 区域筛选（2026-11-03）：国内/国际独立视图（只对 traework/qoder 有意义）。
-      // 「国内」包含 region 缺失的历史行（国际版上线前只有国内账号）；
-      // 「国际」只看明确 intl 的行
+      // 区域筛选（2026-11-03）：国内/国际独立视图（只对 traework/qoder/workbuddy
+      // 有意义）。「国内」包含 region 缺失的历史行；「国际」只看明确 intl 的行。
+      // **脏数据兜底**：修前的埋点 bug 把 245 条国内账号的行写成 intl，这里按
+      // 账号名回查账号库纠偏（账号库是权威来源），否则国际视图挂着国内号流量
       const regionRaw = q('region') ? decodeURIComponent(q('region')).toLowerCase() : '';
       const region = regionRaw === 'cn' || regionRaw === 'intl' ? regionRaw : '';
+      let regionByName = null;
+      if (region && (ch === 'traework' || ch === 'qoder' || ch === 'workbuddy')) {
+        try {
+          const store = ch === 'qoder' ? require('../../qoder/auth')
+            : ch === 'workbuddy' ? require('../../workbuddy/auth')
+              : require('../../traework/auth');
+          const m = new Map();
+          for (const a of store.list()) {
+            const name = a.nickname || a.uid || `账号 ${a.id}`;
+            const reg = ch === 'traework'
+              ? (String(a.region || '').toLowerCase() === 'intl' ? 'intl' : 'cn')
+              : (String(a.region || '').toLowerCase() === 'global' || a.region === 'intl' ? 'intl' : 'cn');
+            if (name) m.set(name, reg);
+          }
+          regionByName = m.size ? m : null;
+        } catch (e) { regionByName = null; }
+      }
 
       // 过滤语义：all=全部；ok=仅成功（2xx/3xx）；err=仅失败（4xx/5xx/0=中断）
       // 通道语义：历史记录没有 channel 字段，归入搭子——分通道埋点上线前
@@ -120,8 +138,9 @@ const routes = [
       const filter = (r) => {
         if (r.ts < since) return false;
         if (!belongs(r, ch)) return false;
-        if (region && (ch === 'traework' || ch === 'qoder')) {
-          const reg = r.region === 'intl' ? 'intl' : 'cn';
+        if (region && (ch === 'traework' || ch === 'qoder' || ch === 'workbuddy')) {
+          const fromAccount = regionByName && r.account ? regionByName.get(r.account) : undefined;
+          const reg = fromAccount || (r.region === 'intl' ? 'intl' : 'cn');
           if (reg !== region) return false;
         }
         if (type === 'ok') return r.status >= 200 && r.status < 400;

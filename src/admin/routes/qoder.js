@@ -553,7 +553,21 @@ const routes = [
         parseInt((req.url.match(/[?&]days=(\d+)/) || [])[1] || '30', 10) || 30));
       const now = Date.now();
       const withinMs = days * 86400000;
-      const rows = grants.expiring({ withinMs, now });
+      // 区域过滤（2026-11-03）：批次账本按账号回查区域——国际视图不该
+      // 带出国内账号的批次（账号已删的旧批次按国内算，与历史口径一致）
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' || regionRaw === 'global' ? 'intl' : (regionRaw === 'cn' ? 'cn' : '');
+      const accountRegion = new Map();
+      if (region) {
+        try {
+          for (const a of authStore.list()) {
+            accountRegion.set(a.id, constants.normalizeRegion(a.region) === 'global' ? 'intl' : 'cn');
+          }
+        } catch (e) { /* 账号表读不到就不按区域过滤 */ }
+      }
+      const regionOf = (g) => (accountRegion.get(g.accountId) || 'cn');
+      let rows = grants.expiring({ withinMs, now });
+      if (region) rows = rows.filter((g) => regionOf(g) === region);
       const all = grants.readAll();
       // 窗口内批次涉及的账号各打一次上游拿总余额（单 GET，快）。
       // 查不到（网络/账号缺失）记 null——该账号批次推不出，如实 null。
@@ -620,9 +634,11 @@ const routes = [
       const since = all.length ? Math.min(...all.map((r) => r.ts || r.grantedAt || 0)) : null;
       return sendJSON(res, 200, {
         windowDays: days,
+        region: region || undefined,
         rows: rows.map(decorate),
-        // 已过期的批次单列——排查「为什么积分少了」时用得上
-        expired: grants.expired({ now }).slice(0, 50).map(decorate),
+        // 已过期的批次单列——排查「为什么积分少了」时用得上（同样按区域收窄）
+        expired: (region ? grants.expired({ now }).filter((g) => regionOf(g) === region) : grants.expired({ now }))
+          .slice(0, 50).map(decorate),
         total: all.length,
         // 账本最早一条的时刻（null = 账本为空）。界面据此说明覆盖范围。
         since,

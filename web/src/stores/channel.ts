@@ -157,7 +157,18 @@ export const channelStore = reactive({
 
   async load() {
     try {
-      const { data } = await client.get('/system/status')
+      // 区域视图（2026-11-03）：通道状态卡也按当前区域出——不带 region 时
+      // TRAE/Qoder/WorkBuddy 的 accounts 是全量的，国际视图里会显示国内账号
+      // （bsk 真机点击切换时抓到的 bug）。动态 import 避免 store 循环依赖。
+      let rq = ''
+      try {
+        const { regionParam } = await import('@/stores/region')
+        const r = regionParam()
+        if (r) rq = `?region=${r}`
+      } catch {
+        /* region store 不可用（模块初始化早期）就不带 */
+      }
+      const { data } = await client.get(`/system/status${rq}`)
       this.infos = data?.channels || {}
       this.loaded = true
     } catch {
