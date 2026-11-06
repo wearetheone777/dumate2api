@@ -1523,7 +1523,7 @@ import { lastErrorFresh, errorWhen } from '@/utils/lastError'
 import { remainText, remainColor } from '@/utils/remain'
 import { traeworkApi } from '@/api/traework'
 import { workbuddyApi, type WorkBuddyDashAccount, type WorkBuddyCreditRow } from '@/api/workbuddy'
-import { regionStore, regionParam } from '@/stores/region'
+import { regionStore, regionParam, isIntlRegion } from '@/stores/region'
 import { watch as vueWatch } from 'vue'
 import type {
   TraeworkCreditRow, TraeworkDashboard, TraeworkCreditRecord, TraeworkDashAccount,
@@ -1614,8 +1614,10 @@ const wbAccounts = computed(() => wbDash.value?.accounts || [])
 // 接口没回来（或失败）时合计显示 —，不拿 0 充数——0 会被读成「积分用完了」。
 const wbCreditRows = ref<WorkBuddyCreditRow[]>([])
 const wbCreditsLoaded = ref(false)
+// 永不返回 null（未加载时 remain=null → 模板显示 —），
+// 避免模板里到处写可能空值的 ?. 链——语义与「—」空态一致
 const wbCreditsTotals = computed(() => {
-  if (!wbCreditsLoaded.value) return null
+  if (!wbCreditsLoaded.value) return { remain: null, checked: 0, counted: 0 }
   let remain: number | null = null
   let checked = 0
   let counted = 0

@@ -17,7 +17,6 @@
   "engines": {
     "node": ">=18"
   },
-  "packageManager": "pnpm@12.4.2",
   "license": "MIT",
   "dependencies": {
     "playwright-core": "^1.63.0"

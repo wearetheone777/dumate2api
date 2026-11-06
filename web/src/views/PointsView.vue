@@ -1128,7 +1128,7 @@
     </template>
 
     <!-- 签到详情：按月份/年份查看。千问办公没有签到体系，不渲染。 -->
-    <CheckinDetailCard v-if="!isQw" />
+    <CheckinDetailCard v-if="!isQw && !isWb" />
   </div>
 </template>
 

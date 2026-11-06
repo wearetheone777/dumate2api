@@ -188,8 +188,19 @@ async function onLogout() {
   router.push('/login')
 }
 
-// 拉一次通道状态给顶栏徽标用。失败不阻断——只是徽标不显示颜色。
-onMounted(() => { channelStore.load() })
+// URL 参数直达通道/区域视图（?channel=workbuddy&region=cn）：让「某通道某
+// 区域的管理视图」可以被链接分享、被书签直达，也让自动化走查不必依赖点击
+// 顶栏切换器。只认合法值，非法参数静默忽略（不报错——URL 是数据不是指令）。
+onMounted(() => {
+  try {
+    const q = new URLSearchParams(window.location.search)
+    const ch = q.get('channel')
+    if (ch && CHANNELS.some((c) => c.id === ch)) channelStore.set(ch)
+    const rg = q.get('region')
+    if (rg === 'cn' || rg === 'intl') regionStore.set(rg)
+  } catch { /* URL 解析失败不影响进入默认视图 */ }
+  channelStore.load()
+})
 // 区域切换（顶栏国内版/国际版）：通道状态卡按区域重报（accounts 数与当前
 // 账号都按区域过滤），不重拉会显示上一个区域的数字
 watch(() => regionStore.current, () => { channelStore.load() })

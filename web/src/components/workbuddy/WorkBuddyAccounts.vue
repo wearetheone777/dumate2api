@@ -74,6 +74,10 @@
                 <div class="font-medium truncate">
                   {{ a.nickname || a.uid || '未命名' }}
                   <a-tag v-if="!a.enabled" color="default" class="ml-1">已停用</a-tag>
+                  <!-- 改名：后端 PATCH 支持 nickname，此前一直没有入口 -->
+                  <a-button type="text" size="small" class="ml-1" style="padding: 0 4px" @click="openRename(a)">
+                    <EditOutlined />
+                  </a-button>
                 </div>
                 <div class="text-xs text-slate-400 font-mono mt-1 truncate">
                   UID {{ a.uid || '—' }}
@@ -102,6 +106,8 @@
               <div>
                 <div class="text-xs text-slate-400">剩余积分</div>
                 <div class="num">{{ creditOf(a.id)?.total ?? '—' }}</div>
+                <!-- 临期包：不用点开详情就该看见的风险（已用完的包不算） -->
+                <div v-if="soonPackText(a)" class="text-xs text-orange-700">{{ soonPackText(a) }}</div>
               </div>
               <div>
                 <div class="text-xs text-slate-400">今日签到</div>
@@ -126,6 +132,7 @@
 
             <div class="mt-3 flex flex-wrap gap-1">
               <a-button v-if="!isIntl" size="small" :loading="busy[a.id]" @click="checkin(a)">签到</a-button>
+              <a-button size="small" @click="openDetail(a)">详情</a-button>
               <a-popconfirm title="确定删除这个账号？" @confirm="remove(a)">
                 <a-button size="small" danger>删除</a-button>
               </a-popconfirm>
@@ -174,6 +181,56 @@
       <a-alert v-if="importError" type="error" show-icon class="mt-3" :message="importError" />
     </a-modal>
 
+    <!-- 详情：完整字段 + 逐包明细（含到期）。credits 里的 packages 从来没在
+         账号页展示过——「哪个包快过期」要进详情才看得见 -->
+    <a-modal v-model:open="detailOpen" :title="`账号详情 · ${detailRow?.nickname || detailRow?.uid || ''}`" :footer="null" width="560">
+      <template v-if="detailRow">
+        <a-descriptions :column="1" size="small" bordered class="mb-3">
+          <a-descriptions-item label="UID"><span class="font-mono text-xs">{{ detailRow.uid || '—' }}</span></a-descriptions-item>
+          <a-descriptions-item label="区域">{{ detailRow.region === 'global' ? '国际（workbuddy.ai）' : '国内（copilot.tencent.com）' }}</a-descriptions-item>
+          <a-descriptions-item label="凭证域"><span class="font-mono text-xs">{{ detailRow.domain || '—' }}</span></a-descriptions-item>
+          <a-descriptions-item label="来源">{{ sourceText(detailRow.source) }}</a-descriptions-item>
+          <a-descriptions-item label="创建时间">{{ detailRow.createdAt ? dateText(detailRow.createdAt) : '—' }}</a-descriptions-item>
+          <a-descriptions-item label="access token">{{ detailRow.expiresAt ? dateText(detailRow.expiresAt) : '—' }}</a-descriptions-item>
+          <a-descriptions-item label="refresh token">
+            {{ detailRow.refreshExpiresAt ? dateText(detailRow.refreshExpiresAt) : '—' }}
+            <a-tag v-if="detailRow.refreshExpiresAt && Date.now() >= detailRow.refreshExpiresAt" color="red" class="ml-1">已过期</a-tag>
+          </a-descriptions-item>
+          <a-descriptions-item label="refresh 尾"><span class="font-mono text-xs">…{{ detailRow.refreshTail || '—' }}</span></a-descriptions-item>
+          <a-descriptions-item label="最近错误">
+            <span v-if="detailRow.lastError" :class="errFresh(detailRow) ? 'text-red-600' : 'text-slate-500'">
+              {{ errorWhen(errAt(detailRow)) }}{{ detailRow.lastError }}
+            </span>
+            <span v-else class="text-slate-400">无</span>
+          </a-descriptions-item>
+        </a-descriptions>
+        <div class="section-title mb-2">套餐包明细</div>
+        <template v-if="creditOf(detailRow.id)?.packages?.length">
+          <div v-for="(p, i) in creditOf(detailRow.id)!.packages" :key="i"
+            class="flex items-center justify-between text-xs py-1"
+            :class="packSoon(p) ? 'text-orange-700' : ''">
+            <span>
+              {{ p.name }}
+              <a-tag v-if="packSoon(p)" color="orange" class="ml-1" size="small">还剩 {{ packDaysLeft(p) }} 天</a-tag>
+            </span>
+            <span class="num">
+              {{ p.remainPrecise != null ? p.remainPrecise : p.remain }}
+              <span class="text-slate-400">/ {{ p.size || '—' }}</span>
+              <span class="text-slate-400 ml-2">{{ p.expireAt ? `到期 ${new Date(p.expireAt).toLocaleDateString('zh-CN')}` : '到期未知' }}</span>
+            </span>
+          </div>
+        </template>
+        <div v-else class="text-xs text-slate-400">
+          {{ detailRow.region === 'global' ? '国际版是订阅制，无套餐包明细' : '该账号没有套餐包明细（额度接口失败或确实为空）' }}
+        </div>
+      </template>
+    </a-modal>
+
+    <!-- 改名：PATCH /accounts/:id 的 nickname 字段此前没有入口 -->
+    <a-modal v-model:open="renameOpen" title="修改昵称" @ok="doRename" :confirm-loading="renameLoading" ok-text="保存" cancel-text="取消">
+      <a-input v-model:value="renameValue" placeholder="昵称（留空恢复为 UID 显示）" @press-enter="doRename" />
+    </a-modal>
+
     <!-- 签到结果 -->
     <a-alert v-if="checkinMsg" :type="checkinMsgType" show-icon class="mt-4" message="签到结果">
       <template #description>
@@ -188,6 +245,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { App } from 'ant-design-vue'
+import { EditOutlined } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { channelStore, isWorkBuddy } from '@/stores/channel'
 import { regionStore, regionParam } from '@/stores/region'
@@ -243,6 +301,56 @@ function checkinText(a: WorkBuddyAccount) {
 
 function tokenExpired(a: WorkBuddyAccount) {
   return !!a.expiresAt && Date.now() >= a.expiresAt
+}
+
+// ---- 套餐包临期（与积分明细页同口径：7 天窗口，已用完的包不算）----
+const packSoon = (p: NonNullable<WorkBuddyCreditRow['packages']>[number]) => {
+  const now = Date.now()
+  return !!(p.expireAt && p.expireAt > now && p.expireAt <= now + 7 * 86400000 && p.remain > 0)
+}
+const packDaysLeft = (p: NonNullable<WorkBuddyCreditRow['packages']>[number]) =>
+  p.expireAt ? Math.max(0, Math.ceil((p.expireAt - Date.now()) / 86400000)) : 0
+
+function soonPackText(a: WorkBuddyAccount): string {
+  const c = creditOf(a.id)
+  if (!c?.packages) return ''
+  const soon = c.packages.filter(packSoon)
+  if (!soon.length) return ''
+  const sum = soon.reduce((s, p) => s + (p.remainPrecise != null ? p.remainPrecise : p.remain), 0)
+  return `${soon.length} 个包 7 天内到期（${sum}）`
+}
+
+// ---- 详情弹窗 ----
+const detailOpen = ref(false)
+const detailRow = ref<WorkBuddyAccount | null>(null)
+function openDetail(a: WorkBuddyAccount) {
+  detailRow.value = a
+  detailOpen.value = true
+}
+
+// ---- 改名 ----
+const renameOpen = ref(false)
+const renameLoading = ref(false)
+const renameValue = ref('')
+let renameId: number | null = null
+function openRename(a: WorkBuddyAccount) {
+  renameId = a.id
+  renameValue.value = a.nickname || ''
+  renameOpen.value = true
+}
+async function doRename() {
+  if (renameId == null) return
+  renameLoading.value = true
+  try {
+    await workbuddyApi.patchAccount(renameId, { nickname: renameValue.value.trim() })
+    message.success('昵称已更新')
+    renameOpen.value = false
+    await load()
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '改名失败')
+  } finally {
+    renameLoading.value = false
+  }
 }
 
 const dateText = (ts: number) => new Date(ts).toLocaleString('zh-CN', { hour12: false })
