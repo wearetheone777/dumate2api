@@ -43,6 +43,27 @@ function agentOf(auth) {
   return require('../proxy-agent').getAgentFor(auth);
 }
 
+// 额度/付费状态的主机与路径按区域走（2026-11-03 国际版接入，证据见
+// constants.js 的国际版段与 hub fetch_entitlement）：国内 ug 族 v2 路径打
+// api.trae.cn；国际 v1 路径打账号落点域（实测回调给 api-sg-central.trae.ai；
+// 没落点信息时回落 hub 美区实测的 grow-normal.traeapi.us）。签到/活动接口
+// 国际版没有（hub 实测 404）。
+function payTargetOf(auth) {
+  if (c.regionOf(auth) === 'intl') {
+    const apiHost = String((auth && auth.apiHost) || '');
+    const host = apiHost && /trae\.ai$|traeapi\.us$|trae\.ai\/|traeapi\.us\//.test(apiHost)
+      ? apiHost.replace(/\/+$/, '')
+      : c.PAY_HOST_INTL;
+    return { host, entUsage: c.EP_ENT_USAGE_V1, payStatus: c.EP_PAY_STATUS_V1 };
+  }
+  return { host: c.UG_HOST, entUsage: c.EP_ENT_USAGE, payStatus: c.EP_PAY_STATUS };
+}
+
+/** 国际版没有 ug 族签到/活动接口——明确报出，不白打一次 404 */
+function intlNoCheckin() {
+  return { ok: false, error: '国际版没有签到/活动接口（上游仅国内版提供，见 trae2api-hub 实测）' };
+}
+
 /**
  * 查签到状态：{ checkedIn, credits, extraCredits, enable }
  *
@@ -52,6 +73,7 @@ function agentOf(auth) {
  * credits 是**签到可得的额度**（不是余额），did_checked_in 是今天是否已领。
  */
 async function status(auth) {
+  if (c.regionOf(auth) === 'intl') return intlNoCheckin();
   let agent;
   try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
   const r = await c.request(c.UG_HOST, c.EP_CHECKIN_STATUS, {
@@ -62,12 +84,18 @@ async function status(auth) {
   }
   // 上游把结果包在 data 里，也可能是平铺——两种都认
   const d = r.data.data || r.data;
+  const credits = Number(d.credits ?? d.credit ?? 0) || 0;
+  const extraCredits = Number(d.extra_credits ?? d.extraCredits ?? 0) || 0;
   return {
     ok: true,
     checkedIn: !!(d.checked_in ?? d.did_checked_in ?? d.checkedIn),
-    credits: Number(d.credits ?? d.credit ?? 0) || 0,
+    credits,
     // 额外赠送（如连续签到奖励）。没有就如实给 0，不编
-    extraCredits: Number(d.extra_credits ?? d.extraCredits ?? 0) || 0,
+    extraCredits,
+    // **credits 与 extra_credits 是二选一，不是两笔相加**（traework2api-panel
+    // 实测：「credits=100 + extra=100 显示 200，实到 100」）。要给「本次可得」
+    // 一个数时取较大的那个；两者都保留是为了让界面能如实展示上游原值。
+    claimable: Math.max(credits, extraCredits),
     enable: d.enable !== false,
   };
 }
@@ -194,7 +222,8 @@ async function claim(auth) {
 async function usage(auth) {
   let agent;
   try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
-  const r = await c.request(c.UG_HOST, c.EP_ENT_USAGE, {
+  const t = payTargetOf(auth);
+  const r = await c.request(t.host, t.entUsage, {
     method: 'POST', body: {}, headers: ugHeaders(withDevice(auth)), agent,
   });
   if (r.status !== 200 || !r.data) {
@@ -227,14 +256,50 @@ async function usage(auth) {
       if (!it || typeof it !== 'object') continue;
       const base = it.entitlement_base_info || it;
       const v = Number(base.credits_limit ?? base.creditsLimit ?? base.limit ?? base.total_amount);
-      if (Number.isFinite(v)) { sum += v; any = true; }
+      // 负数 = 不限量，不能计入「总额」——加个 -1 只会让合计变小
+      if (Number.isFinite(v) && v >= 0) { sum += v; any = true; }
     }
     if (any) limit = sum;
   }
 
   // 剩余 = 总额 − 已消耗；总额拿不到时如实返回 null
   const remain = limit == null ? null : Math.max(0, limit - consumed);
-  return { ok: true, remain, limit, consumed: anyConsumed ? consumed : null, packs: parsePacks(d), raw: d };
+  // 订阅形态只在**国际账号**上解析（2026-11-03 真机教训：国内额度包里也带
+  // subscription_extra.quota 字段，不按区域分就会把国内号的积分口径误显示
+  // 成「按请求数计」——国内号是有积分账的）
+  const intlPlan = c.regionOf(auth) === 'intl' ? parseIntlPlan(d) : null;
+  return { ok: true, remain, limit, consumed: anyConsumed ? consumed : null, packs: parsePacks(d), intlPlan, raw: d };
+}
+
+/**
+ * 国际版的订阅形态（2026-11-03 真机实测，Free plan）。
+ *
+ * 国际账号没有 usage_summary（国内的 total/consumed 积分口径在订阅制上
+ * 不存在），额度是**请求数限额**：premium fast/slow、advanced、
+ * auto_completion、solo 并行数。积分口径的 remain/limit 对它恒为 null
+ * （不是「额度为零」，是「这个口径不适用」），订阅信息单独走 intlPlan。
+ * 国内的额度包没有 subscription_extra，这里恒返回 null。
+ */
+function parseIntlPlan(d) {
+  const num = (v) => (Number.isFinite(Number(v)) && v != null ? Number(v) : null);
+  const list = (d && Array.isArray(d.user_entitlement_pack_list)) ? d.user_entitlement_pack_list : [];
+  for (const it of list) {
+    if (!it || typeof it !== 'object') continue;
+    const b = it.entitlement_base_info || {};
+    const q = b.product_extra && b.product_extra.subscription_extra
+      && b.product_extra.subscription_extra.quota;
+    if (!q || typeof q !== 'object') continue;
+    return {
+      name: String(it.display_desc || '订阅'),
+      premiumFast: num(q.premium_model_fast_request_limit),
+      premiumSlow: num(q.premium_model_slow_request_limit),
+      advanced: num(q.advanced_model_request_limit),
+      autoCompletion: num(q.auto_completion_limit),
+      soloParallel: num(q.solo_agent_parallel_limit),
+      endAt: b.end_time ? Number(b.end_time) * 1000 : null,
+    };
+  }
+  return null;
 }
 
 /**
@@ -260,25 +325,304 @@ function parsePacks(d) {
     if (!it || typeof it !== 'object') continue;
     const b = it.entitlement_base_info || {};
     const q = b.quota || {};
+    // 官方收银台同口径剔除三类包（traework2api-panel 的 creditspool_test）：
+    // 促销包（product_type=3）、隐藏包（is_hide）、已失效包（status=3）。
+    // 不剔除的话「剩余额」会被这些不可用的包抬高，界面显示的数字是假的。
+    const productType = Number(it.product_type ?? it.ProductType ?? b.product_type);
+    const hidden = it.is_hide === true || it.IsHide === true || it.hide === true || b.is_hide === true;
+    const statusNum = it.status == null ? null : Number(it.status);
+    if (productType === 3 || hidden || statusNum === 3) continue;
+
     const limit = Number(q.credits_limit ?? b.credits_limit);
     const used = Number((it.usage || {}).credits_amount);
     const exp = Number(it.expire_time || b.end_time) || null;
     if (!Number.isFinite(limit) && !Number.isFinite(used) && !exp) continue;
-    const lim = Number.isFinite(limit) ? limit : null;
+    // credits_limit = -1 表示**不限量**（官方语义）。按普通数字算会得到
+    // 「剩余 0」，把不限量读成用完了。
+    const unlimited = Number.isFinite(limit) && limit < 0;
+    const lim = Number.isFinite(limit) && !unlimited ? limit : null;
     const usd = Number.isFinite(used) ? used : 0;
     out.push({
       name: String(it.display_desc || it.group_name || '额度包'),
       // 面额拿不到就 null——补 0 会被读成「这个包是空的」
       limit: lim,
+      unlimited,
       used: Number.isFinite(used) ? usd : null,
-      // 剩余按 limit − used；面额缺失时推不出来，如实 null
+      // 剩余按 limit − used；面额缺失/不限量时推不出来，如实 null
       remain: lim == null ? null : Math.max(0, Number((lim - usd).toFixed(4))),
       expireAt: exp ? exp * 1000 : null,
-      status: it.status == null ? null : Number(it.status),
+      status: statusNum,
     });
   }
   // 先按到期时间排，让「最快过期的」排在最前
   return out.sort((a, b) => (a.expireAt || Infinity) - (b.expireAt || Infinity));
+}
+
+/**
+ * 付费状态 / 套餐身份 / 活动资格（`ide_user_pay_status`，2026-10-31 实测）。
+ *
+ * 这个端点补上了两块此前拿不到的信息：
+ *
+ *   1. **套餐档位**：`user_pay_identity_str`（实测 "Free"）+ `is_pay_freshman`。
+ *      TRAE 的账一直是「单 credits + 签到」，看不出账号是什么套餐——
+ *      界面只能说「额度还剩多少」，答不出「为什么这么少」。
+ *   2. **活动资格**：`commercial_activities[]` 里带 `activity_type` 与
+ *      `work_extra`（eligible/grantable/granted/general_credits）。
+ *      实测 `send_message_reward`（type 105）`eligible:true` +
+ *      `general_credits:500`——这是清单里「活动/邀请积分」的数据源，
+ *      也是「为什么我这号没有活动」这个问题的答案。
+ *
+ * **解析口径**：只搬上游原值，不推断。`commercial_activities` 原样透出
+ * （activity_type 的语义映射单独给一份，但**不改写原数组**）；能力位
+ * （`enable_solo_*`）原样保留——它们是布尔，缺字段就是 null 而不是 false
+ * （false 会被读成「明确不支持」，而真相是「上游没说」）。
+ *
+ * 失败不阻断任何东西：调用方（管理端 /status）拿不到就当没有这组信息，
+ * 界面显示「—」而不是编一个 Free。
+ */
+async function payStatus(auth) {
+  let agent;
+  try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
+  const t = payTargetOf(auth);
+  const r = await c.request(t.host, t.payStatus, {
+    method: 'POST', body: {}, headers: ugHeaders(withDevice(auth)), agent,
+  });
+  if (r.status !== 200 || !r.data) {
+    return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+  }
+  const d = r.data.data || r.data;
+  return { ok: true, ...parsePayStatus(d), raw: d };
+}
+
+/** activity_type 的语义（来自上游 activity_id 对照，非官方文档） */
+const ACTIVITY_KINDS = {
+  101: 'work_lite',
+  102: 'new_user_credits',
+  103: 'work_fission',
+  105: 'send_message_reward',
+};
+
+/**
+ * 纯函数：上游 pay_status 体 → 界面用的扁平结构。便于离线验证。
+ *
+ * `capabilities` 里每个值都可能是 null（上游没给这个字段），
+ * **不用 `!!` 兜成 false**——见函数头注释。
+ */
+function parsePayStatus(d) {
+  const src = d && typeof d === 'object' ? d : {};
+  const boolOrNull = (v) => (typeof v === 'boolean' ? v : null);
+  const numOrNull = (v) => (v == null ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
+
+  const acts = Array.isArray(src.commercial_activities) ? src.commercial_activities : [];
+  const activities = acts.map((a) => {
+    if (!a || typeof a !== 'object') return null;
+    const type = numOrNull(a.activity_type);
+    const we = a.work_extra && typeof a.work_extra === 'object' ? a.work_extra : {};
+    return {
+      activityId: String(a.activity_id || ''),
+      activityType: type,
+      // 语义映射只作展示辅助；映射不上就 null，不改写 type
+      kind: ACTIVITY_KINDS[type] || null,
+      enabled: typeof a.Enabled === 'boolean' ? a.Enabled : boolOrNull(a.enabled),
+      startAt: numOrNull(a.start_time_ms),
+      endAt: numOrNull(a.end_time_ms),
+      // 活动资格三态（work_extra 只在这几类活动里出现）
+      eligible: boolOrNull(we.eligible),
+      grantable: boolOrNull(we.grantable),
+      granted: boolOrNull(we.granted),
+      // 可领的通用积分（实测 send_message_reward=500）
+      generalCredits: numOrNull(we.general_credits),
+    };
+  }).filter(Boolean);
+
+  return {
+    // 套餐档位（实测 "Free"）；上游没给就 null
+    payIdentity: src.user_pay_identity_str || null,
+    payIdentityCode: numOrNull(src.user_pay_identity),
+    isFreshman: boolOrNull(src.is_pay_freshman),
+    isCreditsBilling: boolOrNull(src.is_credits_billing),
+    supportCommercialization: boolOrNull(src.is_support_commercialization),
+    // 能力位：null = 上游没说，不是「不支持」
+    capabilities: {
+      soloLite: boolOrNull(src.enable_solo_lite),
+      soloWeb: boolOrNull(src.enable_solo_web),
+      soloCoder: boolOrNull(src.enable_solo_coder),
+      soloBuilder: boolOrNull(src.enable_solo_builder),
+      fission: boolOrNull(src.enable_fission),
+    },
+    activities,
+    // 服务端时间（用来对活动起止做本地时区换算，不依赖本机时钟）
+    serverTimeMs: numOrNull(src.server_time_ms),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 活动/权益领取（2026-11-01，traework2api-panel 实测结论，清单 P2「活动/邀请积分」）。
+//
+// 与签到的关系：签到领的是 checkin_credits（固定 150）；这里是 commercial
+// 活动——send_message_reward（type 105，实测 500 积分）、新人/学生认证/裂变等。
+// payStatus 的 activities 只给**资格**（eligible/grantable），真正的 activity_id
+// 与有效期只在 activity/info 清单里。
+//
+// 两条纪律（panel 的 ClaimActivities 同款，照抄不猜）：
+//   · 9069/9090/9070 是「现在领不到」而不是错误——记成错误会让调度器每天报警；
+//   · notes 只写「哪条、什么结论」，不写积分数字——响应体里没有可信的到账
+//     额度（与签到不同，这里连 gained 字段都没有）。到账与否用 usage 前后
+//     差值看总量。
+// ---------------------------------------------------------------------------
+
+/** 「现在领不到」的业务码：不是失败，下一轮自然再试 */
+const GRANT_PENDING_CODES = new Set([9069, 9090, 9070]);
+
+/**
+ * 纯函数：activity/info 清单体 → 待领列表。
+ * 过滤掉未启用与不在有效期内的（start/end 为 0 = 不限，panel 同口径）。
+ */
+function parseActivityList(d, nowMs) {
+  const now = Number(nowMs) || Date.now();
+  const list = (d && Array.isArray(d.commercial_activities)) ? d.commercial_activities : [];
+  const out = [];
+  for (const a of list) {
+    if (!a || typeof a !== 'object') continue;
+    const id = String(a.activity_id || '');
+    if (!id) continue;
+    const enabled = typeof a.Enabled === 'boolean' ? a.Enabled : a.enabled === true;
+    if (!enabled) continue;
+    const start = Number(a.start_time_ms) || 0;
+    const end = Number(a.end_time_ms) || 0;
+    if ((start && now < start) || (end && now > end)) continue;
+    const type = Number(a.activity_type) || 0;
+    out.push({ activityId: id, activityType: type, kind: ACTIVITY_KINDS[type] || null });
+  }
+  return out;
+}
+
+/** ug 族 POST 的统一小包装：HTTP 非 200 或 body 不带 code 时如实报错 */
+async function ugPost(auth, ep, body) {
+  let agent;
+  try { agent = agentOf(auth); } catch (e) { return { ok: false, error: e.message }; }
+  const r = await c.request(c.UG_HOST, ep, {
+    method: 'POST', body, headers: ugHeaders(withDevice(auth)), agent,
+  });
+  if (r.status !== 200) {
+    return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+  }
+  const d = (r.data && (r.data.data || r.data)) || {};
+  // code 缺省按 0（成功）——与签到 claim 的判法同口径
+  const code = Number(d.code ?? 0) || 0;
+  return { ok: true, code, message: String(d.message || ''), workExtra: d.work_extra || null, raw: d };
+}
+
+/**
+ * 领取单条活动的结论归一（纯函数，便于离线验证）。
+ * 返回 { state: 'claimed'|'granted'|'pending'|'error'|'noop', prizeText?, error? }
+ *   claimed = 本次领到；granted = 已领过（granted=true + grantable=false，panel 实测）；
+ *   pending = 现在领不到（不报警）；noop = 受理了但没有 work_extra 可报（学生认证实测如此）；
+ *   error   = 真失败。
+ */
+function claimVerdict(code, message, workExtra) {
+  if (code === 0) {
+    // 空对象（{}）与缺失等价：没有 granted/grantable 键就没有可报的结论
+    const we = workExtra && typeof workExtra === 'object'
+      && (workExtra.granted != null || workExtra.grantable != null) ? workExtra : null;
+    if (!we) return { state: 'noop' };
+    if (we.granted === true) {
+      return { state: we.grantable === false ? 'granted' : 'claimed', prizeText: String(we.prize_text || '') || null };
+    }
+    // granted=false：受理但没发（可能 grantable=false 上游没给 granted 的变体）
+    return { state: we.grantable === false ? 'granted' : 'pending' };
+  }
+  if (GRANT_PENDING_CODES.has(code)) return { state: 'pending', error: `code=${code} ${message}`.trim() };
+  return { state: 'error', error: `code=${code} ${message}`.trim() };
+}
+
+/**
+ * 领取当前可领的活动 + 权益（三条链路，panel 同构）。
+ * 返回 { ok, notes: [{activityId, kind, state, prizeText?, error?}], benefit, error? }。
+ * 领不到不是失败（pending 不进 error）；网络/HTTP 层错误单独记但不中断其余链路。
+ */
+async function claimActivities(rawAuth) {
+  const auth = await withFreshToken(rawAuth);
+  // 国际版没有活动接口（hub 实测 ug 族 404）——明确报出，不白打四条链路
+  if (c.regionOf(auth) === 'intl') {
+    return { ok: false, notes: [], benefit: { state: 'error', error: intlNoCheckin().error }, error: intlNoCheckin().error };
+  }
+  const notes = [];
+  let hardError = null;
+  // 清单：拿 activity_id / type / 有效期。失败时其余链路没有入参，直接返回
+  const listR = await ugPost(auth, c.EP_ACTIVITY_INFO, { req_source: 1 });
+  if (!listR.ok) return { ok: false, notes, error: `活动清单: ${listR.error}` };
+  const acts = parseActivityList(listR.raw);
+  for (const act of acts) {
+    // 103 裂变必须带 activity_id 单独领；其余走 action（panel 实测，见 constants 注释）
+    const ep = act.activityType === 103 ? c.EP_FISSION_GRANT : c.EP_ACTIVITY_ACTION;
+    const r = await ugPost(auth, ep, { activity_id: act.activityId, req_source: 1 });
+    if (!r.ok) {
+      notes.push({ ...act, state: 'error', error: r.error });
+      continue;
+    }
+    const v = claimVerdict(r.code, r.message, r.workExtra);
+    notes.push({ ...act, ...v });
+    if (v.state === 'error' && !hardError) hardError = `${act.activityId}: ${v.error}`;
+  }
+  // 兜底总入口：action 不认的那几类（send_message_reward 实测落在这里）
+  const deviceId = (withDevice(auth) || {}).deviceId || '';
+  const b = await ugPost(auth, c.EP_GRANT_BENEFIT, { trae_client: 'Lite', device_id: deviceId });
+  let benefit;
+  if (!b.ok) {
+    benefit = { state: 'error', error: b.error };
+  } else {
+    const v = claimVerdict(b.code, b.message, b.workExtra);
+    // benefit 没有 activity 维度，prize_text 同样透出
+    benefit = { ...v };
+    if (v.state === 'error') hardError = hardError || `权益: ${v.error}`;
+  }
+  return { ok: !hardError, notes, benefit, error: hardError || '' };
+}
+
+/**
+ * 领活动并回写账号（供管理端手动触发与定时任务调用）。
+ *
+ * 前后各取一次余额算总差值（与签到 computeGained 同口径）：活动领取的响应
+ * 不带发放数额，差值是「这次到底到账没有」的唯一可见依据。差值为 0 也如实
+ * 返回——可能是领到的都是「已领过」，也可能是延迟入账，不在这一层粉饰。
+ * 快照失败不影响领取本身（gained 如实 null）。
+ */
+async function claimActivitiesAndSave(rawAuth, authStore, opts = {}) {
+  const auth = await withFreshToken(rawAuth);
+  const before = await usage(auth);
+  const r = await claimActivities(auth);
+  const after = r.ok ? await usage(auth) : null;
+  const creditsBefore = before.ok ? before.remain : null;
+  const credits = after && after.ok ? after.remain : null;
+  const gained = (r.ok && credits != null && creditsBefore != null)
+    ? computeGained(creditsBefore, credits, null)
+    : null;
+  const claimed = r.notes.filter((n) => n.state === 'claimed' || n.state === 'granted');
+  if (r.ok) {
+    const fields = { lastError: '' };
+    if (credits != null) fields.credits = credits;
+    authStore.patch(auth.id, fields);
+    // 只有确实有结论（领到/已领）才记账，全是 pending 的不刷流水
+    if (claimed.length || r.benefit.state === 'claimed' || r.benefit.state === 'granted') {
+      ledger.append({
+        channel: 'traework', account_id: auth.id, account: auth.nickname || auth.uid || '',
+        at: Date.now(), credits: gained, source: 'activity',
+        detail: claimed.map((n) => n.activityId).join(','),
+      });
+    }
+  } else {
+    authStore.patch(auth.id, { lastError: `活动领取失败: ${r.error}` });
+  }
+  return {
+    ok: r.ok,
+    error: r.error || '',
+    notes: r.notes,
+    benefit: r.benefit,
+    creditsBefore,
+    credits,
+    gained,
+  };
 }
 
 /**
@@ -363,4 +707,4 @@ async function checkinAndSave(rawAuth, authStore, opts = {}) {
   };
 }
 
-module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining };
+module.exports = { status, claim, claimWithRetry, usage, checkinAndSave, computeGained, withFreshToken, backoffMs, backoffRemaining, parsePacks, payStatus, parsePayStatus, ACTIVITY_KINDS, claimActivities, claimActivitiesAndSave, parseActivityList, claimVerdict, GRANT_PENDING_CODES };

@@ -183,6 +183,43 @@ async function fetchModels(account, { force = false } = {}) {
  * 不落盘：返回 patch 字段由调用方写回，保持「读-改-写」在一次调用里，
  * 避免并发刷新时后写的覆盖先写的（与 qwenwork/auth.js 同一约定）。
  */
+/** access token 的凭证族（hub 同款口径）：device(OAuth) / job(PAT 交换) */
+function tokenFamilyOf(account) {
+  const rt = String((account && account.refreshToken) || '');
+  if (rt.startsWith('drt-')) return 'device';
+  if (rt.startsWith('jrt-')) return 'job';
+  return (account && account.personalToken) ? 'pat' : 'device';
+}
+
+/** jobToken 交换/刷新的公共出口：POST → {token, refresh_token, expires_in(ms)} */
+async function jobTokenPost(url, body, account) {
+  let agent = null;
+  try { agent = require('../proxy-agent').getAgentFor(account); } catch (e) {
+    return { ok: false, error: `出站代理配置错误: ${e.message}` };
+  }
+  const r = await request(url, {
+    method: 'POST',
+    headers: { 'User-Agent': 'qoder/1.0.0', 'Login-Version': c.LOGIN_VERSION },
+    body,
+    agent,
+  });
+  if (r.status !== 200 || !r.data) {
+    const detail = (r.data && (r.data.message || r.data.error)) || String(r.raw || '').slice(0, 120) || r.error || `HTTP ${r.status}`;
+    return { ok: false, error: detail };
+  }
+  const token = r.data.token || '';
+  if (!token) return { ok: false, error: 'jobToken 交换未返回 token' };
+  const out = { accessToken: token };
+  if (r.data.refresh_token) out.refreshToken = r.data.refresh_token;
+  // expires_in 是毫秒（hub 口径），与 deviceToken 的 expires_at（日期串）不同形
+  if (r.data.expires_in) {
+    const ms = Number(r.data.expires_in);
+    if (Number.isFinite(ms) && ms > 0) out.expiresAt = Date.now() + ms;
+  }
+  out.lastError = '';
+  return { ok: true, patch: out };
+}
+
 async function exchange(account) {
   if (!account || !account.refreshToken) return { ok: false, error: '缺少 refreshToken' };
   let agent = null;
@@ -190,6 +227,18 @@ async function exchange(account) {
     return { ok: false, error: `出站代理配置错误: ${e.message}` };
   }
   const ep = c.endpointsOf(account.region);
+  // 凭证族路由（2026-11-01，hub 同款）：drt- 走 deviceToken，jrt- 走 jobToken。
+  // PAT（personalToken）只在最后兜底——它永不覆盖仍然有效的 OAuth 会话。
+  if (tokenFamilyOf(account) === 'job') {
+    const jr = await jobTokenPost(ep.JobRefreshEndpoint, { refresh_token: account.refreshToken }, account);
+    if (jr.ok) return jr;
+    if (account.personalToken) {
+      const pe = await jobTokenPost(ep.JobExchangeEndpoint, { personal_token: account.personalToken }, account);
+      if (pe.ok) return pe;
+      return { ok: false, error: `换票失败（jrt-: ${jr.error}；PAT: ${pe.error}）`, expired: true };
+    }
+    return { ok: false, error: `换票失败（${jr.error}）`, expired: true };
+  }
   const r = await request(ep.RefreshEndpoint, {
     method: 'POST',
     headers: { 'User-Agent': 'qoder/1.0.0', 'Login-Version': c.LOGIN_VERSION },
@@ -200,6 +249,13 @@ async function exchange(account) {
     // refresh 失败通常是凭证本身失效（refresh token 过期/被吊销）——
     // 该做的是重新登录，不是查网络。所以报错文案要指向重登。
     const detail = (r.data && (r.data.message || r.data.error)) || String(r.raw || '').slice(0, 120) || r.error || `HTTP ${r.status}`;
+    // drt- 也死了但账号带着 PAT：最后兜底再试一次（upsert 按 uid 合并后
+    // 存量账号也可能持有 personalToken）
+    if (account.personalToken) {
+      const pe = await jobTokenPost(ep.JobExchangeEndpoint, { personal_token: account.personalToken }, account);
+      if (pe.ok) return pe;
+      return { ok: false, error: `换票失败（${detail}；PAT: ${pe.error}）`, expired: true };
+    }
     return { ok: false, error: `换票失败（${detail}）`, expired: true };
   }
   const token = r.data.device_token || r.data.token || '';
@@ -234,6 +290,50 @@ async function ensureAccount(authStore, account) {
   }
   authStore.patch(account.id, r.patch);
   return authStore.get(account.id) || { ...account, ...r.patch };
+}
+
+/**
+ * 导入 PAT（pt- 个人访问令牌）：交换 jobToken → 拉身份 → 返回落盘记录。
+ *
+ * SSO 强制组织下设备授权流程会被组织拦，PAT 是唯一登录路（hub docs/accounts.md）。
+ * 返回的记录交 authStore.upsert（按 uid 合并——给存量账号补 PAT 时走同一条路）。
+ * machineId/machineToken/machineType 与 login.js 同款生成（COSY 签名身份）。
+ */
+async function importPat(pat, region) {
+  const patStr = String(pat || '').trim();
+  if (!patStr.startsWith('pt-')) return { ok: false, error: 'PAT 必须以 pt- 开头' };
+  const reg = c.normalizeRegion(region);
+  const ep = c.endpointsOf(reg);
+  const ex = await jobTokenPost(ep.JobExchangeEndpoint, { personal_token: patStr }, { region: reg });
+  if (!ex.ok) return { ok: false, error: `PAT 交换失败: ${ex.error}` };
+  const patch = ex.patch || {};
+  const crypto = require('crypto');
+  const rec = {
+    region: reg,
+    accessToken: patch.accessToken,
+    refreshToken: patch.refreshToken || '',
+    personalToken: patStr,
+    expiresAt: patch.expiresAt || (Date.now() + 24 * 3600 * 1000),
+    source: 'pat',
+    platform: 'CLI',
+    machineId: crypto.randomUUID(),
+    machineToken: crypto.randomBytes(38).toString('base64url').slice(0, 50),
+    machineType: crypto.randomBytes(9).toString('hex'),
+  };
+  // 身份尽力拉一次：失败不阻断入库（uid 缺失时 upsert 会新建一条）
+  try {
+    const info = await fetchUserInfo(patch.accessToken, reg);
+    if (info && typeof info === 'object') {
+      rec.uid = String(info.id || '');
+      rec.nickname = String(info.name || '');
+      rec.email = String(info.email || '');
+      rec.userType = String(info.user_type || '');
+      rec.organizationId = String(info.organization_id ?? info.organizationId ?? '');
+      rec.organizationName = String(info.organization_name ?? info.organizationName ?? '');
+    }
+  } catch (e) { /* 身份拿不到就先入库，昵称显示 uid */ }
+  if (!rec.uid) rec.uid = `p-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  return { ok: true, account: rec };
 }
 
 /** 取用户信息（登录后 / 补昵称时用）。opts.agent 出站代理（E 包收口补点） */
@@ -272,10 +372,25 @@ async function fetchQuota(token, region, opts = {}) {
     const total = num(o.total), used = num(o.used), remaining = num(o.remaining);
     return { total, used, remaining, percentage: num(o.percentage), unit: o.unit || 'credits' };
   };
+  // 团队共享额度池（qoder2api-hub #39 实测）：团队号的有效余额 = 套餐 + 可用共享池。
+  // cap = -1 表示不限量（不是 0，别按数字大小判断）。个人号通常没有这个对象。
+  const org = r.data.orgResourcePackage && typeof r.data.orgResourcePackage === 'object'
+    ? (() => {
+      const cap = num(r.data.orgResourcePackage.cap);
+      return {
+        used: num(r.data.orgResourcePackage.used),
+        remaining: num(r.data.orgResourcePackage.remaining),
+        cap,
+        unlimited: cap < 0,
+        available: r.data.orgResourcePackage.available === true,
+      };
+    })()
+    : null;
   return {
     ok: true,
     userQuota: bucket(r.data.userQuota),
     addOnQuota: bucket(r.data.addOnQuota),
+    orgResourcePackage: org,
     isQuotaExceeded: r.data.isQuotaExceeded === true,
     userType: r.data.userType || '',
   };
@@ -284,6 +399,43 @@ async function fetchQuota(token, region, opts = {}) {
 function num(v) {
   return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
+
+// ---- Pro 升级福利包（一次性 +1800，2026-10-31 融合 hub）----
+//
+// 免费号一次性福利，额度是每日签到（100）的 18 倍。**只领一次**，所以调用方
+// 必须把它当成不可逆动作：先查资格、再让用户点。
+//
+// 端点不存在（404/403/410）= 活动已下线，按「不可领取」返回，不当成错误——
+// 不同区域/账号类型覆盖的活动不同，报错会把「没有这个活动」误显示成故障。
+async function fetchProEligibility(token, region, opts = {}) {
+  const ep = c.endpointsOf(region);
+  const r = await request(ep.ProEligibilityEndpoint, { headers: bearerHeaders(token), agent: opts.agent || null });
+  if (r.status === 404 || r.status === 403 || r.status === 410) return { ok: true, eligible: false, gone: true };
+  if (r.status !== 200 || !r.data) return { ok: false, error: r.error || `HTTP ${r.status}`, eligible: null };
+  return { ok: true, eligible: r.data.eligible === true, raw: r.data };
+}
+
+/**
+ * 领取 Pro 福利包。返回 `{ ok, already?, error? }`。
+ *
+ * 已领过：上游回 409 或 body 含 ALREADY——按成功但 `already:true` 处理，
+ * 不当成失败（否则界面会让人反复点，而每次都是同一个结果）。
+ */
+async function claimProBenefit(token, region, opts = {}) {
+  const ep = c.endpointsOf(region);
+  const r = await request(ep.ProClaimEndpoint, {
+    method: 'POST', body: {}, headers: bearerHeaders(token), agent: opts.agent || null,
+  });
+  if (r.status === 409 || /ALREADY/i.test(String(r.raw || ''))) {
+    return { ok: true, already: true };
+  }
+  if (r.status !== 200) return { ok: false, error: `HTTP ${r.status} ${String(r.raw || '').slice(0, 160)}` };
+  if (r.data && r.data.success === false) {
+    return { ok: false, error: String(r.data.message || r.raw || '').slice(0, 160) };
+  }
+  return { ok: true, data: r.data };
+}
+
 
 // ---- 官方积分消耗（credits-summary / credits-heatmap，2026-10-30）----
 // 上游唯一给出「真实消耗口径」的接口：累计消耗 + 单日峰值 + 近 365 天逐日。
@@ -519,7 +671,7 @@ function cachedModels(account) {
 }
 
 module.exports = {
-  request, bearerHeaders, exchange, ensureAccount, fetchUserInfo, fetchPlan,
-  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
+  request, bearerHeaders, exchange, ensureAccount, fetchUserInfo, fetchPlan, importPat, tokenFamilyOf, jobTokenPost,
+  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchProEligibility, claimProBenefit, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
   parseThinkingConfig,
 };

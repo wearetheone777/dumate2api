@@ -104,6 +104,12 @@ function normalizeBucket(raw) {
     t: num(raw.t),
     l: num(raw.l),
     ln: num(raw.ln),
+    // 缓存三段（2026-11-04，hub v1.7.22 融合）：ci=非缓存输入、cc=缓存命中；
+    // c0/c0p=「确认零缓存」的请求数与 prompt 合计（全价请求，行级判定后入桶）
+    ci: num(raw.ci),
+    cc: num(raw.cc),
+    c0: num(raw.c0),
+    c0p: num(raw.c0p),
   };
 }
 
@@ -128,6 +134,11 @@ function create(opts = {}) {
   const hourlyKeepMs = opts.hourlyKeepMs != null ? opts.hourlyKeepMs : DEFAULT_HOURLY_KEEP_MS;
   const flushMs = opts.flushMs != null ? opts.flushMs : DEFAULT_FLUSH_MS;
   const now = opts.now || Date.now;
+  // 全价请求阈值（hub v1.7.21）：单请求 prompt ≥ 阈值且**确认零缓存**。
+  // create 可注入（测试），生产读 env；行级判定发生在 addEntry，聚合桶里
+  // 只留计数——桶是聚合的，snapshot 时无法回放行级条件。
+  const fullPriceMin = Math.max(1, Number(opts.fullPriceMin)
+    || parseInt(process.env.DUMATE_FULL_PRICE_PROMPT_MIN || '100000', 10) || 100000);
 
   const buckets = new Map(); // key → bucket
   let dirty = false;
@@ -159,6 +170,7 @@ function create(opts = {}) {
       else {
         dst.q += b.q; dst.e += b.e; dst.p += b.p; dst.c += b.c;
         dst.t += b.t; dst.l += b.l; dst.ln += b.ln;
+        dst.ci += b.ci; dst.cc += b.cc; dst.c0 += b.c0; dst.c0p += b.c0p;
       }
     }
     if (moves.length) {
@@ -198,6 +210,14 @@ function create(opts = {}) {
       : input + output;
     const status = Number(entry.status) || 0;
     const ms = Number.isFinite(entry.ms) && entry.ms >= 0 ? Number(entry.ms) : null;
+    // 缓存三段：非缓存输入 = input − cached（钳零）；「确认零缓存」只在
+    // 上游**回报了**缓存字段且值为 0 且请求成功时成立（hub v1.7.21 全价请求
+    // 口径——失败请求没有消耗，不计入全价）。cached_reported=false 是
+    // 「上游没回报」，既不算命中也不算确认零缓存。
+    const cached = Math.max(0, Number(entry.cached_tokens) || 0);
+    const noncached = Math.max(0, input - cached);
+    const confirmedZero = !!entry.cached_reported && cached === 0 && status >= 200 && status < 400;
+    const fullPrice = confirmedZero && input >= fullPriceMin;
     const b = {
       s: hourScope(ts),
       r: dim(entry.channel) || 'untagged',
@@ -212,12 +232,17 @@ function create(opts = {}) {
       t: total,
       l: ms == null ? 0 : ms,
       ln: ms == null ? 0 : 1,
+      ci: noncached,
+      cc: cached,
+      c0: fullPrice ? 1 : 0,
+      c0p: fullPrice ? input : 0,
     };
     const key = bucketKey(b);
     const cur = buckets.get(key);
     if (cur) {
       cur.q++; cur.e += b.e; cur.p += b.p; cur.c += b.c;
       cur.t += b.t; cur.l += b.l; cur.ln += b.ln;
+      cur.ci += b.ci; cur.cc += b.cc; cur.c0 += b.c0; cur.c0p += b.c0p;
     } else {
       buckets.set(key, b);
     }
@@ -284,6 +309,10 @@ function create(opts = {}) {
       input_tokens: a.p,
       output_tokens: a.c,
       total_tokens: a.t,
+      // 缓存三段（非缓存输入 / 缓存命中）：老数据桶没有这两个字段时是 0，
+      // 与「上游没给缓存」的真实 0 无法区分——字段语义见 addEntry 注释。
+      input_noncached_tokens: a.ci,
+      cached_tokens: a.cc,
       avg_ms: a.ln ? Math.round(a.l / a.ln) : 0,
       ms_samples: a.ln,
     };
@@ -313,9 +342,10 @@ function create(opts = {}) {
     const channel = dim(opts2.channel);
     const windowed = !!(from || to);
 
-    const acc = () => ({ q: 0, e: 0, p: 0, c: 0, t: 0, l: 0, ln: 0 });
+    const acc = () => ({ q: 0, e: 0, p: 0, c: 0, t: 0, l: 0, ln: 0, ci: 0, cc: 0, c0: 0, c0p: 0 });
     const add = (a, b) => {
       a.q += b.q; a.e += b.e; a.p += b.p; a.c += b.c; a.t += b.t; a.l += b.l; a.ln += b.ln;
+      a.ci += b.ci || 0; a.cc += b.cc || 0; a.c0 += b.c0 || 0; a.c0p += b.c0p || 0;
     };
     const total = acc();
     const byChannel = new Map();
@@ -358,6 +388,16 @@ function create(opts = {}) {
 
     return {
       totals: finish(total),
+      // 全价请求洞察（hub v1.7.21）：prompt ≥ 阈值且确认零缓存的请求——
+      // 换前缀/新开会话/压缩后首轮的高成本形态，单行日志看不出来。
+      // credit_share 本项目不做：各通道积分口径不同且埋点无统一 credits
+      // 字段，tokens 占比是能如实给出的部分（不编数）。
+      full_price: {
+        threshold: fullPriceMin,
+        requests: total.c0,
+        prompt_tokens: total.c0p,
+        prompt_share: total.p > 0 ? Number((total.c0p / total.p).toFixed(4)) : 0,
+      },
       by_channel: keyed(byChannel),
       by_account: keyed(byAccount),
       by_model: keyed(byModel),

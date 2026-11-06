@@ -138,6 +138,26 @@ const HARD_TEXT = /(余额|积分)[^\n]{0,8}(不足|耗尽|用完)|insufficient[
 const MODEL_TEXT = /model[^\n]{0,40}(not available|not found|not exist|unsupported)|模型[^\n]{0,12}(不可用|不存在|不支持)/i;
 
 /**
+ * 内容审核拒绝（确定性拒绝，重试/换号都无用）。
+ *
+ * 词表取自 qoder2api-hub 源码 `_CONTENT_POLICY_MARKERS`（带现场日志：
+ * `InternalError.Algo.DataInspectionFailed: Input text data may contain
+ * inappropriate content.`，阿里云百炼的审核错误形态；千问同属阿里系，
+ * 同一套判据适用）。hub 的处置口径：**不重试、直接返回可读原因**。
+ *
+ * 为什么必须单独识别：这类错误常以 HTTP 500（或 200 帧内 code 字符串
+ * `InternalError.Algo.DataInspectionFailed`）出现——不认它就会落进
+ * 5xx → breaker 分支，换号把每个账号撞一遍同样的拒绝，最后还把账号
+ * 熔断 30 分钟。拒绝的是**这批内容**，不是任何账号。
+ */
+const CONTENT_POLICY_TEXT = /DataInspectionFailed|inappropriate content|input text data may contain|ContentFilter|SensitiveContent|content_policy_rejected/i;
+
+/** 这条错误串是不是上游内容审核拒绝（重试/换号无用） */
+function isContentPolicy(message) {
+  return CONTENT_POLICY_TEXT.test(unescapeDeep(String(message == null ? '' : message)));
+}
+
+/**
  * COSY 上游的**排队/限流**信号（千问与 Qoder 共用一套协议栈）。
  *
  * 实测形状（2026-10-23~26，Qoder）：
@@ -290,6 +310,62 @@ function isDeterministic(status, full) {
   return DETERMINISTIC_TEXT.test(unescapeDeep(String(full || '')));
 }
 
+/**
+ * TRAE（llm_utils_chat / agent 链路）的业务码表。
+ *
+ * **来源与可信度分级，不要当成实测清单**：我们这条链路上真正实测出现过的
+ * 只有 **4001**（模型名/参数无效，流内 `event:error`，HTTP 200）与 **401**
+ * （鉴权失效，HTTP 状态码）。其余取自社区参照（Trae2api-cn / traework2api-panel
+ * / bluechonk 的端点清单），**未在本项目链路复现**，所以判据只按「码值语义 +
+ * 文案特征」做保守分类，不猜处置细节：
+ *
+ *   1001  通用参数错误
+ *   1005  订阅专享模型（Free 号打订阅模型；换模型即可用）—— 已有独立分支
+ *   3003  额度/权益不足
+ *   3004  限流（**2026-11-02 实测**：文案 "We're sorry, your requests have
+ *         exceeded the rate limit"，HTTP 400 载体。社区资料称「权益不可用」，
+ *         未复现——按实测的限流语义理解，处置不变：都是 soft 换号）
+ *   4001  参数无效（**实测**：模型名未知时就是这个，文案无信息量）
+ *   4008  额度耗尽（国际版 raw 链路）
+ *   4011  会话/上下文超限
+ *   4015  风控拦截
+ *   4019  风控/设备异常
+ *   4023  上下文超限（**实测出现过 4026 同族**，见 models.js 的上下文探测）
+ *   4026  上下文超限（实测：1,050,036 token 被拒时就是这个码）
+ *   10101 账号/租户问题
+ *   20405 服务端拒绝
+ *
+ * 分类原则：**确定性错误（重发同一份字节必然同一个失败）不进熔断**，
+ * 它们换账号也没用。风控类（4015/4019）与额度类（3003/4008）要分开——
+ * 前者换号可能有用（不同设备指纹），后者换号确实有用（别的号还有额度）。
+ */
+
+/** TRAE 业务码 → 处置类别。返回 null 表示「不在表里」，交回通用判据 */
+function traeCodeKind(code) {
+  const n = Number(code);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // 订阅专享（1005）：换模型即可用，进 (账号,模型) 负缓存
+  if (n === 1005) return 'model';
+  // 额度/权益类：换号有用（别的账号可能还有额度）
+  if (n === 3003 || n === 3004 || n === 4008) return 'quota';
+  // 风控类：换号可能有用（不同设备指纹），但不进熔断（不是服务故障）
+  if (n === 4015 || n === 4019) return 'risk';
+  // 确定性请求错误：参数/上下文超限，换号无用
+  if (n === 1001 || n === 4001 || n === 4011 || n === 4023 || n === 4026) return 'deterministic';
+  // 账号/租户与服务端拒绝：保守按确定性处理（不惩罚账号）
+  if (n === 10101 || n === 20405) return 'deterministic';
+  return null;
+}
+
+/**
+ * 从错误串里认 TRAE 的业务码。**只在明确是 TRAE 语境时调用**
+ * （`traework <code>: ...` 前缀），否则会把别的通道的数字误判进来。
+ */
+function traeCodeOf(text) {
+  const m = /traework\s+(\d{3,6})\b/i.exec(String(text || ''));
+  return m ? Number(m[1]) : null;
+}
+
 function classifyCore(err) {
   if (err == null) return { kind: null, status: 0, message: '' };
   if (typeof err === 'string') err = { status: 0, message: err };
@@ -309,6 +385,27 @@ function classifyCore(err) {
   if (Number.isFinite(pinned) && pinned > 0) base.retryAfterMs = pinned;
 
   if (status === 429) return { ...base, kind: 'soft' };
+  // TRAE 业务码（2026-10-31，来源见 traeCodeKind 的注释）。
+  // **必须排在 5xx / 403 分支之前**：这些码都 ≥ 1000，会被下面的 breaker
+  // 分支当成服务故障误吃，把「换模型就好」的订阅专享错误放大成账号熔断。
+  const traeCode = traeCodeOf(full);
+  if (traeCode != null) {
+    const k = traeCodeKind(traeCode);
+    if (k === 'model') return { ...base, kind: 'model' };
+    // 额度类与风控类都不进熔断：额度是「稍后/换号」，风控是「换设备/换号」。
+    // 两者都按 soft 交回（客户端会退避重试），但**不给固定时长**——
+    // 上游没在错误里带恢复时刻，编一个会让下一轮误判。
+    if (k === 'quota' || k === 'risk') return { ...base, kind: 'soft' };
+    // 确定性请求错误：请求本身的问题，不惩罚账号（kind 保持 null）
+    if (k === 'deterministic') return base;
+  }
+  // 「订阅专享」模型（2026-10-31 融合，语义对齐 traework2api-panel / Trae2api-cn）：
+  // Free 号打订阅模型上游回 403 或业务码 1005——**换模型即可用**，进 (账号,模型)
+  // 负缓存并明确报错，不罚账号、不进熔断。判据必须放在 5xx 分支之前：
+  // 业务码 1005 > 500 会被下面的 breaker 分支误吃。
+  if (/\b1005\b/.test(unescapeDeep(full)) || /订阅专享|subscription[- ]only/i.test(unescapeDeep(full))) {
+    return { ...base, kind: 'model' };
+  }
   // 限流先于 403/5xx 判：它本质是 429 语义（「稍后再来」），不是服务坏了。
   // 顺序很关键——放后面就会被下面那条 403/5xx 的 breaker 分支吃掉。
   if (isThrottle(full)) {
@@ -334,6 +431,12 @@ function classifyCore(err) {
     if (base.model && MODEL_QUEUE_TEXT.test(unescapeDeep(full))) out.scope = 'model';
     return out;
   }
+  // 内容审核拒绝（DataInspectionFailed 家族，见 CONTENT_POLICY_TEXT 注释）：
+  // 拒绝的是这批内容而不是账号——换哪个号发同一份 body 都会被拒。必须排在
+  // 401/402/403/5xx 之前：上游常把它包在 HTTP 500 里，落到 breaker 分支会把
+  // 「用户内容的问题」放大成「账号连续硬失败 → 熔断 30 分钟」。
+  // kind 保持 null（不惩罚账号），policy 标志给调用方翻人话用。
+  if (isContentPolicy(full)) return { ...base, kind: null, policy: true };
   if (status === 401) return { ...base, kind: 'session_dead' };
   if (status === 402 || HARD_TEXT.test(message)) return { ...base, kind: 'hard' };
   if (status === 403 && MODEL_TEXT.test(message)) return { ...base, kind: 'model' };
@@ -353,13 +456,17 @@ function classify(err) {
   const out = classifyCore(err);
   const raw = typeof err === 'string' ? err
     : (err && (err.message || err.error)) || '';
-  out.deterministic = isDeterministic(out.status, String(raw));
+  // 审核拒绝也是确定性错误（换号无用）——deterministic 标志让「换号前该不该
+  // 等」的判据直接跳过等待。
+  out.deterministic = out.policy === true || isDeterministic(out.status, String(raw));
   return out;
 }
 
 module.exports = {
   payloadError, envelopeStatus, classify, isThrottle, throttleRetryMs, THROTTLE_TEXT,
   isDeterministic,
+  isContentPolicy, CONTENT_POLICY_TEXT,
   QUEUE_TEXT, QUEUE_THROTTLE_COOLDOWN_MS,
   unescapeDeep,
+  traeCodeKind, traeCodeOf,
 };

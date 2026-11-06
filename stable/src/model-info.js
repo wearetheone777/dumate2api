@@ -24,12 +24,42 @@ const SRC = {
   config: '配置',
 };
 
-// 搭子：上游没有模型列表接口（/models、/model/list 实测 404），
-// 真实可用的名字来自探测（ARCHITECTURE.md 的实测结论 + model-map 的 upstream_models）
-const DUMATE_NOTE = '上游无模型列表接口（/models 404、/model/list 400），ID 来自探测；上游只接受 model-text / model-artifact-validate / glm-5，其余名字一律 404。';
-// 上下文：DuMate 配置声明 192K，但 32K 级实测通过、128K 级 10 分钟未返回。
-// 给区间而不是单值——单值会让人以为 192K 可用。
-const DUMATE_CONTEXT = { min: 32768, max: 192000, note: '配置声明 192K；32K 级实测通过，128K 级 10 分钟未返回' };
+// 搭子：上游没有模型列表接口（/models、/model/list 实测 404）。但**真实后端、
+// 上下文与输出上限不是未知的**——2026-10-31 深度逆向实测定案（CLAUDE.md
+// 「搭子的真实模型」节），证据三件套：上游 400 错误体明示（qianfan/阿里云
+// 直吐范围声明）、二分夹逼（GLM 只报「Prompt 超长」）、响应头
+// X-Dumate-Gw-Realmodel（real_model 埋点同源）。cloud 网关按模型转发，
+// 别名行的数据按**实际落到的 target** 查这张表。
+const DUMATE_NOTE = '上游无模型列表接口（/models 404），真实后端与上限来自真机实测（400 错误体明示 / 二分夹逼 / X-Dumate-Gw-Realmodel 响应头）；此外 qianfan/ 前缀走千帆原生透传通道（独立模型命名空间）。';
+const DUMATE_REAL = {
+  'model-text': {
+    real: 'deepseek-v4.1-flash-low-latency',
+    context: 1048576, contextNote: '实测 1,048,576（上游 400 错误体明示）',
+    maxTokens: 393216,
+  },
+  'dm-auto-model/text.L0': {
+    real: 'deepseek-v4.1-flash-low-latency',
+    context: 1048576, contextNote: '实测 1,048,576（上游 400 错误体明示）',
+    maxTokens: 393216,
+  },
+  'dm-auto-model/mm.L0': { real: 'deepseek-v4.1-flash-low-latency', context: 1048576, contextNote: '同 text.L0（视觉由文本后端承担）', maxTokens: 393216 },
+  'glm-5': {
+    real: 'glm-5.2',
+    context: 1048576, contextNote: '≈1,048,576（二分夹逼；GLM 上游只报「Prompt 超长」不给精确值）',
+    maxTokens: 131072,
+  },
+  'dm-auto-model/text.L1': {
+    real: 'kimi-k3',
+    context: 1048576, contextNote: '实测下界 ≥1M，未探顶',
+    maxTokens: 2000000, maxTokensNote: '实测下界（2,000,000 仍接受），未探顶',
+  },
+  'dm-auto-model/text.L2': {
+    real: 'qwen3.8-max',
+    context: 983616, contextNote: '实测 983,616（阿里云 400 错误体明示）',
+    maxTokens: 131072,
+  },
+  'dm-auto-model/mm.L2': { real: 'qwen3.8-max', context: 983616, contextNote: '同 text.L2', maxTokens: 131072 },
+};
 
 // 千问：上下文上限实测 ~1,024,000（1250K 汉字 = 1,022,745 通过；1262K 起 502）
 const QW_CONTEXT = { min: null, max: 1024000, note: '实测 ~1,024,000（1250K 汉字通过；1262K 起 502）' };
@@ -50,6 +80,12 @@ function dumateRows() {
   const cfg = modelmap.load();
   const upstream = new Set(cfg.upstream_models);
   const budget = require('./budget');
+  // 实测倍率缓存（懒加载：读不到就按未实测处理，不影响行结构）
+  let rateOf = null;
+  try {
+    const billing = require('./dumate-billing');
+    rateOf = (t) => billing.rateForTarget(t);
+  } catch (e) { /* 缓存模块不可用按 null */ }
   const rows = [];
   // 暴露列表里的每个名字都列出来（含别名），因为它们都是客户端可传的
   for (const id of cfg.exposed) {
@@ -58,6 +94,10 @@ function dumateRows() {
     // 界面于是把 claude-3-5-sonnet / gpt-4o 显示成「别名 → 自身」，
     // 与实际转发行为不符（它们实际走 model-text）。
     const target = cfg.aliases[id] || (upstream.has(id) ? id : cfg.fallback);
+    // 真实后端与上限按 **target** 查：别名（claude-* 等）实际走的就是目标
+    // 模型的后端，展示目标的实测值才是真实语义。
+    const real = DUMATE_REAL[target] || null;
+    const rateEntry = rateOf ? rateOf(target) : null;
     rows.push({
       id,
       // 可读名是**本地标注**（上游没有模型列表接口），来源单独标出来
@@ -67,67 +107,101 @@ function dumateRows() {
       channel: 'dumate',
       native: upstream.has(id),
       target,
-      rate: null,
-      rateSource: null,
-      contextWindow: DUMATE_CONTEXT.max,
-      contextWindowMin: DUMATE_CONTEXT.min,
-      contextSource: 'measured',
-      contextNote: DUMATE_CONTEXT.note,
-      // 输出预算：网关钳制后的下限（客户端传更小的值会被抬到这里）
-      maxTokens: budget.resolveMaxTokens(0),
-      maxTokensSource: 'config',
+      // 真实后端（X-Dumate-Gw-Realmodel 实测）。上游不吐元数据，这是埋点口径
+      realModel: real ? real.real : null,
+      realModelSource: real ? 'measured' : null,
+      // 实测倍率（积分/千token）：dumate-billing 的缓存按 target 读，7 天
+      // TTL。搭子没有标称倍率，这里填的是**实测值**——没有实测就如实 null
+      // （模型页「计费自检」按钮补测）。别名行显示 target 的倍率，因为
+      // 计费跟着实际落到的模型走。
+      rate: rateEntry ? rateEntry.billed : null,
+      rateSource: rateEntry ? 'measured' : null,
+      rateNote: rateEntry
+        ? `实测于 ${new Date(rateEntry.measuredAt).toLocaleString('zh-CN')}（${rateEntry.tokens} tokens 花了 ${rateEntry.cost} 积分；综合输入+输出，余额两位小数限制精度）`
+        : null,
+      contextWindow: real ? real.context : null,
+      contextWindowMin: null,
+      contextSource: real ? 'measured' : null,
+      contextNote: real ? real.contextNote : '该模型未实测（上游不吐元数据，也没有 400 错误体可泄漏）',
+      // 输出上限：上游真实范围（dumate-caps 同源实测），不是网关钳制下限。
+      // 网关还有一层输出预算下限（65536，思维链兜底）——传小值会被抬高，
+      // 但「上限」列回答的是上游接受多少，两个数不是一个问题。
+      maxTokens: real ? real.maxTokens : null,
+      maxTokensSource: real ? 'measured' : null,
+      maxTokensNote: real ? (real.maxTokensNote || '网关另有输出预算下限 65536（思维链兜底），客户端传小值会被抬到下限') : null,
       capability: 'chat_model',
       multimodal: false,
       // 上游没给模型列表，这里把「别名实际落到哪里」讲清楚——
       // 比笼统的「无接口」更有用：用户能据此判断一个名字是不是真的换了模型
-      note: upstream.has(id)
-        ? DUMATE_NOTE
-        : `客户端名，网关按别名转到 ${target}（上游只认 model-text / model-artifact-validate / glm-5）`,
+      note: upstream.has(id) ? DUMATE_NOTE : `客户端名，网关按别名转到 ${target}`,
     });
   }
   return rows;
 }
 
 /** 千问的行。倍率本地拿不到（计费在 qwenwork.cn 的积分池里），如实 null */
-function qwenworkRows() {
+function qwenworkRows(entries) {
   const constants = require('./qwenwork/constants');
-  let keys = constants.FALLBACK_MODELS.slice();
-  let source = 'config';
-  // listModels 内部会先试接口、失败回落静态表，这里只看结果
-  const cached = qwenworkCachedKeys();
-  if (cached && cached.length) { keys = cached; source = 'upstream'; }
   const budget = require('./budget');
-  return keys.map((k) => {
-    const meta = QW_META[k] || {};
+  let list = Array.isArray(entries) && entries.length ? entries : qwenworkCachedEntries();
+  const source = list ? 'upstream' : 'config';
+  if (!list) {
+    list = constants.FALLBACK_MODELS.map((k) => ({
+      key: k, name: '', rate: null, rateOriginal: null,
+      contextWindow: null, contextTiers: [], multimodal: false,
+    }));
+  }
+  return list.map((e) => {
+    const meta = QW_META[e.key] || {};
+    const ctx = Number.isFinite(e.contextWindow) && e.contextWindow > 0 ? e.contextWindow : null;
     return {
-      id: k,
-      name: meta.name || k,
-      prefixed: `qwen/${k}`,
+      id: e.key,
+      name: e.name || meta.name || e.key,
+      prefixed: `qwen/${e.key}`,
       channel: 'qwenwork',
       native: true,
-      target: k,
-      rate: null,
-      rateSource: null,
-      contextWindow: meta.context ? meta.context.max : null,
+      target: e.key,
+      // 上游模型表的 price_factor（相对值）。拿不到如实 null——不编单价
+      rate: Number.isFinite(e.rate) ? e.rate : null,
+      // 实测 original_price_factor 对千问恒为 0（不是「打 0 折」，是没有原价信息）。
+      // 0 原价与正价并列显示会误导，按「无」处理。
+      rateOriginal: Number.isFinite(e.rateOriginal) && e.rateOriginal > 0 ? e.rateOriginal : null,
+      rateSource: Number.isFinite(e.rate) ? 'upstream' : null,
+      contextWindow: ctx != null ? ctx : (meta.context ? meta.context.max : null),
       contextWindowMin: meta.context ? meta.context.min : null,
-      contextSource: meta.context ? 'measured' : null,
-      contextNote: meta.context ? meta.context.note : '',
+      contextSource: ctx != null ? 'upstream' : (meta.context ? 'measured' : null),
+      contextNote: ctx != null
+        ? '上游模型表 context_config'
+        : (meta.context ? meta.context.note : ''),
       maxTokens: budget.resolveQwenMaxTokens(0),
       maxTokensSource: 'config',
       capability: 'chat_model',
-      multimodal: false,
+      multimodal: e.multimodal === true,
       note: source === 'upstream' ? '' : '模型列表接口 403，当前为静态表（pro / flash）',
     };
   });
 }
 
-// 千问模型表的缓存快照由 index.js 在成功拉取后写入
-let qwenKeysCache = null;
-function setQwenKeys(keys) {
-  qwenKeysCache = Array.isArray(keys) && keys.length ? keys.slice() : null;
+// 千问模型表的缓存快照（上游下发，带倍率/上下文/多模态）。
+// 由 qwenwork/index.js 拉取成功后写入。
+let qwenModelsCache = null;
+
+function setQwenModels(entries) {
+  qwenModelsCache = Array.isArray(entries) && entries.length ? entries.slice() : null;
 }
-function qwenworkCachedKeys() {
-  return qwenKeysCache;
+
+/** 兼容旧调用：只给 key 列表时按「无元数据」的快照处理 */
+function setQwenKeys(keys) {
+  setQwenModels(Array.isArray(keys) && keys.length
+    ? keys.map((k) => ({
+      key: k, name: k, rate: null, rateOriginal: null,
+      contextWindow: null, contextTiers: [], multimodal: false,
+    }))
+    : null);
+}
+
+function qwenworkCachedEntries() {
+  return qwenModelsCache;
 }
 
 // Qoder 模型表的缓存快照（上游下发，带倍率）。由 qoder/index.js 写入。
@@ -156,17 +230,25 @@ const fmtCtx = (n) => {
  * **自己拉而不是读快照**：快照由网关进程写入，管理端进程看不到。
  * 取不到时回落静态表（rate 给 null，如实标「无此数据」，不估算）。
  */
-async function qoderRows() {
+async function qoderRows({ region = '' } = {}) {
   const constants = require('./qoder/constants');
   const budget = require('./budget');
-  let list = qoderCachedModels();
+  // 区域视图（2026-11-03 页面区分）：指定区域时**跳过快照直接拉**——
+  // 快照由网关进程按它的主账号写入，区域不保证与本次请求一致
+  let list = region ? null : qoderCachedModels();
   let fromUpstream = !!list;
   if (!list) {
     // 直接问上游（进程内），与 traeworkRows 同一策略
     try {
       const authStore = require('./qoder/auth');
       const session = require('./qoder/session');
-      const acc = authStore.preferred();
+      let acc = null;
+      if (region) {
+        const pool = authStore.findUsable().filter((a) => constants.normalizeRegion(a.region) === region);
+        acc = pool.find((a) => a.preferred) || pool[0] || null;
+      } else {
+        acc = authStore.preferred();
+      }
       if (acc) {
         const r = await session.fetchModels(acc);
         if (r.ok && r.models.length) { list = r.models; fromUpstream = true; }
@@ -259,12 +341,21 @@ async function qoderRows() {
   }));
 }
 
-/** TRAE 的行：唯一有完整上游元信息的通道 */
-async function traeworkRows({ visibleOnly = false, force = false } = {}) {
+/**
+ * TRAE 的行：唯一有完整上游元信息的通道。
+ *
+ * 默认只列**可用对话模型**（与网关 /v1/models 的 usableIds 同一份判定，
+ * traework/models.isUsableRow）——上游表全量 51 条里有 subagent、
+ * custom_model_* 占位、summary 这类非对话条目，混进模型信息表只会让
+ * 「哪个模型花多少」答不上来（这些条目的倍率/上下文全是 null）。
+ * 排查「为什么某个名字调不通」时传 { all: true } 看全量。
+ */
+async function traeworkRows({ visibleOnly = false, all = false, force = false, region = 'cn' } = {}) {
   const models = require('./traework/models');
-  const r = await models.fetchModels({ force });
+  const r = await models.fetchModels({ force, region: region || 'cn' });
   let list = r.models;
-  if (visibleOnly) list = list.filter((m) => m.visible);
+  if (!all) list = list.filter(models.isUsableRow);
+  else if (visibleOnly) list = list.filter((m) => m.visible);
   return {
     ok: r.ok,
     error: r.error,
@@ -306,16 +397,34 @@ async function traeworkRows({ visibleOnly = false, force = false } = {}) {
 async function allRows({ force = false } = {}) {
   const tw = await traeworkRows({ force });
   return {
-    rows: [...dumateRows(), ...qwenworkRows(), ...tw.rows, ...(await qoderRows())],
+    rows: [...dumateRows(), ...(await qwenRows()), ...tw.rows, ...(await qoderRows())],
     errors: { traework: tw.error || '' },
   };
+}
+
+/**
+ * 千问的行：**自己拉一次模型表**（与 Qoder/TRAE 同理）。
+ * 缓存是模块级的，而 /models/info 跑在管理端进程、拉表发生在网关进程时
+ * 那份缓存根本看不到——只读缓存会让倍率/上下文在界面上永远是空的。
+ */
+async function qwenRows() {
+  try {
+    const qw = require('./qwenwork');
+    const entries = await qw.listModelEntries();
+    return qwenworkRows(entries);
+  } catch (e) {
+    return qwenworkRows();
+  }
 }
 
 /** 某条通道的行 */
 async function rowsFor(channel, opts = {}) {
   if (channel === 'dumate') return { rows: dumateRows(), error: '' };
-  if (channel === 'qwenwork') return { rows: qwenworkRows(), error: '' };
-  if (channel === 'qoder') return { rows: await qoderRows(), error: '' };
+  if (channel === 'qwenwork') {
+    const rows = await qwenRows();
+    return { rows, error: '' };
+  }
+  if (channel === 'qoder') return { rows: await qoderRows(opts), error: '' };
   if (channel === 'traework') {
     const r = await traeworkRows(opts);
     return { rows: r.rows, error: r.error };
@@ -324,6 +433,7 @@ async function rowsFor(channel, opts = {}) {
 }
 
 module.exports = {
-  SRC, allRows, rowsFor, dumateRows, qwenworkRows, traeworkRows, qoderRows,
-  setQwenKeys, setQoderModels, DUMATE_NOTE, DUMATE_CONTEXT, QW_CONTEXT, CHANNELS: channels.CHANNELS,
+  SRC, allRows, rowsFor, dumateRows, qwenworkRows, qwenRows, traeworkRows, qoderRows,
+  setQwenKeys, setQwenModels, qwenworkCachedEntries, setQoderModels,
+  DUMATE_NOTE, DUMATE_REAL, QW_CONTEXT, CHANNELS: channels.CHANNELS,
 };

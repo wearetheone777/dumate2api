@@ -23,6 +23,72 @@ const { payloadError, envelopeStatus, throttleRetryMs } = require('../upstream-e
 const TIMEOUT_MS = 600000;
 
 /**
+ * 出站请求体上限。阿里云 SLB 对单 POST 有 30MB 硬限制，超过直接 RST。
+ *
+ * **必须在本地前置拒绝**：不拦的话连接被重置 → 当成瞬态网络错误 → 换号重试
+ * → 每次重放几十 MB → 整池进熔断（qoder2api-hub 实测的失败链）。而换号对
+ * 体积问题毫无作用——每一份请求一样大。
+ */
+const MAX_BODY_MB = Math.max(1, Number(process.env.DUMATE_QODER_MAX_BODY_MB) || 29);
+
+function assertBodySize(encBody) {
+  const bytes = Buffer.byteLength(String(encBody || ''));
+  const limit = MAX_BODY_MB * 1024 * 1024;
+  if (bytes <= limit) return bytes;
+  const err = new Error(
+    `Qoder 请求体 ${(bytes / 1048576).toFixed(1)}MB 超过上游单请求上限 ${MAX_BODY_MB}MB：`
+    + '请缩短上下文（减少历史/附件）。换账号无用——这是请求本身体积的问题。',
+  );
+  err.statusCode = 413;
+  err.tooLarge = true;
+  throw err;
+}
+
+// ---- DeepSeek 族的 reasoning_content 回填（2026-10-31，融合 hub）----
+// 这族模型的多轮一致性与上一轮的 reasoning_content 强相关，而 OpenAI 兼容
+// 客户端（Codex / Claude Code）只回传正文、不带上轮的思维链。网关把每轮
+// 最后一次 assistant 的「正文 + reasoning」记在内存里，下一轮请求里匹配到
+// 同一条 assistant 消息时补回 reasoning_content。
+//
+// 只对 DeepSeek 族做：其它模型没有这个依赖，多塞一个未知字段是白风险。
+const DEEPSEEK_FAMILY = /dfmodel|dmodel|deepseek/i;
+const REASONING_TTL_MS = 30 * 60 * 1000;
+const REASONING_MAX = 200;
+const reasoningCache = new Map(); // sessionId -> { text, reasoning, model, at }
+
+function rememberReasoning(sessionId, text, reasoning, model) {
+  const key = String(sessionId || '');
+  const t = String(text || '').trim();
+  const r = String(reasoning || '');
+  if (!key || !t || !r) return;
+  const now = Date.now();
+  reasoningCache.delete(key); // 重新插入到队尾（LRU）
+  reasoningCache.set(key, { text: t, reasoning: r, model: String(model || ''), at: now });
+  for (const [k, v] of reasoningCache) {
+    if (reasoningCache.size <= REASONING_MAX && now - v.at <= REASONING_TTL_MS) break;
+    reasoningCache.delete(k);
+  }
+}
+
+function backfillReasoning(modelKey, turns, sessionId) {
+  if (!sessionId || !DEEPSEEK_FAMILY.test(String(modelKey || ''))) return false;
+  const rec = reasoningCache.get(String(sessionId));
+  if (!rec || Date.now() - rec.at > REASONING_TTL_MS) return false;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const m = turns[i];
+    if (!m || m.role !== 'assistant') continue;
+    if (m.reasoning_content) return false; // 客户端自己带了，不覆盖
+    const text = String(contentText(m.content, '')).trim();
+    if (text && text === rec.text) {
+      m.reasoning_content = rec.reasoning;
+      return true;
+    }
+    return false; // 只看最后一条 assistant
+  }
+  return false;
+}
+
+/**
  * 给带工具的请求注入「执行纪律」。
  *
  * 与千问同一问题：上游是对话型产品，脚手架鼓励「每完成一步汇报一句」，
@@ -143,6 +209,76 @@ function resolveReasoningEffort(payload, modelMeta) {
   return best;
 }
 
+/**
+ * 由「首条 user 消息」派生一个**跨轮稳定**的 session_id（UUID 形状）。
+ *
+ * 为什么要 UUID 形状：上游对 session_id 的格式期望是 UUID（客户端日志里全是
+ * UUID）。直接塞 sha1 前缀可能被拒，所以把指纹拼成 UUIDv5 的字节布局
+ * （版本位 5、variant 位 RFC4122），形状合法、内容确定。
+ *
+ * 为什么取首条 user 消息而不是「整个 messages」：会话是**逐轮追加**的，
+ * 拿整个 messages 做指纹等于每轮都换 id（等于没做）。首条 user 消息在
+ * 一段会话里不变，这才是稳定的锚点。
+ *
+ * 取不到（空消息 / 非标准形状）返回 null，调用方回落随机 UUID——没有稳定
+ * 锚点时不硬凑一个（凑出来的会在两个不同会话之间撞 id）。
+ *
+ * @param {object} payload OpenAI 请求体
+ * @returns {string|null}
+ */
+function stableSessionId(payload) {
+  try {
+    const msgs = payload && Array.isArray(payload.messages) ? payload.messages : [];
+    const first = msgs.find((m) => m && m.role === 'user');
+    if (!first) return null;
+    let text = '';
+    if (typeof first.content === 'string') text = first.content;
+    else if (Array.isArray(first.content)) {
+      const part = first.content.find((p) => p && typeof p === 'object' && typeof p.text === 'string');
+      text = part ? part.text : '';
+    }
+    if (!text.trim()) return null;
+    // 与 channel-pool.sessionKeyOf 同一截断（2048 字符）——两处取同一个锚点，
+    // 粘性绑定与前缀缓存亲和才不会指向两个不同的「会话」。
+    const h = crypto.createHash('sha1').update(text.slice(0, 2048)).digest();
+    // 拼成 UUIDv5 形状：版本位 = 5，variant = RFC4122
+    const b = Buffer.from(h.subarray(0, 16));
+    b[6] = (b[6] & 0x0f) | 0x50;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    const hex = b.toString('hex');
+    // 8-4-4-4-12 布局（共 32 个 hex 字符）
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  } catch (e) { return null; }
+}
+
+/** 由会话 id 派生一个确定性的 UUID（用于 business.id） */
+function deriveUuid(seed, salt) {
+  const h = crypto.createHash('sha1').update(`${salt}:${seed}`).digest();
+  const b = Buffer.from(h.subarray(0, 16));
+  b[6] = (b[6] & 0x0f) | 0x50;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const hex = b.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+/**
+ * 由会话 id 派生一个确定性的 `begin_at`（毫秒时间戳）。
+ *
+ * 为什么不是 `Date.now()`：它每轮都变，等于把缓存键改了。为什么也不是一个
+ * 固定的历史时刻（比如 0）：上游可能按它算时长/会话生命周期，给一个明显
+ * 荒谬的值（1970 年）风险更大。
+ *
+ * **完全确定性**（不含 Date.now()）：把哈希映射到一个固定基准点之后的
+ * 0~365 天窗口。同一会话 id 永远得到同一个值——这正是缓存亲和需要的。
+ * 基准点写死而不是取「当前时间」：否则同一会话在跨天后会换值，缓存键又变了。
+ */
+const BEGIN_BASE_MS = Date.UTC(2026, 0, 1);
+function deriveEpochMs(seed) {
+  const h = crypto.createHash('sha1').update(`t:${seed}`).digest();
+  const off = h.readUInt32BE(0) % (365 * 86400000);
+  return BEGIN_BASE_MS + off;
+}
+
 /** 构造上游请求体（OpenAI 形状 → Qoder 形状） */
 function buildBody(modelKey, payload, opts = {}) {
   // 上下文档位：上游同一模型挂着 200K / 400K / 1M 三档（模型表的
@@ -156,7 +292,24 @@ function buildBody(modelKey, payload, opts = {}) {
   // 对话的下一句。
   const requestId = crypto.randomUUID();
   const requestSetId = opts.requestSetId || requestId;
-  const sessionId = (payload && payload.session_id) || opts.sessionId || crypto.randomUUID();
+  // ---- 会话 id 跨轮稳定（2026-10-31，前缀缓存亲和）----
+  //
+  // 原来这里写的是 `payload.session_id || opts.sessionId || randomUUID()`——
+  // **客户端（Codex / Claude Code）从不带 session_id**，opts.sessionId 又只有
+  // 「播报即收尾」的修复轮才传，所以每一轮都拿到一个新的随机 UUID。
+  //
+  // 后果不只是「上游看不出这是同一段对话」：Qoder 的前缀缓存按 (session, 历史)
+  // 做亲和，每轮换 session 等于每轮都从零开始算 prefill——命中率从 ~95% 掉到
+  // ~8%（hub #48 的实测）。既费钱又拖慢首字。
+  //
+  // 现在的口径：**会话键取「首条 user 消息的指纹」**，与 channel-pool 的
+  // sessionKeyOf 同一思路（会话逐轮追加消息，首条不变，跨轮稳定）。显式传入
+  // 的 session_id（payload / opts）仍然优先——客户端真要控制会话时说了算。
+  //
+  // 用 UUIDv5 风格的确定性派生而不是直接用指纹串：上游对 session_id 的格式
+  // 期望是 UUID（客户端日志里全是 UUID），塞一个 sha1 前缀可能被拒。
+  const stable = stableSessionId(payload);
+  const sessionId = (payload && payload.session_id) || opts.sessionId || stable || crypto.randomUUID();
   const messages = (payload && payload.messages) || [];
   let system = '';
   if (payload && typeof payload.system === 'string') system = payload.system;
@@ -166,6 +319,9 @@ function buildBody(modelKey, payload, opts = {}) {
   if (!system && sysMsg) system = contentText(sysMsg.content, '[Image content - not supported by Qoder channel]');
   // system 留在 messages 里（与千问同一实测结论：上游只认 messages 里的 system 角色）
   const turns = messages;
+  // DeepSeek 族的多轮一致性依赖上一轮 reasoning_content（客户端不回传，见
+  // rememberReasoning 的注释）。匹配不上就原样发，不编造。
+  backfillReasoning(modelKey, turns, opts.sessionId);
   const lastUser = [...turns].reverse().find((m) => m && m.role === 'user');
   const text = lastUser ? contentText(lastUser.content, '[Image content - not supported by Qoder channel]') : '';
 
@@ -254,10 +410,19 @@ function buildBody(modelKey, payload, opts = {}) {
       product: 'qoder_work',
       version: c.COSY_VERSION,
       type: 'agent',
-      id: crypto.randomUUID(),
+      // business.id / begin_at 都是**会话级**字段（不是请求级）。
+      // 原来每轮新生成：id 用 randomUUID、begin_at 用 Date.now()——这两个
+      // 每轮变一次，上游按 (session, 历史) 做前缀缓存时缓存键跟着变，
+      // 亲和直接失效（hub #48：命中率 95% → 8%）。现在与 session_id 同源：
+      // 有稳定会话键时用派生值，没有才退回随机/当前时间。
+      id: stable ? deriveUuid(sessionId, 'biz') : crypto.randomUUID(),
       name: '',
-      begin_at: Date.now(),
+      begin_at: stable ? deriveEpochMs(sessionId) : Date.now(),
       stage: 'processing',
+      // 计费归因（qoder2api-hub #119）：官方 CLI 在 business 块带 model_key，
+      // 上游按它记账；缺失时**所有模型都被记成 auto 档计费**——这也是
+      // billing-check 里实测倍率与标称不符的一条候选解释
+      model_key: modelKey,
     },
     system,
     messages: turns,
@@ -614,7 +779,7 @@ function postStream(url, body, headers, onChunk, opts = {}) {
  */
 // 归一化实现提升到 src/usage-norm.js（千问通道同缺口同修，见该文件头注释）。
 
-function aggregate(payloads, model) {
+function aggregate(payloads, model, opts = {}) {
   let content = '';
   let reasoning = '';
   let finish = 'stop';
@@ -647,10 +812,27 @@ function aggregate(payloads, model) {
       }
     } catch (e) { /* 非 JSON 帧跳过 */ }
   }
+  // DSML fail-closed 兜底（2026-10-31 引入，2026-11-04 收敛到共享实现
+  // repair.aggregateDsmlFallback——qwenwork/workbuddy 的 aggregate 同一份）。
+  // recovered 时把 stop 纠正成 tool_calls（模型没走原生调用，上游必然报 stop）。
+  // 其后是 tool echo 兜底（hub#135）：纯 JSON 载荷形状，与 DSML 互补；
+  // opts.toolNames 缺省（off）时零行为变化。
+  const repair = require('../repair');
+  const dsml = repair.aggregateDsmlFallback('qoder', content, calls);
+  content = dsml.content;
+  if (dsml.recovered && finish === 'stop') finish = 'tool_calls';
+  const echo = repair.aggregateToolEchoFallback('qoder', content, calls, opts.toolNames, opts.echoMode);
+  content = echo.content;
+  if (echo.recovered && finish === 'stop') finish = 'tool_calls';
   const message = { role: 'assistant', content };
   if (reasoning) message.reasoning_content = reasoning;
   if (calls.size) {
-    message.tool_calls = [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+    message.tool_calls = [...calls.entries()].sort((a, b) => a[0] - b[0]).map(([idx, v]) => {
+      // 上游偶尔发不带 id 的 tool_call（hub 实测）。客户端按 id 去重/回填
+      // 工具结果，空 id 会让整轮工具失败——缺就补一个稳定的本地 id。
+      if (!v.id) v.id = `call_qd_${Date.now().toString(36)}_${idx}`;
+      return v;
+    });
     if (!content) message.content = null;
   }
   normalizeUsageCache(usage);
@@ -724,8 +906,38 @@ function getQueueStatus(origin, headers, { modelKey, queueType, requestId, agent
   });
 }
 
+/**
+ * 流式路径的 tool_call.id 补全（就地改写，返回是否改过）。
+ *
+ * 上游偶尔发不带 `id` 的 tool_call 增量（hub 实测）。客户端按 id 关联工具结果，
+ * 空 id 会让整轮工具失败。按 index 记住第一次生成的 id，后续帧复用同一个——
+ * 每帧都新生成会让同一次调用变成多个不同调用。
+ */
+function backfillToolCallIds(parsed, ids) {
+  const delta = parsed && parsed.choices && parsed.choices[0] && parsed.choices[0].delta;
+  if (!delta || !Array.isArray(delta.tool_calls)) return false;
+  let changed = false;
+  for (const tc of delta.tool_calls) {
+    if (!tc || typeof tc !== 'object') continue;
+    const idx = tc.index != null ? tc.index : 0;
+    if (tc.id) {
+      if (!ids.has(idx)) ids.set(idx, tc.id);
+      continue;
+    }
+    let id = ids.get(idx);
+    if (!id) {
+      id = `call_qd_${Date.now().toString(36)}_${idx}`;
+      ids.set(idx, id);
+    }
+    tc.id = id;
+    changed = true;
+  }
+  return changed;
+}
+
 module.exports = {
   buildBody, hasFunctionTools, resolveModelKey, unwrap, envelopeStatus, payloadError,
   post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
   getQueueStatus, parseQueueStatus, normalizeUsageCache,
+  assertBodySize, rememberReasoning, backfillToolCallIds,
 };

@@ -45,6 +45,31 @@ const DEFAULT_ALIASES = {
 // 上游真正认识的 ID。其余名字必须经别名映射后才能用。
 const DEFAULT_UPSTREAM = ['model-text', 'model-artifact-validate', 'glm-5'];
 
+// 云端网关（dumate-svc /gateway/apis/v1，9084 与本地回落共用）接受的模型名。
+// **2026-11-06 真机实测定案**（test/probe-dumate-cloud-models.js，个人版账号）：
+// 这 6 个路由名全部 200，而社区对外别名（deepseek-v4.1 / kimi-k3.1-pro /
+// glm-5.3 / qwen-3.8-flash）与本地后端真名（deepseek-v4.1-flash-low-latency /
+// glm-5.2）一律 404——个人版与企业租户同一套路由名。**不要把这份表混进
+// upstream_models**：本地 8980 后端只认上面三个名字，混进去会让本地链路
+// 把 kimi-k31 之类的名字原样透传给 8980 吃 404。
+const DEFAULT_CLOUD_UPSTREAM = [
+  'model-text',
+  'kimi-k31',
+  'glm-53',
+  'glm-53-flash',
+  'deepseek-v4-pro',
+  'deepseek-v41-flash',
+  'qwen38-flash',
+];
+
+// 本地上游名 → 云端路由名（仅 fallback-web 回落时用）。唯一有实测身份依据的
+// 映射：本地 `glm-5` 实跑 glm-5.2（X-Dumate-Gw-Realmodel），云端最接近的智谱
+// 档是 `glm-53`（实跑 glm-5.3）——**同系换代代偿**，不是同模型；回落本来就是
+// 「本地挂了用云端凑」。model-text 两边同名同后端，无需映射；
+// model-artifact-validate 在云端没有对应物，**刻意不映射**——404 如实失败，
+// 不把它悄悄变成一次普通聊天。
+const DEFAULT_CLOUD_ALIASES = { 'glm-5': 'glm-53' };
+
 // /v1/models 对外暴露的条目。
 //
 // **只列上游真实模型**（2026-10-21）：`claude-3-5-sonnet-20241022` / `gpt-4o`
@@ -62,6 +87,8 @@ const DEFAULTS = {
   aliases: DEFAULT_ALIASES,
   upstream_models: DEFAULT_UPSTREAM,
   exposed: DEFAULT_EXPOSED,
+  cloud_upstream: DEFAULT_CLOUD_UPSTREAM,
+  cloud_aliases: DEFAULT_CLOUD_ALIASES,
   fallback: 'model-text',
 };
 
@@ -90,6 +117,7 @@ function mtimeOf() {
 function normalize(raw) {
   const r = raw && typeof raw === 'object' ? raw : null;
   const hasAliases = r && r.aliases && typeof r.aliases === 'object' && !Array.isArray(r.aliases);
+  const hasCloudAliases = r && r.cloud_aliases && typeof r.cloud_aliases === 'object' && !Array.isArray(r.cloud_aliases);
   return {
     aliases: hasAliases ? { ...r.aliases } : { ...DEFAULT_ALIASES },
     upstream_models: r && Array.isArray(r.upstream_models) && r.upstream_models.length
@@ -98,6 +126,10 @@ function normalize(raw) {
     exposed: r && Array.isArray(r.exposed) && r.exposed.length
       ? r.exposed.map(String)
       : DEFAULT_EXPOSED.slice(),
+    cloud_upstream: r && Array.isArray(r.cloud_upstream) && r.cloud_upstream.length
+      ? r.cloud_upstream.map(String)
+      : DEFAULT_CLOUD_UPSTREAM.slice(),
+    cloud_aliases: hasCloudAliases ? { ...r.cloud_aliases } : { ...DEFAULT_CLOUD_ALIASES },
     fallback: r && typeof r.fallback === 'string' && r.fallback ? r.fallback : DEFAULTS.fallback,
   };
 }
@@ -116,6 +148,8 @@ function save(patch) {
     aliases: patch.aliases !== undefined ? patch.aliases : current.aliases,
     upstream_models: patch.upstream_models !== undefined ? patch.upstream_models : current.upstream_models,
     exposed: patch.exposed !== undefined ? patch.exposed : current.exposed,
+    cloud_upstream: patch.cloud_upstream !== undefined ? patch.cloud_upstream : current.cloud_upstream,
+    cloud_aliases: patch.cloud_aliases !== undefined ? patch.cloud_aliases : current.cloud_aliases,
     fallback: patch.fallback !== undefined ? patch.fallback : current.fallback,
   });
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -133,11 +167,114 @@ function reset() {
   return load();
 }
 
+// Claude Desktop 3p 直连网关只发 claude-* 路由名（cc-switch 直连模式的硬约束：
+// direct_inference_model_specs 拒绝非 claude-* 名，真实模型只出现在 label 里）。
+// 按 **key 的通道** 把路由名解析成带前缀的网关模型名——一个 profile 配一把
+// 通道 key，同样的 claude-sonnet-5 在 qoder key 下落 Qwen3.8-Flash、在搭子
+// key 下落 L0。映射表与 cc-switch 四个 9082 provider 的 env 档位一一对应。
+// key 没绑通道时不解析（返回 null 走原 fallback）——不限通道的 key 配哪个
+// profile 都可能，替它选通道等于编造。
+const CLAUDE_ROUTES = {
+  dumate: {
+    sonnet: 'dm-auto-model/text.L0',
+    opus: 'dm-auto-model/text.L1',
+    haiku: 'model-text',
+    fable: 'dm-auto-model/text.L2',
+  },
+  qwenwork: {
+    sonnet: 'qwen/flash',
+    opus: 'qwen/pro',
+    haiku: 'qwen/flash',
+    fable: 'qwen/pro',
+  },
+  traework: {
+    sonnet: 'traework/deepseek-v4.1-flash',
+    opus: 'traework/glm-5.3-flash',
+    haiku: 'traework/glm-5.3-flash',
+    fable: 'traework/kimi-k3.1-pro',
+  },
+  qoder: {
+    sonnet: 'qoder/Qwen3.8-Flash',
+    opus: 'qoder/GLM-5.3-Flash',
+    haiku: 'qoder/DeepSeek-Flash',
+    fable: 'qoder/Qwen3.8-Max',
+  },
+};
+
+// 旧式名不劫持：claude-3-5-sonnet-20241022（role 前有版本段）与
+// claude-sonnet-4-20250514（role 后带 8 位日期串）继续走别名表/fallback，
+// 历史行为不变。只认 claude-{role} 后跟短版本号（1-2 位数字，可多段）的
+// 新式路由名——Claude Desktop / 新版 Claude Code 的形状。
+const CLAUDE_ROUTE_RE = /^claude-(sonnet|opus|haiku|fable)(?:-\d{1,2})*$/i;
+
+/**
+ * claude-* 路由名 → 该通道的网关模型名（带通道前缀，router 可直接认领）。
+ * 兼容三种写法：anthropic/ 前缀、[1M] 后缀、大小写混合。非路由名或通道
+ * 无映射时返回 null，调用方原样放行。
+ */
+function resolveClaudeRoute(name, channel) {
+  if (!name || !channel) return null;
+  let s = String(name).trim();
+  if (s.toLowerCase().startsWith('anthropic/')) s = s.slice('anthropic/'.length);
+  s = s.replace(/\[1M\]$/i, '');
+  const m = CLAUDE_ROUTE_RE.exec(s);
+  if (!m) return null;
+  const table = CLAUDE_ROUTES[channel];
+  if (!table) return null;
+  return table[m[1].toLowerCase()] || null;
+}
+
+/**
+ * 入口统一清理（鉴权段与四个协议 handler 的 route 解析之前调用）：
+ * claude-* 路由名按通道重写；其余名字只剥 [1M] 标记（Claude Code /
+ * Claude Desktop 的「1M 上下文」后缀，qwen/pro[1M] 不剥的话直连通道会
+ * 把 'pro[1M]' 当模型名打上游）。返回 null 表示无需改动。
+ */
+function normalizeIncomingModel(name, channel) {
+  if (!name) return null;
+  const cl = resolveClaudeRoute(name, channel);
+  if (cl) return cl;
+  const s = String(name);
+  return /\[1M\]$/i.test(s) ? s.replace(/\[1M\]$/i, '') : null;
+}
+
 // 与改造前的 mapModel 行为一致：查不到就回落到 fallback
 function mapModel(name) {
   const cfg = load();
   if (!name) return cfg.fallback;
-  return cfg.aliases[name] || cfg.fallback;
+  // [1M] 后缀是「1M 上下文」标记（Claude Code / Claude Desktop 的约定），
+  // 不是模型身份的一部分——不剥的话 glm-5[1M] 会静默落 fallback（历史
+  // 日志里 200 但实际跑的是 model-text，正是这种静默兜底）。
+  const base = String(name).replace(/\[1M\]$/i, '');
+  // 上游真名**直接透传**（2026-11-01）：upstream_models 是实测过的、上游接受
+  // 的名字，它们不需要别名条目就能用——此前别名表是唯一的允许名单，表里
+  // 没有自映射条目的真名会静默落 fallback，逼着配置里躺一堆 glm-5 -> glm-5
+  // 的自映射。别名表现在只承担「真正的改名映射」（如 auto-l0 简写）。
+  if (cfg.upstream_models.includes(base)) return base;
+  return cfg.aliases[base] || cfg.fallback;
+}
+
+/**
+ * 任意入站模型名 → **云端网关**接受的模型名（9084 直连与本地回落共用）。
+ *
+ * 与 mapModel 的关键差别：两条链路的模型名空间不同（本地 8980 只认
+ * model-text / model-artifact-validate / glm-5，云端只认 cloud_upstream 六个
+ * 路由名——2026-11-06 实测，见 DEFAULT_CLOUD_UPSTREAM 注释）。归一顺序：
+ *   1. [1M] 剥壳后命中 cloud_upstream → 原样（kimi-k31 等真名直调）；
+ *   2. cloud_aliases（本地名 → 云端名，如 glm-5 → glm-53）命中 → 映射；
+ *   3. 普通别名表能映射到云端名的（gpt-4o → model-text）→ 用映射结果；
+ *   4. 其余 → fallback（model-text 两边同名同后端，是安全的公共兜底）。
+ */
+function toCloudModel(name) {
+  const cfg = load();
+  if (!name) return cfg.fallback;
+  const base = String(name).replace(/\[1M\]$/i, '');
+  if (cfg.cloud_upstream.includes(base)) return base;
+  const viaCloud = cfg.cloud_aliases[base];
+  if (viaCloud && cfg.cloud_upstream.includes(viaCloud)) return viaCloud;
+  const viaAlias = cfg.aliases[base];
+  if (viaAlias && cfg.cloud_upstream.includes(viaAlias)) return viaAlias;
+  return cfg.fallback;
 }
 
 /**
@@ -150,10 +287,29 @@ function mapModel(name) {
  * 因此下面的中文名是**本地标注**，不是百度下发的官方名称——界面必须标明
  * 来源，不能让人以为这是上游给的元信息。
  */
+// 显示名 = **真实后端名**（X-Dumate-Gw-Realmodel 实测）+ 档位限定词。
+// cc-switch 等客户端的模型列表读 `name` 显示——之前给的是内部 key，用户看不出
+// 是哪个模型；现在直接显示实跑模型。model-text 与 L0 实跑同一个后端，
+// 靠限定词区分（名字完全相同的话客户端列表里分不清谁是谁）。
+// 注意：真实后端串保持 X-Dumate-Gw-Realmodel 的原样小写（忠实于上游回传）。
 const MODEL_NAMES = {
-  'model-text': '文本模型（上游默认）',
-  'model-artifact-validate': '制品校验模型',
-  'glm-5': 'GLM-5',
+  'model-text': 'deepseek-v4.1-flash-low-latency（上游默认档）',
+  'model-artifact-validate': 'model-artifact-validate（制品校验，后端未实测）',
+  'glm-5': 'glm-5.2',
+  'dm-auto-model/text.L0': 'deepseek-v4.1-flash-low-latency（自动档 L0）',
+  'dm-auto-model/text.L1': 'kimi-k3（自动档 L1）',
+  'dm-auto-model/text.L2': 'qwen3.8-max（自动档 L2）',
+  // mm 命名空间（2026-10-31 实测：视觉由文本后端直接承担）
+  'model-mm': 'deepseek-v4.1-flash-low-latency（视觉）',
+  'dm-auto-model/mm.L0': 'deepseek-v4.1-flash-low-latency（视觉 L0）',
+  'dm-auto-model/mm.L2': 'qwen3.8-max（视觉 L2）',
+  // 云端网关路由名（2026-11-06 真机实测，X-Dumate-Gw-Realmodel 回传值）
+  'kimi-k31': 'kimi-k3.1-pro（云端路由）',
+  'glm-53': 'glm-5.3（云端路由）',
+  'glm-53-flash': 'glm-5.3-flash（云端路由）',
+  'deepseek-v4-pro': 'deepseek-v4-pro-0813（云端路由）',
+  'deepseek-v41-flash': 'deepseek-v4.1-flash-low-latency（云端路由，与 model-text 同后端）',
+  'qwen38-flash': 'qwen3.8-flash（云端路由）',
 };
 
 /** 上游 ID → 可读名；没有标注就原样返回（别名表里的 claude-* / gpt-* 属于客户端协议名） */
@@ -168,9 +324,15 @@ module.exports = {
   DEFAULT_ALIASES,
   DEFAULT_UPSTREAM,
   DEFAULT_EXPOSED,
+  DEFAULT_CLOUD_UPSTREAM,
+  DEFAULT_CLOUD_ALIASES,
+  CLAUDE_ROUTES,
+  resolveClaudeRoute,
+  normalizeIncomingModel,
   filePath,
   load,
   save,
   reset,
   mapModel,
+  toCloudModel,
 };

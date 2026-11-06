@@ -24,6 +24,43 @@ const QWEN_PREFIX = 'qwen';
 const TRAEWORK_PREFIX = 'traework';
 /** Qoder 通道的前缀。`qoder/gfmodel` → 上游模型 `gfmodel` */
 const QODER_PREFIX = 'qoder';
+/** WorkBuddy 通道的前缀。`workbuddy/glm-5.3` → 上游模型 `glm-5.3` */
+const WORKBUDDY_PREFIX = 'workbuddy';
+/**
+ * 千帆原生透传的前缀（2026-10-31）。`qianfan/qwen3.5-35b-a3b` → 千帆原生
+ * `qwen3.5-35b-a3b`。
+ *
+ * 它不是「第五个上游」：凭证/账号/额度与搭子完全共用（channel 仍记 dumate），
+ * 但**模型命名空间不同**——应用别名（glm-5 / model-text）在这个端点上会
+ * 401 invalid_model，反过来千帆模型名在应用链路上也不认。所以用显式前缀
+ * 隔离，而不是让同一个模型名两条路都能走。
+ *
+ * 存在的理由：只有这个端点支持 `response_format`（JSON mode / json_schema）。
+ */
+const QIANFAN_PREFIX = 'qianfan';
+// 千问 ACP 会话通道前缀（2026-11-04，P2-17）：agent 型会话，见 resolve 分支
+const QWEN_ACP_PREFIX = 'qwen-acp';
+/**
+ * TRAE 宝（开发者个人助理，2026-11-03 接入）的前缀。
+ *
+ * 它不是第五个通道：与 traework **同一个账号池、同一份 Cloud-IDE-JWT 凭证、
+ * 同一个后端网关**（trae-api-cn.mchost.guru / agent/v3），区别只有对话身份——
+ * `function: "personal_assistant"`（TRAE 宝）而不是 `solo_work_lite`（SOLO）。
+ * 2026-11-03 实测：同一账号同一请求，personal_assistant 消耗 0 credits、
+ * solo_agent_lite 消耗 0.05——TRAE 宝的 11 月免费活动（官方公告至 11.08）
+ * 豁免绑定在这个 function 上。活动结束后豁免是否延续未知，账本照记。
+ *
+ * 模型空间：`traebao/auto`（默认，服务端自选 deepseek-v4.1-flash__dev）或
+ * `traebao/<remote 模型名>`；**不带 config_name 时上游走 TRAE 宝自动档**。
+ */
+const TRAEBAO_PREFIX = 'traebao';
+/**
+ * 搭子自动档的前缀：`dm-auto-model/text.L0` 的**档位编码在模型名里**，
+ * 斜杠不是通道分隔符（2026-10-31 真机实证：L0/L1/L2 分别实跑
+ * DeepSeek-V4.1-Flash-Low-Latency / Kimi-K3 / Qwen3.8-Max）。整个名字
+ * 原样交给搭子（model-map aliases 已登记自映射，mapModel 不会兜底掉）。
+ */
+const DUMATE_AUTO_PREFIX = 'dm-auto-model';
 
 const UPSTREAMS = {
   dumate: {
@@ -102,6 +139,25 @@ const UPSTREAMS = {
     needsBudget: true,
     budgetKind: 'qoder',
   },
+  // WorkBuddy（腾讯 Copilot 系）：进程内直连，**标准 OpenAI 协议**（SSE），
+  // 凭证自持（登录流程后置期从官方客户端认证文件导入，见 src/workbuddy/auth.js）。
+  // 双区域：cn（copilot.tencent.com，billing 在 codebuddy.cn）/
+  // global（www.workbuddy.ai），账号各自独立。
+  workbuddy: {
+    id: 'workbuddy',
+    label: 'WorkBuddy',
+    host: null,
+    portEnv: null,
+    defaultPort: null,
+    prefix: WORKBUDDY_PREFIX,
+    direct: true,
+    basePath: null,
+    auth: () => null,
+    needsModelMap: false,
+    // reasoning 与正文抢预算（国际版 Claude/GPT 系同样吃 reasoning）
+    needsBudget: true,
+    budgetKind: 'workbuddy',
+  },
 };
 
 function portOf(up) {
@@ -136,11 +192,66 @@ function resolve(model) {
   const slash = name.indexOf('/');
   if (slash > 0) {
     const head = name.slice(0, slash);
+    // 搭子自动档的名字自带斜杠，先于通道前缀匹配认领——否则会撞进
+    // unknown_channel 被 400（网关能调的模型因此少一半）
+    if (head === DUMATE_AUTO_PREFIX) {
+      return { channel: 'dumate', target: targetOf(UPSTREAMS.dumate), model: name };
+    }
     const rest = name.slice(slash + 1);
+    // 千帆原生透传：显式前缀、走 provider（不是本地转发），但通道归属仍是
+    // 搭子（同一份网页凭证与额度）。必须在通道前缀循环之前判——它没有
+    // 独立的 UPSTREAMS 条目。
+    if (head === QIANFAN_PREFIX) {
+      const t = targetOf(UPSTREAMS.dumate);
+      return {
+        channel: 'dumate',
+        model: rest,
+        rawQianfan: true,
+        target: {
+          ...t,
+          direct: true,
+          provider: './qianfan-raw',
+          needsModelMap: false,
+          needsBudget: false,
+          budgetKind: '',
+          rawQianfan: true,
+        },
+      };
+    }
+    // 千问 ACP 会话通道（2026-11-04，P2-17）：agent 型会话协议（REST 建会话
+    // + WS 信封 JSON-RPC），与 chat 桥不是一类东西——独立 provider。通道归属
+    // 仍是 qwenwork（同一份凭证与额度池）；模型档位由账号/套餐决定，前缀下
+    // 的模型名只是调用方标签。
+    if (head === QWEN_ACP_PREFIX) {
+      const t = targetOf(UPSTREAMS.qwenwork);
+      return {
+        channel: 'qwenwork',
+        model: rest,
+        target: {
+          ...t,
+          direct: true,
+          provider: './qwenwork/acp',
+          needsModelMap: false,
+          needsBudget: false,
+          budgetKind: '',
+        },
+      };
+    }
     for (const up of Object.values(UPSTREAMS)) {
       if (up.prefix && up.prefix === head) {
         return { channel: up.id, target: targetOf(up), model: rest };
       }
+    }
+    // TRAE 宝：通道归属 traework（同账号池/池状态/埋点），但对话身份换成
+    // personal_assistant。模式同 qianfan/（无独立 UPSTREAMS 条目）。
+    if (head === TRAEBAO_PREFIX) {
+      const t = targetOf(UPSTREAMS.traework);
+      return {
+        channel: 'traework',
+        model: rest,
+        personalAssistant: true,
+        target: { ...t, personalAssistant: true },
+      };
     }
     return { error: `unknown_channel: ${head}` };
   }
@@ -222,6 +333,14 @@ function availability(channel) {
       return { ok: false, reason: e.message };
     }
   }
+  if (channel === 'workbuddy') {
+    try {
+      const st = require('./workbuddy').status();
+      return st.ready ? { ok: true } : { ok: false, reason: st.error || 'not_ready' };
+    } catch (e) {
+      return { ok: false, reason: e.message };
+    }
+  }
   return { ok: true };
 }
 
@@ -230,6 +349,7 @@ function exposedFor(channel, models) {
   if (channel === 'qwenwork') return models.map((m) => `${QWEN_PREFIX}/${m}`);
   if (channel === 'traework') return models.map((m) => `${TRAEWORK_PREFIX}/${m}`);
   if (channel === 'qoder') return models.map((m) => `${QODER_PREFIX}/${m}`);
+  if (channel === 'workbuddy') return models.map((m) => `${WORKBUDDY_PREFIX}/${m}`);
   return models.slice();
 }
 
@@ -237,6 +357,10 @@ module.exports = {
   QWEN_PREFIX,
   TRAEWORK_PREFIX,
   QODER_PREFIX,
+  QIANFAN_PREFIX,
+  QWEN_ACP_PREFIX,
+  TRAEBAO_PREFIX,
+  DUMATE_AUTO_PREFIX,
   UPSTREAMS,
   resolve,
   availability,

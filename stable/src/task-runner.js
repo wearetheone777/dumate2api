@@ -29,7 +29,8 @@ const LOG_FILE = 'task-runs.jsonl';
 function appendLog(entry) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.appendFileSync(path.join(DATA_DIR, LOG_FILE), `${JSON.stringify(entry)}\n`, 'utf8');
+    // M3 账本原子追加：走 jsonl（锁内轮转 + 单次 Buffer write）
+    require('./jsonl').append(path.join(DATA_DIR, LOG_FILE), `${JSON.stringify(entry)}\n`);
   } catch (e) { /* 记录失败不影响任务本身 */ }
   // 同时写进统一记录流，供「记录」页按时间轴展示
   try {

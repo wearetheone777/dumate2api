@@ -67,6 +67,9 @@ function list() {
     uid: a.uid || '',
     nickname: a.nickname || '',
     email: a.email || '',
+    // 区域（2026-11-03 国际版接入）：cn / intl，存量记录缺省按国内。
+    // 界面据此打「国内/国际」徽标，登录时也按它选授权页。
+    region: c.normalizeRegion(a.region),
     // 手机号：只给脱敏形式。完整值只留在账号文件里（PII）
     phone: maskPhone(a.phone),
     // 来源必须一起给——TRAE 这个号是从昵称推断的，不是接口下发的真手机号。
@@ -194,30 +197,39 @@ async function exchangeOnce(a) {
   try { agent = require('../proxy-agent').getAgentFor(a); } catch (e) {
     return { ok: false, error: `出站代理配置错误: ${e.message}` };
   }
-  const host = a.apiHost || c.OAUTH_HOST;
+  // 主机按账号区域走（国际版账号换票打 grow-normal.trae.ai，不是国内
+  // api.trae.com.cn）。国际版带候选回落：连接级失败换下一家（拿到响应
+  // 含 4xx 就交上层按状态码处置——凭证失效换主机也没用）。
   const body = {
     ClientID: c.CLIENT_ID,
     RefreshToken: a.refreshToken,
     ClientSecret: '-',
     UserID: '',
   };
-  const r = await c.request(host, c.EP_EXCHANGE, {
-    method: 'POST', body, headers: oauthHeaders(), agent,
-  });
-  if (r.status !== 200 || !r.data) {
-    return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+  const hosts = a.apiHost ? [a.apiHost] : c.oauthHostCandidates(a);
+  let last = null;
+  for (const host of hosts) {
+    const r = await c.request(host, c.EP_EXCHANGE, {
+      method: 'POST', body, headers: oauthHeaders(), agent,
+    });
+    if (r.status === 200 && r.data) {
+      const res = (r.data && r.data.Result) || r.data || {};
+      const token = res.Token || res.token;
+      if (!token) return { ok: false, error: '响应里没有 Token' };
+      const out = { accessToken: token };
+      if (res.RefreshToken) out.refreshToken = res.RefreshToken;
+      // 到期时间：优先用 JWT 的 exp，其次用接口给的毫秒时间戳
+      const exp = jwtExp(token);
+      if (exp) out.expiresAt = exp;
+      else if (res.ExpiresAt) out.expiresAt = Number(res.ExpiresAt);
+      if (res.RefreshExpireAt) out.refreshExpiresAt = Number(res.RefreshExpireAt);
+      return { ok: true, patch: out };
+    }
+    last = { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+    // 连接级失败才换下一家；HTTP 层有响应（含 401/403）主机没问题
+    if (r.status !== 0) break;
   }
-  const res = (r.data && r.data.Result) || r.data || {};
-  const token = res.Token || res.token;
-  if (!token) return { ok: false, error: '响应里没有 Token' };
-  const out = { accessToken: token };
-  if (res.RefreshToken) out.refreshToken = res.RefreshToken;
-  // 到期时间：优先用 JWT 的 exp，其次用接口给的毫秒时间戳
-  const exp = jwtExp(token);
-  if (exp) out.expiresAt = exp;
-  else if (res.ExpiresAt) out.expiresAt = Number(res.ExpiresAt);
-  if (res.RefreshExpireAt) out.refreshExpiresAt = Number(res.RefreshExpireAt);
-  return { ok: true, patch: out };
+  return last || { ok: false, error: '换票失败：无可用主机' };
 }
 
 /**
@@ -353,7 +365,7 @@ function rotateDevice(a) {
 async function fetchUserInfo(a) {
   let agent = null;
   try { agent = require('../proxy-agent').getAgentFor(a); } catch (e) { return null; }
-  const r = await c.request(a.apiHost || c.OAUTH_HOST, c.EP_USER_INFO, {
+  const r = await c.request(a.apiHost || c.oauthHostOf(a), c.EP_USER_INFO, {
     method: 'POST', body: {}, headers: { ...oauthHeaders(), Authorization: `Cloud-IDE-JWT ${a.accessToken}` }, agent,
   });
   if (r.status !== 200 || !r.data) return null;
@@ -362,6 +374,63 @@ async function fetchUserInfo(a) {
     uid: String(res.UserID || res.userId || res.UID || ''),
     nickname: res.Nickname || res.nickname || res.UserName || '',
     email: res.Email || res.email || '',
+  };
+}
+
+/**
+ * 登录态 + 设备绑定查询（2026-11-01，bluechonk 端点清单实测）。
+ *
+ * 9074 的诊断入口：不用打对话/签到就能看到**上游认为本账号绑定的设备**
+ * （BoundDeviceID）与登录态（IsLogin）。deviceMatch 是本实现自己算的——
+ * 上游绑定的 id 是否等于我们的派生 deviceId；不匹配时 rotateDevice 大概率
+ * 能修，匹配时 9074 就是别的原因（活动侧校验/风控），别再瞎轮换设备。
+ *
+ * **2026-11-01 真机实测定案**：只有 `x-cloudide-token` 被认——
+ * `Authorization: Cloud-IDE-JWT` 回 200 + `IsLogin:false` 空骨架（不报 401）。
+ * DeviceBindStatus 是字符串枚举（实测 "BOUND"）。BoundDeviceID 与我们派生的
+ * deviceId 是两套命名空间（见 parseCheckLogin 注释）——rotateDevice 绕 9074
+ * 换的是请求头，云端绑定记录不受影响。
+ */
+async function checkLogin(rawAuth) {
+  let agent;
+  try { agent = require('../proxy-agent').getAgentFor(rawAuth); } catch (e) { return { ok: false, error: e.message }; }
+  const r = await c.request(rawAuth.apiHost || c.oauthHostOf(rawAuth), c.EP_CHECK_LOGIN, {
+    method: 'POST',
+    body: { uid: rawAuth.uid, IDEVersion: '1.107.1', ReqSource: 'Lite' },
+    headers: {
+      ...oauthHeaders(),
+      'x-cloudide-token': rawAuth.accessToken,
+      Authorization: `Cloud-IDE-JWT ${rawAuth.accessToken}`,
+    },
+    agent,
+  });
+  if (r.status !== 200 || !r.data) {
+    return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}` };
+  }
+  // 鉴权头没被认时上游回 200 + IsLogin:false 的空 Result（不报 401）——
+  // 与 GetUserInfo 的 Result 包装同款。空骨架如实返回，调用方据此判「凭证没过」。
+  const d = (r.data && (r.data.data || r.data.Result || r.data)) || {};
+  return { ok: true, ...parseCheckLogin(d, rawAuth.deviceId), raw: d };
+}
+
+/** 纯函数：CheckLogin 响应体 → 诊断字段 */
+function parseCheckLogin(d, localDeviceId) {
+  const bound = String((d && (d.BoundDeviceID ?? d.bound_device_id)) || '') || null;
+  const local = String(localDeviceId || '');
+  // **两个 id 是两套命名空间，不能直接比相等**（2026-11-01 真机实测定案）：
+  // BoundDeviceID 是登录时设备证明的产物（12 位混合字符，ECDSA 链路），
+  // 我们派生的 deviceId 是 15 位纯数字（ug 族请求头用）。实测两者形态不同但
+  // 签到照常成功——所以 deviceMatch 只在形态相同（都纯数字）时才有比对意义，
+  // 否则如实 null。诊断看的是 boundDeviceId 本身与 deviceBindStatus。
+  const sameShape = bound != null && /^\d+$/.test(bound) && /^\d+$/.test(local);
+  return {
+    isLogin: !!(d && (d.IsLogin ?? d.is_login)),
+    boundDeviceId: bound,
+    // 字符串枚举（实测 "BOUND"），原样透出不解读
+    deviceBindStatus: d ? (d.DeviceBindStatus ?? null) : null,
+    deviceMatch: sameShape ? bound === local : null,
+    expiredAt: d && d.ExpiredAt != null && Number.isFinite(Number(d.ExpiredAt)) ? Number(d.ExpiredAt) : null,
+    region: (d && (d.Region || d.AIRegion)) || null,
   };
 }
 
@@ -404,5 +473,6 @@ async function syncNickname(a) {
 module.exports = {
   FILE, filePath, dataDir, load, save, list, get, findUsable, upsert, remove, patch,
   needsRefresh, exchange, jwtExp, jwtUid, fetchUserInfo, ensureDevice, rotateDevice,
+  checkLogin, parseCheckLogin,
   maskPhone, phoneFromNickname, genId, syncNickname,
 };

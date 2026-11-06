@@ -1,5 +1,5 @@
-快照指纹 sha256（stable/src 下 78 个 .js，按路径+内容计算）：
-6a7226a4df23e905f1f734c775a354b8abc34dd4548601c23924ea7a1ba9fdf4
+快照指纹 sha256（stable/src 下 102 个 .js，按路径+内容计算）：
+33cab228f4d68e7f93681ca97ef1c2aa93de96b3cede05db1024dbbb59daf7df
 
 指纹算法：
   对 stable/src 下所有 .js 文件，按相对路径排序（`/` 分隔），
@@ -7,40 +7,57 @@
   本次已用该算法实算，可复核（scripts/snapshot-closure.js 算闭包，
   指纹与逐字节比对由同目录脚本流程复现）。
 
-来源：main 分支「Qoder 排队重签 + 无内容阈值回宽」提交（父提交 674686d，
-  即 2026-10-30 的「播报即收尾三通道共享化」）。本次是**增量同步**：
-  只覆盖 2 个文件（qoder/chat.js、qoder/index.js），其余 76 个与上一版
-  指纹 9dee04a4… 完全一致。
+来源：main 分支「WorkBuddy 管理端 M1/M2 + M3 账本原子追加/自查端点 +
+TRAE 链路状态 + keepalive 补跑」七连提交（845a5a2，父提交 ac5d357）。
+本次是**大版本同步**：闭包从 78 个文件增长到 102 个——51 个内容更新、
+24 个新增（workbuddy 通道 7 个、qwenwork ACP/搜索/语音/WS 7 个、
+traework remote/solo/billing/tnc 4 个、其余 6 个），stable 无多余文件。
 
-本次覆盖了什么（相对上一版快照 9dee04a4…，2026-10-31 两件）：
-  1. **排队重发必须每轮重签（reSign）**：上游按**签名字节**去重——请求体
-     复用没问题，但 headers 复用时第二次起一律回
-     `{"code":"103","message":"Duplicate request"}`。103 < 400，
-     payloadError 认不出，请求静默挂到内容超时才被掐断；且去重与时间无关
-     （实测同一份 headers 间隔 7 秒重发仍是 103）。修法：重发前重建
-     headers（新 requestId + 新 cosy-date），**不动 encBody**，排队槽位
-     不受影响。实测对照：复用 headers → 103 后沉默；每轮重签 → 正常拿到
-     10605/放行。代价实测小请求 0.1ms / 800KB 请求 18.8ms。
-  2. **queue/status 同机制**（statusHeaders 由常量改成函数）：复用签名时
-     第二次查询起全部 403/103，getQueueStatus 对非 200 返回 null，
-     statusFailures 两次就把它判成「端点不可用」——官方排队轮询协议整条
-     退化成盲等重发。实测每次重建则连续 3 次全部 200。
-  3. **无内容超时 12s/6s → 90s（DUMATE_QODER_CONTENT_MS 默认值）**：
-     按 1270 条成功请求复核，首字 > 6s 占 14.4%、> 30s 占 7.6%、max 63.9s；
-     大上下文（>50K）首字 > 6s 占 20.5%。旧的 6s 上线后 502 里有 36 条
-     first_token_ms 卡在 5006~5030——计时器自己造的。真排队时上游 200~680ms
-     内就回 10605 信封（走 payloadError 断流），根本轮不到这个计时器；
-     90s 盖住本地实测 max 63.9s 与 qoder2api-hub 记载的 71s 上限。
+本次覆盖了什么（相对上一版快照 6a7226a4…，2026-10-31「排队重签 + 无内容
+阈值回宽」，之后主分支累计到 845a5a2）：
 
-验证记录（2026-10-31）：
-  · 闭包重算：node scripts/snapshot-closure.js → 78 个文件，无无法解析的 require
-  · 逐字节比对：src 与 stable/src 闭包内 78 个文件内容零差异；stable 无多余文件
-  · 语法检查：本次覆盖的 2 个文件 node --check 通过
-  · 独立启动：DUMATE2API_PORT=19099 DUMATE_ADMIN_DATA=<repo>/data 启动成功，
-    /health 四通道全部 ready（dumate source=web / qwenwork 2 账号本地签名 /
-    traework 2 账号 / qoder 2 账号 needsClient=false）
-  · 离线回归：verify-qoder-throttle / read-idle / error-surface / channel /
-    repair 全部 exit=0
+1. **WorkBuddy 第五通道完整接入**（6eae877 起）：双区域账号池
+   （copilot.tencent.com / workbuddy.ai）、标准 OpenAI SSE、OAuth 设备登录、
+   签到（仅国内）、billing 套餐包额度、FEFO 临期选号、11-128 指纹清洗、
+   网页 agent 打卡（ACP over streamable HTTP）。
+2. **风控连坐保护**（hub #422）：11140 不再默认换号——设备/出口指纹被扫到
+   时换号等于把同一个指纹挨个报给风控。窗口内 2 个不同账号被限制即整区域
+   暂停 30 分钟（DUMATE_WORKBUDDY_RESTRICTION_* 可调）；暂停态落盘观测快照
+   供管理端横幅跨进程展示，「立即解除」走反向信号文件由网关消费。
+3. **Token 刷新互斥守卫**（refreshGuard）：刷新前重读对齐（存储已有更新的
+   有效 token 直接采纳不打上游）、失败后败者恢复（invalid_grant 时识别
+   三方竞态、采纳对方新值而不是判死账号）。
+4. **TRAE Remote / SOLO 链路 + 逐轮精确账单**：manual 策略必须带完整
+   custom_model；thinking reasoning_effort 协议对齐；get_session_usage 按
+   buildBody 主动写的 session_id 记账（utils_chat/Remote/SOLO 三条链路
+   实测全通）。
+5. **Qoder 官方排队轮询 + 思考档位 + 前缀缓存亲和 + usage 缓存归一**：
+   request_set_id 同槽重发（每轮 reSign）、content deadline 90s、
+   P1/P2 增强（reasoning_effort 归一、max-output 自学习、FEFO、: ping
+   保活、credits-summary 官方口径、错峰优惠透出）。
+6. **M3 账本原子追加**：jsonl.js 全写路径收口——整行 Buffer 单次 write
+   （Windows FILE_APPEND_DATA 原子）+ rotate/append 锁内合并（原窗口会把
+   行追加进已 rename 的归档）；reqlog/records/qoder-grants/task-runner/
+   checkin-ledger 五处散装 appendFileSync 全部收敛。hub 实测文本模式并发
+   丢行 7.3%，此修复使各账本免疫。
+7. **M3 GET /v1/usage 下游自查端点**：key 鉴权（与数据面同口径），
+   today/7d/30d 窗口聚合，响应不含 plain/hash。
+8. **keepalive 重启补跑**（shouldCatchup 纯函数）与健康预警数据面。
+9. **管理端 admin/**（9083 不在 9080 进程内，但 router/auth/accounts/
+   store 在数据面闭包里——key 管理等接口随闭包同步）。
+
+验证记录（2026-11-07）：
+  · 闭包重算：node scripts/snapshot-closure.js --json → 102 个文件，missing 0
+  · 逐字节比对：src 与 stable/src 闭包内 102 个文件内容零差异；
+    stable 无闭包外多余文件（重跑比对脚本复核，0/0/0）
+  · 语法检查：stable/src 全部 102 个文件 node --check 通过
+  · 独立启动：DUMATE2API_PORT=19099 + DUMATE_ADMIN_DATA=<repo>/data 启动成功，
+    /health 五通道全部 ready（dumate source=web fallback 可用 / qwenwork 2 账号
+    本地签名 / traework 3 账号 / qoder 2 账号 needsClient=false /
+    workbuddy 2 账号 needsClient=false）
+  · 离线回归：主目录全量 pnpm test 与逐字节一致的快照内容等价——
+    当前基线 4 项既有红（qwenwork.send e2e / dumateRows×2 / pool 并发选号），
+    提交前即红、与快照无关；M2/M3 新增单测 62 项全绿
   · 未启动 9080（对外服务的启动是用户的决定，不属于发布流程）
 
 注意：9080 若当前在运行，它跑的仍是旧快照代码；要让新代码生效需重启 9080

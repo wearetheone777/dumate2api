@@ -178,6 +178,28 @@ function schedule() {
   if (timer) { clearTimeout(timer); timer = null; }
   if (!state.enabled) { state.next_run_at = null; return; }
   armAt(computeNextRunAt(Date.now(), state));
+  // 重启补跑（2026-11-06）：进程没在跑时今天的时点照样会过去——重启后若
+  // 今天时点已过且 last_run_at 不是今天，立即后台补一轮。幂等由签到接口
+  // already / grants 去重 / running 互斥三层兜底，跑过了就是空转一轮。
+  if (shouldCatchup(Date.now(), state, state.last_run_at)) {
+    runOnce('catchup').catch(() => { /* 补跑失败明天照常 */ });
+  }
+}
+
+// 补跑判据（纯函数，schedule() 接线、测试直测）：今天时点已过 && 今天没跑过。
+// 「恰好等于时点」要补——computeNextRunAt 的 at <= now 分支会把排程翻到明天。
+function shouldCatchup(now, cfg, lastRunAt) {
+  if (!cfg || !cfg.enabled) return false;
+  const point = new Date(now);
+  point.setHours(cfg.hour, cfg.minute, 0, 0);
+  if (point.getTime() > now) return false;
+  if (lastRunAt) {
+    const last = new Date(lastRunAt);
+    if (last.getFullYear() === point.getFullYear()
+      && last.getMonth() === point.getMonth()
+      && last.getDate() === point.getDate()) return false;
+  }
+  return true;
 }
 
 // 取消排程 + 立即中断进行中的一轮（sleepCtx 全部提前返回，阶段边界快速收尾）
@@ -296,9 +318,11 @@ function builtinAdapters() {
       async balance(a) {
         const { fetchWallets } = require('./qwenwork/credits');
         const r = await fetchWallets({ account: a, force: true });
-        // 三池之和即权威口径（fetchWallets 内部已对 account-context 交叉验证）
-        const parts = [r.daily, r.monthly, r.longterm].filter((v) => typeof v === 'number' && Number.isFinite(v));
-        return { ok: !!r.ok && parts.length > 0, remain: parts.length ? parts.reduce((s, v) => s + v, 0) : null, error: r.error || '' };
+        // 合计以 total 为准：它是三池之和（上游坏读时已用 account-context 的
+        // 权威值校正过）。**不要自己把三池加起来**——坏读时池子是 null，
+        // 当成 0 相加会得出「余额 0」，保活会把它当「额度耗尽」报出去。
+        const t = r.ok && typeof r.total === 'number' && Number.isFinite(r.total) ? r.total : null;
+        return { ok: !!r.ok && t != null, remain: t, error: r.error || '' };
       },
     },
     {
@@ -382,6 +406,88 @@ function expireWarn(r, warnHours) {
   const leftMs = at - Date.now();
   if (leftMs > warnHours * 3600 * 1000) return null;
   return { expire_at: at, left_hours: Math.max(0, Math.round((leftMs / 3600000) * 10) / 10) };
+}
+
+// ── 健康预警判据（2026-11-06 清单项「登录态健康预警 UI」的数据面）──
+//
+// 纯函数，输入两个**内存快照**（管理端 /keepalive/health 端点喂入）：
+//   ka          keepalive.snapshot() 的裁剪版（enabled / last_result.results）
+//   webAccounts web-pool.snapshot() 的账号行（搭子网页凭证）
+// 分级：crit（红）= 登录态已死或账号不可用；warn（黄）= 要留意；绿 = alerts 为空。
+// 判读纪律：字段查不到就跳过该条，不编成因（与 grants 推算同一口径）。
+// 注意 results 行的 expire_warn 只覆盖「到期时刻已知」的号——cookie 死
+// （401）的行 expire_at 未知、expire_warn 恒 null，crit 从 error 串判。
+function healthAlerts({ ka, webAccounts } = {}) {
+  const alerts = [];
+  const errKind = (s) => (/401|expired|login|cookie/i.test(String(s || '')) ? 'auth' : 'network');
+
+  // ── 搭子网页账号（web-pool 状态机视图）──
+  for (const a of Array.isArray(webAccounts) ? webAccounts : []) {
+    if (!a || !a.enabled) continue;                 // 未启用的账号不进健康面
+    if (a.disabled) {
+      alerts.push({
+        level: 'crit', channel: 'dumate', account: a.name, reason: 'disabled',
+        message: a.disabled_reason || '账号已被禁用（连续 401 达阈）',
+      });
+      continue;
+    }
+    const err = String(a.last_error || '');
+    if (errKind(err) === 'auth') {
+      alerts.push({
+        level: 'crit', channel: 'dumate', account: a.name, reason: 'cookie_dead',
+        message: `登录态失效（${err.slice(0, 80)}）——需重新登录`,
+      });
+      continue;                                     // 登录态都死了，冷却没有意义
+    }
+    // token 票（约 1h 有效）余量 < 10 分钟：下次请求会自动续期，纯提示
+    if (Number.isFinite(a.token_expires_in_s) && a.token_expires_in_s > 0 && a.token_expires_in_s < 600) {
+      alerts.push({
+        level: 'warn', channel: 'dumate', account: a.name, reason: 'token_low',
+        message: `token 余量仅 ${Math.max(1, Math.round(a.token_expires_in_s / 60))} 分钟（下次请求自动续期）`,
+      });
+    }
+    if (a.cooling) {
+      alerts.push({
+        level: 'warn', channel: 'dumate', account: a.name, reason: 'cooling',
+        message: `冷却中${Number.isFinite(a.cool_remaining_s) && a.cool_remaining_s > 0
+          ? `（${Math.round(a.cool_remaining_s / 60)} 分钟后可重试）` : ''}` +
+          (a.cooldown_reason ? `：${a.cooldown_reason}` : ''),
+      });
+    }
+  }
+
+  // ── 保活轮结果（含直连通道账号——它们的健康信息只在这里有）──
+  const last = ka && ka.last_result;
+  if (last && Array.isArray(last.results)) {
+    for (const r of last.results) {
+      if (!r || r.ok || r.skipped) continue;
+      const kind = errKind(r.error);
+      alerts.push({
+        level: kind === 'auth' ? 'crit' : 'warn',
+        channel: r.channel || '', account: r.name || r.uid || '',
+        reason: kind === 'auth' ? 'refresh_auth_fail' : 'refresh_fail',
+        message: (kind === 'auth' ? '保活续期失败（登录态疑失效）：' : '保活续期失败：') +
+          String(r.error || '未知原因').slice(0, 80),
+      });
+    }
+    if (last.aborted) {
+      alerts.push({
+        level: 'warn', channel: 'keepalive', account: '', reason: 'keepalive_aborted',
+        message: '最近一轮保活被中断（结果不完整）',
+      });
+    }
+  }
+
+  // ── 排程面（提示性）──
+  if (ka && !ka.enabled) {
+    alerts.push({
+      level: 'warn', channel: 'keepalive', account: '', reason: 'keepalive_off',
+      message: '每日保活排程未启用——过期只在请求时被动发现',
+    });
+  }
+
+  // 红的排前面：界面横幅只看计数，明细列表红在上更符合阅读顺序
+  return alerts.sort((x, y) => (x.level === 'crit' ? 0 : 1) - (y.level === 'crit' ? 0 : 1));
 }
 
 // 解冻闭环（纯函数）：冷却中的账号 ∩ 余额查到的账号 ∩ 余额 > 阈值 → 解冻。
@@ -624,5 +730,5 @@ function configure(patch = {}) {
 module.exports = {
   schedule, stop, runOnce, snapshot, configure, state, setAdapters, setPool,
   // 测试/集成专用：排程纯函数、pool 对接层、可取消原语
-  internals: { computeNextRunAt, normalizePool, makeToken, sleepCtx, expireWarn, reconcile, balancePhase, armAt },
+  internals: { computeNextRunAt, normalizePool, makeToken, sleepCtx, expireWarn, reconcile, balancePhase, armAt, shouldCatchup, healthAlerts },
 };

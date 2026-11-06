@@ -67,7 +67,11 @@ function waitForPort(port, host, timeoutMs) {
   });
 }
 
-// Returns { pid, port } either for an already-running instance or a fresh spawn.
+// 无条件 spawn 一个新 backend 并把端口钉死在 -port（2026-11-06 验证记录）：
+// GUI 客户端拉起的 backend 端口是**随机的**（electron.log 实测 52721/52806，
+// 社区项目 Alphaxiaoteng/dumate2api 的「重启端口随机变化」结论只对 GUI 链路
+// 成立）；config.yml 的 port 字段被注释，唯一可靠端口来源就是这个 CLI 参数。
+// 所以本链路不存在端口漂移，也不探测已运行实例（含注释与实现曾不符的修正）。
 async function ensureUpstreamProcess(port) {
   const exe = exePath();
   if (!fs.existsSync(exe)) {

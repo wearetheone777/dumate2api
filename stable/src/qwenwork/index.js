@@ -26,6 +26,18 @@ const crypto = require('crypto');
 // 通道在池里的 uid 键位 = 'qwenwork:<id>'（channel-pool.js 统一裁决）。
 const channelPool = require('../channel-pool');
 const CHANNEL = 'qwenwork';
+// FEFO（临期积分优先）：数据源 expiring.js（写方是管理端 /accounts）
+const expiringSnap = require('../expiring');
+
+// 临期账号的池 uid 集合（accountIds 给 Set<string>，池键位是 'qwenwork:<id>'）。
+// null = FEFO 关闭 / 快照陈旧 / 窗口内无临期——走普通轮询，不报错。
+function fefoUidSet() {
+  const ids = expiringSnap.accountIds(CHANNEL);
+  if (!ids) return null;
+  const out = new Set();
+  for (const id of ids) out.add(channelPool.uidOf(CHANNEL, id));
+  return out;
+}
 // 出站代理工厂（E 包接线）：runOnce 按账号解析 agent
 const proxyAgent = require('../proxy-agent');
 
@@ -52,6 +64,10 @@ function status() {
     wasm: w ? { file: w.file, version: w.version } : null,
     loggedIn: usable.length > 0,
     accounts: usable.length,
+    // ACP 链路上游实定档位（最近一次建会话的 extra_data.mode；无会话 null）
+    acpMode: (() => {
+      try { return require('./acp').lastMode(); } catch (e) { return null; }
+    })(),
     error: !signerReady
       ? 'wasm 未找到（DUMATE_QWENWORK_USE_WASM=1 时才需要它）'
       : (usable.length ? '' : '尚未添加千问账号（需先登录一次）'),
@@ -180,8 +196,14 @@ async function runOnce(account, payload, onChunk, opts) {
       let sent = false;
       let doneSeen = false;
       const down = (inner) => { sent = true; onChunk(inner); };
-      // 每轮新开一扇门：重试轮要丢弃上一轮的缓冲（含暂扣的 usage/finish）
-      gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP) : null;
+      // 每轮新开一扇门：重试轮要丢弃上一轮的缓冲（含暂扣的 usage/finish）。
+      // opts 带模型与通道名：finish 阶段的 DSML fail-closed 兜底要用
+      // （recovered 帧要合成 OpenAI chunk，leak 日志要通道前缀）
+      gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP, {
+        model: modelKey, channel: 'qwenwork',
+        toolNames: repair.toolNamesOf(payload),
+        echoMode: repair.toolEchoMode(),
+      }) : null;
       const deliver = gate ? (inner) => gate.onInner(inner) : down;
       try {
         res = await chat.postStream(built.url, built.body, built.headers, (inner) => {
@@ -266,7 +288,10 @@ async function runOnce(account, payload, onChunk, opts) {
       payloads.push(...chat.unwrap(raw));
     }
     settle();
-    const agg = chat.aggregate(payloads, modelKey);
+    const agg = chat.aggregate(payloads, modelKey, {
+      toolNames: repair.toolNamesOf(payload),
+      echoMode: repair.toolEchoMode(),
+    });
     const msg = (agg.choices && agg.choices[0] && agg.choices[0].message) || {};
     const hasCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
     if (hasCalls || !repairable || attempt >= caps.REPAIR_MAX
@@ -308,7 +333,9 @@ async function send(payload, onChunk, opts = {}) {
 
   // 选号经池状态机：冷却/熔断/禁用/暂停/在途满的账号直接跳过（不再作为
   // 主账号去撞一次失败）；全池不可用时报 503 而不是拿冷却账号空转。
-  let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model });
+  // FEFO：集合非空时候选先限制在临期账号内（快照由管理端 /accounts 写）
+  const fefo = fefoUidSet();
+  let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring: fefo });
   if (!sel) {
     const err = new Error('千问办公没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
     err.statusCode = 503;
@@ -343,9 +370,13 @@ async function send(payload, onChunk, opts = {}) {
       return result;
     } catch (e) {
       const code = Number(e.statusCode) || 0;
-      // 失败喂池：类别判定在 upstream-errors.classify，池动作按类别分发
-      channelPool.noteError(CHANNEL, account.id, { status: code, message: e.message, model });
-      markFailure(account, e.message);
+      // 失败喂池：类别判定在 upstream-errors.classify，池动作按类别分发。
+      // **探针模式（opts.probe）跳过写型惩罚**——billing-check 是观测动作，
+      // 不把健康账号打成冷却（hub v1.7.20 #134 的教训），错误照常上抛。
+      if (!opts.probe) {
+        channelPool.noteError(CHANNEL, account.id, { status: code, message: e.message, model });
+        markFailure(account, e.message);
+      }
       // 限流要单独标出来：千问的限流是 **HTTP 403 + 信封 10605**，只看状态码
       // 会把它和「签名错/无权限」混为一谈（isThrottle 才是判据）。
       errors.push({
@@ -358,7 +389,7 @@ async function send(payload, onChunk, opts = {}) {
       if (e.sent) throw e;
       if (!retryable(code, e.message)) throw e;
       // 下一个候选仍经池选：刚失败的账号若进了冷却，这里自然跳过
-      sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model });
+      sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring: fefo });
       if (!sel) break;
     } finally {
       // 每次尝试结束必须放还在途名额（pickCandidate 命中即占用）
@@ -393,24 +424,80 @@ async function send(payload, onChunk, opts = {}) {
   throw err;
 }
 
-/** 模型列表：优先问服务端，失败回落静态表。用选中账号的凭证 */
-async function listModels() {
+// ---- 模型表与元数据（2026-10-31 起解析完整字段）----
+//
+// 上游 `/api/v2/model/list` 的条目除了 key 还带：
+//   price_factor / original_price_factor   标称倍率（相对值）
+//   context_config                          200K / 400K / 1M 档位
+//   is_vl                                   是否多模态
+// 旧实现只取 key，倍率/上下文/多模态全丢——模型页只能显示「千问无倍率」，
+// 而那是**解析没做**，不是上游没给。
+//
+// 结果缓存 60 秒：模型页会先后调 /models 与 /models/info，不缓存就是两次网络。
+
+const MODELS_TTL_MS = 60000;
+let modelsCache = { at: 0, entries: [], keys: [] };
+
+function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 归一化一条上游模型行（纯函数，便于离线验证） */
+function normalizeModelRow(m) {
+  if (!m || typeof m !== 'object') return null;
+  const key = m.key || m.model_key || m.name;
+  if (!key) return null;
+  const tiers = [];
+  const cfg = m.context_config && typeof m.context_config === 'object' ? m.context_config : null;
+  if (cfg) {
+    for (const x of Object.values(cfg)) {
+      const n = numOrNull(x && (x.token_count ?? x.tokens));
+      if (n && n > 0) tiers.push(n);
+    }
+  }
+  tiers.sort((a, b) => a - b);
+  const ctxMax = tiers.length ? tiers[tiers.length - 1] : numOrNull(m.max_input_tokens);
+  return {
+    key: String(key),
+    name: String(m.display_name || m.displayName || m.name || key),
+    rate: numOrNull(m.price_factor),
+    rateOriginal: numOrNull(m.original_price_factor),
+    contextWindow: ctxMax,
+    contextTiers: tiers,
+    multimodal: m.is_vl === true,
+    enabled: m.enable !== false,
+  };
+}
+
+/** 解析模型表响应（纯函数）。同时认 qwork 与 list 两种外壳。 */
+function parseModelsResponse(j) {
+  const list = (j && (Array.isArray(j.qwork) ? j.qwork : Array.isArray(j.list) ? j.list : null)) || [];
+  return list.map(normalizeModelRow).filter((x) => x && x.enabled);
+}
+
+async function fetchModelList(force = false) {
+  if (!force && modelsCache.entries.length && Date.now() - modelsCache.at < MODELS_TTL_MS) return modelsCache;
   try {
     const account = await chat.ensureAccount(authStore, pickAccount());
-    const built = await bridge.prepareInferAsync({
+    // **签名必须覆盖模型表自己的路径**（2026-10-31 实测）：签名串里带 pathSig，
+    // 复用聊天路径的签名去打 /api/v2/model/list，上游判 Signature invalid（403）。
+    // 旧实现在这里静默回落静态表——模型表从未真正来自上游。
+    const sign = require('./cosy-sign');
+    const sess = sign.newSession({
       uid: account.uid,
       token: account.accessToken,
-      bodyJson: '{}',
-      modelKey: constants.DEFAULT_MODEL,
       machineId: account.machineId || '',
     });
+    // GET 无请求体，按空串签名（与 Qoder 的 queue/status 同一约定）
+    const headers = sign.buildHeaders(sess, constants.MODELS_PATH, '', 'application/json');
     const u = new URL(constants.GATEWAY);
     const res = await new Promise((resolve, reject) => {
       const req = require('https').request({
         hostname: u.hostname,
         path: constants.MODELS_PATH,
         method: 'GET',
-        headers: { ...built.headers, 'Accept': 'application/json' },
+        headers: { ...headers, Accept: 'application/json' },
         timeout: 20000,
       }, (r) => {
         let b = '';
@@ -422,21 +509,40 @@ async function listModels() {
       req.end();
     });
     if (res.status === 200) {
-      const j = JSON.parse(res.raw);
-      const keys = ((j && j.qwork) || []).filter((m) => m && m.enable !== false).map((m) => m.key);
-      if (keys.length) {
-        // 成功拉到就告诉 model-info：界面据此把上下文等字段标成「上游下发」，
-        // 而不是回落静态表（两者可信度不同）
-        try { require('../model-info').setQwenKeys(keys); } catch (e) { /* 不影响返回 */ }
-        return keys;
+      const entries = parseModelsResponse(JSON.parse(res.raw));
+      if (entries.length) {
+        modelsCache = { at: Date.now(), entries, keys: entries.map((e) => e.key) };
+        // 成功拉到就告诉 model-info：界面据此把倍率/上下文标成「上游下发」
+        try { require('../model-info').setQwenModels(entries); } catch (e) { /* 不影响返回 */ }
+        return modelsCache;
       }
     }
   } catch (e) { /* 拿不到就用兜底，不阻断 */ }
-  return constants.FALLBACK_MODELS.slice();
+  return modelsCache.entries.length ? modelsCache : { at: 0, entries: [], keys: [] };
+}
+
+/** 模型 key 列表：优先问服务端，失败回落静态表 */
+async function listModels(force = false) {
+  const r = await fetchModelList(force);
+  return r.keys.length ? r.keys : constants.FALLBACK_MODELS.slice();
+}
+
+/** 带元数据的模型表（倍率/上下文/多模态）。接口不可用时给静态条目 */
+async function listModelEntries(force = false) {
+  const r = await fetchModelList(force);
+  if (r.entries.length) return r.entries;
+  return constants.FALLBACK_MODELS.map((key) => ({
+    key, name: key, rate: null, rateOriginal: null,
+    contextWindow: null, contextTiers: [], multimodal: false, enabled: true,
+  }));
 }
 
 module.exports = {
-  warmup, status, send, listModels, pickAccount,
+  warmup, status, send, listModels, listModelEntries, pickAccount,
+  normalizeModelRow, parseModelsResponse,
+  // FEFO 集合推导导出：端到端回归用（verify-expiring-fefo.js）。
+  // Qoder 3f 的教训——没导出的内部推导就是没测到的内部推导
+  fefoUidSet,
   chatCompletion: (p, opts) => send(p, undefined, opts),
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
 };

@@ -121,11 +121,24 @@ function normalizeList(items) {
 
 // 通道绑定。'' / null = 不限通道（兼容已有 key：网关按模型名前缀分流，
 // 不按 key 分流）。设成具体通道后，这把 key 只能调该通道的模型。
-// 三条通道：dumate（本地转发）、qwenwork（直连）、traework（直连，凭证自持）
+// 五条通道：dumate（本地转发）、qwenwork（直连）、traework（直连，凭证自持）、
+// qoder（直连，纯本地签名）、workbuddy（直连，双区域）
 const { CHANNELS, normalize } = require('./channels');
 function normalizeChannel(v) {
   return normalize(v);
 }
+
+// 区域维度（2026-11-01）：'' = 不限 / 'cn' = 仅国内账号 / 'intl' = 仅国际账号。
+// 只对有国际版的通道有意义——qoder（global 端点）、traework（2026-11-03 国际版
+// 已接入）、workbuddy（双区域）；dumate 与 qwenwork 是纯国内产品（上游连国际
+// 端点都没有），intl key 打它们在 validate 就拒，不进运行时。
+const KEY_REGIONS = ['', 'cn', 'intl'];
+function normalizeRegionKey(v) {
+  const s = String(v || '').trim().toLowerCase();
+  return KEY_REGIONS.includes(s) ? s : '';
+}
+/** 没有国际版的通道（区域恒为国内） */
+const CN_ONLY_CHANNELS = new Set(['dumate', 'qwenwork']);
 
 // ---- 校验 ----
 // 返回 { ok } 或 { ok:false, reason }。reason 直接面向使用者，
@@ -152,6 +165,17 @@ function validate(key, ip, model, channel) {
   // 通道判定的老路径不该因此被拒）。
   if (key.channel && channel && key.channel !== channel) {
     return { ok: false, reason: 'channel_not_allowed' };
+  }
+
+  // 区域绑定：intl key 打纯国内通道直接拒（上游连国际端点都不存在，
+  // 放进运行时只会变成「没有可用账号」这种无信息量报错）。cn key 打
+  // 国内通道天然通过；qoder/traework 的账号级过滤在 send 里做——
+  // 请求的模型名不编码区域（qoder/xxx 两个区的账号都能接），区域约束
+  // 只能落在账号池选择上。channel 未知时跳过（与通道绑定同一口径）。
+  if (key.region && channel) {
+    if (key.region === 'intl' && CN_ONLY_CHANNELS.has(channel)) {
+      return { ok: false, reason: 'region_not_available' };
+    }
   }
 
   return { ok: true };
@@ -196,7 +220,8 @@ function list() {
   const { keys } = load();
   return keys.map((k) => ({
     ...k,
-    // 明文 hash 不出接口：管理端只需要展示与统计
+    // hash 不出接口（校验用），plain 出接口（管理端查看/复制完整 key；
+    // 旧 key 没有这个字段，前端按「明文未存」显示）
     hash: undefined,
   }));
 }
@@ -224,6 +249,13 @@ function create(opts = {}) {
       name: String(opts.name || '').trim() || autoName,
       prefix: token.slice(0, 12),
       hash: hash(token),
+      // 明文随 key 一起落盘（2026-11-01 用户要求）：管理端要支持随时查看与
+      // 复制完整 key——「明文仅创建时返回一次」的旧策略废除了。明文本就
+      // 属于签发方（网关/管理端）自持的凭证，data/ 目录已 gitignore，与
+      // web-accounts.json 明文存 cookie 是同一种信任边界。
+      // 旧 key 没有 plain 字段：明文在旧策略下从未落盘，无法回填，界面对
+      // 这些 key 如实显示「明文未存」。
+      plain: token,
       created_at: now,
       expires_at: opts.expires_at || null,
       enabled: opts.enabled !== false,
@@ -231,6 +263,8 @@ function create(opts = {}) {
       model_allowlist: normalizeList(opts.model_allowlist),
       // 通道绑定：留空 = 不限（网关按模型名前缀分流）
       channel: normalizeChannel(opts.channel),
+      // 区域绑定：留空 = 不限；'cn'/'intl' 只对 qoder/traework 有区分度
+      region: normalizeRegionKey(opts.region),
       note: String(opts.note || ''),
     };
     keys.push(key);
@@ -251,6 +285,7 @@ function update(id, patch = {}) {
     if (patch.ip_allowlist !== undefined) k.ip_allowlist = normalizeList(patch.ip_allowlist);
     if (patch.model_allowlist !== undefined) k.model_allowlist = normalizeList(patch.model_allowlist);
     if (patch.channel !== undefined) k.channel = normalizeChannel(patch.channel);
+    if (patch.region !== undefined) k.region = normalizeRegionKey(patch.region);
     if (patch.note !== undefined) k.note = String(patch.note);
     save(data);
     return { ...k, hash: undefined };
@@ -272,6 +307,9 @@ function remove(id) {
 module.exports = {
   PREFIX,
   CHANNELS,
+  KEY_REGIONS,
+  normalizeRegionKey,
+  CN_ONLY_CHANNELS,
   filePath,
   load,
   save,

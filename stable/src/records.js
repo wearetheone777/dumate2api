@@ -6,6 +6,7 @@
 // 汇总成一个按时间排序的记录流，才能回答「这个账号这几天都发生了什么」。
 const fs = require('fs');
 const path = require('path');
+const jsonl = require('./jsonl');
 
 const DATA_DIR = process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', 'data');
 const FILE = 'activity.jsonl';
@@ -13,11 +14,9 @@ const FILE = 'activity.jsonl';
 function append(entry) {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.appendFileSync(
-      path.join(DATA_DIR, FILE),
-      `${JSON.stringify({ ts: Date.now(), ...entry })}\n`,
-      'utf8',
-    );
+    // M3 账本原子追加：走 jsonl.append（锁内轮转 + 单次 Buffer write），
+    // 跨进程并发不再有丢行/交错窗口
+    jsonl.append(path.join(DATA_DIR, FILE), `${JSON.stringify({ ts: Date.now(), ...entry })}\n`);
   } catch (e) { /* 记录失败不能影响动作本身 */ }
 }
 

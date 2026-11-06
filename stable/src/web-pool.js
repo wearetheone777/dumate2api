@@ -29,6 +29,8 @@ const crypto = require('crypto');
 const accounts = require('./accounts');
 const { classify } = require('./upstream-errors');
 const pool = require('./pool').pool;
+// FEFO 数据源（写方是管理端 /web-accounts 的临期快照）
+const expiringSnap = require('./expiring');
 // per-account 出站代理（施工包 E 接线）：getAgentFor 按账号 proxy 字段 > 全局
 // DUMATE_PROXY 解析，无代理返回 null（直连）。账号配了代理就绝不回退直连——
 // 解析失败抛错走请求失败路径进冷却，静默回退等于把真实出口 IP 裸奔出去。
@@ -89,18 +91,18 @@ function httpsJSON(hostname, path, method, headers, body, timeout = 30000, agent
           if (data.length > MAX_JSON_RESP_BYTES) {
             data = '';
             req.destroy();
-            resolve({ status: 0, json: null, raw: 'upstream response too large' });
+            resolve({ status: 0, headers: null, json: null, raw: 'upstream response too large' });
           }
         });
         res.on('end', () => {
           let json = null;
           try { json = JSON.parse(data); } catch (e) { json = null; }
-          resolve({ status: res.statusCode, json, raw: json ? null : data.slice(0, 300) });
+          resolve({ status: res.statusCode, headers: res.headers, json, raw: json ? null : data.slice(0, 300) });
         });
       }
     );
-    req.on('error', (e) => resolve({ status: 0, json: null, raw: e.message }));
-    req.on('timeout', () => { req.destroy(); resolve({ status: 0, json: null, raw: 'timeout' }); });
+    req.on('error', (e) => resolve({ status: 0, headers: null, json: null, raw: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ status: 0, headers: null, json: null, raw: 'timeout' }); });
     if (payload) req.write(payload);
     req.end();
   });
@@ -138,6 +140,13 @@ async function getToken(account, force = false, agent = null) {
     if (r.status !== 200 || !r.json || !r.json.result || !r.json.result.token) {
       const msg = r.json && r.json.message ? r.json.message : (r.raw || `HTTP ${r.status}`);
       st.last_error = `取 token 失败：${msg}`;
+      // token/get 回 401 = cookie 已失效，旧票随之必死——当场清缓存。不清的话
+      // 后续请求会先拿僵尸票打模型网关吃 401、再触发强刷回到 token/get 再失败
+      // 一次，每个请求都两连败；清了之后失败路径缩短为一次 token/get。
+      if (r.status === 401) {
+        st.token = null;
+        st.token_expire_at = 0;
+      }
       return { ok: false, error: st.last_error, expired: r.status === 401 };
     }
 
@@ -161,11 +170,25 @@ async function getToken(account, force = false, agent = null) {
 // model/paid 透传给池做模型级负缓存与积分保底判据。
 // 惩罚态判定（冷却/熔断/禁用/暂停/在途满/保底）全在 pool.pick,这里只提供
 // 「启用账号」这个候选集。
+// FEFO：优先消耗临期积分的账号集合（快照由管理端 /web-accounts 顺带写，
+// 读的时候陈旧/为空即返回 null——走普通轮询，行为回到加这个功能之前）。
+// 快照里的账号 id 是字符串（JSON 对象键），pool.pick 的候选是数字 id，转换。
+function fefoIdSet() {
+  const ids = expiringSnap.accountIds('dumate');
+  if (!ids) return null;
+  return new Set([...ids].map(Number));
+}
+
 function pick(exclude = new Set(), opts = {}) {
   const ids = accounts.load().accounts
     .filter((a) => a.enabled)
     .map((a) => a.id);
-  const id = pool.pick(ids, { exclude, model: opts.model, paid: opts.paid });
+  const id = pool.pick(ids, {
+    exclude, model: opts.model, paid: opts.paid,
+    // 集合非空时候选被限制在临期账号内（pool.pick 的 expiring 语义）；
+    // 临期号不健康时池自动退回全量候选
+    expiring: fefoIdSet(),
+  });
   if (id == null) return null;
   return { account: accounts.getRaw(id), st: stateOf(id) };
 }
@@ -207,16 +230,101 @@ async function callModel(account, path, method, body, opts = {}) {
       'X-Dumate-Account-Id': 'global',
     }, body, opts.timeout || 600000, agent);
 
+    // 云端网关回传的真实后端模型（X-Dumate-Gw-Realmodel）。响应头一到就
+    // 回调——埋点在响应结束时落笔，等返回值链路传下去就赶不上了
+    const realModel = (r.headers && r.headers['x-dumate-gw-realmodel']) || '';
+    if (realModel && typeof opts.onRealModel === 'function') {
+      try { opts.onRealModel(realModel); } catch (e) { /* 埋点失败不影响转发 */ }
+    }
+
     // token 失效：强制刷一次再重试一次。不无限重试——真失效（cookie 过期）
     // 时重试再多次也没用，只会放大延迟。
     if (r.status === 401 && !opts._retried) {
       return callModel(account, path, method, body, { ...opts, forceToken: true, _retried: true });
     }
 
-    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: r.json, raw: r.raw, account };
+    return { ok: r.status >= 200 && r.status < 300, status: r.status, json: r.json, raw: r.raw, headers: r.headers, account };
   } finally {
     pool.release(account.id);
   }
+}
+
+// 流式单次尝试（不含 401 编排与在途帽，外部请走 callModelStream）。
+// opts._swallow401 = true 时把 401 错误体吞掉不上 onChunk——错误体一旦进了
+// 调用方的嗅探层（fallback-web 首块嗅探 / guardedChunk 的 committed 置位），
+// 包装层的强刷重试与故障转移就全被短路了。
+async function streamOnce(account, path, method, body, onChunk, agent, opts) {
+  return await new Promise((resolve) => {
+    getToken(account, opts.forceToken, agent).then((t) => {
+      if (!t.ok) return resolve({ ok: false, status: 401, error: t.error, expired: t.expired, account });
+
+      const payload = JSON.stringify(body);
+      const req = https.request(
+        {
+          hostname: GATEWAY_HOST,
+          path: GATEWAY_PREFIX + path,
+          method,
+          timeout: opts.timeout || 600000,
+          ...(agent ? { agent } : {}),
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+            Authorization: `Bearer ${t.token}`,
+            'X-Dumate-Client-Type': 'web',
+            'X-Dumate-Account-Id': 'global',
+            'Content-Length': Buffer.byteLength(payload),
+          },
+        },
+        (res) => {
+          // 401 拦截（仅首次尝试）：token 可能在本地 expired_at 之前被服务端
+          // 作废（同账号在别处重新登录会顶掉旧票）。丢弃错误体、交包装层强刷
+          // 重试——这次尝试对外不存在，onStatus/onChunk 都不触发。
+          if (res.statusCode === 401 && opts._swallow401) {
+            res.resume();
+            return resolve({ ok: false, status: 401, swallowed: true, account });
+          }
+          // 响应头一到就回调：调用方要在「还没转发任何内容」时决定
+          // 是否接受这次响应（否则只能等整条流结束，那就没法做故障转移了）
+          if (typeof opts.onStatus === 'function') {
+            try { opts.onStatus(res.statusCode); } catch (e) { /* 忽略 */ }
+          }
+          // 云端网关回传的真实后端模型（X-Dumate-Gw-Realmodel）。响应头
+          // 一到就上报——埋点在流结束时落笔，晚一步就赶不上
+          const realModel = res.headers['x-dumate-gw-realmodel'] || '';
+          if (realModel && typeof opts.onRealModel === 'function') {
+            try { opts.onRealModel(realModel); } catch (e) { /* 忽略 */ }
+          }
+          // text 只用于日志/usage 扫描（usage 在流的最后），转发走 onChunk。
+          // 原实现全量累积（审计 P1-1c：号称「不缓冲」实际整条 SSE 又存一份），
+          // 这里改为尾部固定窗口——语义不变，内存有界。
+          const TEXT_TAIL = 1024 * 1024;
+          let text = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => {
+            text += c;
+            if (text.length > TEXT_TAIL) text = text.slice(-TEXT_TAIL);
+            try { onChunk(c); } catch (e) { /* 下游写失败不影响上游读取 */ }
+          });
+          res.on('end', () => {
+            const ok = res.statusCode >= 200 && res.statusCode < 300;
+            resolve({
+              ok, status: res.statusCode, text, account, streamed: true,
+              realModel: res.headers['x-dumate-gw-realmodel'] || '',
+            });
+          });
+        },
+      );
+      req.on('error', (e) => {
+        resolve({ ok: false, status: 0, error: e.message, account });
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ ok: false, status: 0, error: 'timeout', account });
+      });
+      req.write(payload);
+      req.end();
+    }).catch((e) => resolve({ ok: false, status: 0, error: e.message, account }));
+  });
 }
 
 // 流式调用：把上游的 SSE 原样透传给调用方，不缓冲。
@@ -229,6 +337,10 @@ async function callModel(account, path, method, body, opts = {}) {
 // 成败标记不在本函数做：旧实现在这里与故障转移循环各记一次，同一次失败
 // 被计两遍；现在统一由带故障转移语义的调用方（callStreamWithFailover/probe）
 // 喂池，直连调用方（chatlab 实验）不污染账号状态。
+//
+// 401 自愈（与 callModel 对齐，2026-11-06）：首次尝试的 401 错误体被
+// streamOnce 吞掉（不喂 onChunk、不触发 onStatus），这里强刷 token 重试一次；
+// 重试仍 401 时错误体按原样经 onChunk 交给调用方（真失效重试也没用，不无限循环）。
 async function callModelStream(account, path, method, body, onChunk, opts = {}) {
   if (!pool.acquire(account.id)) {
     return { ok: false, status: 0, error: '账号在途请求已达上限', busy: true, account, streamed: true };
@@ -238,61 +350,13 @@ async function callModelStream(account, path, method, body, onChunk, opts = {}) 
     try { agent = agentFor(account); } catch (e) {
       return { ok: false, status: 0, error: `出站代理配置错误: ${e.message}`, account, streamed: true };
     }
-    return await new Promise((resolve) => {
-      getToken(account, opts.forceToken, agent).then((t) => {
-        if (!t.ok) return resolve({ ok: false, status: 401, error: t.error, expired: t.expired, account });
-
-        const payload = JSON.stringify(body);
-        const req = https.request(
-          {
-            hostname: GATEWAY_HOST,
-            path: GATEWAY_PREFIX + path,
-            method,
-            timeout: opts.timeout || 600000,
-            ...(agent ? { agent } : {}),
-            headers: {
-              'Content-Type': 'application/json',
-              Accept: 'text/event-stream',
-              Authorization: `Bearer ${t.token}`,
-              'X-Dumate-Client-Type': 'web',
-              'X-Dumate-Account-Id': 'global',
-              'Content-Length': Buffer.byteLength(payload),
-            },
-          },
-          (res) => {
-            // 响应头一到就回调：调用方要在「还没转发任何内容」时决定
-            // 是否接受这次响应（否则只能等整条流结束，那就没法做故障转移了）
-            if (typeof opts.onStatus === 'function') {
-              try { opts.onStatus(res.statusCode); } catch (e) { /* 忽略 */ }
-            }
-            // text 只用于日志/usage 扫描（usage 在流的最后），转发走 onChunk。
-            // 原实现全量累积（审计 P1-1c：号称「不缓冲」实际整条 SSE 又存一份），
-            // 这里改为尾部固定窗口——语义不变，内存有界。
-            const TEXT_TAIL = 1024 * 1024;
-            let text = '';
-            res.setEncoding('utf8');
-            res.on('data', (c) => {
-              text += c;
-              if (text.length > TEXT_TAIL) text = text.slice(-TEXT_TAIL);
-              try { onChunk(c); } catch (e) { /* 下游写失败不影响上游读取 */ }
-            });
-            res.on('end', () => {
-              const ok = res.statusCode >= 200 && res.statusCode < 300;
-              resolve({ ok, status: res.statusCode, text, account, streamed: true });
-            });
-          },
-        );
-        req.on('error', (e) => {
-          resolve({ ok: false, status: 0, error: e.message, account });
-        });
-        req.on('timeout', () => {
-          req.destroy();
-          resolve({ ok: false, status: 0, error: 'timeout', account });
-        });
-        req.write(payload);
-        req.end();
-      }).catch((e) => resolve({ ok: false, status: 0, error: e.message, account }));
-    });
+    const first = await streamOnce(account, path, method, body, onChunk, agent,
+      { ...opts, _swallow401: !opts._retried });
+    if (first.swallowed && !opts._retried) {
+      return await streamOnce(account, path, method, body, onChunk, agent,
+        { ...opts, forceToken: true, _retried: true });
+    }
+    return first;
   } finally {
     pool.release(account.id);
   }
@@ -328,15 +392,28 @@ async function callWithFailover(path, method, body, opts = {}) {
     // 不要为了一个必然失败的请求把所有账号都试一遍。
     // 402（余额耗尽）与 429（限流）是账号级状态，换号有意义，且各自进冷却域。
     if (status >= 400 && status < 500 && status !== 401 && status !== 402 && status !== 429) {
+      // 400 里可能带 max_tokens 范围声明（上游按模型转发，各家不同）——
+      // 顺手学习（dumate-caps.js）：认不出格式就丢弃，不影响转发
+      if (status === 400) {
+        try {
+          require('./dumate-caps').learn(body && body.model,
+            (r.json && r.json.error && r.json.error.message) || r.raw || r.error || '');
+        } catch (e) { /* 学习失败不影响主流程 */ }
+      }
       return { ...r, attempts: i + 1, no_retry: true };
     }
 
-    markFailure(item.account.id, {
-      status,
-      code: r.json && r.json.error && r.json.error.code,
-      message: r.error || (r.json && r.json.error && r.json.error.message) || `HTTP ${status}`,
-      model,
-    });
+    // markFailure 是写型惩罚（冷却/负缓存）。**探针模式（opts.probe）跳过**：
+    // billing-check 是观测动作，撞限流把账号写进冷却等于健康检查伤号
+    // （hub v1.7.20 #134 的教训）。错误照常进 errors 如实返回。
+    if (!opts.probe) {
+      markFailure(item.account.id, {
+        status,
+        code: r.json && r.json.error && r.json.error.code,
+        message: r.error || (r.json && r.json.error && r.json.error.message) || `HTTP ${status}`,
+        model,
+      });
+    }
     errors.push({ account: accounts.displayName(item.account), status, error: r.error || r.last_error });
   }
 
@@ -402,6 +479,12 @@ async function callStreamWithFailover(path, method, body, onChunk, opts = {}) {
 
     // 4xx（除 401/402/429）是请求本身的问题，换账号也一样失败
     if (status >= 400 && status < 500 && status !== 401 && status !== 402 && status !== 429) {
+      // 与 callWithFailover 同款学习：流式失败体在 r.text 尾部窗口里
+      if (status === 400) {
+        try {
+          require('./dumate-caps').learn(body && body.model, r.text || r.error || '');
+        } catch (e) { /* 学习失败不影响主流程 */ }
+      }
       return { ...r, attempts: i + 1, no_retry: true };
     }
     markFailure(item.account.id, failInfo());

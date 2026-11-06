@@ -102,6 +102,35 @@ const QODER_QUOTA = [
 ];
 
 /**
+ * TRAE 业务码（2026-11-02 实测补充）。3004 的真实文案是**限流**
+ * （"We're sorry, your requests have exceeded the rate limit"）——码表里
+ * 「权益不可用」的旧注释与实测不符（见 upstream-errors.js 的 traeCodeKind）。
+ * 这些码的上游 message 是整段英文，不翻译的话账号卡上读不出重点：
+ * 它不是账号坏了，是瞬时限流/额度状态，稍后自动恢复。
+ */
+const TRAE_ERROR = [
+  [/traework\s+3004\b/i, '上游限流（traework 3004），稍后自动恢复；网关已按软冷却处置并换号重试'],
+  [/traework\s+3003\b/i, 'TRAE 额度/权益不足（traework 3003），换其他账号可用'],
+  [/traework\s+4008\b/i, 'TRAE 额度耗尽（traework 4008，国际版）'],
+  // 4028（2026-11-06，Trae2api-cn 实测同款边界）：部分模型在 Remote/raw 链路
+  // 上游固定拒绝（换账号/重试无效）——不是风控也不是额度，是端点-模型组合
+  // 不可用。指引改走其他链路，别让用户在错误码上猜。
+  [/traework\s+(remote\s+)?4028\b/i,
+    'TRAE 该模型在此链路不可用（4028，Trae2api-cn 实测部分模型在 Remote/raw 上固定失败）；改走其他链路（去掉 DUMATE_TRAEWORK_REMOTE/SOLO 开关即回落 utils_chat）或换模型'],
+];
+
+/**
+ * 内容审核拒绝（2026-11-01，判据同 upstream-errors 的 CONTENT_POLICY_TEXT，
+ * 词表取自 qoder2api-hub 实测：InternalError.Algo.DataInspectionFailed 家族）。
+ * 放在最前判——比网络错误更具体，且这类错误不该被翻译成「上游故障」：
+ * 换账号、重试都无效，用户要看到的是「调整输入」这个动作。
+ */
+const CONTENT_POLICY = [
+  [/DataInspectionFailed|inappropriate content|input text data may contain|ContentFilter|SensitiveContent|content_policy_rejected/i,
+    '上游内容安全审核未通过：输入可能含敏感内容，调整措辞后重试（换账号无效）'],
+];
+
+/**
  * 翻译一条错误。匹配不到就**原样返回**（含空串）。
  *
  * @param {unknown} msg 原始错误串或 Error
@@ -115,6 +144,10 @@ function explainError(msg) {
   // 读取侧会对已翻译过的存量值再翻一次：已带这段中文说明的就跳过——
   // 无锚的子串匹配（RESOURCE_LIMIT / read idle / upstream timeout）不跳的话，
   // 重翻会命中翻译结果里保留的原串，套娃成双重括号。
+  for (const [re, text] of CONTENT_POLICY) {
+    if (s.includes(text)) continue;
+    if (re.test(s)) return `${text}（${s}）`;
+  }
   for (const [re, text] of OWN_TIMEOUT) {
     if (s.includes(text)) continue;
     if (re.test(s)) return `${text}（${s}）`;
@@ -129,6 +162,11 @@ function explainError(msg) {
   for (const [re, text] of QODER_QUOTA) {
     if (s.includes(text)) continue;
     if (re.test(unescaped)) return `${text}（${s}）`;
+  }
+  // TRAE 业务码：`traework <code>:` 前缀形态（index.js 写入时的样式）。
+  for (const [re, text] of TRAE_ERROR) {
+    if (s.includes(text)) continue;
+    if (re.test(s)) return `${text}（${s}）`;
   }
   for (const [re, text] of NET_ERRORS) {
     if (s.includes(text)) continue;

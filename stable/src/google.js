@@ -16,6 +16,7 @@ const { resolveMaxTokens } = require('./budget');
 const modelmap = require('./modelmap');
 const { markFirstToken } = require('./reqlog');
 const images = require('./images');
+const { cachedTokensOf } = require('./usage-norm');
 
 // 回落名由 modelmap 决定，不再在本模块另立一个常量——两处常量必然漂移
 const DEFAULT_MODEL = modelmap.DEFAULTS.fallback;
@@ -212,6 +213,7 @@ function openAIToGoogle(openaiResp, originalModel) {
   if (!parts.length) parts.push({ text: '' });
 
   const usage = openaiResp.usage || {};
+  const cached = cachedTokensOf(usage);
   return {
     candidates: [{
       content: { role: 'model', parts },
@@ -222,6 +224,9 @@ function openAIToGoogle(openaiResp, originalModel) {
       promptTokenCount: usage.prompt_tokens || 0,
       candidatesTokenCount: usage.completion_tokens || 0,
       totalTokenCount: (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
+      // Gemini 的 promptTokenCount **含**缓存，cachedContentTokenCount 是其中的
+      // 子集——所以这里只补这个字段，不改分子。上游没报缓存就不造字段。
+      ...(cached > 0 ? { cachedContentTokenCount: cached } : {}),
     },
     modelVersion: originalModel || openaiResp.model || DEFAULT_MODEL,
   };
@@ -244,6 +249,7 @@ function translateStreamToGoogle(upstreamRes, res, originalModel, onDone) {
   const decoder = new StringDecoder('utf8');
   let inputTokens = 0;
   let outputTokens = 0;
+  let cachedTokens = 0;
   let finishReason = null;
 
   // 收尾时回报 usage 供埋点；end/error 两条路径只会生效一次
@@ -273,6 +279,8 @@ function translateStreamToGoogle(upstreamRes, res, originalModel, onDone) {
       if (chunkJson.usage) {
         if (chunkJson.usage.prompt_tokens != null) inputTokens = chunkJson.usage.prompt_tokens;
         if (chunkJson.usage.completion_tokens != null) outputTokens = chunkJson.usage.completion_tokens;
+        const c = cachedTokensOf(chunkJson.usage);
+        if (c > 0) cachedTokens = c;
       }
       const delta = chunkJson.choices && chunkJson.choices[0] && chunkJson.choices[0].delta;
       if (!delta) continue;
@@ -317,6 +325,7 @@ function translateStreamToGoogle(upstreamRes, res, originalModel, onDone) {
           promptTokenCount: inputTokens,
           candidatesTokenCount: outputTokens,
           totalTokenCount: inputTokens + outputTokens,
+          ...(cachedTokens > 0 ? { cachedContentTokenCount: cachedTokens } : {}),
         },
       });
     }

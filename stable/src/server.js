@@ -5,6 +5,10 @@ const { mapModel, anthropicToOpenAI, openAIToAnthropic, mapFinishReason } = requ
 const { googleToOpenAI, openAIToGoogle, translateStreamToGoogle } = require('./google');
 const { responsesToOpenAI, openAIToResponse, translateStreamToResponses } = require('./responses');
 const images = require('./images');
+const dumateCaps = require('./dumate-caps');
+const promptGuard = require('./prompt-guard');
+const media = require('./media');
+const { cachedTokensOf } = require('./usage-norm');
 const { resolveMaxTokens, resolveQwenMaxTokens, resolveTraeworkMaxTokens, resolveQoderMaxTokens } = require('./budget');
 const webFallback = require('./fallback-web');
 
@@ -12,12 +16,14 @@ const webFallback = require('./fallback-web');
 // 分开写必然漂移（曾经就漏了千问，导致小预算直接截断正文）。
 // 千问与 TRAE 的下限都远低于搭子（16384 vs 32768），因为它们的
 // reasoning 峰值比搭子小一个量级。
-function resolveBudget(target, requested) {
+// 搭子（默认分支）带映射后的模型名取**按模型上限**（dumate-caps.js）：
+// 全局 CEIL 来自 GLM 一家的范围，对 deepseek 低延迟/kimi-k3 是白压低。
+function resolveBudget(target, requested, model) {
   const kind = target && target.budgetKind;
   if (kind === 'qwenwork') return resolveQwenMaxTokens(requested);
   if (kind === 'traework') return resolveTraeworkMaxTokens(requested);
   if (kind === 'qoder') return resolveQoderMaxTokens(requested);
-  return resolveMaxTokens(requested);
+  return resolveMaxTokens(requested, dumateCaps.capOf(model));
 }
 const reqlog = require('./reqlog');
 // 首字标记归 reqlog 统一实现：三个协议翻译器（Responses / Anthropic / Google）
@@ -37,12 +43,17 @@ const boot = require('./boot');
 const PROXY_PORT = parseInt(process.env.DUMATE2API_PORT || '9080', 10);
 const PROXY_HOST = process.env.DUMATE2API_HOST || '127.0.0.1';
 // 审计修复（P0-1）：DUMATE2API_KEY 此前定义后从未被使用——管理员设了这个
-// 变量也不会有任何强制，是个配置陷阱。现在它与登记 key 体系并联：
-//   - DUMATE_REQUIRE_KEY=1          → 校验管理端登记的 key（原开关，语义不变）
-//   - 设置了 DUMATE2API_KEY（非空）  → 同样强制鉴权，命中该 env 密钥（或任一
-//     登记 key）才放行。两个开关任意一个打开即启用鉴权。
+// 变量也不会有任何强制，是个配置陷阱。现在它与登记 key 体系并联：命中该
+// env 密钥（或任一登记 key）才放行。
+//
+// **鉴权强制（2026-11-01 用户要求）**：「不鉴权」形态已删除——模型端点一律
+// 要求 API key，没有 key 的调用一律 401，想用必须先在管理端创建 key。
+// DUMATE_REQUIRE_KEY 因此成为死变量：设 0/1 都不再改变行为（显式设 0 时
+// 启动日志告警，避免管理员误以为关掉了）。
 const ENV_API_KEY = String(process.env.DUMATE2API_KEY || '').trim();
-const REQUIRE_KEY = process.env.DUMATE_REQUIRE_KEY === '1' || !!ENV_API_KEY;
+if (process.env.DUMATE_REQUIRE_KEY === '0') {
+  console.warn('[dumate2api] DUMATE_REQUIRE_KEY=0 无效：鉴权已强制，无法通过环境变量关闭');
+}
 
 let upstreamPort = null;
 let upstreamManaged = false;
@@ -52,6 +63,19 @@ const DISCOVERY_INTERVAL = 30000; // re-discover every 30s if port changes
 
 function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
+}
+
+/**
+ * 从请求 URL 解析区域视图参数（2026-11-03）：'cn' / 'intl'，缺省/未知 = ''（全量）。
+ * 区域视图是**整页切换**（顶栏「国内版/国际版」），各接口据此只返回该区域数据。
+ */
+function regionParamOf(req) {
+  const m = String((req && req.url) || '').match(/[?&]region=([^&]*)/);
+  if (!m) return '';
+  const raw = decodeURIComponent(m[1]).toLowerCase();
+  if (raw === 'cn') return 'cn';
+  if (raw === 'intl' || raw === 'global') return 'intl';
+  return '';
 }
 
 /**
@@ -156,11 +180,15 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   //   qwenwork → 官方 wasm 封装请求体（依赖客户端安装的 wasm）
   //   traework → 自持凭证，直接调上游
   //   qoder    → 纯本地签名（cosy.js），连 wasm 都不需要
-  const provider = route.channel === 'traework'
-    ? require('./traework')
-    : route.channel === 'qoder'
-      ? require('./qoder')
-      : require('./qwenwork');
+  const provider = route.target.provider
+    ? require(route.target.provider)
+    : route.channel === 'traework'
+      ? require('./traework')
+      : route.channel === 'qoder'
+        ? require('./qoder')
+        : route.channel === 'workbuddy'
+          ? require('./workbuddy')
+          : require('./qwenwork');
   const wantStream = !!payload.stream;
 
   // 请求 id 在这里就定下来：埋点与积分归因两边都要用同一个值才能配对。
@@ -171,15 +199,40 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   // provider 在发请求前回调「这次实际用了哪个账号」，由它写进埋点。
   // 多账号轮询下（TRAE）只有 provider 知道选中的是哪一个——
   // 在埋点处猜一个必然会在轮询时记错。
-  const onAccount = (name) => { if (name) req._upstreamAccount = String(name); };
+  // 第二个参数是账号 id（2026-11-03）：请求日志按它回查账号区域，国内/国际
+  // 的拆分（请求日志、用量）才有数据源。区域解析失败不影响请求。
+  const onAccount = (name, id) => {
+    if (name) req._upstreamAccount = String(name);
+    if (id != null && (route.channel === 'traework' || route.channel === 'qoder' || route.channel === 'workbuddy')) {
+      try {
+        const store = route.channel === 'qoder' ? require('./qoder/auth')
+          : route.channel === 'workbuddy' ? require('./workbuddy/auth')
+            : require('./traework/auth');
+        const a = store.get(id);
+        if (a) {
+          const reg = String(a.region || '').toLowerCase();
+          // 三通道的区域术语归一：qoder/workbuddy 内部用 global，日志统一 intl。
+          // **缺省/空 region 一律按国内**——存量账号（区域字段上线前建的）没有
+          // region，判成 intl 会把国内流量整批算进国际视图（2026-11-03 实测：
+          // 10927 条国内行的 region 是空串，只有 210 条真是 intl，但……）
+          // 所以「cn 或缺省 → cn」，「只有明确 global/intl → intl」
+          req._upstreamRegion = (reg === 'global' || reg === 'intl') ? 'intl' : 'cn';
+        }
+      } catch (e) { /* 区域解析失败不影响请求 */ }
+    }
+  };
   // provider 解析出**实际发给上游的模型 key** 后回调（目前只有 Qoder 报）。
   // `route.model` 只是去掉前缀的调用方写法，显示名有没有解析成功看不出来。
   const onModel = (name) => { if (name) req._mappedModel = String(name); };
 
   try {
+    // TRAE 宝身份标记（2026-11-03）：resolve() 把 `traebao/` 前缀剥掉后才到
+    // provider 手里，send() 靠 payload.model 认不出身份——显式经 opts 传。
+    if (route.personalAssistant) req._personalAssistant = true;
+    const providerOpts = { reqId, onAccount, onModel, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
-      const result = await provider.send(payload, undefined, { reqId, onAccount, onModel });
+      const result = await provider.send(payload, undefined, providerOpts);
       const out = kind === 'openai' ? result : result;
       if (kind === 'anthropic') {
         const anth = openAIToAnthropic(out, payload.model);
@@ -289,7 +342,19 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
           clearInterval(pingTimer);
           return;
         }
-        if (!translated && !res.headersSent) return;
+        if (!res.headersSent) {
+          // OpenAI 直通分支（2026-11-06 补）：首帧可能 14~70s 才到（ACP 实测
+          // 14~35s、qoder 大上下文 30~70s），此前一条 ping 都发不出——中间
+          // 代理的空闲超时照样断连，保活等于没做。改为：send 起跑 5s 仍无
+          // 首帧，先发头放开 ping。5s 足够上游的快速错误（排队信封 ~0.5s、
+          // 402/403）以 4xx 返回；5s 后失败走 catch 的流内错误帧路径（已
+          // 实现），客户端照样能看到原因——静默窗口从 30s+ 压到 ≤10s。
+          // 翻译器分支维持原语义：头由翻译器首帧触发，发出前不写。
+          if (!translated) {
+            if (Date.now() - startedAt >= Number(process.env.DUMATE_PING_QUIET_MS || 5000)) writeSSEHead();
+            else return;
+          } else return;
+        }
         try { shim.write(': ping\n\n'); } catch (e) { clearInterval(pingTimer); }
       }, 5000);
     }
@@ -319,7 +384,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
           seen += `data: ${inner}\n`;
           if (seen.length > TAIL) seen = seen.slice(-TAIL);
           shim.write(`data: ${inner}\n\n`);
-        }, { reqId, onAccount, onModel });
+        }, { ...providerOpts });
         // traework 的 provider 回调不发 [DONE]（事件流用 event:done 收尾，
         // 已在 readStream 里吃掉），所以这里补一个再关流。
         // **顺序关键**：先补 [DONE]、再 end——直接 end 会让翻译器在
@@ -501,6 +566,9 @@ function forwardWithFallback(portOrTarget, path, method, headers, body, clientRe
       // 账号在池子选中时就回填（早于流结束），供埋点记录「实际用了哪个」。
       // 多账号轮询下只有池子知道，在埋点处猜必然是错的。
       onAccount: (name) => { if (name && clientReq) clientReq._upstreamAccount = String(name); },
+      // 云端网关回传的真实后端模型（响应头 X-Dumate-Gw-Realmodel），
+      // 响应头一到就回填，赶在埋点落笔之前
+      onRealModel: (m) => { if (m && clientReq) clientReq._realModel = String(m); },
     });
     // 标记这次走了回落——埋点与界面据此区分「用的是哪套凭证」
     if (clientReq) clientReq._credentialSource = 'web';
@@ -681,12 +749,26 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 映射后的模型：客户端发来的名字经 modelmap 转换后实际打给上游的值。
     // 排查「为什么 glm-5 变成了 model-text」这类问题时要看它。
     mapped_model: req._mappedModel || '',
+    // 上游真实执行的模型（网页链路云端网关回传 X-Dumate-Gw-Realmodel）。
+    // 上游会按请求模型静默改路由（glm-5 预置展示 GLM-5.2），不记这个
+    // 就只能靠猜。桌面链路拿不到这个头，如实留空。
+    real_model: req._realModel || '',
     stream: !!info.stream,
     messages: info.messages || 0,
     status: status || 0,
     input_tokens: u.input || 0,
     output_tokens: u.output || 0,
     total_tokens: u.total || 0,
+    // 缓存命中与「上游是否回报了缓存字段」（hub v1.7.22 的 cached_reported
+    // 口径）：reported=false 时 cached 恒 0 是「未知」，不是「确认零命中」——
+    // 全价请求统计（usage-agg）只认前者，把没回报的算成零命中会虚增全价占比。
+    cached_tokens: u.cached || 0,
+    cached_reported: !!u.cachedReported,
+    // 计量口径（2026-11-06）：qwen-acp 的会话帧不带 token 计量（tokens 恒 0），
+    // 扣费真实发生（三池差值实证）但逐笔金额网关侧拿不到——差值法每请求要
+    // 多 2 次上游调用，不值得。标 wallet-delta 让界面显示「无计量」，
+    // 否则 0 token 会被读成「没花钱」。
+    metering: /^qwen-acp\//.test(info.model || '') ? 'wallet-delta' : '',
     ip: reqlog.clientIP(req),
     // 客户端标识：区分 Codex / Claude Code / 其它调用方，排查兼容问题时最先看这个
     ua: String(h['user-agent'] || '').slice(0, 200),
@@ -699,6 +781,9 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // provider 没报时按通道读当前凭证兜底。都没有就留空——
     // 界面显示「—」，而不是编一个名字。
     account: req._upstreamAccount || require('./upstream-account').fallback(req._channel || 'dumate'),
+    // 区域（2026-11-03 国际版）：traework/qoder 的直连请求随账号记录
+    // cn/intl，请求日志与用量据此拆分。搭子/千问纯国内，不记（空串）。
+    region: req._upstreamRegion || '',
     ...(extra || {}),
   });
 
@@ -728,6 +813,61 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
 
 // ==================== OpenAI Compatible Endpoints ====================
 
+/**
+ * Key 自查用量（M3，workbuddy-manager 出处）：GET /v1/usage
+ *
+ * 下游 Key 使用方用自己的 key 查「这个 key 用了多少」。聚合自
+ * requests.jsonl（reqlog），窗口 today / 7d / 30d；quota 如实 null——
+ * Key 配额维度（上限×重置周期）还没实现，null 与 0 含义不同。
+ *
+ * 安全红线：响应里绝不出现 hash 与 plain（自查端点不会把明文 key 还给
+ * 调用方——req._apiKey 里两者都在，必须手工挑字段）。
+ */
+async function handleKeyUsage(req, res) {
+  const key = req._apiKey || null;
+  const keyId = key && key.id != null ? key.id : null;
+  if (keyId == null) {
+    return sendJSON(res, 401, { error: { message: 'Invalid or missing API key', type: 'authentication_error', code: 'unknown_key' } });
+  }
+  // 全量读（requests.jsonl 有 32MB 轮转兜底）后按 key 过滤聚合。
+  // 自查是低频动作，整文件扫描可接受；高频化再做 usage-agg 的持久桶
+  const { rows } = reqlog.read({ limit: 0, filter: (r) => r && r.key_id === keyId });
+  const now = Date.now();
+  const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+  const windows = [
+    { name: 'today', since: dayStart.getTime() },
+    { name: '7d', since: now - 7 * 86400000 },
+    { name: '30d', since: now - 30 * 86400000 },
+  ];
+  const aggregate = (since) => {
+    const hit = rows.filter((r) => Number(r.ts) >= since);
+    const out = {
+      requests: hit.length,
+      failed: hit.filter((r) => Number(r.status) >= 400).length,
+      input_tokens: hit.reduce((s, r) => s + (Number(r.input_tokens) || 0), 0),
+      output_tokens: hit.reduce((s, r) => s + (Number(r.output_tokens) || 0), 0),
+      total_tokens: hit.reduce((s, r) => s + (Number(r.total_tokens) || 0), 0),
+    };
+    // 最近一次请求时刻：对账时回答「这个 key 还活着吗」
+    out.last_request_at = hit.length ? Math.max(...hit.map((r) => Number(r.ts) || 0)) : null;
+    return out;
+  };
+  return sendJSON(res, 200, {
+    key: {
+      id: keyId,
+      name: key.name || '',
+      enabled: key.enabled !== false,
+      channel: key.channel || null,
+      region: key.region || null,
+      expires_at: key.expires_at || null,
+    },
+    usage: Object.fromEntries(windows.map((w) => [w.name, aggregate(w.since)])),
+    quota: null,
+    quota_note: 'Key 配额维度未实现（上限×重置周期）——quota 恒 null，与「没有消耗」区分',
+    generated_at: now,
+  });
+}
+
 async function handleOpenAIModels(req, res) {
   // 条目来自 modelmap（可经管理端编辑），不再硬编码：
   // 之前这里的列表与 anthropic.js 的 MODEL_MAP 各写一份，会各自漂移。
@@ -738,13 +878,13 @@ async function handleOpenAIModels(req, res) {
     id,
     object: 'model',
     created,
-    // 区分「上游直接认识」与「靠别名转换」——后者换名字也能用，
-    // 但前者才是上游真实模型，界面与客户端据此判断
-    owned_by: upstream.has(id) ? 'dumate' : 'dumate-proxy',
-    // 可读名来自 modelmap.displayName：上游没有模型列表接口，这几个名字是
-    // **本地标注**（`model-text` → 文本模型），不是百度下发的元信息。
-    // 别名（claude-* / gpt-*）没有标注，原样返回。
-    // 带上 name 是为了与其它通道形状一致——cc-switch 读 `name` 显示模型名。
+    // 分组按「映射后是否落到上游真名」判：暴露列表现在是**真实后端名**
+    // （deepseek-v4.1-flash-low-latency 等，经别名映射到上游槽位），客户端
+    // （cc-switch 按 owned_by 分组）看到的组名仍是 dumate；只有兜底型的
+    // 名字才算 dumate-proxy。
+    owned_by: upstream.has(modelmap.mapModel(id)) ? 'dumate' : 'dumate-proxy',
+    // 可读名来自 modelmap.displayName：真实后端名的条目 name===id；
+    // 带上 name 是为了与其它通道形状一致。
     name: modelmap.displayName(id),
   }));
 
@@ -757,9 +897,32 @@ async function handleOpenAIModels(req, res) {
   if ((process.env.DUMATE_QWENWORK_AUTOSTART || 'auto') !== 'off') {
     try {
       const qw = require('./qwenwork');
-      const models = await qw.listModels();
-      for (const m of router.exposedFor('qwenwork', models)) {
-        data.push({ id: m, object: 'model', created, owned_by: 'qwenwork', name: m.slice('qwen/'.length) });
+      // 用带元数据的条目：倍率/上下文/多模态都是上游下发的（2026-10-31 起解析）
+      const entries = await qw.listModelEntries();
+      for (const e of entries) {
+        data.push({
+          id: `qwen/${e.key}`,
+          object: 'model',
+          created,
+          owned_by: 'qwenwork',
+          name: e.name || e.key,
+          ...(e.contextWindow ? { contextWindow: e.contextWindow, maxContextWindow: e.contextWindow } : {}),
+          ...(e.multimodal ? { multimodal: true } : {}),
+        });
+      }
+      // ACP 会话通道（2026-11-04，P2-17）：agent 型会话，模型档位由账号/套餐
+      // 决定（new_prompt 不接受逐轮指定），只列 auto 一个标签。凭证与千问
+      // 同池——有可用账号才列。
+      const acp = require('./qwenwork/acp');
+      const acpSt = acp.status();
+      if (acpSt.ready) {
+        data.push({
+          id: 'qwen-acp/auto',
+          object: 'model',
+          created,
+          owned_by: 'qwenwork',
+          name: '千问 ACP 会话（agent 型，档位随账号套餐）',
+        });
       }
     } catch (e) { /* 通道不可用，不列 */ }
   }
@@ -775,6 +938,35 @@ async function handleOpenAIModels(req, res) {
         for (const m of tw.listModelEntries()) {
           data.push({
             id: `traework/${m.id}`,
+            object: 'model',
+            created,
+            owned_by: 'traework',
+            name: m.name,
+            ...(m.contextWindow ? { contextWindow: m.contextWindow, maxContextWindow: m.maxContextWindow } : {}),
+          });
+        }
+        // TRAE 宝（开发者个人助理，2026-11-03）：免费豁免（官方 11 月活动）
+        // 绑定 function=personal_assistant，且**实测只有 deepseek-v4.1-flash
+        // 一个模型可通**（20 个 remote 模型逐个验证，其余上游 4001）。
+        // 所以这里只透 auto（服务端自选，即官方默认 deepseek-v4.1-flash__dev）
+        // 与 deepseek-v4.1-flash 两条，不把模型表整体换前缀——列出去调不通
+        // 的模型等于给客户端埋坑。
+        data.push({
+          id: 'traebao/auto',
+          object: 'model',
+          created,
+          owned_by: 'traework',
+          name: 'TRAE 宝自动档（deepseek-v4.1-flash，免费）',
+          // 窗口实测 1M（2026-11-03：1,021,270 token 通过、~1.08M 拒 4026），
+          // 与模型表标称一致。抓包 model_config 的 prompt_max_tokens:168000
+          // 只是会话预算参数，不是输入硬限——别按它声明。
+          contextWindow: 1000000,
+          maxContextWindow: 1000000,
+        });
+        for (const m of tw.listModelEntries()) {
+          if (m.id !== 'deepseek-v4.1-flash') continue;
+          data.push({
+            id: `traebao/${m.id}`,
             object: 'model',
             created,
             owned_by: 'traework',
@@ -809,17 +1001,286 @@ async function handleOpenAIModels(req, res) {
     } catch (e) { /* 通道不可用，不列 */ }
   }
 
+  // WorkBuddy（第五通道，2026-11-03）：标准 OpenAI 协议，国内/国际两区账号。
+  // 两区模型表不同，都列出来（前缀同名——调用名即 workbuddy/<id>，
+  // 上游按账号区域路由到对应端点；两区都有的模型（glm-5.3）合并去重）
+  try {
+    const wb = require('./workbuddy');
+    if (wb.status().ready) {
+      const seen = new Set();
+      for (const m of await wb.listModelEntries('cn')) {
+        if (seen.has(m.id)) continue;
+        seen.add(m.id);
+        data.push({
+          id: m.id, object: 'model', created, owned_by: 'workbuddy', name: m.name,
+          ...(m.contextWindow ? { contextWindow: m.contextWindow, maxContextWindow: m.maxContextWindow } : {}),
+        });
+      }
+      for (const m of await wb.listModelEntries('global')) {
+        if (seen.has(m.id)) continue;
+        seen.add(m.id);
+        data.push({
+          id: m.id, object: 'model', created, owned_by: 'workbuddy', name: `${m.name}（国际）`,
+          ...(m.contextWindow ? { contextWindow: m.contextWindow, maxContextWindow: m.maxContextWindow } : {}),
+        });
+      }
+    }
+  } catch (e) { /* 通道不可用，不列 */ }
+
+  // 千帆原生透传（qianfan/ 前缀）：只有这个端点支持 response_format。
+  // 模型清单**静态**——上游没有模型列表接口（/gateway/v2/models 回 404），
+  // 只列实测验证过的那个，其余名字原样透传由上游报错。
+  try {
+    const qr = require('./qianfan-raw');
+    if (qr.status().ready) {
+      for (const m of qr.listModels()) {
+        data.push({ id: `qianfan/${m}`, object: 'model', created, owned_by: 'qianfan-raw', name: m });
+      }
+    }
+  } catch (e) { /* 不可用不列 */ }
+
   // hiddenModels 热配置（F5）：输出侧过滤。管理端 PUT 后下一次列表即新口径。
   try {
     data = livecfg.applyHiddenModels(data);
   } catch (e) { /* 配置不可用按全量列表 */ }
 
+  // Key 的通道绑定同样约束模型列表（2026-11-01）：绑定了通道的 key 只能看到
+  // 该通道的模型——与对话侧的 channel_not_allowed 同一口径，否则客户端从
+  // 列表里选了别的通道的模型，请求时才撞 403，体验割裂。未绑定/未开鉴权
+  // 时维持全量（现状）。qianfan/ 的通道归属是 dumate（同一份凭证），所以
+  // dumate key 的列表里带 qianfan-raw 分组。
+  if (req._apiKey && req._apiKey.channel) {
+    const bound = req._apiKey.channel;
+    data = data.filter((m) => {
+      try { return (require('./upstream-router').resolve(m.id).channel || '') === bound; }
+      catch (e) { return false; }
+    });
+  }
   sendJSON(res, 200, { object: 'list', data });
 }
 
-async function handleOpenAIChat(req, res) {
+// ==================== 媒体端点（搭子的工具接口）====================
+// 2026-10-31：生图与 TTS 走**同一份网页凭证**，端点挂在
+// `dumate-svc.baidu.com/gateway/v2/tools/dumate/*`。四家上游里只有搭子有
+// 这类工具，所以不做通道分流；请求体是标准 OpenAI 形状，翻译在 src/media.js。
+async function handleImageGenerations(req, res) {
   const startedAt = Date.now();
+  req._logPath = '/v1/images/generations';
+  req._channel = 'dumate';
   const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const model = body.model || media.DEFAULT_IMAGE_MODEL;
+  const r = await media.generateImage({
+    prompt: body.prompt,
+    model,
+    n: body.n,
+    size: body.size,
+    quality: body.quality,
+    imageUrls: body.image_urls || body.imageUrls,
+    responseFormat: body.response_format,
+  });
+  if (!r.ok) {
+    const status = r.status || 502;
+    logRequest(req, res, startedAt, { model, stream: false, messages: 0 }, status, null, { media: 'image', error: r.error });
+    return sendJSON(res, status, { error: { message: r.error, type: 'api_error' } });
+  }
+  logRequest(req, res, startedAt, { model: r.model || model, stream: false, messages: 0 }, 200, null, { media: 'image' });
+  return sendJSON(res, 200, { created: r.created, data: r.data });
+}
+
+/** 文生视频（搭子 dumate-video）。OpenAI 没有标准视频端点，形状按 images/generations
+ *  同族给：{model, prompt} → {created, data:[{url}]}。视频是分钟级任务，
+ *  轮询超时（DUMATE_MEDIA_VIDEO_POLL_TIMEOUT_MS，默认 15 分钟）时回 504 + taskId，
+ *  调用方可拿 taskId 直接轮询上游（任务不会因超时取消）。 */
+async function handleVideo(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/videos/generations';
+  req._channel = 'dumate';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const model = body.model || media.DEFAULT_VIDEO_MODEL;
+  const r = await media.generateVideo({
+    prompt: body.prompt,
+    model,
+  });
+  if (!r.ok) {
+    const status = r.status || 502;
+    logRequest(req, res, startedAt, { model, stream: false, messages: 0 }, status, null, { media: 'video', error: r.error });
+    const out = { error: { message: r.error, type: 'api_error' } };
+    if (r.taskId) out.task_id = r.taskId;
+    return sendJSON(res, status, out);
+  }
+  logRequest(req, res, startedAt, { model: r.model || model, stream: false, messages: 0 }, 200, null, { media: 'video' });
+  return sendJSON(res, 200, { created: r.created, data: r.data });
+}
+
+async function handleSpeech(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/audio/speech';
+  req._channel = 'dumate';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const model = body.model || media.DEFAULT_TTS_MODEL;
+  const r = await media.synthesizeSpeech({
+    input: body.input,
+    model,
+    voice: body.voice,
+    speed: body.speed,
+    responseFormat: body.response_format,
+  });
+  if (!r.ok) {
+    const status = r.status || 502;
+    logRequest(req, res, startedAt, { model, stream: false, messages: 0 }, status, null, { media: 'tts', error: r.error });
+    return sendJSON(res, status, { error: { message: r.error, type: 'api_error' } });
+  }
+  logRequest(req, res, startedAt, { model, stream: false, messages: 0 }, 200, null, { media: 'tts' });
+  res.writeHead(200, {
+    'Content-Type': r.contentType || 'audio/mpeg',
+    'Content-Length': r.buffer.length,
+    ...(res._cors || {}),
+  });
+  return res.end(r.buffer);
+}
+
+// 千问搜索端点（2026-10-31）。两条都是**只读检索**，不消耗对话额度里的
+// 输出预算，但走的是同一份账号凭证与出站代理。
+//
+// 响应刻意**不做 OpenAI 兼容包装**：搜索结果的形状与 chat completion 无关，
+// 硬套一个 `choices` 只会让客户端去猜。直接给 `{items:[...]}`，字段名与
+// 上游一致（title/link/snippet/publishedTime/hostname）。
+async function handleWebSearch(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/search/web';
+  req._channel = 'qwenwork';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const search = require('./qwenwork/search');
+  try {
+    const r = await search.webSearch({
+      query: body.query || body.q,
+      allowedDomains: body.allowed_domains || body.allowedDomains,
+      blockedDomains: body.blocked_domains || body.blockedDomains,
+    });
+    logRequest(req, res, startedAt, { model: 'qwenwork/web-search', stream: false, messages: 0 }, 200, null, { media: 'web_search', results: r.items.length });
+    return sendJSON(res, 200, { object: 'search_result', items: r.items, request_id: r.requestId });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'qwenwork/web-search', stream: false, messages: 0 }, status, null, { media: 'web_search', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+/** 语音润色（千问 voice/polish）：把 ASR 转写文本润色成可直接发送的话。
+ *  通道专属端点（千问能力，OpenAI 无对应标准接口），与 /v1/search/* 同族。 */
+async function handleVoicePolish(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/voice/polish';
+  req._channel = 'qwenwork';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const voice = require('./qwenwork/voice');
+  try {
+    const r = await voice.polishVoiceText(body.text, { accountId: body.account_id });
+    if (!r.ok) {
+      logRequest(req, res, startedAt, { model: 'qwenwork/voice-polish', stream: false, messages: 0 }, r.status || 502, null, { media: 'voice_polish', error: r.error });
+      return sendJSON(res, r.status || 502, { error: { message: r.error, type: 'api_error' } });
+    }
+    logRequest(req, res, startedAt, { model: 'qwenwork/voice-polish', stream: false, messages: 0 }, 200, null, { media: 'voice_polish' });
+    return sendJSON(res, 200, { text: r.text });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'qwenwork/voice-polish', stream: false, messages: 0 }, status, null, { media: 'voice_polish', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleImageSearch(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/search/images';
+  req._channel = 'qwenwork';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  const search = require('./qwenwork/search');
+  try {
+    const r = await search.imageSearch({ query: body.query || body.q, count: body.count });
+    logRequest(req, res, startedAt, { model: 'qwenwork/image-search', stream: false, messages: 0 }, 200, null, { media: 'image_search', results: r.items.length });
+    return sendJSON(res, 200, { object: 'image_search_result', items: r.items, request_id: r.requestId });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'qwenwork/image-search', stream: false, messages: 0 }, status, null, { media: 'image_search', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleFileUpload(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/files/upload';
+  req._channel = 'qwenwork';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  let body;
+  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  }
+  // 请求体形状：{ name, content_base64, mime_type? }。用 base64 而不是
+  // multipart，是因为网关没有 multipart 解析器（零第三方依赖），而文件
+  // 上传是低频动作，客户端做一次 base64 编码完全可以接受。
+  const name = String(body.name || body.path || '').trim();
+  const b64 = String(body.content_base64 || body.data || '');
+  if (!name || !b64) {
+    return sendJSON(res, 400, { error: { message: '需要 name 与 content_base64', type: 'invalid_request_error' } });
+  }
+  let buf;
+  try { buf = Buffer.from(b64, 'base64'); } catch (e) {
+    return sendJSON(res, 400, { error: { message: 'content_base64 不是合法 base64', type: 'invalid_request_error' } });
+  }
+  const files = require('./qwenwork/files');
+  try {
+    const r = await files.uploadBytes(buf, { path: name, mimeType: body.mime_type || body.mimeType });
+    logRequest(req, res, startedAt, { model: 'qwenwork/file-upload', stream: false, messages: 0 }, 200, null, { media: 'file_upload', bytes: r.size });
+    return sendJSON(res, 200, {
+      object: 'file',
+      size: r.size,
+      path: r.raw && r.raw.storage_path ? r.raw.storage_path : r.path,
+      // 如实标注：file_uuid 由上游 ACP 会话下发，当前 HTTP 链路拿不到。
+      // 不要把 session_id 当引用键回给客户端——它不是文件标识。
+      file_uuid: r.fileUuid,
+      reference_note: r.fileUuid ? null
+        : '上游只回了 storage_path，file_uuid 由 ACP 会话下发；当前 HTTP 链路无法在对话里引用该文件',
+    });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'qwenwork/file-upload', stream: false, messages: 0 }, status, null, { media: 'file_upload', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleOpenAIChat(req, res) {
+  const startedAt = Date.now();  const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let reqBody;
   try {
@@ -834,6 +1295,10 @@ async function handleOpenAIChat(req, res) {
   // 通道分流：`qwen/xxx` 走千问办公，其余走搭子。
   // 必须在 mapModel 之前——千问的模型名（pro/flash）不在搭子的别名表里，
   // 先过 mapModel 会被兜底成 model-text，等于把请求打到错的模型上。
+  // Claude Desktop 3p 直连的 claude-* 路由名按 key 通道重写（幂等：重写后的
+  // 名字带通道前缀，不再是 claude-* 形状）；key 没绑通道时原样放行。
+  const _cl = modelmap.normalizeIncomingModel(reqBody.model, req._apiKey && req._apiKey.channel);
+  if (_cl) reqBody.model = _cl;
   const route = router.resolve(reqBody.model);
   if (route.error) {
     return sendJSON(res, 400, { error: { message: route.error, type: 'invalid_request_error' } });
@@ -850,6 +1315,10 @@ async function handleOpenAIChat(req, res) {
   if (route.target.needsModelMap) {
     reqBody.model = mapModel(route.model);
     req._mappedModel = reqBody.model;
+    // 出站提示词卫生（两项都是默认关闭的选通开关，见 src/prompt-guard.js）：
+    // 合规词零宽空格脱敏（DUMATE_DESENSITIZE=1）+ 超大工具输出截断（DUMATE_TOOL_OUTPUT_CAP）
+    promptGuard.desensitizeBody(reqBody);
+    promptGuard.capToolOutputs(reqBody, process.env.DUMATE_TOOL_OUTPUT_CAP);
   } else {
     reqBody.model = route.model;
   }
@@ -860,7 +1329,7 @@ async function handleOpenAIChat(req, res) {
   // 千问办公不套这一档：实测它的推理与正文分开流（reasoning 2060 字 / 正文
   // 96 字），机制不同，套上搭子的 32768 下限只会把小请求凭空撑大。
   if (route.target.needsBudget) {
-    reqBody.max_tokens = resolveBudget(route.target, reqBody.max_tokens);
+    reqBody.max_tokens = resolveBudget(route.target, reqBody.max_tokens, reqBody.model);
   }
 
   const target = route.target;
@@ -869,7 +1338,7 @@ async function handleOpenAIChat(req, res) {
   // 在 mapModel / 预算之后、转发之前分流——它的 body 构造与搭子不同，
   // 且要经官方 wasm 封装。
   if (target.direct) {
-    return await handleDirectChannel(req, res, reqBody, route, { startedAt, info, kind: 'openai' });
+    return await handleDirectChannel(req, res, reqBody, route, { startedAt, info, kind: 'openai', region: req._apiKeyRegion || '' })
   }
 
   // 云端网关（dumate-svc.baidu.com）只在被显式要求时才在流尾补一个 usage 帧；
@@ -1059,7 +1528,10 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
   req._mappedModel = openaiReq.model;
 
   // 通道分流：Google 路径的模型名来自 URL，googleToOpenAI 已把它落到
-  // openaiReq.model，所以这里与 chat 路径共用同一套解析。
+  // openaiReq.model，所以这里与 chat 路径共用同一套解析。claude-* 路由名
+  // 按 key 通道重写，同 chat 路径。
+  const _cl = modelmap.normalizeIncomingModel(openaiReq.model, req._apiKey && req._apiKey.channel);
+  if (_cl) openaiReq.model = _cl;
   const route = router.resolve(openaiReq.model);
   if (route.error) {
     return sendJSON(res, 400, { error: { message: route.error, code: 400, status: 'INVALID_ARGUMENT' } });
@@ -1078,12 +1550,17 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
     req._mappedModel = route.model;
   }
   if (route.target.needsBudget) {
-    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens);
+    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens, openaiReq.model);
+  }
+  // 出站提示词卫生（搭子路径；默认关闭的选通开关，见 src/prompt-guard.js）
+  if (route.target.needsModelMap) {
+    promptGuard.desensitizeBody(openaiReq);
+    promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
   if (target.direct) {
     openaiReq.stream = isStream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'google' });
+    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'google', region: req._apiKeyRegion || '' })
   }
   // 同 handleOpenAIChat：云端只在被显式要求时回流 usage 帧。
   if (isStream) openaiReq.stream_options = { include_usage: true };
@@ -1175,7 +1652,10 @@ async function handleOpenAIResponses(req, res) {
   const openaiReq = responsesToOpenAI(reqBody, isStream);
   req._mappedModel = openaiReq.model;
 
-  // 通道分流：Codex 的 responses 接口同样支持 qwen/ 前缀
+  // 通道分流：Codex 的 responses 接口同样支持 qwen/ 前缀。claude-* 路由名
+  //（Claude Desktop 3p 直连）按 key 通道重写，同 chat 路径。
+  const _cl = modelmap.normalizeIncomingModel(openaiReq.model, req._apiKey && req._apiKey.channel);
+  if (_cl) openaiReq.model = _cl;
   const route = router.resolve(openaiReq.model);
   if (route.error) {
     return sendJSON(res, 400, { error: { message: route.error, type: 'invalid_request_error' } });
@@ -1191,20 +1671,25 @@ async function handleOpenAIResponses(req, res) {
     req._mappedModel = openaiReq.model;
     // 与 Anthropic 路径同口径：reasoning_effort 只给直连通道，搭子透传前剥掉
     delete openaiReq.reasoning_effort;
-    // 图像同理：翻译层（Google→OpenAI）现在保真透传 image_url part，
-    // 搭子上游不认识——压回占位文本（恢复保真前的行为）
-    images.flattenImageParts(openaiReq);
+    // 图像保真透传（2026-10-31 真机实证）：搭子上游认 OpenAI 标准 image_url
+    // part（data URI，网页凭证与桌面链路均 200 且能识别颜色），不再压回占位
+    // 文本。此前「上游不支持图像」是能力边界误判
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
   }
   if (route.target.needsBudget) {
-    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens);
+    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens, openaiReq.model);
+  }
+  // 出站提示词卫生（搭子路径；默认关闭的选通开关，见 src/prompt-guard.js）
+  if (route.target.needsModelMap) {
+    promptGuard.desensitizeBody(openaiReq);
+    promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
   if (target.direct) {
     openaiReq.stream = isStream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'responses' });
+    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'responses', region: req._apiKeyRegion || '' })
   }
   // 同 handleOpenAIChat：云端只在被显式要求时回流 usage 帧。
   if (isStream) openaiReq.stream_options = { include_usage: true };
@@ -1269,6 +1754,10 @@ async function handleAnthropicMessages(req, res) {
   // 通道分流**必须在转换之前**：工具模式按通道选（直连通道转发结构化工具、
   // 搭子保持文本降级），而模式要在调用转换时就定下来。模型名直接取
   // anthropicReq.model——转换不会改它（映射在下面的 needsModelMap 分支里做）。
+  // Claude Desktop 3p 直连（Anthropic 协议）的 claude-* 路由名按 key 通道
+  // 重写——这是 Desktop 直连的主路径，同 chat 路径的幂等重写。
+  const _cl = modelmap.normalizeIncomingModel(anthropicReq.model, req._apiKey && req._apiKey.channel);
+  if (_cl) anthropicReq.model = _cl;
   const route = router.resolve(anthropicReq.model);
   if (route.error) {
     return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: route.error } });
@@ -1279,12 +1768,16 @@ async function handleAnthropicMessages(req, res) {
   }
   req._channel = route.channel;
 
-  // Convert to OpenAI format。直连通道开 nativeTools：不开的话 Anthropic 的
-  // tools 会被整段丢弃，模型收不到工具定义，只能在正文里吐 `<seed:tool_call>`
+  // Convert to OpenAI format。**四条通道一律开 nativeTools**：不开的话 Anthropic
+  // 的 tools 会被整段丢弃，模型收不到工具定义，只能在正文里吐 `<seed:tool_call>`
   // 文本式调用——Claude Code 拿不到 tool_use 块，直接判定回合结束
-  // （表现为「很快就输出、任务没做」）。搭子（needsModelMap）保持文本降级，
-  // 它的上游确实不支持 function calling，这是能力边界不是缺陷。
-  const openaiReq = anthropicToOpenAI(anthropicReq, { nativeTools: !route.target.needsModelMap });
+  // （表现为「很快就输出、任务没做」）。
+  //
+  // 搭子（needsModelMap）原先保持文本降级，理由是「上游不支持 function calling」。
+  // 2026-10-31 实测推翻：`glm-5` + tools 在应用链路 `/gateway/apis/v1/chat/completions`
+  // 上非流式返回 tool_calls、流式返回完整 delta.tool_calls（id/name/arguments）
+  // 与 finish_reason=tool_calls。降级只是历史能力误判，不是上游边界。
+  const openaiReq = anthropicToOpenAI(anthropicReq, { nativeTools: true });
   req._mappedModel = openaiReq.model;
 
   if (route.target.needsModelMap) {
@@ -1293,19 +1786,23 @@ async function handleAnthropicMessages(req, res) {
     // 思考强度是直连通道（Qoder）才下发的字段；搭子是「最小干预透传」，
     // 多余字段原样进云端，行为未知——剥掉（翻译层加的，这里剥干净）。
     delete openaiReq.reasoning_effort;
-    // 图像同理（Responses→OpenAI 翻译层已保真透传 image_url part）
-    images.flattenImageParts(openaiReq);
+    // 图像保真透传（同 Google 路径：搭子上游认 image_url part，2026-10-31 实测）
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
   }
   if (route.target.needsBudget) {
-    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens);
+    openaiReq.max_tokens = resolveBudget(route.target, openaiReq.max_tokens, openaiReq.model);
+  }
+  // 出站提示词卫生（搭子路径；默认关闭的选通开关，见 src/prompt-guard.js）
+  if (route.target.needsModelMap) {
+    promptGuard.desensitizeBody(openaiReq);
+    promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
   if (target.direct) {
     openaiReq.stream = !!anthropicReq.stream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'anthropic' });
+    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'anthropic', region: req._apiKeyRegion || '' })
   }
   // Ask the upstream for a usage-bearing final chunk so we can report real
   // token counts instead of zeroes. Harmless if the upstream ignores it.
@@ -1381,7 +1878,17 @@ function translateStreamToAnthropic(upstreamRes, res, originalModel, onDone) {
   let hasText = false;
   let inputTokens = 0;
   let outputTokens = 0;
+  let cachedTokens = 0;
+  let cacheCreation = 0;
   let lastFinishReason = null;
+  // Anthropic 的 usage 口径：input_tokens **不含**缓存，缓存单独报在
+  // cache_read_input_tokens。上游的 prompt_tokens 含缓存，所以出口要减。
+  const usageOut = () => ({
+    input_tokens: Math.max(0, inputTokens - cachedTokens),
+    output_tokens: outputTokens,
+    cache_read_input_tokens: cachedTokens,
+    cache_creation_input_tokens: cacheCreation,
+  });
   // 工具调用缓冲。**刻意缓冲到流末再发**，两个理由：
   //   1. Anthropic 的 content block 是**顺序**的（必须关掉前一个才能开下一个），
   //      而上游的多个 tool_call 增量会按 index 交错到达。实时发块会让「往已关闭
@@ -1408,6 +1915,10 @@ function translateStreamToAnthropic(upstreamRes, res, originalModel, onDone) {
         if (chunk.usage) {
           if (chunk.usage.prompt_tokens != null) inputTokens = chunk.usage.prompt_tokens;
           if (chunk.usage.completion_tokens != null) outputTokens = chunk.usage.completion_tokens;
+          const c = cachedTokensOf(chunk.usage);
+          if (c > 0) cachedTokens = c;
+          const cc = Number(chunk.usage.cache_creation_input_tokens);
+          if (Number.isFinite(cc) && cc > 0) cacheCreation = cc;
         }
         const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
         if (!delta) continue;
@@ -1545,7 +2056,7 @@ function translateStreamToAnthropic(upstreamRes, res, originalModel, onDone) {
         stop_reason: sentToolUse ? 'tool_use' : mapFinishReason(lastFinishReason),
         stop_sequence: null,
       },
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+      usage: usageOut()
     });
     sendEvent('message_stop', { type: 'message_stop' });
     finish(200);
@@ -1572,7 +2083,7 @@ function translateStreamToAnthropic(upstreamRes, res, originalModel, onDone) {
     sendEvent('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: mapFinishReason(lastFinishReason), stop_sequence: null },
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+      usage: usageOut()
     });
     sendEvent('message_stop', { type: 'message_stop' });
     finish(502);
@@ -1637,6 +2148,9 @@ const server = http.createServer(async (req, res) => {
         status: 'ok',
         upstream_port: upstreamPort,
         upstream_managed: upstreamManaged,
+        // 鉴权强制开启（2026-11-01），恒 true。保留字段是为了管理端探测
+        // 逻辑不变（它读不到网关进程的环境变量，只能读这里）。
+        require_key: true,
         // 通道状态：搭子是主链路，千问是可选。分开报，便于一眼看出
         // 「qwen/ 请求会在哪一步失败」。千问是进程内直连，没有端口，
         // 所以报的是 wasm 版本与登录态而不是 port。
@@ -1671,10 +2185,23 @@ const server = http.createServer(async (req, res) => {
           },
           // TRAE Work：凭证自持（OAuth 换取），没有 wasm 依赖。
           // ready 取决于「有没有可用账号」——与千问的 wasm+登录态判定不同。
+          // region（2026-11-03 区域视图）：顶栏切到国内/国际时，通道状态卡
+          // 必须只显示该区域的账号，否则「国际视图里写着测150 等 3 个」
+          // （bsk 真机点击切换时抓到的 bug）。'' = 全量。
           traework: (() => {
             try {
-              const st = require('./traework').status();
-              return { direct: true, ready: st.ready, accounts: st.accounts, error: st.error || '' };
+              const tw = require('./traework');
+              const reg = regionParamOf(req);
+              const st = tw.status();
+              if (!reg) return { direct: true, ready: st.ready, accounts: st.accounts, error: st.error || '' };
+              const rows = require('./traework/auth').list().filter((a) => (a.region || 'cn') === reg);
+              const ready = rows.some((a) => a.enabled && a.hasAccess !== false);
+              return {
+                direct: true, ready,
+                accounts: rows.length,
+                region: reg,
+                error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
+              };
             } catch (e) {
               return { direct: true, ready: false, accounts: 0, error: e.message };
             }
@@ -1683,8 +2210,36 @@ const server = http.createServer(async (req, res) => {
           // （签名是纯本地算法）。needsClient=false 明确表示不依赖任何客户端安装。
           qoder: (() => {
             try {
+              const reg = regionParamOf(req);
               const st = require('./qoder').status();
-              return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+              if (!reg) return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+              const rows = require('./qoder/auth').list()
+                .filter((a) => (String(a.region || 'cn').toLowerCase() === 'cn' ? 'cn' : 'intl') === reg);
+              const ready = rows.some((a) => a.enabled);
+              return {
+                direct: true, ready, needsClient: false,
+                accounts: rows.length, region: reg,
+                error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
+              };
+            } catch (e) {
+              return { direct: true, ready: false, needsClient: false, accounts: 0, error: e.message };
+            }
+          })(),
+          // WorkBuddy：第五通道（2026-11-03），标准 OpenAI 协议 + 双区域账号。
+          // 凭证自持（登录流程后置期从客户端认证文件导入）。
+          workbuddy: (() => {
+            try {
+              const reg = regionParamOf(req);
+              const st = require('./workbuddy').status();
+              if (!reg) return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+              const rows = require('./workbuddy/auth').list()
+                .filter((a) => (String(a.region || '').toLowerCase() === 'global' ? 'intl' : 'cn') === reg);
+              const ready = rows.some((a) => a.enabled && a.hasAccess && a.hasRefresh);
+              return {
+                direct: true, ready, needsClient: false,
+                accounts: rows.length, region: reg,
+                error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
+              };
             } catch (e) {
               return { direct: true, ready: false, needsClient: false, accounts: 0, error: e.message };
             }
@@ -1694,11 +2249,10 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // ==================== API Key 鉴权 ====================
-    // 触发条件（满足其一）：DUMATE_REQUIRE_KEY=1，或设置了 DUMATE2API_KEY。
-    // 环境变量密钥此前是死变量（定义后从未校验），现已接线：命中登记 key
-    // 或 env 密钥任一即放行。鉴权在路由分发之前统一做，避免新增端点漏挂。
-    if (REQUIRE_KEY && url !== '/health' && url !== '/ping') {
+    // ==================== API Key 鉴权（强制，2026-11-01）====================
+    // 「不鉴权」形态已删除：模型端点一律要求 key（/health /ping 豁免，探活
+    // 需要）。鉴权在路由分发之前统一做，避免新增端点漏挂。
+    if (url !== '/health' && url !== '/ping') {
       const token = keysvc.tokenFromHeaders(req.headers);
       let key = keysvc.resolve(token);
       // env 密钥兜底：与登记 key 体系并联，常时比较（keys.tokenMatches）
@@ -1728,6 +2282,15 @@ const server = http.createServer(async (req, res) => {
           } catch (e) { model = null; }
         }
       }
+      // Claude Desktop 3p 直连只发 claude-* 路由名（无通道前缀），按 key 的
+      // 通道解析成带前缀的网关模型名——否则无前缀名会被 router 归进搭子，
+      // 再被下面的通道绑定判定 403。只在 key 绑了通道时解析（与
+      // resolveClaudeRoute 的约定一致）；重写只影响这里的判定与后续 handler
+      // 的 route 解析，handler 会做同样的重写（幂等），请求体原文不动。
+      if (model && key && key.channel) {
+        const cl = modelmap.normalizeIncomingModel(model, key.channel);
+        if (cl) model = cl;
+      }
       // 通道绑定判定：靠模型名前缀，与 upstream-router 的分流口径一致。
       // 解析不出来（如 GET /v1/models）就不传通道，validate 会跳过这条规则
       // ——不该因为「无法判定通道」把只读请求拒掉。
@@ -1737,6 +2300,12 @@ const server = http.createServer(async (req, res) => {
           const r = require('./upstream-router').resolve(model);
           reqChannel = r.channel || '';
         } catch (e) { reqChannel = ''; }
+      } else if (req.method === 'POST') {
+        // 无 model 字段的工具端点按路径归通道：搜索/语音润色/文件上传是千问
+        // （纯国内），生图/视频/TTS 是搭子。不映射的话，区域绑定的 key 打
+        // 这些端点会绕过 validate 的区域判定（channel 未知即跳过）。
+        if (/^\/(v1\/)?(search|voice\/polish|files\/upload)/.test(url)) reqChannel = 'qwenwork';
+        else if (/^\/(v1\/)?(images\/generations|videos\/generations|audio\/speech)/.test(url)) reqChannel = 'dumate';
       }
 
       const verdict = keysvc.validate(key, reqlog.clientIP(req), model, reqChannel);
@@ -1754,6 +2323,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
       req._apiKey = key;
+      // 区域约束（keys.region）：qoder/traework 的 send 用它过滤账号池
+      req._apiKeyRegion = (key && key.region) || '';
     }
 
     // ==================== OpenAI compatible ====================
@@ -1762,9 +2333,47 @@ const server = http.createServer(async (req, res) => {
       return await handleOpenAIModels(req, res);
     }
 
+    // Key 自查用量（M3，workbuddy-manager 出处）：下游 Key 使用方用自己的
+    // key 查「这个 key 用了多少」——不持管理端登录态也能对账。走上面统一的
+    // key 鉴权（无效/停用/过期 key 拿不到响应，与数据面同口径）。
+    if (url === '/v1/usage' && req.method === 'GET') {
+      return await handleKeyUsage(req, res);
+    }
+
     // Chat completions (OpenAI format, pass-through with model mapping)
     if (url === '/v1/chat/completions' && req.method === 'POST') {
       return await handleOpenAIChat(req, res);
+    }
+
+    // 媒体端点（搭子工具接口）：生图 / 语音合成。标准 OpenAI 形状，
+    // 凭证走网页池，与对话共用同一套账号冷却与熔断。
+    if ((url === '/v1/images/generations' || url === '/images/generations') && req.method === 'POST') {
+      return await handleImageGenerations(req, res);
+    }
+    if ((url === '/v1/videos/generations' || url === '/videos/generations') && req.method === 'POST') {
+      return handleVideo(req, res);
+    }
+    if ((url === '/v1/audio/speech' || url === '/audio/speech') && req.method === 'POST') {
+      return await handleSpeech(req, res);
+    }
+    // 千问搜索端点（2026-10-31，解包 1.4.0 客户端挖到）。**通道专属**：
+    // 只有千问有这两个能力，不做跨通道分流；路径刻意不占用 `/v1/images/...`
+    // （那是搭子的生图，语义不同——生图是「生成」，图搜是「检索」）。
+    if ((url === '/v1/search/web' || url === '/search/web') && req.method === 'POST') {
+      return await handleWebSearch(req, res);
+    }
+    if ((url === '/v1/voice/polish' || url === '/voice/polish') && req.method === 'POST') {
+      return handleVoicePolish(req, res);
+    }
+    if ((url === '/v1/search/images' || url === '/search/images') && req.method === 'POST') {
+      return await handleImageSearch(req, res);
+    }
+    // 千问附件上传（barn，P2-17 的 HTTP 半边）。返回的 file_uuid 是**引用键**，
+    // 但当前只能在上游 ACP 会话里用——我们还没有那条通道（见 docs 的缺口说明）。
+    // 所以这个端点如实返回 `file_uuid: null` 时表示上游没下发引用键，
+    // 调用方不要拿 session_id 当引用（它只是上传会话，不是文件标识）。
+    if ((url === '/v1/files/upload' || url === '/files/upload') && req.method === 'POST') {
+      return await handleFileUpload(req, res);
     }
 
     // Responses API (Codex CLI 0.155+ 只认 wire_api="responses")
@@ -1931,19 +2540,16 @@ async function start() {
     log(`✓ dumate2api listening on http://${PROXY_HOST}:${PROXY_PORT}`);
     // 同步代码卡住时打日志，把「静默假死」变成可排查的痕迹（见函数注释）
     startLagMonitor();
-    // 鉴权态势（P0-1）：env 密钥 / 登记 key 开关任一打开即有鉴权；
-    // 都没开且监听非回环地址时显式告警（不拒启，保持兼容）。
-    if (REQUIRE_KEY) {
-      log(ENV_API_KEY
-        ? '✓ 已启用鉴权：模型端点要求 Bearer / x-api-key（DUMATE2API_KEY 或管理端登记 key）'
-        : '✓ 已启用鉴权：模型端点要求管理端登记的 API key（DUMATE_REQUIRE_KEY=1）');
-    } else {
-      const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
-      if (!LOOPBACK.has(String(PROXY_HOST).toLowerCase())) {
-        log(`⚠ 安全警告：未启用任何 API key 鉴权（未设 DUMATE2API_KEY / DUMATE_REQUIRE_KEY=1），且监听 ${PROXY_HOST} 非回环地址——局域网内任何设备都能直接消耗上游账号与积分。`);
-        log('  最小修复：设 DUMATE2API_KEY=<密钥> 后，客户端请求头带 Bearer <密钥>。');
+    // 鉴权态势（2026-11-01 起强制）：没有「不鉴权」形态。原「未开鉴权且
+    // 监听非回环」的安全警告随之失去存在场景——现在任何监听地址都要求 key。
+    log(ENV_API_KEY
+      ? '✓ 鉴权强制开启：模型端点要求 Bearer / x-api-key（管理端登记 key 或 DUMATE2API_KEY）'
+      : '✓ 鉴权强制开启：模型端点要求管理端登记的 API key（DUMATE_REQUIRE_KEY 已废除，无需设置）');
+    try {
+      if (!keysvc.list().length) {
+        log('⚠ 当前没有任何登记 key：所有模型请求都会 401。到管理端「API Key」页创建一把再使用。');
       }
-    }
+    } catch (e) { /* keys.json 读不到不影响启动 */ }
     if (!cors.allowlistSize()) {
       log('· CORS 默认关闭（浏览器跨域请求将在 preflight 被拒）；如需放行请设 DUMATE_CORS_ORIGINS=http://localhost:xxxx（逗号分隔，支持 *.example.com）');
     }
@@ -1955,8 +2561,8 @@ async function start() {
     log('  Health:    http://127.0.0.1:' + PROXY_PORT + '/health');
     log('');
     log('cc-switch configuration:');
-    log('  Claude Code: Base URL = http://127.0.0.1:' + PROXY_PORT + (REQUIRE_KEY ? ', API Key = <你的 DUMATE2API_KEY 或登记 key>' : ', API Key = nokey'));
-    log('  Codex:       Base URL = http://127.0.0.1:' + PROXY_PORT + '/v1' + (REQUIRE_KEY ? ', API Key = <你的 DUMATE2API_KEY 或登记 key>' : ', API Key = nokey'));
+    log('  Claude Code: Base URL = http://127.0.0.1:' + PROXY_PORT + ', API Key = <管理端登记的 key 或 DUMATE2API_KEY>');
+    log('  Codex:       Base URL = http://127.0.0.1:' + PROXY_PORT + '/v1, API Key = <管理端登记的 key 或 DUMATE2API_KEY>');
   });
 }
 

@@ -48,19 +48,44 @@ function withAgentDiscipline(system, hasTools) {
 }
 
 /** 把 OpenAI 请求体改写成 SOLO 的形状。meta（可选）会被填入过滤后的工具数量 */
-function buildBody(payload, model, meta) {
+function buildBody(payload, model, meta, opts = {}) {
   const obj = JSON.parse(JSON.stringify(payload || {}));
   obj.stream = true;
-  obj.function = c.FUNCTION;
+  // 对话身份（2026-11-03）：默认 solo_work_lite（SOLO 轻通道）；TRAE 宝
+  // （`traebao/` 前缀，opts.persona）用 personal_assistant——开发者个人助理，
+  // 11 月免费活动的豁免绑定在这个 function 上（实测对照 0 vs 0.05 credits）。
+  obj.function = opts.persona ? c.FUNCTION_ASSISTANT : c.FUNCTION;
 
-  const modelName = String(model || obj.model || c.DEFAULT_MODEL).trim() || c.DEFAULT_MODEL;
-  obj.model = modelName;
-  obj.config_name = modelName;
+  if (opts.persona && !model) {
+    // TRAE 宝自动档：不写 model/config_name，服务端自选官方默认
+    // （实测 deepseek-v4.1-flash__dev）。其余清理照走。
+    delete obj.model;
+  } else {
+    const modelName = String(model || obj.model || c.DEFAULT_MODEL).trim() || c.DEFAULT_MODEL;
+    obj.model = modelName;
+    obj.config_name = modelName;
+  }
+  // 主动写 session_id（ObjectId 形状，与客户端生成的一致）：上游按**请求体的
+  // session_id** 累计商业账单（Trae2api-cn 对旧版端点的实测结论；persona 链路
+  // 2026-11-03 实测查它返回真实 credits）。不写时上游自分配的 id 不进账单键，
+  // get_session_usage 查回全零骨架——这是 2026-10-31「拿 session_id 查只回
+  // 全零」定案的根因：当时查的是流 metadata 里上游自分配的 id，不是主动写的
+  // 账单键。修复轮（withRepairNudge）复用同一 body → 同一账单键，同一次
+  // send 的重试序列合并计费。
+  // 账单键写进请求体；meta 缺省（部分直调只造请求体不回读 meta）时兜底
+  if (!meta) meta = {};
+  if (!meta.sessionId) meta.sessionId = oidSessionId();
+  obj.session_id = meta.sessionId;
 
   // messages：content 字符串 → 数组；assistant 的 tool_calls → function_call
   if (Array.isArray(obj.messages)) {
+    const dropped = { images: 0, orphanTool: 0, emptyAssistant: 0, roleFixed: 0 };
     for (const m of obj.messages) {
       if (!m || typeof m !== 'object') continue;
+      // role 归一（2026-10-31）：OpenAI 的 `developer` 与 Anthropic 的 `system`
+      // 在 SOLO 链路上都只认 `system`。不归一的话整轮被上游拒（4001），
+      // 而 4001 的文案是「param is invalid」，完全看不出是 role 的问题。
+      if (m.role === 'developer') { m.role = 'system'; dropped.roleFixed += 1; }
       // 图像只属于 user 消息（OpenAI/Anthropic 规范如此）。历史里的
       // assistant/tool 图像 part 剥掉——上游对非 user 图像的行为未知，
       // 不给它赌的机会。user 的 image_url part 原样透传（实测上游接受，
@@ -68,7 +93,10 @@ function buildBody(payload, model, meta) {
       if (m.role !== 'user' && Array.isArray(m.content)) {
         const kept = m.content.filter((p) => !(p && typeof p === 'object'
           && (p.type === 'image_url' || p.type === 'input_image')));
-        if (kept.length !== m.content.length) m.content = kept;
+        if (kept.length !== m.content.length) {
+          m.content = kept;
+          dropped.images += 1;
+        }
       }
       if (m.role === 'assistant' && Array.isArray(m.tool_calls)) {
         const kept = [];
@@ -91,6 +119,51 @@ function buildBody(payload, model, meta) {
       }
       // 已是数组则透传
     }
+
+    // ---- 请求体韧性（2026-10-31，三类会在上游炸整轮的形状）----
+    //
+    // 1. **孤儿 tool 消息**：role:'tool' 的 tool_call_id 找不到对应的
+    //    assistant tool_call（客户端截断历史 / 用户手工编辑时常见）。
+    //    上游对孤儿 tool 的反应是整轮 4001，且文案毫无信息量。
+    // 2. **空 assistant 消息**：content 空数组 + 无 tool_calls。上游同样拒。
+    // 3. **首条非 system**：SOLO 要求 system 在最前（我们注入纪律时依赖它）。
+
+    // 先收集所有「被 assistant 声明的 tool_call id」
+    const declaredIds = new Set();
+    for (const m of obj.messages) {
+      if (!m || m.role !== 'assistant' || !Array.isArray(m.tool_calls)) continue;
+      for (const tc of m.tool_calls) {
+        const id = tc && tc.id;
+        if (id) declaredIds.add(String(id));
+      }
+    }
+    // 再剔掉引用不到声明 id 的 tool 消息
+    const pruned = obj.messages.filter((m) => {
+      if (!m || typeof m !== 'object') return false;
+      if (m.role === 'tool') {
+        const id = m.tool_call_id != null ? String(m.tool_call_id) : '';
+        if (!id || !declaredIds.has(id)) { dropped.orphanTool += 1; return false; }
+        return true;
+      }
+      // 空 assistant：既没正文也没工具调用，上游拒
+      if (m.role === 'assistant') {
+        const hasCalls = Array.isArray(m.tool_calls) && m.tool_calls.length;
+        const ctext = Array.isArray(m.content)
+          ? m.content.map((p) => (p && p.text) || '').join('').trim()
+          : String(m.content == null ? '' : m.content).trim();
+        if (!hasCalls && !ctext) { dropped.emptyAssistant += 1; return false; }
+      }
+      return true;
+    });
+    // system 必须在最前：把第一条 system 提前（不是复制，是移动）
+    const sysIdx = pruned.findIndex((m) => m && m.role === 'system');
+    if (sysIdx > 0) {
+      const [s] = pruned.splice(sysIdx, 1);
+      pruned.unshift(s);
+      dropped.roleFixed += 1;
+    }
+    obj.messages = pruned;
+    if (meta) meta.dropped = dropped;
   }
 
   // tools：parameters 对象 → JSON 字符串；非 function 形状剔除
@@ -149,29 +222,71 @@ function buildBody(payload, model, meta) {
   return JSON.stringify(obj);
 }
 
-/** 发流式请求。返回 { stream, status, raw }。auth 兼作账号记录：出站代理
- *  （E 包接线）按它的 proxy 字段 > 全局 DUMATE_PROXY 解析，null 直连。 */
-function postStream(body, auth) {
+// ---------------------------------------------------------------------------
+// 基址候选轮转（2026-10-31，TNC 域名动态发现）。
+//
+// 官方客户端不写死 agent 网关：它请求逻辑主机名，TTNet 按 TNC 下发的域名表
+// 改写成具体后端。上游换分片时（国服 2026-10-15 换过）写死的基址静默失效。
+// postStream 按 tnc.js 的候选链轮转：连接级失败换下一家，全部失败清表下轮重拉。
+// ---------------------------------------------------------------------------
+
+const tnc = require('./tnc');
+
+/** 该错误是不是连接级失败（换基址有意义的）；代理配置错误不是，直接终止 */
+function isConnectError(msg) {
+  return /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|EHOSTUNREACH|ENETUNREACH|connect timeout|socket hang up|certificate|timeout/i
+    .test(String(msg || ''));
+}
+
+/** 发流式请求到单个基址。连接阶段有独立超时（黑洞主机不该占满 600s） */
+function postStreamOnce(host, body, auth) {
   return new Promise((resolve) => {
     let agent = null;
     try { agent = require('../proxy-agent').getAgentFor(auth); } catch (e) {
-      return resolve({ stream: null, status: 0, error: `出站代理配置错误: ${e.message}` });
+      // 代理配置错误与基址无关，不参与轮转
+      return resolve({ stream: null, status: 0, error: `出站代理配置错误: ${e.message}`, fatal: true });
     }
-    const u = new URL(c.AGENT_HOST + c.EP_CHAT);
+    const u = new URL(host + c.EP_CHAT);
+    let settled = false;
+    const settle = (v) => { if (settled) return; settled = true; clearTimeout(connectTimer); resolve(v); };
     const req = https.request({
       hostname: u.hostname,
       path: u.pathname,
       method: 'POST',
       headers: { ...soloHeaders(auth, true), 'Content-Length': Buffer.byteLength(body) },
-      // 长流不能设总超时，否则 SSE 会被掐断
+      // 长流不能设总超时，否则 SSE 会被掐断（socket 空闲 600s 仍兜底）
       timeout: c.STREAM_TIMEOUT_MS,
       ...(agent ? { agent } : {}),
-    }, (res) => resolve({ stream: res, status: res.statusCode }));
-    req.on('error', (e) => resolve({ stream: null, status: 0, error: e.message }));
-    req.on('timeout', () => { req.destroy(); resolve({ stream: null, status: 0, error: 'timeout' }); });
+    }, (res) => settle({ stream: res, status: res.statusCode, host }));
+    // 连接超时：到点主动断，error 事件带原因交 settle
+    const connectTimer = setTimeout(() => {
+      try { req.destroy(new Error(`connect timeout (${host})`)); } catch (e) { /* 已结束 */ }
+      settle({ stream: null, status: 0, error: `connect timeout (${host})`, host });
+    }, c.CONNECT_TIMEOUT_MS);
+    if (connectTimer.unref) connectTimer.unref();
+    req.on('error', (e) => settle({ stream: null, status: 0, error: e.message, host }));
+    req.on('timeout', () => { req.destroy(); settle({ stream: null, status: 0, error: 'timeout', host }); });
     req.write(body);
     req.end();
   });
+}
+
+/** 发流式请求。返回 { stream, status, raw }。auth 兼作账号记录：出站代理
+ *  （E 包接线）按它的 proxy 字段 > 全局 DUMATE_PROXY 解析，null 直连；
+ *  auth.region（'cn'|'intl'，缺省 cn）决定候选链。 */
+async function postStream(body, auth) {
+  const hosts = await tnc.agentHosts(auth);
+  let last = null;
+  for (const host of hosts) {
+    const r = await postStreamOnce(host, body, auth);
+    if (r.stream || r.fatal) return r;
+    // 拿到响应（含 4xx/5xx）就交上层按状态码处置——换基址只救「连不上」
+    if (r.status !== 0 || !isConnectError(r.error)) return r;
+    last = r;
+  }
+  // 全部候选都连不上：TNC 表可能已过期，清缓存让下次请求重新拉表
+  tnc.invalidate(auth);
+  return last;
 }
 
 /**
@@ -278,6 +393,44 @@ function normalizeToolCall(tc) {
     }
   }
   return out;
+}
+
+/**
+ * 从整轮事件里取「本轮 turn id」（逐轮账单的入参）。
+ *
+ * 上游把 `reply_to_message_id` / `user_message_id` 放在事件数据里，位置不固定
+ * （可能是顶层、也可能嵌一层 data）。取最后一个非空值——一轮里会重复出现，
+ * 后面的是本轮最终 id。取不到就返回 null，调用方据此跳过逐轮账单、退回过
+ * consumed 差值口径，不编一个 id。
+ */
+/** 24-hex ObjectId 形态 id（时间戳 4B + 随机 8B）。TRAE 宝模式的 session_id
+ *  用它生成：**主动传入的 session_id 会被上游按它记账**（2026-11-03 实测
+ *  get_session_usage 查它返回真实 credits_float），与 solo_work_lite 不传
+ *  session_id 时上游自分配、查询回全零骨架的行为不同。 */
+function oidSessionId() {
+  const ts = Math.floor(Date.now() / 1000).toString(16).padStart(8, '0');
+  let r = '';
+  for (let i = 0; i < 16; i++) r += Math.floor(Math.random() * 16).toString(16);
+  return ts + r;
+}
+
+function turnIdOf(events) {
+  let id = null;
+  for (const e of Array.isArray(events) ? events : []) {
+    const d = (e && e.data) || {};
+    const inner = (d.data && typeof d.data === 'object') ? d.data : {};
+    const v = d.reply_to_message_id || d.user_message_id || d.message_id
+      || inner.reply_to_message_id || inner.user_message_id || inner.message_id;
+    if (v) id = String(v);
+    // utils_chat 的 metadata 里这两个字段存在但**实测恒为 0/空**（2026-10-31）。
+    // 仍认非零值：别的部署或 Remote 链路上可能填得出来，到时候逐轮账单直接可用。
+    const pcid = Number(d.prompt_completion_id ?? inner.prompt_completion_id);
+    if (Number.isFinite(pcid) && pcid > 0) id = String(pcid);
+    // **不拿 session_id 兜底**：实测用 session_id 查 get_session_usage 只回
+    // 全零骨架（amount_float=0、usage_group_details 空），把它当 turn id 会让
+    // 每轮多打一次上游却永远拿不到数。宁可返回 null，让调用方走差值口径。
+  }
+  return id;
 }
 
 /** TRAE 的 output 事件 → OpenAI delta 形状（content / reasoning_content / tool_calls） */
@@ -409,16 +562,23 @@ function createTextGate(emit, model, hold) {
       }
       if (evt.event === 'token_usage') {
         const d = evt.data || {};
+        const usage = {
+          prompt_tokens: d.prompt_tokens || 0,
+          completion_tokens: d.completion_tokens || 0,
+          total_tokens: d.total_tokens || 0,
+          completion_tokens_details: { reasoning_tokens: d.reasoning_tokens || 0 },
+        };
+        // 缓存命中镜像（2026-10-31，traework2api-panel issue#3）：上游报顶层
+        // cache_read_input_tokens，不镜像进标准位的话按标准协议解析的客户端
+        // 恒显示缓存未命中。原字段口径与 usage-norm.js 一致：上游没给不造字段。
+        if (d.cache_read_input_tokens != null) {
+          usage.prompt_tokens_details = { cached_tokens: Number(d.cache_read_input_tokens) || 0 };
+        }
         held.push(JSON.stringify({
           id: 'traework', object: 'chat.completion.chunk',
           created: Math.floor(Date.now() / 1000), model,
           choices: [],
-          usage: {
-            prompt_tokens: d.prompt_tokens || 0,
-            completion_tokens: d.completion_tokens || 0,
-            total_tokens: d.total_tokens || 0,
-            completion_tokens_details: { reasoning_tokens: d.reasoning_tokens || 0 },
-          },
+          usage,
         }));
         return;
       }
@@ -438,28 +598,49 @@ function createTextGate(emit, model, hold) {
     result() { return { toolCalls, text, live, pending }; },
     /** 收尾：把还没下发的正文与暂扣的帧补发出去 */
     finish() {
-      // DSML 流式兜底（2026-10-30）：整轮零工具调用、正文还没 flush（pending
-      // 仍在缓冲里）、且正文带 DSML 块——解析还原成 tool_calls 补发，正文发
-      // 剥离后的干净版（pending 置空阻止 flush 发原文）。已 flush（live）的
-      // 场景正文出去了收不回，维持现状（不劣化）；reasoning 早已直发不受影响。
-      if (!live && toolCalls === 0 && pending && /dsml/i.test(pending)) {
-        const parsed = parseDsmlToolCalls(pending);
-        if (parsed) {
+      // DSML 流式兜底（2026-10-30 引入；2026-10-31 升级为共享分类器的
+      // fail-closed 三分判据——recovered 还原 / empty 剥离 + WARN / leak 报错，
+      // 见 src/repair.js classifyDsml 注释）。只救「还没 flush（pending 仍在
+      // 缓冲里）」的场景；已 flush（live）的正文出去了收不回，维持现状
+      // （不劣化）；reasoning 早已直发不受影响。
+      if (!live && toolCalls === 0 && pending && /dsml/i.test(repair.stripFences(pending))) {
+        const cls = repair.classifyDsml(pending);
+        if (cls.kind === 'recovered') {
           pending = '';
-          emit(mkChunk({ content: parsed.clean }));
+          emit(mkChunk({ content: cls.clean }));
           emit(mkChunk({
-            tool_calls: parsed.calls.map((cc, i) => ({
+            tool_calls: cls.calls.map((cc, i) => ({
               index: i,
               id: `call_dsml_${Date.now().toString(36)}${i}`,
               type: 'function',
               function: { name: cc.name, arguments: cc.arguments },
             })),
           }));
+          // 上游 done 报 stop 的话纠正为 tool_calls（与 aggregate 同一口径）
+          for (let i = 0; i < held.length; i++) {
+            try {
+              const h = JSON.parse(held[i]);
+              if (h.choices && h.choices[0] && h.choices[0].finish_reason === 'stop') {
+                h.choices[0].finish_reason = 'tool_calls';
+                held[i] = JSON.stringify(h);
+              }
+            } catch (e) { /* 非 JSON 帧跳过 */ }
+          }
           held.push(JSON.stringify({
             id: 'traework', object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000), model,
             choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
           }));
+        } else if (cls.kind === 'empty') {
+          pending = repair.stripDsmlTags(pending);
+          repair.logDsml('traework', 'empty', pending);
+        } else {
+          // leak：fail-closed。reasoning 已直发，调用方 catch 后按已发头处理
+          repair.logDsml('traework', 'leak', pending);
+          pending = '';
+          const err = new Error('DSML 协议残片无法还原：正文带未闭合的 tool 调用结构（fail-closed，本轮丢弃）');
+          err.statusCode = 502;
+          throw err;
         }
       }
       flush(); for (const f of held) emit(f);
@@ -468,51 +649,12 @@ function createTextGate(emit, model, hold) {
 }
 
 // ---------------------------------------------------------------------------
-// DeepSeek DSML 工具调用回退解析（2026-10-30，融合自 trae2api-hub trae_proxy.py）
-//
-// 现象：DeepSeek 系模型偶尔把工具调用以**文本标记**写进正文而不是走原生
-// tool_calls 增量——形状是 `<dsml:calls>` 包 `<dsml:invoke name="…">` 包
-// `<dsml:parameter name="…">`（标签名里 DSML 的位置与分隔符不固定，前缀
-// 任意）。客户端拿到的是一段 XML 文本，本轮工具调用不执行。
-//
-// 处置是**纯兜底**：只在「正文含 DSML 标记且本轮没有任何原生 tool_calls」
-// 时才解析——原生工具调用永远优先（真实调用带调用 id 与上游语义，文本
-// 解析只是尽力还原），有原生调用时正文里的 DSML 文本原样保留（那可能是
-// 模型在讨论格式而不是在调用）。流式路径不解析：正文可能已直发，收不回；
-// 非流式（aggregate，含 chatlab 试调台）在聚合出口做，正文全量在手。
+// DeepSeek DSML 工具调用回退解析（2026-10-30 引入；2026-10-31 解析函数与
+// fail-closed 分类器收敛到 src/repair.js——千问/Qoder 同款协议残片同修，
+// 这里的 parseDsmlToolCalls 只是对共享层的 re-export，别在这里加逻辑）
 // ---------------------------------------------------------------------------
 
-/** `<…DSML…calls>…</…DSML…calls>` 块（DOTALL：块可跨行） */
-const DSML_CALLS_RE = /<[^>]*dsml[^>]*calls>([\s\S]*?)<\/[^>]*dsml[^>]*calls>/i;
-/** `<…DSML…invoke name="…">…</…DSML…invoke>`（g 必须：exec 循环推进靠它） */
-const DSML_INVOKE_RE = /<[^>]*dsml[^>]*invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/[^>]*invoke>/gi;
-/** `<…DSML…parameter name="…">…</…DSML…parameter>`（g 同上） */
-const DSML_PARAM_RE = /<[^>]*dsml[^>]*parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)<\/[^>]*parameter>/gi;
-
-/**
- * 从正文解析 DSML 工具调用块。
- * @returns {{calls:Array<{name:string,arguments:string}>, clean:string}|null}
- *          null = 没有 DSML 块或块里没有 invoke（正文原样保留）
- */
-function parseDsmlToolCalls(text) {
-  const s = String(text || '');
-  if (!/dsml/i.test(s)) return null;
-  const m = DSML_CALLS_RE.exec(s);
-  if (!m) return null;
-  const calls = [];
-  let inv;
-  while ((inv = DSML_INVOKE_RE.exec(m[1])) !== null) {
-    const params = {};
-    let p;
-    while ((p = DSML_PARAM_RE.exec(inv[2])) !== null) {
-      params[p[1]] = p[2].trim();
-    }
-    calls.push({ name: inv[1], arguments: JSON.stringify(params) });
-  }
-  if (!calls.length) return null;
-  const clean = (s.slice(0, m.index).trim() + ' ' + s.slice(m.index + m[0].length).trim()).trim();
-  return { calls, clean };
-}
+const parseDsmlToolCalls = repair.parseDsmlToolCalls;
 
 /**
  * 聚合整轮结果（非流式路径）。
@@ -554,23 +696,36 @@ function aggregate(events, model) {
         total_tokens: d.total_tokens || 0,
         completion_tokens_details: { reasoning_tokens: d.reasoning_tokens || 0 },
       };
+      // 缓存命中镜像（与流式门同一口径，misakano issue#3）
+      if (d.cache_read_input_tokens != null) {
+        usage.prompt_tokens_details = { cached_tokens: Number(d.cache_read_input_tokens) || 0 };
+      }
     }
     if (e.event === 'done' && d.finish_reason) finish = d.finish_reason;
   }
 
-  // DSML 回退（见 parseDsmlToolCalls 注释）：零原生调用且正文带 DSML 块时
-  // 还原成结构化工具调用并从正文剥离；原生调用优先，不碰正文。
-  if (!calls.size && content) {
-    const parsed = parseDsmlToolCalls(content);
-    if (parsed) {
-      content = parsed.clean;
-      parsed.calls.forEach((c, i) => {
+  // DSML 回退（fail-closed 三分判据见 src/repair.js classifyDsml）：零原生
+  // 调用且正文带 DSML 块时还原成结构化工具调用并从正文剥离；空壳剥离 + WARN；
+  // 未闭合结构报错（把半截协议喂给客户端比明确失败更糟）。原生调用优先，不碰正文。
+  if (!calls.size && content && /dsml/i.test(repair.stripFences(content))) {
+    const cls = repair.classifyDsml(content);
+    if (cls.kind === 'recovered') {
+      content = cls.clean;
+      cls.calls.forEach((c, i) => {
         calls.set(i, {
           id: `call_dsml_${Date.now().toString(36)}${i}`,
           type: 'function',
           function: { name: c.name, arguments: c.arguments },
         });
       });
+    } else if (cls.kind === 'empty') {
+      content = repair.stripDsmlTags(content);
+      repair.logDsml('traework', 'empty', content);
+    } else {
+      repair.logDsml('traework', 'leak', content);
+      const e = new Error('DSML 协议残片无法还原：正文带未闭合的 tool 调用结构（fail-closed，本轮丢弃）');
+      e.statusCode = 502;
+      throw e;
     }
   }
 
@@ -607,8 +762,7 @@ function aggregate(events, model) {
   return out;
 }
 
-module.exports = {
-  buildBody, postStream, readStream, toOpenAIChunk, deltaOf, aggregate, eventError, normalizeToolCall,
+module.exports = {  buildBody, postStream, readStream, toOpenAIChunk, deltaOf, aggregate, eventError, normalizeToolCall,
   createTextGate, looksUnfinished, withRepairNudge, REPAIR_NUDGE, REPAIR_MAX, HOLD_CAP,
-  parseDsmlToolCalls,
+  parseDsmlToolCalls, turnIdOf, oidSessionId,
 };

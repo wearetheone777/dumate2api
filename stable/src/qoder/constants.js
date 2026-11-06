@@ -35,6 +35,11 @@ const ENDPOINTS = {
     DeviceLoginBase: 'https://qoder.com.cn/device/selectAccounts',
     PollEndpoint: 'https://openapi.qoder.com.cn/api/v1/deviceToken/poll',
     RefreshEndpoint: 'https://openapi.qoder.com.cn/api/v1/deviceToken/refresh',
+    // jobToken 族（2026-11-01，qoder2api-hub：PAT 导入与 jrt- 刷新走这套）。
+    // PAT（pt-，网页版「设置 → Personal Access Token」签发，长期）在
+    // SSO 强制组织下是唯一登录路——设备授权流程会被组织拦。
+    JobExchangeEndpoint: 'https://openapi.qoder.com.cn/api/v1/jobToken/exchange',
+    JobRefreshEndpoint: 'https://openapi.qoder.com.cn/api/v1/jobToken/refresh',
     UserinfoBase: 'https://openapi.qoder.com.cn/api/v1/userinfo',
     PlanEndpoint: 'https://openapi.qoder.com.cn/api/v2/user/plan',
     QuotaEndpoint: 'https://openapi.qoder.com.cn/api/v2/quota/usage',
@@ -43,6 +48,11 @@ const ENDPOINTS = {
     // 上游唯一给出「真实消耗口径」的地方——补 grants「只有领取额没有剩余额」的缺口。
     CreditsSummaryEndpoint: 'https://openapi.qoder.com.cn/sash/api/v1/ai-conversations/credits-summary',
     CreditsHeatmapEndpoint: 'https://openapi.qoder.com.cn/sash/api/v1/ai-conversations/credits-heatmap',
+    // Pro 升级福利包（一次性 +1800，qoder2api-hub accounts.md）。GET 查资格、
+    // POST 领取；已领过回 409 或 ALREADY。端点不存在（404/403/410）= 活动已下线，
+    // 按「不可领取」处理，不当成错误。
+    ProEligibilityEndpoint: 'https://openapi.qoder.com.cn/sash/api/v1/me/pro-upgrade/eligibility',
+    ProClaimEndpoint: 'https://openapi.qoder.com.cn/sash/api/v1/me/pro-upgrade/claim',
     ChatStreamURL: 'https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1',
     ModelListURL: 'https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1',
     JobTokenURL: 'https://gateway.qoder.com.cn/algo/api/v3/user/jobToken?Encode=1',
@@ -54,12 +64,16 @@ const ENDPOINTS = {
     DeviceLoginBase: 'https://qoder.com/device/selectAccounts',
     PollEndpoint: 'https://openapi.qoder.sh/api/v1/deviceToken/poll',
     RefreshEndpoint: 'https://openapi.qoder.sh/api/v1/deviceToken/refresh',
+    JobExchangeEndpoint: 'https://openapi.qoder.sh/api/v1/jobToken/exchange',
+    JobRefreshEndpoint: 'https://openapi.qoder.sh/api/v1/jobToken/refresh',
     UserinfoBase: 'https://openapi.qoder.sh/api/v1/userinfo',
     PlanEndpoint: 'https://openapi.qoder.sh/api/v2/user/plan',
     QuotaEndpoint: 'https://openapi.qoder.sh/api/v2/quota/usage',
     CampaignsBase: 'https://openapi.qoder.sh/sash/api/v1/me/campaigns',
     CreditsSummaryEndpoint: 'https://openapi.qoder.sh/sash/api/v1/ai-conversations/credits-summary',
     CreditsHeatmapEndpoint: 'https://openapi.qoder.sh/sash/api/v1/ai-conversations/credits-heatmap',
+    ProEligibilityEndpoint: 'https://openapi.qoder.sh/sash/api/v1/me/pro-upgrade/eligibility',
+    ProClaimEndpoint: 'https://openapi.qoder.sh/sash/api/v1/me/pro-upgrade/claim',
     // 主力推理主机。官方 0.4.8 客户端 endpoint 缓存实测（qoder2api-hub 逆向）：
     // inference=api3、securityInference=api2；api1 是旧配置首位，常年直连超时。
     ChatStreamURL: 'https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1',

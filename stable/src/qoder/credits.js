@@ -78,6 +78,13 @@ function capture(account, credits, opts = {}) {
   };
   // 实测倍率（computeBilledRate 的说明——上游改路由的可见性数据源）
   if (opts.billedRate != null) entry.billed_rate = opts.billedRate;
+  // 折扣前额度（上游 usage 若带 original_credits）：两者比值即真实折扣——
+  // discountFactor 的乘性方向从此不用再猜（错峰窗口内的实测比对数据源）
+  const oc = Number(opts.originalCredits);
+  if (Number.isFinite(oc) && oc > 0) {
+    entry.original_credits = Math.round(oc * 10000) / 10000;
+    entry.discount = Math.round((Number(credits) / oc) * 10000) / 10000;
+  }
   append(entry);
   return entry;
 }
@@ -157,6 +164,13 @@ function since() {
 
 /** 逐笔明细（按时间倒序），供仪表盘表格 */
 function creditRecords(limit) {
+  // 区域随行给（2026-11-03 页面区分）：按账号 id 回查，global 归一成 intl。
+  // 账号已删除的旧行如实空串，不猜。
+  let regions = null;
+  try {
+    const authStore = require('./auth');
+    regions = new Map(authStore.list().map((a) => [a.id, (String(a.region).toLowerCase() === 'cn' ? 'cn' : 'intl')]));
+  } catch (e) { regions = null; }
   return readHistory()
     .slice()
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
@@ -166,9 +180,13 @@ function creditRecords(limit) {
       req_id: r.req_id || '',
       account: r.account || '',
       account_id: r.account_id,
+      region: regions && r.account_id != null ? (regions.get(r.account_id) || '') : '',
       model: r.model || '',
       ms: r.ms ?? null,
       cost: r.credits ?? null,
+      // 折扣前额度与真实折扣（上游给了才落账，没有就如实 null）
+      original_credits: r.original_credits ?? null,
+      discount: r.discount ?? null,
       // 上游直给，恒为精确值（与 TRAE 的游标差不同源）
       exact: true,
     }));

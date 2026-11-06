@@ -26,6 +26,7 @@
 //      注释）。本地签名是纯 CPU 的同步计算，微秒级。
 const core = require('../cosy');
 const c = require('./constants');
+const crypto = require('crypto');
 
 /** 聊天路径去掉 /algo 前缀——签名用的 pathSig（与 Qoder 同一约定） */
 const CHAT_PATH_SIG = c.CHAT_PATH.replace(/^\/algo/, '');
@@ -54,6 +55,38 @@ function newSession({ uid, token, machineId }) {
 }
 
 /**
+ * 官方桌面端的 `X-QwenWork-*` 身份头（2026-10-31 解包 1.4.0 客户端确认）。
+ *
+ * 构造处是 `getQwenWorkClientHeaders()`（out/main/main.js）：
+ *   X-QwenWork-Version         ← app 版本（1.4.0）
+ *   X-QwenWork-Release-Version ← qoderworkUpgradeVersion（1.4.0-26102705）
+ *   X-QwenWork-Build           ← release 里 `-` 之后那段（26102705）
+ *   X-QwenWork-Platform        ← 'win' / 'mac'
+ *   X-QwenWork-Arch            ← process.arch
+ *   X-QwenWork-Channel         ← 渠道
+ *   X-QwenWork-App-Mode        ← appModeId
+ *
+ * 我们的 COSY 签名头已经足够让上游接受请求（实测 1.1.52 时代就正常出流），
+ * 这一组是**补齐官方指纹**——上游若按客户端身份做灰度/版本门，缺这组就是
+ * 第一个被拦的地方。`DUMATE_QWENWORK_OS_HEADERS=0` 可关（排障对照用）。
+ *
+ * 注意 `X-QwenWork-App-Mode` 的真实取值没在解包里找到字面量（来自
+ * `constants$4.a.appModeId` 的运行时配置），这里不编一个具体值：只发有确切
+ * 依据的六个头，第七个留给上游不认时的排障线索（而不是猜一个假值发出去）。
+ */
+function clientHeaders() {
+  if (process.env.DUMATE_QWENWORK_OS_HEADERS === '0') return {};
+  return {
+    'X-QwenWork-Version': c.IDE_VERSION,
+    'X-QwenWork-Release-Version': c.RELEASE_VERSION,
+    'X-QwenWork-Build': c.BUILD,
+    'X-QwenWork-Platform': 'win',
+    'X-QwenWork-Arch': 'x64',
+    'X-QwenWork-Channel': 'stable',
+  };
+}
+
+/**
  * 构造全部请求头。body 是**已 Encode 的字符串**。
  * Accept 与 Content-Length 由 chat.js 的 post/postStream 统一补，这里不管。
  */
@@ -75,13 +108,23 @@ function buildHeaders(sess, pathSig, body, accept, extra) {
     ),
     'cosy-version': c.COSY_VERSION,
     'cosy-machineid': sess.machineId || '',
+    // 2026-11-06 对照 Buddy2api v2.2.17（providers/qwenwork/chat.py + constants.py，
+    // 1.0.4 客户端真机组合）补的三件：请求标识、机型枚举、内部模型键镜像。
+    // 它们在我们 1.1.71 组合里缺席而上游一直放行——补上是把指纹缺口收窄，
+    // 排障对照可用 DUMATE_QWENWORK_OS_HEADERS=0 整组关掉。
+    'cosy-machinetype': '5',
+    'cosy-machineos': c.MACHINE_OS,
+    'x-request-id': crypto.randomUUID(),
+    // 官方 qoderclicn 抓包带 OpenTelemetry 头（xrp-cosy 桌面逆向 §3.1）；
+    // W3C 标准格式：00-<32hex trace-id>-<16hex span-id>-01
+    traceparent: `00-${crypto.randomBytes(16).toString('hex')}-${crypto.randomBytes(8).toString('hex')}-01`,
     'login-version': c.LOGIN_VERSION,
     'user-agent': c.USER_AGENT,
     'cosy-scene': c.SCENE,
     'cosy-business-product': c.BUSINESS_PRODUCT,
     'cosy-business-type': c.BUSINESS_TYPE,
   };
-  return Object.assign(headers, extra || {});
+  return Object.assign(headers, clientHeaders(), extra || {});
 }
 
 /**
@@ -98,6 +141,8 @@ function prepareInfer({ uid, token, bodyJson, modelKey, machineId }) {
   const headers = buildHeaders(sess, CHAT_PATH_SIG, body, 'text/event-stream', {
     'x-model-key': modelKey,
     'x-model-source': 'system',
+    // Buddy2api 实测组合里的模型键第三镜像（x-model-key / model_config.key 之外）
+    'x-internal-model-key': modelKey,
   });
   return { url: c.GATEWAY + c.CHAT_PATH + '?' + c.CHAT_QUERY, body, headers };
 }
@@ -109,8 +154,9 @@ async function prepareInferAsync({ uid, token, bodyJson, modelKey, machineId }) 
   const headers = buildHeaders(sess, CHAT_PATH_SIG, body, 'text/event-stream', {
     'x-model-key': modelKey,
     'x-model-source': 'system',
+    'x-internal-model-key': modelKey,
   });
   return { url: c.GATEWAY + c.CHAT_PATH + '?' + c.CHAT_QUERY, body, headers };
 }
 
-module.exports = { prepareInfer, prepareInferAsync, newSession, buildHeaders, identityJson, CHAT_PATH_SIG };
+module.exports = { prepareInfer, prepareInferAsync, newSession, buildHeaders, identityJson, CHAT_PATH_SIG, clientHeaders };

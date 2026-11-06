@@ -20,6 +20,7 @@
 
 const { markFirstToken } = require('./reqlog');
 const { imagePartsFromContent } = require('./images');
+const { cachedTokensOf } = require('./usage-norm');
 
 // ---------- 请求侧 ----------
 
@@ -235,10 +236,7 @@ function usageFrom(openaiUsage) {
   // 字段（DeepSeek prompt_cache_hit_tokens / Qwen completion_tokens_details）
   // 归一进标准位，但直接打标准 OpenAI usage 的通道（搭子回落等）也带
   // prompt_tokens_details.cached_tokens——这里曾是**硬编码 0**，Codex 的
-  // /status 永远显示缓存 0。多形状回退对齐 buddy-switch 的
-  // build_responses_usage（2026-10-30 融合）。
-  const details = (u.prompt_tokens_details && typeof u.prompt_tokens_details === 'object')
-    ? u.prompt_tokens_details : {};
+  // /status 永远显示缓存 0。形状清单收敛在 usage-norm.cachedTokensOf。
   const pickNum = (...cands) => {
     for (const v of cands) {
       const n = Number(v);
@@ -246,12 +244,7 @@ function usageFrom(openaiUsage) {
     }
     return 0;
   };
-  const cached = pickNum(
-    details.cached_tokens,
-    u.prompt_cache_hit_tokens,
-    u.cache_read_input_tokens,
-    u.cached_tokens,
-  );
+  const cached = cachedTokensOf(u);
   const reasoning = pickNum(
     u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens,
     u.reasoning_tokens,

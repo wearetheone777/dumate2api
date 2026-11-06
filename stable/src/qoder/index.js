@@ -15,10 +15,11 @@ const authStore = require('./auth');
 const session = require('./session');
 const constants = require('./constants');
 const { normalizeError } = require('../errtext');
-const { isThrottle, unescapeDeep, throttleRetryMs } = require('../upstream-errors');
+const { isThrottle, unescapeDeep, throttleRetryMs, isContentPolicy } = require('../upstream-errors');
 const ledger = require('../checkin-ledger');
 const grants = require('./grants');
 const maxOutput = require('./max-output');
+const clock = require('./clock');
 // 「播报即收尾」（共享判定与缓冲门，见 src/repair.js）
 const repair = require('../repair');
 // 选号接缝（集成阶段）：冷却/熔断/粘性/在途帽统一走池状态机。
@@ -50,6 +51,15 @@ async function warmupModels() {
     if (r && r.ok && r.models && r.models.length) last = r;
     else if (!last.ok) last = r || last;
   }
+  // 时钟偏差自检（hub issue #64）：启动时测一次，超阈值打 WARN——时钟漂移的
+  // 401 与凭证失效形态一致，不在这里看得见就只能靠换凭证瞎试
+  for (const region of new Set(accounts.map((a) => a.region))) {
+    clock.measureSkew(region).then((skew) => {
+      if (clock.shouldWarn(skew)) {
+        console.warn(`[qoder] 机器时间偏差 ${skew > 0 ? '+' : ''}${Math.round(skew)}s（超过 ${clock.WARN_THRESHOLD_S}s 时 COSY 签名会 401，先校时再排查凭证）`);
+      }
+    }).catch(() => { /* 测不出就不报 */ });
+  }
   return last;
 }
 
@@ -60,6 +70,8 @@ function status() {
     // 这条通道没有 wasm 依赖，如实标注（千问的 status 有 wasm 字段）
     needsClient: false,
     accounts: usable.length,
+    // 时钟偏差（缓存直读，status 是同步路径不发请求；null = 还没测过/已过期）
+    clock: { cn: clock.cachedSkewOf('cn'), global: clock.cachedSkewOf('global') },
     error: usable.length ? '' : '尚未添加 Qoder 账号（需先登录一次）',
   };
 }
@@ -81,6 +93,125 @@ function pickAccount() {
 function poolStatusOf(code) {
   const n = Number(code) || 0;
   return n === 105 ? 401 : n;
+}
+
+// ---------------------------------------------------------------------------
+// 客户端渲染错误码的识别（2026-11-01，对齐 qoder2api-hub 风控文档 §7.4）。
+//
+// hub 逆向官方客户端得到的**已渲染错误码清单**：
+//   103/105/110/112/114/115/116/117/118/119/122/406/430/10605/80411/80412/
+//   100400/100401/100403
+// 其中 105/110/112/114/430/10605 已有专门处置（额度/排队/版本门，见上下文）。
+// 剩下的按证据分级处理——**只认清单内的码，120/121 不在清单里，不猜**：
+//
+//   · 100401/100403 → hub 明确语义「鉴权/权限拒绝」，映射到既有 HTTP 401/403
+//     复用既有处置（session_dead 防误杀计数 / 403+无权限文案换号）。
+//   · 103 → 本项目实测语义「Duplicate request」（按签名字节去重，2026-10-31
+//     重签修复的同一机制）。重签后正常路径不再出现；再出现说明有重试竞态，
+//     新签名重试即解，可换号，短冷却（请求级问题不罚账号）。
+//   · 406 → 标准 HTTP 语义（payloadError 本来就认，状态码合法，retryable(406)
+//     = false、池不惩罚）——现状已正确，不动。
+//   · 115/116/117/118/119/122/80411/80412/100400 → **无公开语义**（hub 只列
+//     码值，i18n 里也没有映射）。不编含义，只做两件有据的事：
+//       1. 帧识别 fail loudly——这些码 <400 时 payloadError 不认，整帧会被当
+//          正常数据静默转发（「200 + 空回答」失败模式，与 112 同源）；
+//       2. 处置保守：不惩罚账号（语义未知宁可少惩罚）、不换号（官方客户端
+//          对渲染码的行为是弹错误对话框而非重试）。
+//
+// 另有一个**与分类无关但更基础**的修复：业务码会原样进 e.statusCode，而
+// res.writeHead 要求 100-599——上游回 80411/100401 时旧代码直接抛
+// ERR_HTTP_INVALID_STATUS_CODE。httpStatusOf 把超范围的码压回 400。
+// ---------------------------------------------------------------------------
+
+/** 鉴权/权限业务码 → 既有 HTTP 语义（hub §7.4 明确语义） */
+const AUTH_BIZ_MAP = { 100401: 401, 100403: 403 };
+/** <400 的已渲染码（payloadError 认不出，会静默转发）。103 单独判重 */
+const OPAQUE_SUB400 = /^(103|115|116|117|118|119|122)$/;
+/** ≥400 的无语义码（payloadError 认得出 code，但 statusCode 非法且不该进 5xx 分支） */
+const OPAQUE_OVER400 = /^(80411|80412|100400)$/;
+
+/** 业务码 → 合法 HTTP 状态码。超范围（如 80411/100401）一律压 400：语义未知按保守处置 */
+function httpStatusOf(code) {
+  const n = Number(code) || 0;
+  if (n >= 100 && n <= 599) return n;
+  return 400;
+}
+
+/**
+ * 把帧识别的原始结果（payloadError / quotaFrameError 的返回）归一成
+ * 可抛出的形状：鉴权码映射、无语义码转 400 + opaqueCode 标志、判重转
+ * 429 + dupRequest 标志、审核拒绝打 policy 标志。其余形状原样透传
+ * （quotaKind 等字段保留）。
+ */
+function frameThrown(fe) {
+  if (!fe) return fe;
+  const c = String(fe.code != null ? fe.code : '').trim();
+  if (AUTH_BIZ_MAP[c]) {
+    const mapped = AUTH_BIZ_MAP[c];
+    // 403 的 message 带「无权限」锚：retryable(403) 按文案认出可换号
+    const why = mapped === 403 ? '无权限访问' : '鉴权失败';
+    return {
+      code: mapped,
+      message: `qoder auth biz(${c}): ${why}${fe.message ? ': ' + fe.message : ''}`,
+    };
+  }
+  if (c === '103') {
+    return {
+      code: 429,
+      message: `qoder dup(103): ${fe.message || 'Duplicate request'}（请求签名判重，重试即解）`,
+      dupRequest: true,
+    };
+  }
+  if (OPAQUE_SUB400.test(c) || OPAQUE_OVER400.test(c)) {
+    return {
+      code: 400,
+      message: `qoder biz(${c}): ${fe.message || '上游业务错误'}`,
+      opaqueCode: c,
+    };
+  }
+  if (isContentPolicy(fe.message)) return { ...fe, policy: true };
+  return fe;
+}
+
+/**
+ * 顶层帧的**无语义渲染码**识别（<400，payloadError/quotaFrameError 都认不出
+ * 的那批）。只看顶层 code 字段，不匹配帧的字符串全文——模型正文里讨论到
+ * `{"code":"115"}` 不能误伤（与 quotaFrameError 同一纪律）。
+ * 返回原始 {code, message}，映射交给 frameThrown。
+ */
+function bizFrameError(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const c = String(parsed.code != null ? parsed.code : '').trim();
+  if (!OPAQUE_SUB400.test(c)) return null;
+  return { code: c, message: String(parsed.message || '').trim() };
+}
+
+/** bizFrameError 的响应原文版（SSE 行或裸 JSON，逐行解析、只看顶层 code） */
+function bizFromBody(raw) {
+  const text = String(raw || '');
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    const json = t.startsWith('data:') ? t.slice(5).trim() : t;
+    if (!json || json === '[DONE]') continue;
+    let o;
+    try { o = JSON.parse(json); } catch (e) { continue; }
+    const be = bizFrameError(o);
+    if (be) return be;
+  }
+  return null;
+}
+
+/** frameThrown 的结果 → 抛出的 Error：statusCode 钳制 + 全部标志透传 */
+function thrownFrameErr(fe, sent) {
+  const t = frameThrown(fe);
+  const err = new Error(`qoder ${t.code}: ${t.message}`);
+  err.statusCode = httpStatusOf(t.code);
+  if (t.quotaKind) err.quotaKind = t.quotaKind;
+  if (t.policy) err.policy = true;
+  if (t.dupRequest) err.dupRequest = true;
+  if (t.opaqueCode) err.opaqueCode = t.opaqueCode;
+  if (sent !== undefined) err.sent = sent;
+  return err;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,10 +279,16 @@ function quotaFromBody(raw) {
   return null;
 }
 
+/** 判重的短冷却（与排队挂起同量级：请求级问题，不是账号坏了） */
+const DUP_COOLDOWN_MS = 5000;
+
 /**
  * 喂池的错误形状。105→401 的旧映射保留；额度类改喂「429 + 显式时长」——
  * classify 对显式 retryAfterMs 只透传（见 upstream-errors），applySoftCooldown
  * 拿它做固定冷却且不递增 soft_streak。430 喂 400（不惩罚）。
+ *
+ * 2026-11-01 增三支：审核拒绝/无语义码 → 400（不惩罚账号——前者拒绝的是
+ * 内容不是账号，后者语义未知宁可少惩罚）；判重 → 429 + 5 秒短冷却。
  */
 function poolInfoOf(e, model) {
   const code = Number(e.statusCode) || 0;
@@ -165,6 +302,9 @@ function poolInfoOf(e, model) {
       retryAfterMs: qk === 'daily' ? msUntilMidnight() : QUOTA_COOLDOWN_MS,
     };
   }
+  if (e.policy || isContentPolicy(e.message)) return { status: 400, message: e.message, model };
+  if (e.dupRequest) return { status: 429, message: e.message, model, retryAfterMs: DUP_COOLDOWN_MS };
+  if (e.opaqueCode) return { status: 400, message: e.message, model };
   return { status: poolStatusOf(code), message: e.message, model };
 }
 
@@ -251,7 +391,9 @@ function fefoUidSet(usable) {
   try {
     const set = new Set();
     for (const g of grants.expiring({ withinMs: days * 86400000 })) {
-      const acc = usable.find((a) => a.id === g.account_id);
+      // 账本字段是 accountId（grants.fromClaim 写入的驼峰命名）——曾写成
+      // account_id，find 恒失败、集合恒空，FEFO 从未生效过（2026-11-01 修）。
+      const acc = usable.find((a) => a.id === g.accountId);
       if (acc) set.add(channelPool.uidOf(CHANNEL, acc.id));
     }
     return set.size ? set : null;
@@ -274,6 +416,11 @@ function fefoUidSet(usable) {
  * 于是第二个账号白放着、用户拿一个 403。
  */
 function retryable(code, message, quotaKind) {
+  // 内容审核拒绝先于一切状态码判（含 n===0 的网络分支——带审核串的「未知
+  // 状态错误」也是上游拒绝）：拒绝的是这批内容，换哪个号发同一份 body 都会
+  // 被拒（hub：确定性拒绝，重试无效）。判据在完整 message 上，因为上游常把
+  // 它包在 HTTP 500 / 200 帧里，数字 code 认不出。
+  if (isContentPolicy(message)) return false;
   const n = Number(code);
   if (!Number.isFinite(n) || n === 0) return true; // 网络错误/超时：换号试一次
   // 额度类业务码先于 403 文案判：112/110/114 换号有用（别的号可能还有额度）；
@@ -422,6 +569,9 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     });
     // encode 进 worker（审计 P1-5b）：几 MB 请求的编码不再独占事件循环
     encBody = await cosy.encodeAsync(Buffer.from(bodyJson));
+    // 体积前置检查：超 SLB 上限就本地拒绝，别让连接被 RST 后当成网络错误
+    // 反复换号重放（会把整池打进熔断）。
+    chat.assertBodySize(encBody);
     headers = cosy.buildHeaders(sess, ep.ChatPathSig, encBody, 'text/event-stream', HEADER_EXTRA, { sse: true });
   };
   /**
@@ -548,6 +698,15 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       let firstErr = null;
       let doneSeen = false;
       let gate = null;
+      // DeepSeek 族 reasoning 回填的素材：本轮正文与思维链（只有最终成功的
+      // 那一轮才会写进缓存，修复轮整轮丢弃）。
+      let contentAcc = '';
+      let reasoningAcc = '';
+      const toolIds = new Map(); // tool_call index -> 补出来的 id
+      const rememberTurn = () => {
+        try { chat.rememberReasoning(pinnedSession, contentAcc, reasoningAcc, modelKey); }
+        catch (e) { /* 缓存失败不影响响应 */ }
+      };
       const candidates = constants.chatStreamCandidates(region);
       // 排队状态查询打「本次尝试实际用的主机」——队列跟着主机走
       let statusOrigin = '';
@@ -556,6 +715,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       // 原样重发，四个状态标志随之复位
       const attemptStream = () => {
         firstErr = null; sent = false; doneSeen = false; sawUp = false;
+        contentAcc = ''; reasoningAcc = ''; toolIds.clear();
         // 识别到错误帧就立刻中止上游：Qoder 零额度时是**挂起**而不是报错，
         // 不主动断就要等 socket 空闲超时（600s），客户端早已超时。
         const ac = new AbortController();
@@ -568,17 +728,27 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           let parsed = null;
           try { parsed = JSON.parse(inner); } catch (e) { /* 非 JSON 帧照原样转发 */ }
           if (parsed) {
-            const err = chat.payloadError(parsed) || quotaFrameError(parsed);
+            const err = frameThrown(chat.payloadError(parsed) || quotaFrameError(parsed) || bizFrameError(parsed));
             if (err) {
               firstErr = err;
               try { ac.abort(); } catch (e) { /* 已结束 */ }
               return;
             }
             noteCredits(parsed);
-          // usage 缓存字段归一化（#112）：DeepSeek/Qwen 的缓存命中数字搬到
-          // 标准位 prompt_tokens_details.cached_tokens，改写发生在转发前——
-          // 原样转发的话按标准协议解析的客户端读到的缓存恒为 0
-          if (parsed.usage && chat.normalizeUsageCache(parsed.usage)) inner = JSON.stringify(parsed);
+            // 累积本轮正文/思维链，供下一轮 DeepSeek reasoning 回填
+            const ch0 = parsed.choices && parsed.choices[0];
+            const d0 = ch0 && ch0.delta;
+            if (d0) {
+              if (d0.content) contentAcc += d0.content;
+              if (d0.reasoning_content) reasoningAcc += d0.reasoning_content;
+            }
+            // usage 缓存字段归一化（#112）：DeepSeek/Qwen 的缓存命中数字搬到
+            // 标准位 prompt_tokens_details.cached_tokens，改写发生在转发前——
+            // 原样转发的话按标准协议解析的客户端读到的缓存恒为 0。
+            // tool_call.id 缺失同样就地补全（上游偶发不带 id 的增量帧）。
+            const changedUsage = parsed.usage && chat.normalizeUsageCache(parsed.usage);
+            const changedIds = chat.backfillToolCallIds(parsed, toolIds);
+            if (changedUsage || changedIds) inner = JSON.stringify(parsed);
           }
           // 只有**过了错误判定**的帧才算「上游真实数据」——排队信封（10605）
           // 与额度错误帧必须留在 sawUp=false，否则排队等待轮的守卫失效。
@@ -608,7 +778,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           lastUsage = null;       // 每轮独立结算（每轮都是一次真实上游请求）
           nextRound = false;
         }
-        gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP) : null;
+        gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP, {
+          model: modelKey, channel: 'qoder',
+          toolNames: repair.toolNamesOf(payload),
+          echoMode: repair.toolEchoMode(),
+        }) : null;
         // 尝试可能以**异常**结束（静默形态：content deadline / read idle 掐断
         // 时 postStream reject）——不能让它在等待判定之前飞出循环
         let res = null;
@@ -636,9 +810,7 @@ async function runOnce(account, payload, onChunk, opts, meter) {
         }
         if (attemptErr) { attemptErr.sent = sent || (gate ? gate.result().emitted > 0 : false); throw attemptErr; }
         if (firstErr) {
-          const err = new Error(`qoder ${firstErr.code}: ${firstErr.message}`);
-          err.statusCode = firstErr.code;
-          if (firstErr.quotaKind) err.quotaKind = firstErr.quotaKind;
+          const err = thrownFrameErr(firstErr);
           // 门的 emitted 也算：reasoning 是直发的，有一帧到下游就不能再换号
           err.sent = sent || (gate ? gate.result().emitted > 0 : false);
           throw err;
@@ -655,6 +827,8 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           err.statusCode = res.status;
           const qk = quotaKindOfText(String(res.raw || ''));
           if (qk) err.quotaKind = qk;
+          // 审核拒绝常包在 HTTP 500 里（正文 discussion 也可能触发它），从 raw 认
+          if (isContentPolicy(String(res.raw || ''))) err.policy = true;
           err.sent = sent || (gate ? gate.result().emitted > 0 : false);
           throw err;
         }
@@ -665,19 +839,15 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           // 额度类业务码（112/110/114/430）< 400，envelopeStatus/payloadError
           // 都不认——它们才是「200 + 空回答」的另一半来源，单独兜一层。
           const qf = quotaFromBody(res.raw);
-          if (qf) {
-            const err = new Error(`qoder ${qf.code}: ${qf.message}`);
-            err.statusCode = qf.code;
-            err.quotaKind = qf.quotaKind;
-            err.sent = false;
-            throw err;
-          }
+          if (qf) throw thrownFrameErr(qf, false);
+          // 无语义渲染码（115/103…）同样 <400：额度层没认出的在这里兜
+          const bf = bizFromBody(res.raw);
+          if (bf) throw thrownFrameErr(bf, false);
           const es = chat.envelopeStatus(res.raw);
           if (es && es.code >= 400) {
-            const err = new Error(`qoder ${es.code}: ${es.message}`);
-            err.statusCode = es.code;
-            err.sent = false;
-            throw err;
+            // envelopeStatus 的 code 可能是业务码（100401/80411…）：frameThrown
+            // 负责映射/转 400，thrownFrameErr 负责把 statusCode 压回合法范围
+            throw thrownFrameErr(es, false);
           }
         }
         // 正常收尾：哨兵有门时交给了门（finish() 收尾补发，顺序正文→usage→
@@ -685,11 +855,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
         if (!gate && doneSeen) onChunk('[DONE]');
         meter.settle(peakCredits, { usage: lastUsage, expectedRate: billingExpectedRate(modelMeta) });
         // ----「播报即收尾」修复判定（与千问 / TRAE 同构）----
-        if (!gate) return res;
+        if (!gate) { rememberTurn(); return res; }
         const g = gate.result();
-        if (g.live || g.toolCalls > 0) { gate.finish(); return res; }          // 正常或在干活
-        if (!repair.looksUnfinished(g.text, caps.HOLD_CAP)) { gate.finish(); return res; }
-        if (repairAttempt >= caps.REPAIR_MAX) { gate.finish(); return res; }  // 上限到，吐给它收尾
+        if (g.live || g.toolCalls > 0) { rememberTurn(); gate.finish(); return res; }  // 正常或在干活
+        if (!repair.looksUnfinished(g.text, caps.HOLD_CAP)) { rememberTurn(); gate.finish(); return res; }
+        if (repairAttempt >= caps.REPAIR_MAX) { rememberTurn(); gate.finish(); return res; }  // 上限到，吐给它收尾
         repairAttempt++;
         curPayload = repair.appendRepairNudge(curPayload);
         repair.logRepair('qoder', opts.reqId, repairAttempt, g.text);
@@ -738,15 +908,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       // 优先用它——排在 envelopeStatus 之前，否则会先被 raw 的空壳信封盖掉，
       // 让 `retryAfterSeconds` / `modelKey` 这些限流判据丢掉。
       if (res.firstErr) {
-      const err = new Error(`qoder ${res.firstErr.code}: ${res.firstErr.message}`);
-      err.statusCode = res.firstErr.code;
-      if (res.firstErr.quotaKind) err.quotaKind = res.firstErr.quotaKind;
-      throw err;
+      throw thrownFrameErr(res.firstErr);
     }
     const es = chat.envelopeStatus(res.raw);
     if (es && es.code >= 400) {
-      const err = new Error(`qoder ${es.code}: ${es.message}`);
-      err.statusCode = es.code;
+      const err = thrownFrameErr(es);
       const qk = quotaKindOfText(String(res.raw || ''));
       if (qk) err.quotaKind = qk;
       throw err;
@@ -754,16 +920,16 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     // 额度类业务码 < 400，envelopeStatus 认不出——聚合前单独兜一层，
     // 否则「零额度挂起结束后回 200 + 112 错误体」会聚合成空回答。
     const qf = quotaFromBody(res.raw);
-    if (qf) {
-      const err = new Error(`qoder ${qf.code}: ${qf.message}`);
-      err.statusCode = qf.code;
-      err.quotaKind = qf.quotaKind;
-      throw err;
-    }
+    if (qf) throw thrownFrameErr(qf);
+    // 无语义渲染码（115/103…）同样 <400：额度层没认出的在这里兜
+    const bf = bizFromBody(res.raw);
+    if (bf) throw thrownFrameErr(bf);
     // 与流式路径同理：非 SSE 的 HTTP 错误体也要认，否则会聚合成一个空回答
     if (res.status >= 400) {
-      const err = new Error(`qoder ${res.status}: ${String(res.raw || '').replace(/\s+/g, ' ').trim().slice(0, 200) || 'upstream error'}`);
+      const detail = String(res.raw || '').replace(/\s+/g, ' ').trim().slice(0, 200) || 'upstream error';
+      const err = new Error(`qoder ${res.status}: ${detail}`);
       err.statusCode = res.status;
+      if (isContentPolicy(String(res.raw || ''))) err.policy = true;
       throw err;
     }
     const payloads = [];
@@ -776,15 +942,26 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     // 响应里的 model 回填**真实名**（GLM-5.3-Flash），不是内部 key：
     // 流式帧是原样转发上游的（上游恒为 "auto"），非流式这条却会把
     // gfmodel 这种代号回给客户端，两边观感不一致
-    const out = chat.aggregate(payloads, (modelMeta && modelMeta.name) || modelKey);
+    const out = chat.aggregate(payloads, (modelMeta && modelMeta.name) || modelKey, {
+      toolNames: repair.toolNamesOf(payload),
+      echoMode: repair.toolEchoMode(),
+    });
+    // 非流式同样记下本轮 reasoning，供下一轮 DeepSeek 回填。**只在确认收尾时记**
+    // ——修复轮会整轮丢弃，提前记会把被丢弃的那轮思维链留给下一句对话。
+    const rememberOut = () => {
+      try {
+        const om = out && out.choices && out.choices[0] && out.choices[0].message;
+        if (om) chat.rememberReasoning(pinnedSession, om.content, om.reasoning_content, modelKey);
+      } catch (e) { /* 缓存失败不影响响应 */ }
+    };
     if (out && out.usage) noteCredits(out.usage);
     if (opts && opts.onAccount) { /* 非流式也报一次 */ }
     meter.settle(peakCredits, { usage: lastUsage, expectedRate: billingExpectedRate(modelMeta) });
     // ----「播报即收尾」修复判定（与流式同构；不带工具 / 上限到 → 原样返回）----
-    if (!repairable || repairAttempt >= caps.REPAIR_MAX) return out;
+    if (!repairable || repairAttempt >= caps.REPAIR_MAX) { rememberOut(); return out; }
     const omsg = (out.choices && out.choices[0] && out.choices[0].message) || {};
-    if (Array.isArray(omsg.tool_calls) && omsg.tool_calls.length) return out;
-    if (!repair.looksUnfinished(omsg.content, caps.HOLD_CAP)) return out;
+    if (Array.isArray(omsg.tool_calls) && omsg.tool_calls.length) { rememberOut(); return out; }
+    if (!repair.looksUnfinished(omsg.content, caps.HOLD_CAP)) { rememberOut(); return out; }
     repairAttempt++;
     curPayload = repair.appendRepairNudge(curPayload);
     repair.logRepair('qoder', opts.reqId, repairAttempt, omsg.content);
@@ -879,10 +1056,27 @@ function makeMeter(account, opts) {
           ms: opts.startedAt ? Date.now() - opts.startedAt : null,
           // 实测倍率（上游改路由的可见性，见 credits.computeBilledRate）
           billedRate: require('./credits').computeBilledRate(credits, extra.usage, extra.expectedRate),
+          // 折扣前额度（usage 帧若带 original_credits，见 credits.capture）
+          originalCredits: extra.usage && extra.usage.original_credits,
         });
       } catch (e) { /* 记账失败绝不影响已发出的响应 */ }
     },
   };
+}
+
+/** 按区域过滤账号（keys.region 的运行时约束）。'' = 不限 */
+function accountsForRegion(usable, region) {
+  if (!region) return usable;
+  const want = region === 'intl' ? 'global' : 'cn';
+  return usable.filter((a) => constants.normalizeRegion(a.region) === want);
+}
+
+/** 区域过滤后为空时的报错——要说出是哪个区域没号，而不是笼统的「没有账号」 */
+function noRegionAccountError(region) {
+  if (!region) return new Error('Qoder 没有可用账号，请先添加一个');
+  const e = new Error(`Qoder 没有可用的${region === 'intl' ? '国际' : '国内'}账号（该 API Key 限定区域：${region === 'intl' ? '国际' : '国内'}）`);
+  e.statusCode = 503;
+  return e;
 }
 
 async function send(payload, onChunk, opts = {}) {
@@ -892,8 +1086,12 @@ async function send(payload, onChunk, opts = {}) {
   const startedAt = Date.now();
   // 会话粘性 + 池选号（冷却/熔断/禁用/暂停/在途满跳过），见 channel-pool.js
   const sessionKey = channelPool.sessionKeyOf(payload, opts);
-  const usable = authStore.findUsable();
-  if (!usable.length) throw new Error('Qoder 没有可用账号，请先添加一个');
+  // 区域约束（API Key 的 region，2026-11-01）：'cn' → 只用国内账号，'intl' →
+  // 只用国际（global）账号，'' = 不限。请求的模型名不编码区域，区域约束只能
+  // 落在账号池选择上——不加过滤的话，intl key 的请求会被 FEFO/轮询派给国内
+  // 账号，约束形同虚设。
+  const usable = accountsForRegion(authStore.findUsable(), opts.region);
+  if (!usable.length) throw noRegionAccountError(opts.region);
   // 排队等待预算 + 共享 request_set_id（官方轮询协议，2026-10-30）。
   // 预算是**整次请求**的（所有账号共享）——runOnce 内的排队等待受它约束，
   // 耗尽后 throttle 错误按旧路交回（换号/429）。request_set_id 在多次尝试间
@@ -930,7 +1128,9 @@ async function send(payload, onChunk, opts = {}) {
     tried.add(account.id);
     if (opts.onAccount) {
       const name = account.nickname || account.uid || `账号 ${account.id}`;
-      try { opts.onAccount(name); } catch (e) { /* 上报失败不影响请求 */ }
+      // 第二个参数是账号 id（2026-11-03）：请求日志按它回查区域，国内/国际
+      // 拆分才有数据源。既有调用方只取第一个参数，不受影响。
+      try { opts.onAccount(name, account.id); } catch (e) { /* 上报失败不影响请求 */ }
     }
     // 每个账号一份：换号重试时归因要记到**实际成功的那个**账号上
     const meter = makeMeter(account, { ...opts, model, startedAt });
@@ -950,8 +1150,20 @@ async function send(payload, onChunk, opts = {}) {
       // 失败喂池：105（Login expired）按 401 进防误杀计数；额度类业务码
       // （112/110/114/430）按 poolInfoOf 的专门处置（固定冷却/不惩罚），
       // 其余按 classify。
-      channelPool.noteError(CHANNEL, account.id, poolInfoOf(e, model));
-      markFailure(account, e.message);
+      //
+      // **探针模式（opts.probe，hub v1.7.20 #134 的教训）**：billing-check 是
+      // 「读健康状态」的观测动作，撞 10605/112/110 时把账号写进冷却，等于
+      // 健康检查把健康账号打成病人——下一个真实请求在毫秒级被本地拒绝。
+      // probe 只跳过写型惩罚（冷却/熔断/lastError），错误照常上抛如实展示。
+      if (!opts.probe) {
+        channelPool.noteError(CHANNEL, account.id, poolInfoOf(e, model));
+        // 401/105 的偏差标注（hub issue #64）：时钟漂移的 401 与凭证失效形态
+        // 一致。有新鲜缓存且超阈值才加话（测不出就不加），并顺手刷新一次测量。
+        const isAuthErr = code === 401 || code === 105 || /login expired/i.test(String(e.message || ''));
+        const clockHint = isAuthErr ? clock.annotate401(account.region) : '';
+        if (isAuthErr) clock.measureSkew(account.region).catch(() => { /* 排障信息，失败不管 */ });
+        markFailure(account, `${e.message}${clockHint}`);
+      }
       errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled, quotaKind: e.quotaKind || '' });
       if (e.sent) throw e; // 流式已吐帧，不能再换号
       if (!retryable(code, e.message, e.quotaKind)) throw e;
@@ -1124,7 +1336,17 @@ function checkin(account) {
  * 已经自愈的错误（千问/搭子的 lastError 就是这个坑）。只有确实领到了才记时间。
  */
 async function checkinAndSave(account) {
-  const a = account || pickAccount();
+  let a = account || pickAccount();
+  if (!a) return { ok: false, error: '没有可用账号', claimed: [] };
+  // 签到要**新鲜** access token：管理端与 keepalive 拿的是落盘对象，
+  // token 过期后签到必然 401，界面表现为「点了没反应、状态仍未查询」。
+  // 聊天链路的 send() 会自己刷新，签到链路必须同样刷新——刷新是主流程，
+  // 不能靠调用方各自记得。换票失败的原因（如 refresh token 失效）如实带回。
+  try {
+    a = await session.ensureAccount(authStore, a);
+  } catch (e) {
+    return { ok: false, error: e.message, claimed: [] };
+  }
   let r;
   try {
     // 把账号传下去：签到成功时顺手写本地批次账本（过期提醒的数据源）
@@ -1163,4 +1385,8 @@ module.exports = {
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
   // 额度类业务码的识别与处置（离线验证用：test/verify-qoder-throttle.js）
   quotaKindOfText, quotaFrameError, quotaFromBody, retryable, poolInfoOf,
+  // FEFO 候选集推导（离线验证用：账本字段 accountId 的端到端回归）
+  fefoUidSet,
+  // 客户端渲染错误码（2026-11-01）：鉴权映射 / 无语义码 / statusCode 钳制
+  httpStatusOf, frameThrown, thrownFrameErr, bizFrameError, bizFromBody, accountsForRegion,
 };
