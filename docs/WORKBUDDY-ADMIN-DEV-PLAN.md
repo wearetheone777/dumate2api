@@ -4,6 +4,16 @@
 > `src/admin/routes/workbuddy.js` 逐页交叉验证；GitHub 上游项目功能调研
 > （workbuddy2api-hub / workbuddy2api-panel / workbuddy-manager /
 > qoder-trae-workbuddy-switch / CreditDaddy）。
+>
+> **执行状态（2026-11-07 更新）**：
+> - ✅ M1 全部完成（提交 141c24c + 962cc4f：九个页面级缺口 + WorkBuddyLoginState）
+> - ✅ M2 全部完成（提交 09e18ed：2.1–2.7 七项，43/43 单测；2.5/2.6 的模型页
+>   UI 标注与 2.7 的 keepalive 抖动待 ModelsView.vue / keepalive.js 的并行
+>   未提交改动合并后接入）
+> - ✅ M3 部分完成：**账本原子追加**（3bfc3d0，hub 教训吸收）、
+>   **GET /v1/usage 下游自查**（05c33ef）
+> - ⏸ M3 其余项（Key 配额/通知/自更新/热更新/多粒度聚合）：均为多人分发
+>   场景功能，当前单人自用形态边际价值低——触发条件见各条目
 
 ## 背景
 
@@ -146,17 +156,21 @@ WorkBuddy 是第五条通道（2026-11-03 接入，双区域 cn/global），数�
 
 ## M3 · 看需求再决定（P2）
 
-| 项 | 出处 | 说明 |
-|---|---|---|
-| 下游密钥自查端点 `GET /v1/usage` | workbuddy-manager | 给下游 Key 使用方查已用/剩余 |
-| Key 配额维度（上限×重置周期、模型通配符白名单、吊销/恢复三态） | Buddy Switch / hub | KeysView 扩展 |
-| 用量多粒度聚合（小时层/分钟环、Key×模型×账号透视） | hub `usage/` | 与 M2.6 台账共用存储 |
-| **账本原子追加** | hub 实测文本追加并发丢行 7.3% | 本项目 usage/credits jsonl 同款风险，值得单独吸收：整行单次 os.write + Windows 文件锁 |
-| 自更新/回滚体系 | hub wb_updates | 检查更新、sha256 校验、备份保留、面板回滚 |
-| 在线配置热更新 | panel livecfg | 密钥/冷却/池参数面板改完即生效 |
-| 国际版每日活跃打卡的管理端开关与执行记录 | hub wb_webagent（协议已在 `src/workbuddy/webagent.js` 移植） | 只差定时开关 UI 与执行历史 |
-| 全量调用审计 + 入站 IP 白名单 + 只读 API Token | workbuddy-manager | 多人用时再上 |
-| 通知推送（邮件/QQ 机器人） | workbuddy-manager | 签到失败/账号异常/积分临期 |
+> **触发条件**：以下均为多人/分发场景功能。单人自用（Codex CLI / Claude Code /
+> cc-switch 直连）时按兵不动；出现「把 key 发给别人用」「部署到公网」的需求
+> 时再按此表实施。
+
+| 项 | 出处 | 说明 | 状态 |
+|---|---|---|---|
+| 下游密钥自查端点 `GET /v1/usage` | workbuddy-manager | 给下游 Key 使用方查已用/剩余 | ✅ 05c33ef |
+| **账本原子追加** | hub 实测文本追加并发丢行 7.3% | 整行单次 os.write + 跨进程锁 + rotate/append 窗口互斥；6 个写路径全部收口 src/jsonl.js | ✅ 3bfc3d0 |
+| Key 配额维度（上限×重置周期、模型通配符白名单、吊销/恢复三态） | Buddy Switch / hub | KeysView 扩展；`/v1/usage` 的 quota 字段已留位 | ⏸ 多人分发时 |
+| 用量多粒度聚合（小时层/分钟环、Key×模型×账号透视） | hub `usage/` | 与 M2.6 台账共用存储 | ⏸ 对账需求出现时 |
+| 自更新/回滚体系 | hub wb_updates | 检查更新、sha256 校验、备份保留、面板回滚 | ⏸ 远程部署时 |
+| 在线配置热更新 | panel livecfg | 密钥/冷却/池参数面板改完即生效（livecfg 已有底座） | ⏸ 参数频繁调整时 |
+| 国际版每日活跃打卡的管理端开关与执行记录 | hub wb_webagent（协议已在 `src/workbuddy/webagent.js` 移植） | 只差定时开关 UI 与执行历史 | ⏸ 国际版跑量时 |
+| 全量调用审计 + 入站 IP 白名单 + 只读 API Token | workbuddy-manager | 多人用时再上 | ⏸ 多人用时 |
+| 通知推送（邮件/QQ 机器人） | workbuddy-manager | 签到失败/账号异常/积分临期 | ⏸ 多账号上量时 |
 
 ## 明确不做
 
