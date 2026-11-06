@@ -94,7 +94,10 @@ function appendMany(entries) {
     }
     if (!fresh.length) return 0;
     fs.mkdirSync(dataDir(), { recursive: true });
-    fs.appendFileSync(filePath(), fresh.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+    // M3 账本原子追加：批量多行拼成一个 buffer 单次写（原子性以单次 write
+    // 为界，与行数无关）；幂等判据 readAll 在锁外有竞态，但读侧按 key 去重、
+    // 双写零伤害——与 qoder/grants 同款取舍
+    require('./jsonl').append(filePath(), fresh.map((r) => JSON.stringify(r)).join('\n') + '\n');
     return fresh.length;
   } catch (e) {
     // 记账失败不影响签到本身，但历史会缺一条——返回 0 让调用方知道

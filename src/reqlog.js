@@ -9,6 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const filelock = require('./filelock');
+const jsonl = require('./jsonl');
 
 const ROOT = path.resolve(__dirname, '..');
 const LOG_DIR = process.env.DUMATE_ADMIN_DATA || path.join(ROOT, 'data');
@@ -28,7 +29,10 @@ function ensureDir() {
   try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (e) { /* 已存在 */ }
 }
 
-// 单文件超限就轮转一次：留一份上一代用于排查，不无限增长
+// 单文件超限就轮转一次：留一份上一代用于排查，不无限增长。
+// 轮转与追加已收口到 jsonl.append（M3 账本原子追加：锁内 rotate + 单次
+// Buffer write，跨进程并发不再有「追加进已被 rename 走的 .old」丢行窗口；
+// 这里保留 .1 后缀命名——jsonl 默认 .old，本文件的既有命名是 .1）
 function rotateIfNeeded(file) {
   try {
     const st = fs.statSync(file);
@@ -60,8 +64,10 @@ function record(entry) {
     } catch (e) { /* 配置读不到按默认（记录）处理 */ }
     ensureDir();
     const file = path.join(LOG_DIR, FILE);
-    rotateIfNeeded(file);
-    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, 'utf8');
+    // 单次 Buffer 追加（M3）：32MB 轮转上限传给 jsonl（锁内先轮转再追加），
+    // 归档后缀保持既有 .1 约定（reqlog-hook 与管理端读路径都认 .1）。
+    // 高频路径（每请求一行）正是跨进程并发丢行的主战场
+    jsonl.append(file, `${JSON.stringify(entry)}\n`, MAX_BYTES, '.1');
   } catch (e) {
     // 只报一次，避免磁盘满时每请求刷屏
     if (!disabled) {

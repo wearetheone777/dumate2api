@@ -34,7 +34,10 @@ function record(entry) {
     if (!entry || !entry.grantId) return false;
     if (hasGrant(entry.grantId)) return false;
     fs.mkdirSync(dataDir(), { recursive: true });
-    fs.appendFileSync(filePath(), `${JSON.stringify(entry)}\n`, 'utf8');
+    // M3 账本原子追加：幂等判据 hasGrant 在锁外有竞态（两进程同时 record
+    // 同一 grantId 会双写）——但读侧消费按 grantId 去重，双写的伤害是零；
+    // 丢行才是真伤害（过期提醒少一条），所以这里只解决原子性不加重锁
+    require('../jsonl').append(filePath(), `${JSON.stringify(entry)}\n`);
     return true;
   } catch (e) {
     // 记账失败不该影响签到本身——但过期提醒会少一条，所以返回 false 让调用方知道
