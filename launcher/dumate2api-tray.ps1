@@ -330,8 +330,12 @@ function Stop-Stable {
 
 function Exit-App {
     if ($script:Exiting) { return }
-    Add-Log '退出中：先停止服务 …' 'warn'
+    # 完全退出 = **全部服务**都停（9082/9083 + 9080 稳定版）——控制台都没了
+    # 还留一个对外服务在跑，状态就没人看得见了；9080 的显式启停按钮仍在，
+    # 只要不想退它就别点完全退出（关窗口收进托盘不影响任何服务）。
+    Add-Log '完全退出：停止全部服务（9082 / 9083 / 9080）…' 'warn'
     Stop-Services
+    Stop-Stable
     $script:Exiting = $true
     try { $script:Tray.Visible = $false; $script:Tray.Dispose() } catch { }
     try { $script:Form.Close() } catch { }
