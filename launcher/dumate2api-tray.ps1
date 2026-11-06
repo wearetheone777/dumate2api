@@ -201,9 +201,9 @@ function Start-Services {
         Start-Sleep -Milliseconds 900
 
         Add-Log '启动网关 9082 …'
+        # 鉴权已强制开启且无需任何 env（9082 日志：DUMATE_REQUIRE_KEY 已废除）
         $gw = Start-NodeHidden 'src\server.js' @{
             DUMATE2API_PORT = $script:GatewayPort
-            DUMATE_REQUIRE_KEY = '1'
         } $script:LogGateway
         if ($gw) { $script:Procs += $gw }
 
@@ -296,9 +296,8 @@ function Start-Stable {
         Reset-LogFile $script:LogStable
         Add-Log '启动稳定版 9080（stable\src，对外服务）…'
         $p = Start-NodeHidden 'stable\src\server.js' @{
-            DUMATE2API_PORT    = $script:StablePort
-            DUMATE_ADMIN_DATA  = $script:DataDir
-            DUMATE_REQUIRE_KEY = '1'
+            DUMATE2API_PORT   = $script:StablePort
+            DUMATE_ADMIN_DATA = $script:DataDir
         } $script:LogStable
         if ($p) { $script:Procs += $p }
         Start-Sleep -Milliseconds 1500
