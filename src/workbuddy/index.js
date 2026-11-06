@@ -6,6 +6,8 @@
 //   - 上游是标准 OpenAI SSE——流式块原样透传，非流式本地聚合
 //   - 失败分类按 upstream.rs：hard_credit→402 / session_dead→401 /
 //     soft_rate→429 / 其余按状态码
+const fs = require('fs');
+const path = require('path');
 const c = require('./constants');
 const chat = require('./chat');
 const authStore = require('./auth');
@@ -51,6 +53,123 @@ const RESTRICTION_HOLD_MS = Math.max(0, (() => {
 const restrictionEvents = new Map(); // region -> Map(uid -> ts)
 const restrictionHold = new Map();   // region -> untilMs
 
+// --- 连坐状态的跨进程观测副本（2026-11-06 加，为管理端 9083 服务）---
+//
+// 判定权威仍是上面两个内存 Map：连坐场景要的是「立刻失败」，读内存零开销。
+// 但**管理端是另一个进程**（9083 跑 admin/server.js，9082 才是网关），两边
+// 各自 require 本模块会拿到各自的内存 Map——管理端读到的永远是空的。
+// 所以状态变化时顺手落一份快照给管理端读，「一键解除」则反向落一个信号文件，
+// 由网关在下一次判定时消费。落盘失败一律不影响判定（观测不该拖垮热路径）。
+const filelock = require('../filelock');
+function dataDir() {
+  return process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', '..', 'data');
+}
+const RESTRICTION_FILE = 'workbuddy-restriction.json';
+const RESTRICTION_CLEAR_FILE = 'workbuddy-restriction-clear.json';
+const restrictionFilePath = () => path.join(dataDir(), RESTRICTION_FILE);
+const restrictionClearPath = () => path.join(dataDir(), RESTRICTION_CLEAR_FILE);
+
+/** 把当前连坐状态写成观测快照（供管理端跨进程读取）。失败静默 */
+function persistRestriction(now = Date.now()) {
+  try {
+    fs.mkdirSync(dataDir(), { recursive: true });
+    const regions = {};
+    for (const [region, until] of restrictionHold) {
+      if (until > now) regions[region] = { until, remainingMs: until - now };
+    }
+    const events = {};
+    for (const [region, ev] of restrictionEvents) {
+      const live = [...ev].filter(([, at]) => now - at <= RESTRICTION_WAVE_WINDOW_MS);
+      if (live.length) {
+        events[region] = live.map(([uid, at]) => ({ uid, at, agoMs: now - at }));
+      }
+    }
+    const snap = {
+      at: now,
+      config: {
+        waveMin: RESTRICTION_WAVE_MIN,
+        waveWindowMs: RESTRICTION_WAVE_WINDOW_MS,
+        holdMs: RESTRICTION_HOLD_MS,
+        restrictedRotateMax: RESTRICTED_ROTATE_MAX,
+      },
+      regions,
+      events,
+    };
+    const target = restrictionFilePath();
+    const tmp = `${target}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(snap, null, 2), 'utf8');
+    filelock.renameAtomic(tmp, target);
+  } catch (e) { /* 观测副本写失败不影响判定 */ }
+}
+
+/**
+ * 读观测快照（管理端用；网关进程内读内存更准，读这个也可以）。
+ * 返回 null 表示从没触发过连坐（或文件不可读）。
+ * **注意 until 可能已过期**——调用方要自己比 now，不要直接当成「正在暂停」。
+ */
+function restrictionSnapshot() {
+  try {
+    return JSON.parse(fs.readFileSync(restrictionFilePath(), 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+/** 请求解除某区域的连坐暂停（管理端调用；网关下次判定时消费） */
+function requestClearRestriction(region) {
+  // **先校验原始入参**：c.normalizeRegion('') 会默认成 'cn'，直接用会把
+  // 「调用方忘了传 region」变成「清掉国内区域暂停」——危险默认，必须拦。
+  const raw = String(region || '').trim().toLowerCase();
+  if (!raw) return { ok: false, error: '缺 region（cn / intl）' };
+  const r = c.normalizeRegion(raw);
+  try {
+    fs.mkdirSync(dataDir(), { recursive: true });
+    // 1) 信号文件：这是给**网关进程**的（它改不了别进程的内存，只能靠文件）
+    const target = restrictionClearPath();
+    const tmp = `${target}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ region: r, at: Date.now() }), 'utf8');
+    filelock.renameAtomic(tmp, target);
+    // 2) 乐观更新快照：管理端立刻看到「已解除」，不必等网关下一次请求触发消费。
+    //    网关侧仍以信号文件为准——若网关一直没流量，快照与内存短暂不一致，
+    //    但那时也没有请求会被暂停，不影响正确性。
+    const snap = restrictionSnapshot();
+    if (snap && snap.regions && snap.regions[r]) {
+      delete snap.regions[r];
+      const t2 = `${restrictionFilePath()}.tmp`;
+      fs.writeFileSync(t2, JSON.stringify(snap, null, 2), 'utf8');
+      filelock.renameAtomic(t2, restrictionFilePath());
+    }
+    // 3) 本进程内存也清一下：管理端若将来在同进程调 status，口径一致
+    if (restrictionHold.has(r)) {
+      restrictionHold.delete(r);
+      restrictionEvents.delete(r);
+    }
+    return { ok: true, region: r };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/** 消费解除信号（网关侧）：读到就清该区域内存态并删文件。只在暂停期间调用 */
+function consumeClearSignal(now = Date.now()) {
+  const p = restrictionClearPath();
+  let sig = null;
+  try {
+    sig = JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (e) {
+    // 没有文件是常态；有文件但解析失败就直接删掉，别让它一直挡着
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) { /* 删不掉也无所谓 */ }
+    return false;
+  }
+  try { fs.unlinkSync(p); } catch (e) { /* 已被别的进程消费 */ }
+  const region = sig && sig.region;
+  if (!region) return false;
+  restrictionHold.delete(region);
+  restrictionEvents.delete(region);
+  persistRestriction(now);
+  return true;
+}
+
 /** 记一次账号级风控限制；窗口内不同账号数达阈值即整区域暂停，返回暂停到的时刻（0 = 未触发） */
 function noteAccountRestriction(region, uid, now = Date.now()) {
   if (RESTRICTION_HOLD_MS <= 0) return 0;
@@ -60,21 +179,67 @@ function noteAccountRestriction(region, uid, now = Date.now()) {
     if (now - at > RESTRICTION_WAVE_WINDOW_MS) ev.delete(k);
   }
   ev.set(String(uid || '-'), now);
-  if (ev.size < RESTRICTION_WAVE_MIN) return 0;
+  if (ev.size < RESTRICTION_WAVE_MIN) {
+    persistRestriction(now); // 不足以连坐，但「哪些号已被限制」本身值得观测
+    return 0;
+  }
   const until = now + RESTRICTION_HOLD_MS;
   if (until > (restrictionHold.get(region) || 0)) restrictionHold.set(region, until);
+  persistRestriction(now);
   return until;
 }
 
 /** 区域连坐暂停剩余毫秒（0 = 没有暂停） */
 function restrictionHoldRemaining(region, now = Date.now()) {
+  const until = restrictionHold.get(region) || 0;
+  if (until <= now) return 0;
+  // 只在**确实处于暂停**时才检查解除信号：热路径上暂停期间本来就在快速失败，
+  // 多一次 stat 无所谓；正常服务时一次都不查。
+  consumeClearSignal(now);
   return Math.max(0, (restrictionHold.get(region) || 0) - now);
 }
 
 /** 测试与运维观测：清空连坐状态 */
-function _restrictionReset() {
+function _restrictionReset(now = Date.now()) {
   restrictionEvents.clear();
   restrictionHold.clear();
+  persistRestriction(now);
+  try { if (fs.existsSync(restrictionClearPath())) fs.unlinkSync(restrictionClearPath()); } catch (e) { /* 忽略 */ }
+}
+
+/**
+ * 当前连坐状态（管理端与网关同一口径）：内存为准，内存空则回落读落盘快照。
+ *
+ * 为什么要回落：管理端 9083 与网关 9082 是不同进程，各自 require 本模块拿到
+ * 各自的内存 Map。管理端内存恒空，只能读网关落下的快照。
+ * regions 只保留**仍有效**的暂停（快照里的 until 可能已过期）。
+ */
+function restrictionState(now = Date.now()) {
+  const config = {
+    waveMin: RESTRICTION_WAVE_MIN,
+    waveWindowMs: RESTRICTION_WAVE_WINDOW_MS,
+    holdMs: RESTRICTION_HOLD_MS,
+    restrictedRotateMax: RESTRICTED_ROTATE_MAX,
+  };
+  const liveRegions = {};
+  for (const [region, until] of restrictionHold) {
+    if (until > now) liveRegions[region] = { until, remainingMs: until - now };
+  }
+  if (Object.keys(liveRegions).length) {
+    const events = {};
+    for (const [region, ev] of restrictionEvents) {
+      const live = [...ev].filter(([, at]) => now - at <= RESTRICTION_WAVE_WINDOW_MS);
+      if (live.length) events[region] = live.map(([uid, at]) => ({ uid, at, agoMs: now - at }));
+    }
+    return { at: now, source: 'memory', config, regions: liveRegions, events };
+  }
+  const snap = restrictionSnapshot();
+  if (!snap) return { at: null, source: 'none', config, regions: {}, events: {} };
+  const fromFile = {};
+  for (const [region, v] of Object.entries(snap.regions || {})) {
+    if (v && Number(v.until) > now) fromFile[region] = { until: Number(v.until), remainingMs: Number(v.until) - now };
+  }
+  return { at: snap.at || null, source: 'snapshot', config: snap.config || config, regions: fromFile, events: snap.events || {} };
 }
 
 /**
@@ -521,6 +686,9 @@ module.exports = {
   fefoUidSet,
   // 风控连坐 + 失败处置（可离线测的纯函数）
   noteAccountRestriction, restrictionHoldRemaining, _restrictionReset, errorActionOf,
+  // 跨进程观测（管理端 9083 读快照、写解除信号；网关侧消费信号）
+  restrictionSnapshot, requestClearRestriction, consumeClearSignal,
+  restrictionState,
   chatCompletion: (p, opts) => send(p, undefined, opts),
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
   DEFAULT_MODEL: 'auto',

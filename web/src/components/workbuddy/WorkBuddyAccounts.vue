@@ -2,8 +2,18 @@
   <div class="page">
     <PageHeader title="账号管理" :sub="subText">
       <template #actions>
+        <!-- 分组筛选（M2.4）：选中组后一键签到只作用于该组，卡片列表同步收窄 -->
+        <a-select
+          v-if="groupOptions.length"
+          v-model:value="groupFilter"
+          size="small"
+          style="width: 132px"
+          :options="groupOptions"
+          placeholder="全部分组"
+          allow-clear
+        />
         <a-button size="small" class="ghost-btn" :loading="loading" :disabled="!enabledCount" @click="checkinAll">
-          一键签到
+          {{ groupFilter ? `签到「${groupFilter}」组` : '一键签到' }}
         </a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="load">刷新</a-button>
         <a-button type="primary" size="small" :loading="oauthLoading" :disabled="oauthPolling" @click="startOauthLogin">
@@ -55,25 +65,34 @@
       <div class="flex items-center justify-between mb-3">
         <div>
           <span class="section-title">账号列表</span>
-          <span class="hint-text ml-2">共 {{ rows.length }} 个 · 启用 {{ enabledCount }} 个</span>
+          <span class="hint-text ml-2">
+            共 {{ filteredRows.length }} 个<template v-if="groupFilter">（组内）</template> · 启用 {{ enabledCount }} 个
+          </span>
         </div>
       </div>
 
-      <a-empty v-if="!rows.length && !loading" :description="`还没有${isIntl ? '国际' : '国内'}版账号`">
+      <a-empty v-if="!filteredRows.length && !loading" :description="groupFilter ? `分组「${groupFilter}」下没有账号` : `还没有${isIntl ? '国际' : '国内'}版账号`">
         <a-button type="primary" :loading="oauthLoading" @click="startOauthLogin">浏览器登录添加账号</a-button>
         <a-button class="ml-2" @click="importOpen = true">其他方式导入</a-button>
       </a-empty>
 
-      <a-skeleton v-if="loading && !rows.length" active :paragraph="{ rows: 4 }" />
+      <a-skeleton v-if="loading && !filteredRows.length" active :paragraph="{ rows: 4 }" />
 
       <a-row v-else :gutter="[16, 16]">
-        <a-col v-for="a in rows" :key="a.id" :span="8" :xs="24" :md="8">
+        <a-col v-for="a in filteredRows" :key="a.id" :span="8" :xs="24" :md="8">
           <a-card size="small" :bordered="true" class="h-full">
             <div class="flex items-start justify-between">
               <div class="min-w-0">
                 <div class="font-medium truncate">
                   {{ a.nickname || a.uid || '未命名' }}
                   <a-tag v-if="!a.enabled" color="default" class="ml-1">已停用</a-tag>
+                  <!-- 分组（M2.4）：点击标签直接改组 -->
+                  <a-tag
+                    v-if="a.group"
+                    color="geekblue"
+                    class="ml-1 cursor-pointer"
+                    @click="openGroup(a)"
+                  >{{ a.group }}</a-tag>
                   <!-- 改名：后端 PATCH 支持 nickname，此前一直没有入口 -->
                   <a-button type="text" size="small" class="ml-1" style="padding: 0 4px" @click="openRename(a)">
                     <EditOutlined />
@@ -141,6 +160,28 @@
             <div class="mt-2 text-xs text-slate-400">
               来源 {{ sourceText(a.source) }}
               · refresh …{{ a.refreshTail || '—' }}
+            </div>
+            <!-- 出站代理（M2.1）：脱敏展示。配置了代理的账号，聊天/签到/刷新
+                 全部走它（login IP = 调用 IP，降低风控面）；未配 = 直连。
+                 原始 URL 含凭证不出进程，这里显示的是 redact 后的形态 -->
+            <div class="mt-1 text-xs flex items-center gap-1">
+              <span class="text-slate-400">出站</span>
+              <a-tag v-if="a.proxy" color="purple" class="mr-0">
+                <span class="font-mono">{{ a.proxy }}</span>
+              </a-tag>
+              <span v-else class="text-slate-400">直连</span>
+              <a-button type="text" size="small" style="padding: 0 4px" @click="openProxy(a)">
+                <EditOutlined />
+              </a-button>
+            </div>
+            <!-- 分组（M2.4）：未分组也给出入口——批量操作的前提是先圈组 -->
+            <div class="mt-1 text-xs flex items-center gap-1">
+              <span class="text-slate-400">分组</span>
+              <span v-if="a.group" class="text-slate-500">{{ a.group }}</span>
+              <span v-else class="text-slate-400">未分组</span>
+              <a-button type="text" size="small" style="padding: 0 4px" @click="openGroup(a)">
+                <EditOutlined />
+              </a-button>
             </div>
           </a-card>
         </a-col>
@@ -231,6 +272,56 @@
       <a-input v-model:value="renameValue" placeholder="昵称（留空恢复为 UID 显示）" @press-enter="doRename" />
     </a-modal>
 
+    <!-- 出站代理：http://[user:pass@]host[:port]。保存时后端 normalize 校验，
+         非法地址当场 400（配了代理就绝不静默回退直连）。空串 = 清除回直连 -->
+    <a-modal
+      v-model:open="proxyOpen"
+      :title="`出站代理 · ${proxyRow?.nickname || proxyRow?.uid || ''}`"
+      :confirm-loading="proxyLoading"
+      ok-text="保存"
+      cancel-text="取消"
+      @ok="doSaveProxy"
+    >
+      <a-alert type="info" show-icon class="mb-3">
+        <template #message>账号级出口隔离</template>
+        <template #description>
+          <div class="text-xs">
+            配置后该账号的<b>聊天 / 签到 / token 刷新 / OAuth 登录</b>全部走此代理
+            （登录 IP 与调用 IP 一致）。支持 <code>http://host:port</code> 与
+            <code>http://user:pass@host:port</code>。清空 = 回直连。
+          </div>
+        </template>
+      </a-alert>
+      <a-input
+        v-model:value="proxyValue"
+        placeholder="http://user:pass@host:port（留空保存 = 清除）"
+        @press-enter="doSaveProxy"
+      />
+      <div v-if="proxyRow?.proxy" class="mt-2 text-xs text-slate-400">
+        当前：{{ proxyRow.proxy }}
+      </div>
+    </a-modal>
+
+    <!-- 分组（M2.4）：自由命名；下拉给已有组名便于归组，也可手输新组名 -->
+    <a-modal
+      v-model:open="groupOpen"
+      :title="`设置分组 · ${groupRow?.nickname || groupRow?.uid || ''}`"
+      :confirm-loading="groupLoading"
+      ok-text="保存"
+      cancel-text="取消"
+      @ok="doSaveGroup"
+    >
+      <a-auto-complete
+        v-model:value="groupValue"
+        :options="groupOptions"
+        placeholder="组名（留空保存 = 移出分组）"
+        @press-enter="doSaveGroup"
+      />
+      <div class="mt-2 text-xs text-slate-400">
+        组是自由标签：同组账号可用「签到『组名』组」一键批量签到。
+      </div>
+    </a-modal>
+
     <!-- 签到结果 -->
     <a-alert v-if="checkinMsg" :type="checkinMsgType" show-icon class="mt-4" message="签到结果">
       <template #description>
@@ -259,6 +350,14 @@ const status = ref<WorkBuddyStatus | null>(null)
 const credits = ref<{ count: number; rows: WorkBuddyCreditRow[] } | null>(null)
 const loading = ref(false)
 const rows = computed(() => status.value?.rows ?? [])
+// 分组筛选（M2.4）：空 = 全部。列表、计数、一键签到范围都跟着收窄
+const groupFilter = ref<string>('')
+const filteredRows = computed(() =>
+  groupFilter.value ? rows.value.filter((a) => (a.group || '') === groupFilter.value) : rows.value)
+const groupOptions = computed(() => {
+  const groups = [...new Set(rows.value.map((a) => (a.group || '').trim()).filter(Boolean))]
+  return groups.sort().map((g) => ({ label: g, value: g }))
+})
 const isIntl = computed(() => regionStore.current === 'intl')
 
 const busy = reactive<Record<number, boolean>>({})
@@ -279,7 +378,7 @@ const subText = computed(() => {
   return `WorkBuddy ${r}账号 · 可用 ${status.value.accounts} 个`
 })
 
-const enabledCount = computed(() => rows.value.filter((a) => a.enabled).length)
+const enabledCount = computed(() => filteredRows.value.filter((a) => a.enabled).length)
 
 function creditOf(id: number): WorkBuddyCreditRow | undefined {
   return credits.value?.rows.find((r) => r.id === id)
@@ -353,6 +452,56 @@ async function doRename() {
   }
 }
 
+// ---- 出站代理（M2.1）----
+const proxyOpen = ref(false)
+const proxyLoading = ref(false)
+const proxyValue = ref('')
+const proxyRow = ref<WorkBuddyAccount | null>(null)
+function openProxy(a: WorkBuddyAccount) {
+  proxyRow.value = a
+  proxyValue.value = '' // 安全：不回填原始 URL（前端根本没有它，只有脱敏形态）
+  proxyOpen.value = true
+}
+async function doSaveProxy() {
+  if (proxyRow.value == null) return
+  proxyLoading.value = true
+  try {
+    const { data } = await workbuddyApi.patchAccount(proxyRow.value.id, { proxy: proxyValue.value.trim() })
+    message.success(proxyValue.value.trim() ? `代理已设置：${data.proxy || ''}` : '代理已清除（回直连）')
+    proxyOpen.value = false
+    await load()
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '代理保存失败')
+  } finally {
+    proxyLoading.value = false
+  }
+}
+
+// ---- 分组（M2.4）----
+const groupOpen = ref(false)
+const groupLoading = ref(false)
+const groupValue = ref('')
+const groupRow = ref<WorkBuddyAccount | null>(null)
+function openGroup(a: WorkBuddyAccount) {
+  groupRow.value = a
+  groupValue.value = a.group || ''
+  groupOpen.value = true
+}
+async function doSaveGroup() {
+  if (groupRow.value == null) return
+  groupLoading.value = true
+  try {
+    await workbuddyApi.patchAccount(groupRow.value.id, { group: groupValue.value.trim() })
+    message.success(groupValue.value.trim() ? `已移入分组「${groupValue.value.trim()}」` : '已移出分组')
+    groupOpen.value = false
+    await load()
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '分组保存失败')
+  } finally {
+    groupLoading.value = false
+  }
+}
+
 const dateText = (ts: number) => new Date(ts).toLocaleString('zh-CN', { hour12: false })
 
 const errAt = (a: WorkBuddyAccount) => a.lastErrorAt ?? null
@@ -402,8 +551,10 @@ async function checkin(a: WorkBuddyAccount) {
 async function checkinAll() {
   loading.value = true
   try {
-    const { data } = await workbuddyApi.checkin()
+    // 选中分组时只签该组（M2.4）；不选中 = 全部可用账号
+    const { data } = await workbuddyApi.checkin(undefined, groupFilter.value || undefined)
     reportCheckin(data?.results || [])
+    if (data && data.ok === false && data.error) message.warning(data.error)
     await load()
   } catch (e: any) {
     message.error(e?.response?.data?.error || '签到失败')

@@ -47,7 +47,35 @@ const routes = [
         mode: 'multi',
         modeNote: 'WorkBuddy 的凭证由本项目自持（登录流程后置期：从官方客户端认证文件导入或手动粘贴 token），可多账号并存。国内（copilot.tencent.com）与国际（workbuddy.ai）账号不通用。',
         rows,
+        // 风控连坐状态（跨进程：网关写快照、这里读快照）。
+        // regions 只含**仍有效**的暂停；events 是窗口内被限制过的账号——两者
+        // 一起才说清「为什么暂停」，只给倒计时会让运维不知道触发源。
+        restriction: wb.restrictionState(),
       });
+    },
+  },
+  {
+    // 风控连坐暂停状态（仪表盘横幅轮询用，比 /status 轻——不查账号文件）
+    method: 'GET',
+    path: '/restriction',
+    handler: async ({ res }) => {
+      return sendJSON(res, 200, wb.restrictionState());
+    },
+  },
+  {
+    // 一键解除连坐暂停。body: {region:'cn'|'intl'}（也接受 global）
+    //
+    // 跨进程：管理端改不了网关内存，所以写的是**信号文件**，由网关在下一次
+    // 判定时消费；同时乐观更新快照，管理端立刻看到解除。
+    method: 'POST',
+    path: '/restriction/clear',
+    handler: async ({ res, body }) => {
+      const region = (body && body.region) || '';
+      const r = wb.requestClearRestriction(region);
+      if (r.ok) {
+        try { require('../auth').audit('admin', 'workbuddy_restriction_clear', r.region); } catch (e) { /* 审计失败不影响结果 */ }
+      }
+      return sendJSON(res, r.ok ? 200 : 400, r);
     },
   },
   {
@@ -211,21 +239,31 @@ const routes = [
     },
   },
   {
-    // 手动签到：幂等，已签的自动跳过；国际版明确报「不支持」
+    // 手动签到：幂等，已签的自动跳过；国际版明确报「不支持」。
+    // body: {id?} 单账号，{group?} 按组批量（M2.4），都不传 = 全部可用账号
     method: 'POST',
     path: '/checkin',
     handler: async ({ res, body }) => {
       const id = body && body.id;
-      const list = id ? [authStore.get(id)].filter(Boolean) : authStore.findUsable();
+      const group = body && body.group ? String(body.group).trim() : '';
+      let list;
+      if (id) {
+        list = [authStore.get(id)].filter(Boolean);
+      } else if (group) {
+        list = authStore.findUsable().filter((a) => (a.group || '') === group);
+        if (!list.length) return sendJSON(res, 200, { ok: false, error: `分组「${group}」下没有可用账号` });
+      } else {
+        list = authStore.findUsable();
+      }
       if (!list.length) return sendJSON(res, 200, { ok: false, error: '没有可用账号' });
       const out = [];
       for (const a of list) {
         const r = await wb.checkin(a);
-        out.push({ id: a.id, nickname: a.nickname || a.uid || '', region: a.region, ...r });
+        out.push({ id: a.id, nickname: a.nickname || a.uid || '', region: a.region, group: a.group || '', ...r });
         if (r.ok && !r.already) authStore.patch(a.id, { lastCheckin: Date.now(), lastError: '' });
       }
       const okCount = out.filter((r) => r.ok).length;
-      try { require('../auth').audit('admin', 'workbuddy_checkin', id || 'all', `${okCount}/${out.length}`); } catch (e) { /* 审计失败不影响结果 */ }
+      try { require('../auth').audit('admin', 'workbuddy_checkin', id || (group ? `group:${group}` : 'all'), `${okCount}/${out.length}`); } catch (e) { /* 审计失败不影响结果 */ }
       return sendJSON(res, 200, { ok: true, results: out });
     },
   },
@@ -371,6 +409,14 @@ const routes = [
 
       const billed = billing.billedRate(delta, tokens && tokens.total);
       const ratio = billing.ratioOf(billed, expected);
+      // 实测单价台账（M2.6）：delta 是干净样本（前后快照差值），喂进 EMA。
+      // 真实流量不喂——公测口径 usage.credit=0，没有可信计量字段
+      let ledgerRow = null;
+      if (billed != null) {
+        try {
+          ledgerRow = require('../../workbuddy/rate-ledger').recordRate(model, 'cn', billed, { nominal: expected });
+        } catch (e) { /* 台账失败不影响探针结果 */ }
+      }
       // 量化分辨率：套餐剩余额的粒度 = 上游小数位（precise 缺失时按整数 1）。
       // 单请求可分辨的最小倍率 = 粒度 ÷ (tokens/1000)——大于标称一半时 ratio
       // 只是量化伪影（2026-11-04 首次探针 1012 tokens ±0.988 的教训）。
@@ -396,6 +442,7 @@ const routes = [
         singleAccount,
         free,
         elapsedMs: Date.now() - startedAt,
+        ledger: ledgerRow ? { ema: ledgerRow.ema, samples: ledgerRow.samples, min: ledgerRow.min, max: ledgerRow.max } : null,
         warning: delta == null
           ? '请求成功，但 8 秒内未观测到套餐剩余额的变化——真机实证该账号的对话当前不实时扣套餐（公测/活动口径，与 usage.credit=0 一致），此为真实测量结果而非故障；免费模型不扣费同理'
           : (free ? '该模型标称免费（x0.00）——测到扣费说明上游可能改了计费口径'
@@ -407,6 +454,58 @@ const routes = [
           + '测量分辨率 = 剩余额粒度 ÷ (tokens/1000)（见 resolution 字段），'
           + '分辨率大于标称一半时 ratio 只是量化伪影——用 ?count=2000 加大输出可压过。'
           + '与 TRAE/Qoder 的倍率数字**不可跨通道互比**（各通道积分体系不同）。',
+      });
+    },
+  },
+  {
+    // 模型输出上限探测结果（M2.5）：读 data/workbuddy-output-probes.json。
+    // UI 按行红/绿/灰标注 + 超 30 天褪色——实测值不写死代码，重跑探针即刷新
+    method: 'GET',
+    path: '/output-probes',
+    handler: async ({ res }) => {
+      const probe = require('../../workbuddy/output-probe');
+      const doc = probe.loadProbes();
+      const rows = Object.values(doc);
+      return sendJSON(res, 200, {
+        count: rows.length,
+        staleAfterMs: 30 * 86400 * 1000,
+        rows,
+      });
+    },
+  },
+  {
+    // 跑一次输出上限探针。body: {model, region?}。耗时可达 1~3 分钟
+    //（最多 4 档、每档一次真实请求），前端要给长超时并明示进度
+    method: 'POST',
+    path: '/probe-output',
+    handler: async ({ res, body }) => {
+      const probe = require('../../workbuddy/output-probe');
+      const model = String((body && body.model) || '').trim().replace(/^workbuddy\//, '');
+      if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数' });
+      const region = (body && body.region) || undefined;
+      try {
+        const row = await probe.probeOne(model, region ? { region } : {});
+        probe.saveProbe(row);
+        try { require('../auth').audit('admin', 'workbuddy_probe_output', `${model}@${row.region}`, row.verdict); } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, row });
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
+    // 实测单价台账（M2.6）：每模型 EMA（credits ÷ 千 token）+ min/max 全距。
+    // 样本源是 billing-check 探针；模型页/积分页可与标称并排展示
+    method: 'GET',
+    path: '/rate-ledger',
+    handler: async ({ res }) => {
+      const ledger = require('../../workbuddy/rate-ledger');
+      const doc = ledger.loadLedger();
+      const rows = Object.values(doc).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      return sendJSON(res, 200, {
+        count: rows.length,
+        alpha: ledger.ALPHA,
+        rows,
       });
     },
   },
@@ -427,10 +526,37 @@ const routes = [
       const fields = {};
       if (body && body.enabled !== undefined) fields.enabled = !!body.enabled;
       if (body && body.nickname !== undefined) fields.nickname = String(body.nickname || '').trim();
+      // 分组（M2.4）：空串 = 移出分组。组名限 40 字符，防手滑贴一大段
+      if (body && body.group !== undefined) fields.group = String(body.group || '').trim().slice(0, 40);
+      // 出站代理（M2.1）：保存前必须过 normalizeProxyUrl——非法地址在保存时
+      // 就暴露，而不是等第一次请求失败才发现。空串 = 清除（回到直连）。
+      // 配了代理就绝不静默回退直连（proxy-agent 的约定），所以校验失败直接 400。
+      if (body && body.proxy !== undefined) {
+        const raw = String(body.proxy || '').trim();
+        if (!raw) {
+          fields.proxy = ''; // 清除
+        } else {
+          try {
+            const proxyAgent = require('../../proxy-agent');
+            fields.proxy = proxyAgent.normalizeProxyUrl(raw);
+          } catch (e) {
+            return sendJSON(res, 400, { error: `代理地址无效: ${e.message}` });
+          }
+        }
+      }
       const a = authStore.patch(params[0], fields);
       if (!a) return sendJSON(res, 404, { error: '账号不存在' });
-      try { require('../auth').audit('admin', 'workbuddy_account_patch', params[0], JSON.stringify(fields)); } catch (e) { /* 审计失败不影响结果 */ }
-      return sendJSON(res, 200, { ok: true, account: authStore.list().find((x) => x.id === a.id) });
+      try {
+        require('../auth').audit('admin', 'workbuddy_account_patch', params[0],
+          JSON.stringify({ ...fields, proxy: fields.proxy !== undefined ? (fields.proxy ? 'set' : 'cleared') : undefined }));
+      } catch (e) { /* 审计失败不影响结果 */ }
+      // 返回脱敏形态——原始 URL（含可能的 user:pass）不出进程
+      const proxyAgent = require('../../proxy-agent');
+      return sendJSON(res, 200, {
+        ok: true,
+        proxy: a.proxy ? proxyAgent.describeProxy(a) : null,
+        account: authStore.list().find((x) => x.id === a.id),
+      });
     },
   },
 ];

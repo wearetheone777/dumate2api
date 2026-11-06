@@ -51,6 +51,10 @@ function save(data) {
 
 /** 列表（脱敏：token 全量不外传，只给尾部 6 位供人工核对） */
 function list() {
+  // 代理脱敏（proxy-agent 的 describeProxy）：原始 URL 含 user:pass，**任何
+  // 对外形状都必须过 redact**——list() 是管理端 API 的出口，这里漏了原始
+  // URL 就等于把代理凭证发给浏览器。
+  const proxyAgent = require('../proxy-agent');
   return load().accounts.map((a) => ({
     id: a.id,
     uid: a.uid || '',
@@ -75,6 +79,11 @@ function list() {
     tier: a.tier && Number(a.tier.at) > 0
       ? { paid: !!a.tier.paid, package: String(a.tier.package || ''), at: Number(a.tier.at) }
       : null,
+    // 出站代理（M2.1）：只给脱敏形态与有无标记。null = 直连（未配代理）
+    proxy: proxyAgent.describeProxy(a),
+    // 分组（M2.4）：自由命名标签，批量操作（签到/启停/刷新）按组圈定范围。
+    // 不做枚举——组名是用户自己的心智模型，后台只存字符串
+    group: a.group || '',
   }));
 }
 
@@ -230,15 +239,78 @@ async function exchangeOnce(a) {
   return { ok: true, patch: out };
 }
 
-/** 换票（带单飞）。与 traework/auth.exchange 同构 */
+/**
+ * 换票（带单飞 + refreshGuard，2026-11-06 M2.3）。
+ *
+ * 单飞只解决**进程内**并发；真正的杀手是**跨进程轮换竞态**——9083（keepalive
+ * 排程）与 9082（请求热路径）是两个进程，官方桌面客户端是第三个写者，三方
+ * 都可能对同一账号发起刷新。refreshToken 是**一次性轮换**的：两方拿同一个
+ * 旧值打上游，后到者 invalid_grant，而且旧值已被作废——账号就此报废。
+ *
+ * guard 两步（CreditDaddy 的 refreshGuard 语义，不加锁原语）：
+ *   1. 打上游**前**重读存储：存储里已有「与传入不同的 refreshToken 且仍有效」
+ *      → 别人已经换好了，直接采纳，不再打上游（多打一次 = 多一次作废风险）。
+ *   2. 打上游**失败后**重读：存储的 refreshToken 与本次所用不同且有效
+ *      → 竞态败者恢复：别人用同一个旧值抢先成功，采纳对方的新值，
+ *      而不是把 invalid_grant 记成 session_dead 判死账号。
+ *
+ * 同步文件锁罩不住这条路径（withLock 是同步的，网络调用 30s 会被 STALE_MS
+ * 抢锁），所以靠「重读 + 判别」而不是互斥。
+ */
 async function exchange(a) {
   const id = a && a.id != null ? String(a.id) : '';
-  if (!id) return exchangeOnce(a);
+  // 无 id（导入/登录期的裸对象）同样走接缝：exchangeOnce 会真打上游，
+  // 测试必须能替换它——两条路径的调用口径必须一致
+  if (!id) return module.exports.exchangeOnce(a);
   const inflight = refreshFlights.get(id);
   if (inflight) return inflight;
-  const p = exchangeOnce(a).finally(() => { refreshFlights.delete(id); });
+  const p = (async () => {
+    // --- guard 1：刷新前重读对齐 ---
+    const fresh = get(a.id) || a;
+    const stored = fresh && fresh.refreshToken ? String(fresh.refreshToken) : '';
+    const passed = a && a.refreshToken ? String(a.refreshToken) : '';
+    if (stored && passed && stored !== passed
+        && fresh.expiresAt && Date.now() + 60000 < fresh.expiresAt) {
+      return {
+        ok: true,
+        adopted: true,
+        patch: {
+          accessToken: fresh.accessToken,
+          refreshToken: stored,
+          expiresAt: fresh.expiresAt,
+          refreshExpiresAt: fresh.refreshExpiresAt || null,
+          lastError: '',
+        },
+      };
+    }
+    const used = stored || passed;
+    // 经 module.exports（而非局部 exports）调用：文件尾部 module.exports = {...}
+    // 重指向后，局部 exports 还是旧对象——测试接缝（假 exchangeOnce）会失效。
+    const r = await module.exports.exchangeOnce(fresh);
+    if (!r.ok) {
+      // --- guard 2：败者恢复 ---
+      const now = get(a.id);
+      const nowToken = now && now.refreshToken ? String(now.refreshToken) : '';
+      if (nowToken && used && nowToken !== used
+          && now.accessToken && now.expiresAt && Date.now() + 60000 < now.expiresAt) {
+        return {
+          ok: true,
+          adopted: true,
+          patch: {
+            accessToken: now.accessToken,
+            refreshToken: nowToken,
+            expiresAt: now.expiresAt,
+            refreshExpiresAt: now.refreshExpiresAt || null,
+            lastError: '',
+          },
+        };
+      }
+      return r;
+    }
+    return r;
+  })();
   refreshFlights.set(id, p);
-  return p;
+  return p.finally(() => { refreshFlights.delete(id); });
 }
 
 /** token 余量不足就先换票（签到/额度等辅助路径用；对话走 index.ensureFresh） */
@@ -335,4 +407,7 @@ function importManual(opts) {
 module.exports = {
   FILE, dataDir, filePath, load, save, list, get, findUsable, upsert, patch, remove,
   needsRefresh, exchange, ensureFresh, importFromClient, importManual,
+  // 测试接缝：exchange() 经 exports.exchangeOnce 调上游，测试可替换成假实现
+  // （真实现直接打 refresh 端点，离线测不了）。生产代码路径不受影响。
+  exchangeOnce,
 };

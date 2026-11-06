@@ -301,6 +301,63 @@
 
     <!-- ============ WorkBuddy：第五通道（双区域），指标卡 + 趋势 + 账号健康 ============ -->
     <template v-else-if="isWb">
+      <!-- 风控连坐暂停横幅（2026-11-06）：11140 命中后上游会按设备/出口指纹
+           连坐，默认两个不同账号在窗口内被限制就整区域暂停 30 分钟——这时
+           换号只会把同一个指纹挨个报给风控，正确做法是停手等它过去。
+           横幅要给出三件事：还有多久、为什么、能不能立刻解除。 -->
+      <a-alert
+        v-if="wbHold"
+        type="error"
+        show-icon
+        class="mb-3 wb-hold-banner"
+      >
+        <template #message>
+          <span class="font-medium">
+            {{ wbHold.regionLabel }}风控连坐暂停中 · 剩余 {{ wbHold.countdownText }}
+          </span>
+        </template>
+        <template #description>
+          <div>
+            窗口内已有 {{ wbHold.uidCount }} 个账号被上游限制
+            <template v-if="wbHold.uidList.length">
+              （{{ wbHold.uidList.join('、') }}）
+            </template>，
+            按 {{ Math.round(restrictionConfig.waveMin) }} 个账号 / 
+            {{ Math.round(restrictionConfig.waveWindowMs / 60000) }} 分钟 的连坐判定
+            整区域暂停 {{ Math.round(restrictionConfig.holdMs / 60000) }} 分钟。
+          </div>
+          <div class="mt-1 text-xs">
+            <b>暂停期间不换号</b>——换号等于把同一个设备/出口指纹挨个报给风控，
+            正是账号被成批送走的路径。等窗口过去，或确认已解除后手动恢复。
+          </div>
+          <div class="mt-2">
+            <a-button size="small" danger :loading="wbClearing" @click="clearWbHold">
+              立即解除
+            </a-button>
+            <span class="text-xs ml-2 text-slate-500">
+              解除只清本地暂停，不改变上游对你的判定
+            </span>
+          </div>
+        </template>
+      </a-alert>
+
+      <!-- 概览待办（M2.7，出处 Buddy Switch）：三类需要处理的事一眼可见，
+           一点直达对应页面。只列**当前区域视图**下的问题；全空则整条不渲染——
+           空的待办条本身就是噪音。 -->
+      <div v-if="wbTodos.length" class="wb-todos mb-3">
+        <a-button
+          v-for="t in wbTodos"
+          :key="t.key"
+          size="small"
+          :type="t.urgent ? 'primary' : 'default'"
+          :danger="t.urgent"
+          class="wb-todo-btn"
+          @click="router.push(t.to)"
+        >
+          {{ t.label }}
+        </a-button>
+      </div>
+
       <!-- 顶部指标卡：口径与 Qoder 对齐（账号 / 积分合计 / 临期 / 今日请求）。
            剩余积分来自 credits（套餐包合计），临期按包的 expireAt 聚合；
            国际版是订阅制，积分口径两格显示 — 与说明，不硬凑数字 -->
@@ -1514,6 +1571,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import TodayUsageCard from '@/components/TodayUsageCard.vue'
 import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
@@ -1522,7 +1580,7 @@ import { qwenworkApi, type QwCredits, type QwDailyRow, type QwAccount, type QwCr
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
 import { remainText, remainColor } from '@/utils/remain'
 import { traeworkApi } from '@/api/traework'
-import { workbuddyApi, type WorkBuddyDashAccount, type WorkBuddyCreditRow } from '@/api/workbuddy'
+import { workbuddyApi, type WorkBuddyDashAccount, type WorkBuddyCreditRow, type WorkBuddyRestriction } from '@/api/workbuddy'
 import { regionStore, regionParam, isIntlRegion } from '@/stores/region'
 import { watch as vueWatch } from 'vue'
 import type {
@@ -1649,6 +1707,96 @@ const wbSummary = computed(() => wbDash.value?.summary || null)
 const wbInfo = computed(() => channelStore.infos['workbuddy'] || null)
 // 趋势数据：/usage/overview?days=14&channel=workbuddy 已在 refreshWb 里拉了
 const wbDaily = computed(() => usage.value?.daily || [])
+
+// ---- 风控连坐暂停（跨进程：网关判定、管理端读快照）----
+const wbRestriction = ref<WorkBuddyRestriction | null>(null)
+const wbClearing = ref(false)
+// 倒计时用：每秒推进一格。不重拉接口——remainingMs 是快照时刻的静态值，
+// 本地按 now 递减才是实时的（否则要么不跳动、要么每秒打一次管理端）。
+const wbNow = ref(Date.now())
+let wbTick: ReturnType<typeof setInterval> | null = null
+
+const restrictionConfig = computed(() => wbRestriction.value?.config || {
+  waveMin: 2, waveWindowMs: 900000, holdMs: 1800000, restrictedRotateMax: 0,
+})
+
+/** 当前区域视图对应的暂停（无 = null）。regions 只含仍有效的暂停 */
+const wbHold = computed(() => {
+  const r = wbRestriction.value
+  if (!r) return null
+  const key = regionStore.current === 'intl' ? 'global' : 'cn'
+  const hit = r.regions && r.regions[key]
+  if (!hit) return null
+  const remaining = Math.max(0, Number(hit.until) - wbNow.value)
+  if (remaining <= 0) return null
+  const uidList = (r.events && r.events[key] ? r.events[key] : []).map((e) => e.uid).slice(0, 6)
+  return {
+    regionLabel: regionStore.current === 'intl' ? '国际版 ' : '国内版 ',
+    remaining,
+    countdownText: fmtCountdown(remaining),
+    uidCount: (r.events && r.events[key] ? r.events[key].length : 0),
+    uidList,
+  }
+})
+
+/** 毫秒 → mm:ss（超过 1 小时给 h:mm:ss） */
+function fmtCountdown(ms: number): string {
+  const total = Math.ceil(ms / 1000)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`
+}
+
+// ---- 概览待办（M2.7）：需重登 / 未签到 / 积分将过期，一点直达 ----
+const router = useRouter()
+const wbTodos = computed(() => {
+  const out: Array<{ key: string; label: string; to: string; urgent: boolean }> = []
+  const refreshExpired = wbSummary.value?.refreshExpired ?? 0
+  if (refreshExpired > 0) {
+    out.push({ key: 'relogin', label: `${refreshExpired} 个账号需重登（refresh 过期）`, to: '/web-accounts', urgent: true })
+  }
+  if (!isIntlRegion() && wbCreditsLoaded.value) {
+    const unchecked = wbCreditsTotals.value.counted - wbCreditsTotals.value.checked
+    if (unchecked > 0) {
+      out.push({ key: 'checkin', label: `${unchecked} 个账号今日未签到`, to: '/web-accounts', urgent: false })
+    }
+  }
+  if (wbExpiring.value.count > 0) {
+    out.push({
+      key: 'expiring',
+      label: `${wbExpiring.value.count} 个套餐包 7 天内到期（${wbExpiring.value.amount} 积分）`,
+      to: '/points',
+      urgent: true,
+    })
+  }
+  return out
+})
+
+async function loadWbRestriction() {
+  try {
+    const { data } = await workbuddyApi.restriction()
+    wbRestriction.value = data
+  } catch (e) { /* 拉不到就不显示横幅，不影响仪表盘其余部分 */ }
+}
+
+async function clearWbHold() {
+  wbClearing.value = true
+  try {
+    const region = regionStore.current === 'intl' ? 'intl' : 'cn'
+    const { data } = await workbuddyApi.clearRestriction(region)
+    if (data && data.ok) {
+      await loadWbRestriction()
+    } else if (data && data.error) {
+      // 管理端已有 message 组件（App.useApp），这里用最轻的 alert 兜底：
+      // 解除失败必须让用户看到，否则会以为「点了没用」
+      console.warn('解除失败:', data.error)
+    }
+  } finally {
+    wbClearing.value = false
+  }
+}
 
 // ---- Qoder ----
 // 账号健康快照来自 /qoder/dashboard（本地落盘，不打上游）
@@ -2231,6 +2379,7 @@ async function refreshWb() {
     usage.value = u.data
     wbCreditRows.value = c.data?.rows || []
     wbCreditsLoaded.value = true
+    await loadWbRestriction()
     await channelStore.load()
     lastRefresh.value = new Date().toLocaleTimeString('zh-CN')
     await nextTick()
@@ -2565,6 +2714,11 @@ function onResize() {
 onMounted(() => {
   window.addEventListener('resize', onResize)
   refresh()
+  // 连坐倒计时：只在 WorkBuddy 通道下每秒推进一格。其余通道不启定时器——
+  // 一个每秒醒的 interval 在长期开着的控制台里不是零成本
+  wbTick = setInterval(() => {
+    if (isWb.value) wbNow.value = Date.now()
+  }, 1000)
 })
 
 // 切通道要重拉数据：四条通道的数据源不同，不重拉会看到上一个通道的残留。
@@ -2577,6 +2731,7 @@ vueWatch(() => regionStore.current, () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
+  if (wbTick) { clearInterval(wbTick); wbTick = null }
   reqChart?.dispose()
   tokChart?.dispose()
   qwChart?.dispose()
@@ -2598,5 +2753,15 @@ onBeforeUnmount(() => {
 .qw-chart {
   height: 260px;
   width: 100%;
+}
+
+/* 概览待办条（M2.7）：横向胶囊排布，任务多时自动换行 */
+.wb-todos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.wb-todo-btn {
+  border-radius: 999px;
 }
 </style>
