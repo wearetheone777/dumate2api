@@ -159,6 +159,11 @@ export interface TraeworkModel {
   /** 客户端可见性：false 的多是内部模型（子代理 / 压缩用） */
   visible: boolean
   usage: string
+  /** 思考档位（remote/solo manual 链路）：descriptor 显式声明的才非空——
+   *  当前上游 0 个可用（唯一支持的模型在 remote 端点 4001），协议就绪等放开 */
+  reasoningEfforts?: Array<'light' | 'high' | 'extra_high'> | null
+  /** 1M Max（descriptor max_mode + 输入/输出上限齐备）。当前上游 0 个声明 */
+  maxMode?: boolean
 }
 
 /** 仪表盘用：一个 TRAE Work 账号的健康快照（本地数据，不打上游） */
@@ -263,7 +268,24 @@ export interface TraeworkBillingCheck {
   note?: string
 }
 
+/** TRAE 对话链路状态（/traework/links，2026-11-06）：三条链路的开关与能力边界 */
+export interface TraeworkLinks {
+  /** 'auto-only'=REMOTE=1（auto 档纯文本）；'auto+manual'=REMOTE=2；'off'=关闭 */
+  remote: 'auto-only' | 'auto+manual' | 'off'
+  solo: boolean
+  /** 逐轮精确账单 enrichment 开关（关了明细页没有「精确」标记） */
+  sessionBilling: boolean
+  remoteMaxMode: boolean
+  priority: string
+  capabilities: {
+    utilsChat: { tools: boolean; effort: boolean; billing: string }
+    remote: { tools: boolean; effort: string; maxMode: boolean; billing: string }
+    solo: { tools: boolean; effort: string; billing: string; region: string }
+  }
+}
+
 export const traeworkApi = {
+  links: () => client.get<TraeworkLinks>('/traework/links'),
   status: (region?: 'cn' | 'intl') =>
     client.get<TraeworkStatus>(`/traework/status${region ? `?region=${region}` : ''}`),
   dashboard: (region?: 'cn' | 'intl') =>

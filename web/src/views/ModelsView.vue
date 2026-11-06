@@ -63,6 +63,33 @@
 
       <a-alert v-if="twError" type="warning" show-icon class="mt-3" :message="twError" />
 
+      <!-- 链路状态（2026-11-06）：三条链路的开关与优先级。开关在环境变量里，
+           这里只读展示——排障「请求实际走了哪条链」看这里 -->
+      <a-alert
+        v-if="twLinks"
+        type="info"
+        show-icon
+        class="mt-3"
+      >
+        <template #message>
+          对话链路 ·
+          <a-tag :color="twLinks.remote !== 'off' ? 'blue' : 'default'">Remote {{ twLinks.remote === 'auto-only' ? '（auto 档）' : twLinks.remote === 'auto+manual' ? '（auto+显式）' : '关' }}</a-tag>
+          <a-tag :color="twLinks.solo ? 'blue' : 'default'">SOLO raw {{ twLinks.solo ? '开' : '关' }}</a-tag>
+          <a-tag color="default">utils_chat（默认主力）</a-tag>
+          <a-tag :color="twLinks.sessionBilling ? 'green' : 'orange'">逐轮精确账单 {{ twLinks.sessionBilling ? '开' : '关' }}</a-tag>
+          <span class="text-xs text-slate-500 ml-1">优先级：{{ twLinks.priority }}</span>
+        </template>
+        <template #description>
+          <span class="text-xs">
+            思考档位：上游声明支持的模型
+            <b class="num">{{ twReasoningModels.length }}</b> 个<template v-if="twReasoningModels.length">（{{ twReasoningModels.slice(0, 3).map((m: any) => m.id).join('、') }}<template v-if="twReasoningModels.length > 3"> 等</template>）</template>；
+            1M Max：<b class="num">{{ twMaxModels.length }}</b> 个。
+            两个能力当前上游目录均为 0/协议已就绪——开关开了没生效是上游未声明，
+            不是网关问题。
+          </span>
+        </template>
+      </a-alert>
+
       <!-- 计费自检结果：TRAE 没有逐笔账单，实测倍率来自 consumed 增量 ÷ tokens。
            billed 为 null（没测到增量）比「比值偏离」更常见，单独标黄 -->
       <a-alert
@@ -171,6 +198,15 @@
               <a-tag :color="qwStatus.refreshExpired ? 'red' : (qwStatus.tokenExpired ? 'orange' : 'green')">
                 {{ qwStatus.refreshExpired ? 'refresh token 已过期' : (qwStatus.tokenExpired ? 'token 已过期' : '有效') }}
               </a-tag>
+            </div>
+          </div>
+          <div class="qw-channel-cell">
+            <div class="cell-label">ACP 实定档位</div>
+            <div class="cell-value">
+              <!-- new_prompt 不接受逐轮指定模型，档位由上游按账号/套餐定——
+                   建会话响应的 extra_data.mode 是唯一观测口 -->
+              <span class="font-mono text-xs">{{ qwStatus.acpMode || '—' }}</span>
+              <span v-if="!qwStatus.acpMode" class="cell-sub">尚无 ACP 会话</span>
             </div>
           </div>
         </div>
@@ -780,7 +816,7 @@ import { qwenworkApi } from '@/api/qwenwork'
 import { traeworkApi } from '@/api/traework'
 import { qoderApi, type QoderModel, type QoderCreditRow } from '@/api/qoder'
 import { workbuddyApi } from '@/api/workbuddy'
-import type { TraeworkCreditRow, TraeworkModel } from '@/api/traework'
+import type { TraeworkCreditRow, TraeworkModel, TraeworkLinks } from '@/api/traework'
 import type { QwCredits } from '@/api/qwenwork'
 import type { ModelMapData, ProbeResult } from '@/api/models'
 import type { SystemStatus } from '@/api/system'
@@ -1052,7 +1088,7 @@ const qwError = ref('')
 // 千问积分池：与模型表一起展示，回答「这些模型花的是哪份额度」
 const qw = ref<QwCredits | null>(null)
 // 千问通道元信息：账号、套餐、token 状态
-const qwStatus = ref<{ account: string; tier: string; planId: string; refreshExpired: boolean; tokenExpired: boolean } | null>(null)
+const qwStatus = ref<{ account: string; tier: string; planId: string; refreshExpired: boolean; tokenExpired: boolean; acpMode: string | null } | null>(null)
 
 // 计费自检：千问没有标称倍率（模型表无 price_factor），探针只报实测成本
 // （三池余额差值 ÷ tokens）。默认用 flash——成本量级最小
@@ -1201,8 +1237,15 @@ const modelColumns = [
 // 默认关：模型信息表只列可用对话模型，排查个别名字时才打开
 const twShowAll = ref(false)
 
+// TRAE 链路状态（2026-11-06）：三条链路的开关与优先级——用户需要知道请求
+// 实际走哪条链，否则「开关开了没效果」无从排查
+const twLinks = ref<TraeworkLinks | null>(null)
+// 思考档位 / 1M Max 的上游支持现状（descriptor 显式声明的才计数）
+const twReasoningModels = computed(() => twModels.value.filter((m: any) => m.reasoningEfforts?.length))
+const twMaxModels = computed(() => twModels.value.filter((m: any) => m.maxMode))
+
 async function loadTwModels(force = false) {
-  const [m, credits, usage, info] = await Promise.all([
+  const [m, credits, usage, info, links] = await Promise.all([
     traeworkApi.models({ refresh: force, region: twRegion.value })
       .catch((e: any) => ({ data: { models: [], total: 0, error: e?.message || '取模型列表失败', fetchedAt: 0, rateNote: '' } })),
     traeworkApi.credits().catch(() => ({ data: { count: 0, rows: [] } })),
@@ -1210,6 +1253,7 @@ async function loadTwModels(force = false) {
       .catch(() => ({ data: { rows: [] } })),
     modelInfoApi.list({ channel: 'traework', refresh: force, all: twShowAll.value, region: twRegion.value })
       .catch(() => ({ data: { rows: [], error: '' } })),
+    traeworkApi.links().catch(() => ({ data: null as TraeworkLinks | null })),
   ])
   twModels.value = m.data.models || []
   twFetchedAt.value = m.data.fetchedAt || 0
@@ -1218,6 +1262,7 @@ async function loadTwModels(force = false) {
   twRows.value = credits.data.rows || []
   twUsage.value = (usage.data.rows || []) as any
   twInfoRows.value = info.data.rows || []
+  twLinks.value = links.data || null
   // 元信息（账号数 / token 到期）来自通道状态，进页面时顶栏可能还没拉过
   await channelStore.load()
 }
@@ -1248,7 +1293,7 @@ async function load() {
       // 模型表、积分状态、积分池、近 7 天使用、统一模型信息——五份并行拉
       const [models, status, credits, usage, info] = await Promise.all([
         qwenworkApi.models().catch((e: any) => ({ data: { models: [], error: e?.message || '取模型列表失败' } })),
-        qwenworkApi.status().catch((e: any) => ({ data: { ready: false, error: e?.message, account: '', tier: '', planId: '', refreshExpired: false, tokenExpired: false } })),
+        qwenworkApi.status().catch((e: any) => ({ data: { ready: false, error: e?.message, account: '', tier: '', planId: '', refreshExpired: false, tokenExpired: false, acpMode: null } })),
         qwenworkApi.credits().catch((e: any) => ({ data: { ok: false, error: e?.message || '取不到千问积分' } })),
         client.get('/reqlogs?days=7&status=all&channel=qwenwork&limit=200&offset=0')
           .catch(() => ({ data: { rows: [] } })),

@@ -25,6 +25,33 @@ function regionFilter(rows, url) {
 
 const routes = [
   {
+    // 链路状态（2026-11-06）：TRAE 对话请求现在有三条链路（utils_chat / Remote /
+    // SOLO raw），开关全部由环境变量控制——前端模型卡要显示「请求实际走哪条
+    // 链」就得有这个数据源。只读，不在这里改开关（改 env 要重启才有意义）。
+    method: 'GET',
+    path: '/links',
+    handler: async ({ res }) => {
+      const remote = String(process.env.DUMATE_TRAEWORK_REMOTE || '');
+      return sendJSON(res, 200, {
+        // 链路开关现状
+        remote: remote === '1' ? 'auto-only' : remote === '2' ? 'auto+manual' : 'off',
+        solo: process.env.DUMATE_TRAEWORK_SOLO === '1',
+        // 逐轮精确账单（credits enrichment）开关——关了明细页就没有「精确」标记
+        sessionBilling: process.env.DUMATE_TRAEWORK_SESSION_BILLING !== '0',
+        // 1M Max 全局开关（descriptor 硬门仍然生效）
+        remoteMaxMode: process.env.DUMATE_TRAEWORK_REMOTE_MAX_MODE === '1',
+        // 链路优先级说明（前端展示用）
+        priority: 'REMOTE=2 manual > SOLO raw（纯文本）> utils_chat（默认主力）',
+        // 各链路的能力边界（与 CLAUDE.md「TRAE 融合批次」节一致）
+        capabilities: {
+          utilsChat: { tools: true, effort: false, billing: 'session_usage' },
+          remote: { tools: false, effort: 'manual 策略', maxMode: true, billing: 'session_usage' },
+          solo: { tools: false, effort: '协议就绪待证据', billing: 'session_usage', region: 'cn-only' },
+        },
+      });
+    },
+  },
+  {
     // 通道状态 + 账号列表（脱敏：refreshToken 只给尾部 6 位）
     method: 'GET',
     path: '/status',
