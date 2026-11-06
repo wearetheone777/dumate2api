@@ -813,6 +813,61 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
 
 // ==================== OpenAI Compatible Endpoints ====================
 
+/**
+ * Key 自查用量（M3，workbuddy-manager 出处）：GET /v1/usage
+ *
+ * 下游 Key 使用方用自己的 key 查「这个 key 用了多少」。聚合自
+ * requests.jsonl（reqlog），窗口 today / 7d / 30d；quota 如实 null——
+ * Key 配额维度（上限×重置周期）还没实现，null 与 0 含义不同。
+ *
+ * 安全红线：响应里绝不出现 hash 与 plain（自查端点不会把明文 key 还给
+ * 调用方——req._apiKey 里两者都在，必须手工挑字段）。
+ */
+async function handleKeyUsage(req, res) {
+  const key = req._apiKey || null;
+  const keyId = key && key.id != null ? key.id : null;
+  if (keyId == null) {
+    return sendJSON(res, 401, { error: { message: 'Invalid or missing API key', type: 'authentication_error', code: 'unknown_key' } });
+  }
+  // 全量读（requests.jsonl 有 32MB 轮转兜底）后按 key 过滤聚合。
+  // 自查是低频动作，整文件扫描可接受；高频化再做 usage-agg 的持久桶
+  const { rows } = reqlog.read({ limit: 0, filter: (r) => r && r.key_id === keyId });
+  const now = Date.now();
+  const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+  const windows = [
+    { name: 'today', since: dayStart.getTime() },
+    { name: '7d', since: now - 7 * 86400000 },
+    { name: '30d', since: now - 30 * 86400000 },
+  ];
+  const aggregate = (since) => {
+    const hit = rows.filter((r) => Number(r.ts) >= since);
+    const out = {
+      requests: hit.length,
+      failed: hit.filter((r) => Number(r.status) >= 400).length,
+      input_tokens: hit.reduce((s, r) => s + (Number(r.input_tokens) || 0), 0),
+      output_tokens: hit.reduce((s, r) => s + (Number(r.output_tokens) || 0), 0),
+      total_tokens: hit.reduce((s, r) => s + (Number(r.total_tokens) || 0), 0),
+    };
+    // 最近一次请求时刻：对账时回答「这个 key 还活着吗」
+    out.last_request_at = hit.length ? Math.max(...hit.map((r) => Number(r.ts) || 0)) : null;
+    return out;
+  };
+  return sendJSON(res, 200, {
+    key: {
+      id: keyId,
+      name: key.name || '',
+      enabled: key.enabled !== false,
+      channel: key.channel || null,
+      region: key.region || null,
+      expires_at: key.expires_at || null,
+    },
+    usage: Object.fromEntries(windows.map((w) => [w.name, aggregate(w.since)])),
+    quota: null,
+    quota_note: 'Key 配额维度未实现（上限×重置周期）——quota 恒 null，与「没有消耗」区分',
+    generated_at: now,
+  });
+}
+
 async function handleOpenAIModels(req, res) {
   // 条目来自 modelmap（可经管理端编辑），不再硬编码：
   // 之前这里的列表与 anthropic.js 的 MODEL_MAP 各写一份，会各自漂移。
@@ -2276,6 +2331,13 @@ const server = http.createServer(async (req, res) => {
     // Models list
     if (url === '/v1/models' && req.method === 'GET') {
       return await handleOpenAIModels(req, res);
+    }
+
+    // Key 自查用量（M3，workbuddy-manager 出处）：下游 Key 使用方用自己的
+    // key 查「这个 key 用了多少」——不持管理端登录态也能对账。走上面统一的
+    // key 鉴权（无效/停用/过期 key 拿不到响应，与数据面同口径）。
+    if (url === '/v1/usage' && req.method === 'GET') {
+      return await handleKeyUsage(req, res);
     }
 
     // Chat completions (OpenAI format, pass-through with model mapping)
