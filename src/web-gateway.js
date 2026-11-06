@@ -117,10 +117,13 @@ function pickUsage(u) {
 async function handleOpenAIModels(req, res) {
   const cfg = modelmap.load();
   const created = Math.floor(Date.now() / 1000);
-  const upstream = new Set(cfg.upstream_models);
+  // 9084 只打云端网关，模型列表用**云端名空间**（cloud_upstream，2026-11-06
+  // 实测：本地名 glm-5 / model-artifact-validate 在云端一律 404，列出来只会
+  // 让客户端选中一个必失败的模型）。owned_by 同口径。
+  const upstream = new Set(cfg.cloud_upstream);
   sendJSON(res, 200, {
     object: 'list',
-    data: cfg.exposed.map((id) => ({
+    data: cfg.cloud_upstream.map((id) => ({
       id,
       object: 'model',
       created,
@@ -143,7 +146,9 @@ async function handleOpenAIChat(req, res) {
   const info = reqlog.describeRequest(reqBody);
   req._logPath = '/v1/chat/completions';
 
-  reqBody.model = modelmap.mapModel(reqBody.model);
+  // 云端名空间归一（toCloudModel，2026-11-06）：云端只认 cloud_upstream 六个
+  // 路由名——glm-5 等本地名在这里会 404，必须先归一。
+  reqBody.model = modelmap.toCloudModel(reqBody.model);
   reqBody.max_tokens = resolveMaxTokens(reqBody.max_tokens);
 
   const r = await pool.callWithFailover('/chat/completions', 'POST', reqBody, {
@@ -224,8 +229,9 @@ async function handleAnthropicMessages(req, res) {
   const openaiReq = anthropicToOpenAI(anthropicReq);
   // 9084 只有搭子一条通道，没有前缀分流，所以映射在这里补——翻译层已经
   // 不再自己 mapModel（那会让 `traework/xxx` 这类带前缀的名字在 9080/9082
-  // 上被提前兜底、前缀丢失）。同文件 OpenAI 路径的 mapModel 是同一口径。
-  openaiReq.model = modelmap.mapModel(openaiReq.model);
+  // 上被提前兜底、前缀丢失）。同文件 OpenAI 路径的映射同一口径。
+  // 2026-11-06 改 toCloudModel：9084 打的是云端网关，本地名 glm-5 会 404。
+  openaiReq.model = modelmap.toCloudModel(openaiReq.model);
   if (anthropicReq.stream) openaiReq.stream_options = { include_usage: true };
 
   const r = await pool.callWithFailover('/chat/completions', 'POST', openaiReq, {
@@ -285,14 +291,58 @@ function translateStreamToAnthropic(r, req, res, startedAt, info, originalModel)
   }
 
   const text = msg.content || '';
-  send('content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } });
-  if (text) {
-    send('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text } });
+  const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+  // 空正文 + 有工具调用时不发空 text 块（与主网关 translateStreamToAnthropic
+  // 同口径：空 text 块会让部分客户端判定「模型只说了句空话」）
+  if (text || !toolCalls.length) {
+    send('content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } });
+    if (text) {
+      send('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text } });
+    }
+    send('content_block_stop', { type: 'content_block_stop', index });
+    index++;
   }
-  send('content_block_stop', { type: 'content_block_stop', index });
+
+  // 工具块：按顺序依次发 start + 完整 input_json_delta + stop。
+  // 用 input_json_delta 而不是在 start 里塞 input——前者是各家客户端都吃的
+  // 标准形状（与主网关 server.js 的 toolBuf 收尾同一口径）。
+  // 9084 的云端调用恒为非流式（callWithFailover 返回完整 JSON），所以这里
+  // 拿到的 tool_calls 是完整的，不需要跨帧累积。
+  let sentToolUse = false;
+  for (const tc of toolCalls) {
+    const fn = tc.function || tc;
+    if (!fn.name) {
+      // 没名字的工具发给客户端只会报 unknown tool，不发——但必须留痕
+      console.warn('[web-gateway] 丢弃一个没有名字的工具调用（上游未给 name）');
+      continue;
+    }
+    const args = typeof fn.arguments === 'string' ? fn.arguments : (fn.arguments ? JSON.stringify(fn.arguments) : '{}');
+    send('content_block_start', {
+      type: 'content_block_start',
+      index,
+      content_block: {
+        type: 'tool_use',
+        id: tc.id || ('toolu_' + Math.random().toString(36).slice(2, 10)),
+        name: fn.name,
+        input: {},
+      },
+    });
+    send('content_block_delta', {
+      type: 'content_block_delta',
+      index,
+      delta: { type: 'input_json_delta', partial_json: args || '{}' },
+    });
+    send('content_block_stop', { type: 'content_block_stop', index });
+    index++;
+    sentToolUse = true;
+  }
+
+  // stop_reason：有工具调用**必须**是 tool_use，不能照搬上游 finish_reason
+  // （上游给 tool_calls 时也可能报 stop，翻译成 end_turn 会让 Claude Code
+  // 认为回合正常结束、不去执行工具——主网关 2026-10-03 踩过的同一个坑）
   send('message_delta', {
     type: 'message_delta',
-    delta: { stop_reason: mapFinishReason(choice.finish_reason), stop_sequence: null },
+    delta: { stop_reason: sentToolUse ? 'tool_use' : mapFinishReason(choice.finish_reason), stop_sequence: null },
     usage: { input_tokens: usage.input, output_tokens: usage.output },
   });
   send('message_stop', { type: 'message_stop' });
@@ -336,7 +386,7 @@ function googleToOpenAI(googleReq) {
   if (sys) messages.unshift({ role: 'system', content: sys });
 
   return {
-    model: modelmap.mapModel(googleReq.model),
+    model: modelmap.toCloudModel(googleReq.model),
     messages,
     max_tokens: resolveMaxTokens(
       googleReq.generationConfig && googleReq.generationConfig.maxOutputTokens,
@@ -496,4 +546,4 @@ function start() {
 
 if (require.main === module) start();
 
-module.exports = { server, start };
+module.exports = { server, start, translateStreamToAnthropic };

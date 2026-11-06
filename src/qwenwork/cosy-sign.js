@@ -26,6 +26,7 @@
 //      注释）。本地签名是纯 CPU 的同步计算，微秒级。
 const core = require('../cosy');
 const c = require('./constants');
+const crypto = require('crypto');
 
 /** 聊天路径去掉 /algo 前缀——签名用的 pathSig（与 Qoder 同一约定） */
 const CHAT_PATH_SIG = c.CHAT_PATH.replace(/^\/algo/, '');
@@ -107,6 +108,16 @@ function buildHeaders(sess, pathSig, body, accept, extra) {
     ),
     'cosy-version': c.COSY_VERSION,
     'cosy-machineid': sess.machineId || '',
+    // 2026-11-06 对照 Buddy2api v2.2.17（providers/qwenwork/chat.py + constants.py，
+    // 1.0.4 客户端真机组合）补的三件：请求标识、机型枚举、内部模型键镜像。
+    // 它们在我们 1.1.71 组合里缺席而上游一直放行——补上是把指纹缺口收窄，
+    // 排障对照可用 DUMATE_QWENWORK_OS_HEADERS=0 整组关掉。
+    'cosy-machinetype': '5',
+    'cosy-machineos': c.MACHINE_OS,
+    'x-request-id': crypto.randomUUID(),
+    // 官方 qoderclicn 抓包带 OpenTelemetry 头（xrp-cosy 桌面逆向 §3.1）；
+    // W3C 标准格式：00-<32hex trace-id>-<16hex span-id>-01
+    traceparent: `00-${crypto.randomBytes(16).toString('hex')}-${crypto.randomBytes(8).toString('hex')}-01`,
     'login-version': c.LOGIN_VERSION,
     'user-agent': c.USER_AGENT,
     'cosy-scene': c.SCENE,
@@ -130,6 +141,8 @@ function prepareInfer({ uid, token, bodyJson, modelKey, machineId }) {
   const headers = buildHeaders(sess, CHAT_PATH_SIG, body, 'text/event-stream', {
     'x-model-key': modelKey,
     'x-model-source': 'system',
+    // Buddy2api 实测组合里的模型键第三镜像（x-model-key / model_config.key 之外）
+    'x-internal-model-key': modelKey,
   });
   return { url: c.GATEWAY + c.CHAT_PATH + '?' + c.CHAT_QUERY, body, headers };
 }
@@ -141,6 +154,7 @@ async function prepareInferAsync({ uid, token, bodyJson, modelKey, machineId }) 
   const headers = buildHeaders(sess, CHAT_PATH_SIG, body, 'text/event-stream', {
     'x-model-key': modelKey,
     'x-model-source': 'system',
+    'x-internal-model-key': modelKey,
   });
   return { url: c.GATEWAY + c.CHAT_PATH + '?' + c.CHAT_QUERY, body, headers };
 }

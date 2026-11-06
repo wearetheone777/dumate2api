@@ -241,6 +241,27 @@ const hasTool = (chunks) => chunks.some((c) => typeof c === 'object' && c.choice
     ok(err && err.sent === true, 'err.sent=true（客户端已看到 reasoning，换号会输出两段）');
   }
 
+  // ---------------------------------------------------------------------
+  section('10. 非流式 DSML 兜底（2026-11-04 补齐 aggregate 出口——此前千问只有流式门有）');
+  {
+    const CALLS = '<dsml:calls><dsml:invoke name="read_file">'
+      + '<dsml:parameter name="path">/tmp/a.txt</dsml:parameter></dsml:invoke></dsml:calls>';
+    chat.post = async () => ({
+      status: 200,
+      headers: {},
+      raw: [
+        frame({ choices: [{ index: 0, delta: { content: '先看文件。' + CALLS }, finish_reason: null }] }),
+        frame({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+      ].map((f) => `data: ${f}`).join('\n') + '\n',
+    });
+    const out = await qwen.chatCompletion(payload({ stream: false }));
+    const msg = out.choices[0].message;
+    ok(Array.isArray(msg.tool_calls) && msg.tool_calls[0].function.name === 'read_file',
+      'DSML 还原成结构化调用');
+    ok(msg.content === '先看文件。', '正文是剥离后的干净版');
+    ok(out.choices[0].finish_reason === 'tool_calls', 'finish stop 已纠正');
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => {

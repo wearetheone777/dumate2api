@@ -778,7 +778,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
           lastUsage = null;       // 每轮独立结算（每轮都是一次真实上游请求）
           nextRound = false;
         }
-        gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP, { model: modelKey, channel: 'qoder' }) : null;
+        gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP, {
+          model: modelKey, channel: 'qoder',
+          toolNames: repair.toolNamesOf(payload),
+          echoMode: repair.toolEchoMode(),
+        }) : null;
         // 尝试可能以**异常**结束（静默形态：content deadline / read idle 掐断
         // 时 postStream reject）——不能让它在等待判定之前飞出循环
         let res = null;
@@ -938,7 +942,10 @@ async function runOnce(account, payload, onChunk, opts, meter) {
     // 响应里的 model 回填**真实名**（GLM-5.3-Flash），不是内部 key：
     // 流式帧是原样转发上游的（上游恒为 "auto"），非流式这条却会把
     // gfmodel 这种代号回给客户端，两边观感不一致
-    const out = chat.aggregate(payloads, (modelMeta && modelMeta.name) || modelKey);
+    const out = chat.aggregate(payloads, (modelMeta && modelMeta.name) || modelKey, {
+      toolNames: repair.toolNamesOf(payload),
+      echoMode: repair.toolEchoMode(),
+    });
     // 非流式同样记下本轮 reasoning，供下一轮 DeepSeek 回填。**只在确认收尾时记**
     // ——修复轮会整轮丢弃，提前记会把被丢弃的那轮思维链留给下一句对话。
     const rememberOut = () => {
@@ -1143,13 +1150,20 @@ async function send(payload, onChunk, opts = {}) {
       // 失败喂池：105（Login expired）按 401 进防误杀计数；额度类业务码
       // （112/110/114/430）按 poolInfoOf 的专门处置（固定冷却/不惩罚），
       // 其余按 classify。
-      channelPool.noteError(CHANNEL, account.id, poolInfoOf(e, model));
-      // 401/105 的偏差标注（hub issue #64）：时钟漂移的 401 与凭证失效形态
-      // 一致。有新鲜缓存且超阈值才加话（测不出就不加），并顺手刷新一次测量。
-      const isAuthErr = code === 401 || code === 105 || /login expired/i.test(String(e.message || ''));
-      const clockHint = isAuthErr ? clock.annotate401(account.region) : '';
-      if (isAuthErr) clock.measureSkew(account.region).catch(() => { /* 排障信息，失败不管 */ });
-      markFailure(account, `${e.message}${clockHint}`);
+      //
+      // **探针模式（opts.probe，hub v1.7.20 #134 的教训）**：billing-check 是
+      // 「读健康状态」的观测动作，撞 10605/112/110 时把账号写进冷却，等于
+      // 健康检查把健康账号打成病人——下一个真实请求在毫秒级被本地拒绝。
+      // probe 只跳过写型惩罚（冷却/熔断/lastError），错误照常上抛如实展示。
+      if (!opts.probe) {
+        channelPool.noteError(CHANNEL, account.id, poolInfoOf(e, model));
+        // 401/105 的偏差标注（hub issue #64）：时钟漂移的 401 与凭证失效形态
+        // 一致。有新鲜缓存且超阈值才加话（测不出就不加），并顺手刷新一次测量。
+        const isAuthErr = code === 401 || code === 105 || /login expired/i.test(String(e.message || ''));
+        const clockHint = isAuthErr ? clock.annotate401(account.region) : '';
+        if (isAuthErr) clock.measureSkew(account.region).catch(() => { /* 排障信息，失败不管 */ });
+        markFailure(account, `${e.message}${clockHint}`);
+      }
       errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled, quotaKind: e.quotaKind || '' });
       if (e.sent) throw e; // 流式已吐帧，不能再换号
       if (!retryable(code, e.message, e.quotaKind)) throw e;

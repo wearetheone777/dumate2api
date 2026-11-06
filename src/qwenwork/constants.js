@@ -78,6 +78,17 @@ const MACHINE_OS = 'x86_64_win32';
 const LOGIN_VERSION = 'v2';
 const USER_AGENT = 'qoderwork/1.1.0';
 
+// ---- ACP 会话通道（2026-11-04，P2-17 前置解锁）----
+// 协议证据：tang-bugu/dsh-connect-qwenwork 的实测 README（2026-10-22 真机
+// 跑通、10-29 补 32KB 上限）——REST 建会话 + 带信封的 JSON-RPC over WS。
+// **域是 qwenwork.cn 裸域，不是 gateway.qwenwork.cn**（README 字面）。
+// 单条消息 32768 字节硬上限：1009 关闭、reason "read limited at 32769 bytes"，
+// permessage-deflate 压缩救不了——发送前必须裁剪（acp.promptOf）。
+const ACP_ORIGIN = process.env.DUMATE_QWENWORK_ACP_ORIGIN || 'https://qwenwork.cn';
+const ACP_SESSIONS_PATH = '/api/chat-sessions';
+const ACP_WS_PATH = '/api/chat-ws';
+const ACP_MAX_PROMPT_BYTES = 32768;
+
 // 模型目录会随服务端变化。**2026-10-31 真机复核**（/api/v2/model/list，修复了
 // 签名路径 bug 后首次拉通）：上游当前只有 flash（标准）/ pro（高级）/
 // qwen3.8-max-preview（Qwen3.8-Max，千问最强）三个，Buddy2api 等社区项目
@@ -118,6 +129,10 @@ module.exports = {
   MACHINE_OS,
   LOGIN_VERSION,
   USER_AGENT,
+  ACP_ORIGIN,
+  ACP_SESSIONS_PATH,
+  ACP_WS_PATH,
+  ACP_MAX_PROMPT_BYTES,
   FALLBACK_MODELS,
   DEFAULT_MODEL,
   MODEL_ALIASES,

@@ -299,9 +299,149 @@
       </a-card>
     </template>
 
-    <!-- ============ WorkBuddy：第五通道（双区域），账号健康 + 用量 ============ -->
+    <!-- ============ WorkBuddy：第五通道（双区域），指标卡 + 趋势 + 账号健康 ============ -->
     <template v-else-if="isWb">
-      <a-card :bordered="false" class="mt-1">
+      <!-- 顶部指标卡：口径与 Qoder 对齐（账号 / 积分合计 / 临期 / 今日请求）。
+           剩余积分来自 credits（套餐包合计），临期按包的 expireAt 聚合；
+           国际版是订阅制，积分口径两格显示 — 与说明，不硬凑数字 -->
+      <a-row :gutter="[16, 16]">
+        <a-col :xs="12" :sm="12" :lg="8" :xl="4">
+          <a-card :bordered="false" class="h-full">
+            <a-statistic title="账号总数" :value="wbSummary?.total ?? '—'">
+              <template #suffix><span class="text-sm text-slate-400">个</span></template>
+            </a-statistic>
+            <div class="text-xs text-slate-500 mt-2">
+              <template v-if="wbSummary">启用 {{ wbSummary.enabled }} 个</template>
+              <span v-else>—</span>
+            </div>
+          </a-card>
+        </a-col>
+        <a-col :xs="12" :sm="12" :lg="8" :xl="4">
+          <a-card :bordered="false" class="h-full">
+            <a-statistic
+              title="剩余积分合计"
+              :value="wbCreditsTotals.remain ?? '—'"
+              :precision="wbCreditsTotals.remain != null && !Number.isInteger(wbCreditsTotals.remain) ? 2 : undefined"
+              value-style="color:var(--lab-primary)"
+            />
+            <div class="text-xs text-slate-500 mt-2">
+              {{ isIntlRegion() ? '国际版订阅制，无积分口径' : 'billing 套餐包按账号独立' }}
+            </div>
+          </a-card>
+        </a-col>
+        <a-col :xs="12" :sm="12" :lg="8" :xl="4">
+          <a-card :bordered="false" class="h-full">
+            <a-statistic
+              title="7 天内到期积分"
+              :value="wbExpiring.amount"
+              :precision="wbExpiring.amount != null && !Number.isInteger(wbExpiring.amount) ? 2 : undefined"
+              :value-style="wbExpiring.amount > 0 ? 'color:var(--lab-warn)' : ''"
+            />
+            <div class="text-xs text-slate-500 mt-2">
+              <template v-if="wbExpiring.count">
+                {{ wbExpiring.count }} 个套餐包临期 · 到期即作废
+              </template>
+              <template v-else-if="isIntlRegion()">订阅制无套餐包</template>
+              <template v-else>暂无临期套餐包</template>
+            </div>
+          </a-card>
+        </a-col>
+        <a-col :xs="12" :sm="12" :lg="8" :xl="4">
+          <a-card :bordered="false" class="h-full">
+            <a-statistic title="今日请求" :value="usage?.cards.today.requests ?? '—'">
+              <template #suffix><span class="text-sm text-slate-400">次</span></template>
+            </a-statistic>
+            <div class="text-xs text-slate-500 mt-2">
+              <template v-if="usage"><span class="num">{{ usage.cards.today.tokens }}</span> Token</template>
+              <span v-else>—</span>
+            </div>
+          </a-card>
+        </a-col>
+        <a-col :xs="12" :sm="12" :lg="8" :xl="4">
+          <a-card :bordered="false" class="h-full">
+            <a-statistic title="今日已签到" :value="isIntlRegion() ? '—' : `${wbCreditsTotals.checked} / ${wbCreditsTotals.counted}`" />
+            <div class="text-xs text-slate-500 mt-2">
+              {{ isIntlRegion() ? '国际版没有签到接口' : '签到每日一次，幂等' }}
+            </div>
+          </a-card>
+        </a-col>
+        <a-col :xs="12" :sm="12" :lg="8" :xl="4">
+          <a-card :bordered="false" class="h-full">
+            <a-statistic
+              title="refresh 过期"
+              :value="wbSummary?.refreshExpired ?? '—'"
+              :value-style="(wbSummary?.refreshExpired ?? 0) > 0 ? 'color:var(--lab-warn)' : ''"
+            >
+              <template #suffix><span class="text-sm text-slate-400">个</span></template>
+            </a-statistic>
+            <div class="text-xs text-slate-500 mt-2">
+              过期账号无法自动续期，需重新登录
+            </div>
+          </a-card>
+        </a-col>
+      </a-row>
+
+      <!-- 趋势 + 上游状态。与 TRAE/Qoder 同一布局（左趋势右状态），
+           三条直连通道并排看时位置一致才不会找不着。 -->
+      <a-row :gutter="[16, 16]" class="mt-4">
+        <a-col :xs="24" :lg="17">
+          <a-card title="近 14 天调用趋势" :bordered="false" class="h-full">
+            <template #extra><span class="text-xs text-slate-500">按天聚合 · 与搭子仪表盘同口径</span></template>
+            <a-empty v-if="!wbDaily.length" description="还没有 WorkBuddy 请求记录" />
+            <!-- 请求数与 Token 拆成上下两张共享 X 轴的小图：量纲不同，
+                 共图会凭空造出「此消彼长」的相关性（与 TRAE/Qoder 同一画法） -->
+            <template v-else>
+              <div class="trend-block">
+                <div class="trend-label">请求数</div>
+                <div ref="wbReqChartEl" class="trend-chart" />
+              </div>
+              <div class="trend-block">
+                <div class="trend-label">Token</div>
+                <div ref="wbTokChartEl" class="trend-chart" />
+              </div>
+            </template>
+          </a-card>
+        </a-col>
+
+        <a-col :xs="24" :lg="7">
+          <a-card title="上游状态" :bordered="false" class="h-full">
+            <a-descriptions :column="1" size="small">
+              <a-descriptions-item label="通道">
+                <a-tag :color="wbInfo?.ready ? 'green' : 'red'">
+                  {{ wbInfo?.ready ? '就绪' : '不可用' }}
+                </a-tag>
+                <span v-if="wbInfo?.error" class="text-xs text-slate-400 ml-1">
+                  {{ wbInfo.error }}
+                </span>
+              </a-descriptions-item>
+              <a-descriptions-item label="可用账号">
+                <template v-if="wbInfo?.accounts !== undefined">
+                  {{ wbInfo.accounts }} 个
+                </template>
+                <span v-else class="text-slate-400">—</span>
+              </a-descriptions-item>
+              <a-descriptions-item label="当前账号">
+                {{ wbInfo?.account || '—' }}
+              </a-descriptions-item>
+              <a-descriptions-item label="上游端点">
+                <span class="font-mono text-xs">
+                  {{ isIntlRegion() ? 'www.workbuddy.ai' : 'copilot.tencent.com' }}
+                </span>
+              </a-descriptions-item>
+            </a-descriptions>
+            <a-alert
+              type="info"
+              show-icon
+              class="mt-3"
+              message="凭证自持，双区域账号互不通用"
+              description="国内（copilot.tencent.com）与国际（workbuddy.ai）是两套独立账号。access token 到期时网关用 refresh token 自动换新（国内 workbuddy / 国际 plugin 两种刷新渠道）。"
+            />
+          </a-card>
+        </a-col>
+      </a-row>
+
+      <!-- 账号健康快照：本地落盘数据，不打上游 -->
+      <a-card :bordered="false" class="mt-4">
         <template #title>
           <span>账号健康快照</span>
           <a-tag v-if="wbAccounts.length" color="green" class="ml-2">
@@ -856,8 +996,33 @@
               <a-descriptions-item label="refresh token">
                 <span class="font-mono text-xs">{{ fmtExpire(qwInfo?.refreshExpiresAt) }}</span>
                 <a-tag v-if="qwInfo?.refreshExpired" color="orange" class="ml-1">已过期</a-tag>
+                <a-tag v-else-if="qwInfo?.refreshExpiringSoon" color="orange" class="ml-1">临期</a-tag>
+              </a-descriptions-item>
+              <a-descriptions-item label="ACP 档位">
+                <span class="font-mono text-xs">{{ qwInfo?.acpMode || '—' }}</span>
+                <span v-if="!qwInfo?.acpMode" class="text-xs text-slate-400 ml-1">尚无 ACP 会话</span>
+              </a-descriptions-item>
+              <a-descriptions-item label="FEFO 选号">
+                <!-- 写方是管理端 /accounts（本页加载即刷新），读方是网关热路径。
+                     快照陈旧时网关自动退回普通轮询——这里要让退化可见。 -->
+                <template v-if="qwFefo?.at">
+                  <a-tag v-if="qwFefo.fresh" color="green">生效中</a-tag>
+                  <a-tag v-else color="default">已退化</a-tag>
+                  <span class="text-xs text-slate-400 ml-1">
+                    快照 {{ fefoAgeText(qwFefo.at) }} · {{ qwFefo.accounts }} 个临期账号
+                  </span>
+                </template>
+                <span v-else class="text-xs text-slate-400">快照未落盘</span>
               </a-descriptions-item>
             </a-descriptions>
+            <a-alert
+              v-if="qwInfo?.refreshExpiringSoon && !qwInfo?.refreshExpired"
+              type="warning"
+              show-icon
+              class="mt-3"
+              message="refresh token 24 小时内过期"
+              description="过期后无法自动续期，账号会变成不可用——请到「账号管理」删除后重新登录。"
+            />
             <a-alert
               v-if="qwInfo?.refreshExpired"
               type="warning"
@@ -892,6 +1057,8 @@
                 <a-tag :color="errFresh(a) ? 'red' : a.refreshExpired ? 'orange' : a.enabled && a.usable ? 'green' : 'default'">
                   {{ errFresh(a) ? '异常' : a.refreshExpired ? '待重登' : a.enabled && a.usable ? '在线' : '停用' }}
                 </a-tag>
+                <a-tag v-if="a.refreshExpiringSoon && !a.refreshExpired" color="orange" class="ml-1">临期重登</a-tag>
+                <a-tag v-if="a.adoptedFrom === 'official-desktop'" color="purple" class="ml-1">收编</a-tag>
               </div>
               <div v-if="a.phone" class="account-card-meta">
                 {{ a.phone }}
@@ -997,6 +1164,87 @@
 
     <!-- 搭子通道：账号池 + 用量 -->
     <template v-else>
+    <!-- 登录态健康横幅（2026-11-06 清单项）：数据来自 /keepalive/health——
+         后端纯内存快照，打开页面不会触发任何上游请求。判级在后端
+         healthAlerts（纯函数），前端只着色展示不重复判级。
+         红/黄才可展开明细，绿色一行带过不打扰。 -->
+    <a-alert
+      v-if="health"
+      :type="healthBanner.type"
+      show-icon
+      class="mb-4"
+    >
+      <template #message>
+        <span>{{ healthBanner.text }}</span>
+        <a-button
+          v-if="health.alerts.length"
+          type="link"
+          size="small"
+          class="ml-2 px-1"
+          @click="healthOpen = !healthOpen"
+        >{{ healthOpen ? '收起明细' : `明细（${health.alerts.length}）` }}</a-button>
+        <a-button type="link" size="small" class="px-1" @click="openSchedModal">排程设置</a-button>
+        <a-button
+          type="link"
+          size="small"
+          class="px-1"
+          :loading="kaRunning"
+          @click="onRunKeepalive"
+        >立即跑一轮</a-button>
+      </template>
+      <template v-if="healthOpen && health.alerts.length" #description>
+        <div v-for="(al, i) in health.alerts" :key="i" class="text-sm leading-7">
+          <a-tag :color="al.level === 'crit' ? 'red' : 'orange'" class="mr-2">{{ al.level === 'crit' ? '危险' : '警告' }}</a-tag>
+          <span class="text-slate-400 mr-2">{{ al.channel || '—' }}</span>
+          <span class="font-medium mr-2">{{ al.account || '—' }}</span>
+          <span>{{ al.message }}</span>
+        </div>
+        <div class="text-xs text-slate-400 mt-2">
+          保活排程：{{ health.keepalive.enabled
+            ? `每日 ${String(health.keepalive.hour).padStart(2, '0')}:${String(health.keepalive.minute).padStart(2, '0')} 启动（凭证余量 ${health.keepalive.warn_hours}h 内进预警）`
+            : '未启用' }}
+          <template v-if="health.keepalive.next_run_at"> · 下次 {{ fmtHealthTime(health.keepalive.next_run_at) }}</template>
+          <template v-else-if="!health.keepalive.enabled"> · 账号页可开启</template>
+        </div>
+      </template>
+    </a-alert>
+
+    <!-- 保活排程编辑：PUT /keepalive/config（后端 configure 白名单校验 + 即时生效） -->
+    <a-modal v-model:open="schedOpen" title="保活排程设置" :confirm-loading="schedSaving" @ok="saveSched">
+      <div class="space-y-3">
+        <div class="flex items-center justify-between">
+          <span>每日自动保活</span>
+          <a-switch v-model:checked="schedForm.enabled" />
+        </div>
+        <div class="text-xs text-slate-400 -mt-2">
+          未启用时过期只在请求时被动发现；启用后每天低峰时点自动「续票 → 签到 → 查余额 → 解冻冷却账号」。
+        </div>
+        <div class="flex items-center justify-between">
+          <span>触发时点</span>
+          <a-space>
+            <a-input-number v-model:value="schedForm.hour" :min="0" :max="23" style="width: 70px" />
+            <span>:</span>
+            <a-input-number v-model:value="schedForm.minute" :min="0" :max="59" style="width: 70px" />
+          </a-space>
+        </div>
+        <div class="flex items-center justify-between">
+          <span>随机后延（分钟）</span>
+          <a-input-number v-model:value="schedForm.jitter_minutes" :min="0" :max="120" style="width: 90px" />
+        </div>
+        <div class="flex items-center justify-between">
+          <span>提前预警窗口（小时）</span>
+          <a-input-number v-model:value="schedForm.warn_hours" :min="0" :max="168" style="width: 90px" />
+        </div>
+        <div class="flex items-center justify-between">
+          <span>签到参与解冻闭环</span>
+          <a-switch v-model:checked="schedForm.checkin" />
+        </div>
+        <div class="text-xs text-slate-400 -mt-2">
+          时点 + 随机后延只往后不往前（留在低峰窗口）；错过时点（关机/重启）会在下次启动时自动补跑，签到接口幂等不会重复领取。
+        </div>
+      </div>
+    </a-modal>
+
     <!-- 顶部指标卡：数据来自 /web-accounts/dashboard（账号池）+ /stats（用量） -->
     <a-row :gutter="[16, 16]">
       <a-col :xs="12" :sm="12" :xl="5">
@@ -1265,7 +1513,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import TodayUsageCard from '@/components/TodayUsageCard.vue'
 import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
@@ -1274,7 +1522,7 @@ import { qwenworkApi, type QwCredits, type QwDailyRow, type QwAccount, type QwCr
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
 import { remainText, remainColor } from '@/utils/remain'
 import { traeworkApi } from '@/api/traework'
-import { workbuddyApi, type WorkBuddyDashAccount } from '@/api/workbuddy'
+import { workbuddyApi, type WorkBuddyDashAccount, type WorkBuddyCreditRow } from '@/api/workbuddy'
 import { regionStore, regionParam } from '@/stores/region'
 import { watch as vueWatch } from 'vue'
 import type {
@@ -1282,6 +1530,8 @@ import type {
   TraeworkCreditsSummary, TraeworkExpiring,
 } from '@/api/traework'
 import client from '@/api/client'
+import { fetchKeepaliveHealth, fetchKeepaliveConfig, saveKeepaliveConfig, runKeepaliveOnce, type KeepaliveHealth, type KeepaliveConfig } from '@/api/health'
+import { App } from 'ant-design-vue'
 import type { SystemStatus } from '@/api/system'
 import type { PointsData, AccountsData } from '@/api/points'
 import type { StatsSummary, DailyRow } from '@/api/stats'
@@ -1339,6 +1589,10 @@ const accounts = ref<AccountsData | null>(null)
 const stats = ref<StatsSummary | null>(null)
 const daily = ref<DailyRow[]>([])
 const dash = ref<DashData | null>(null)
+// 登录态健康横幅（/keepalive/health，纯内存快照）。null = 端点不可达，
+// 横幅整个隐藏（v-if）——健康面挂了不该让仪表盘跟着挂。
+const health = ref<KeepaliveHealth | null>(null)
+const healthOpen = ref(false)
 const loading = ref(false)
 const error = ref('')
 const lastRefresh = ref('')
@@ -1356,6 +1610,43 @@ const isWb = computed(() => isWorkBuddy())
 // ---- WorkBuddy（第五通道，双区域）----
 const wbDash = ref<{ accounts: WorkBuddyDashAccount[]; summary: { total: number; enabled: number; refreshExpired: number; errored: number } | null } | null>(null)
 const wbAccounts = computed(() => wbDash.value?.accounts || [])
+// 额度来自 /workbuddy/credits（套餐包，按区域过滤）。加载标志与 Qoder 同口径：
+// 接口没回来（或失败）时合计显示 —，不拿 0 充数——0 会被读成「积分用完了」。
+const wbCreditRows = ref<WorkBuddyCreditRow[]>([])
+const wbCreditsLoaded = ref(false)
+const wbCreditsTotals = computed(() => {
+  if (!wbCreditsLoaded.value) return null
+  let remain: number | null = null
+  let checked = 0
+  let counted = 0
+  for (const r of wbCreditRows.value) {
+    if (r.total != null) remain = (remain ?? 0) + (r.totalPrecise != null ? r.totalPrecise : r.total)
+    // 只数明确 true 的——查不出的（null）不计入，否则「已签 2/2」会把查不出的也算已签
+    if (r.checkedIn === true) checked++
+    if (r.region !== 'global') counted++
+  }
+  return { remain, checked, counted }
+})
+// 7 天内到期（按包的 expireAt 聚合；已用完的包不计入——到期不构成损失）
+const wbExpiring = computed(() => {
+  if (!wbCreditsLoaded.value) return { amount: 0, count: 0 }
+  const now = Date.now()
+  let amount = 0
+  let count = 0
+  for (const r of wbCreditRows.value) {
+    for (const p of r.packages || []) {
+      if (p.expireAt && p.expireAt > now && p.expireAt <= now + 7 * 86400000 && p.remain > 0) {
+        amount += p.remainPrecise != null ? p.remainPrecise : p.remain
+        count++
+      }
+    }
+  }
+  return { amount, count }
+})
+const wbSummary = computed(() => wbDash.value?.summary || null)
+const wbInfo = computed(() => channelStore.infos['workbuddy'] || null)
+// 趋势数据：/usage/overview?days=14&channel=workbuddy 已在 refreshWb 里拉了
+const wbDaily = computed(() => usage.value?.daily || [])
 
 // ---- Qoder ----
 // 账号健康快照来自 /qoder/dashboard（本地落盘，不打上游）
@@ -1519,6 +1810,9 @@ const qw = ref<QwCredits | null>(null)
 const qwDaily = ref<QwDailyRow[]>([])
 // 账号健康快照用——千问现在也是多账号池，每个账号一张卡
 const qwAccounts = ref<QwAccount[]>([])
+// FEFO 快照新鲜度（/accounts 响应的 fefo 字段，src/expiring.js info()）。
+// 让「临期优先选号没生效」可以被看见，而不是静默退回普通轮询。
+const qwFefo = ref<{ at: number | null; fresh: boolean; accounts: number; windowDays: number } | null>(null)
 // 顶部指标卡（账号总数 / 有效期内 / 即将过期 / 积分余额）
 const qwSummary = ref<QwAccountsSummary | null>(null)
 // 即将过期的积分，摊平成表格行。来源是各账号的 expiringSoon——
@@ -1563,6 +1857,14 @@ function fmtExpire(iso?: string | null) {
   const t = Date.parse(iso)
   if (!Number.isFinite(t)) return '—'
   return new Date(t).toLocaleString('zh-CN', { hour12: false })
+}
+
+/** FEFO 快照的相对年龄（TTL 默认 6 小时，分钟级展示足够） */
+function fefoAgeText(at: number) {
+  const m = Math.floor((Date.now() - at) / 60000)
+  if (m < 1) return '刚刚'
+  if (m < 60) return `${m} 分钟前`
+  return `${Math.floor(m / 60)} 小时前`
 }
 
 const accountColumns = [
@@ -1814,6 +2116,7 @@ async function refreshQw() {
     qwDaily.value = d.data.rows
     qwAccounts.value = (a.data && a.data.accounts) || []
     qwSummary.value = (a.data && a.data.summary) || null
+    qwFefo.value = (a.data && a.data.fefo) || null
     qwRecords.value = (rec.data && rec.data.rows) || []
     qwWindow.value = (rec.data && rec.data.window) || { total: 0, requests: 0 }
     usage.value = u.data
@@ -1910,25 +2213,91 @@ async function refreshTw() {
   }
 }
 
-// WorkBuddy 仪表盘：账号健康快照（本地）+ 今日用量（按当前区域过滤）。
+// WorkBuddy 仪表盘：指标卡（本地 dashboard + credits）+ 趋势 + 账号健康快照。
 // 签到仅国内版有；国际视图不显示签到统计
 async function refreshWb() {
   loading.value = true
   error.value = ''
   try {
     const r = regionParam() as 'cn' | 'intl' | undefined
-    const [d, u] = await Promise.all([
+    const [d, u, c] = await Promise.all([
       workbuddyApi.dashboard(r).catch(() => ({ data: { accounts: [], summary: null } })),
       client.get(`/usage/overview?days=14&channel=workbuddy${r ? `&region=${r}` : ''}`).catch(() => ({ data: null })),
+      workbuddyApi.credits(r).catch(() => ({ data: { rows: [] } })),
     ])
     wbDash.value = d.data
     usage.value = u.data
+    wbCreditRows.value = c.data?.rows || []
+    wbCreditsLoaded.value = true
     await channelStore.load()
     lastRefresh.value = new Date().toLocaleTimeString('zh-CN')
+    await nextTick()
+    renderWbChart()
   } catch (e: any) {
     error.value = e?.response?.data?.error || e?.message || '未知错误'
   } finally {
     loading.value = false
+  }
+}
+
+// 横幅着色与文案：判级已在后端 healthAlerts 完成，这里只做映射——
+// crit>0 红、warn>0 黄、否则绿。绿色不展开明细，一行带过。
+const healthBanner = computed(() => {
+  const h = health.value
+  if (!h) return { type: 'success' as const, text: '' }
+  const { crit, warn, enabled } = h.summary
+  if (crit > 0) return { type: 'error' as const, text: `账号池有 ${crit} 个危险项 · ${warn} 个警告（${enabled} 个启用账号）` }
+  if (warn > 0) return { type: 'warning' as const, text: `账号池 ${warn} 个警告（${enabled} 个启用账号，无危险项）` }
+  return { type: 'success' as const, text: `账号池健康：${enabled} 个账号全部正常` }
+})
+const fmtHealthTime = (iso: string) =>
+  new Date(iso).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+
+// ── 保活排程编辑 + 手动触发 ──
+// message 走 App.useApp() 实例（静态 import 拿不到上下文，与 WebAccountsView 同口径）
+const { message } = App.useApp()
+const schedOpen = ref(false)
+const schedSaving = ref(false)
+const kaRunning = ref(false)
+const schedForm = reactive<KeepaliveConfig>({
+  enabled: false, hour: 22, minute: 30, jitter_minutes: 30,
+  warn_hours: 24, sem_cap: 3, per_account_delay_ms: 2000,
+  balance_threshold: 0, checkin: true,
+})
+
+async function openSchedModal() {
+  schedOpen.value = true
+  try {
+    Object.assign(schedForm, await fetchKeepaliveConfig())
+  } catch (e) {
+    // 拉不到配置就用当前表单默认值（保存时后端白名单校验兜底）
+  }
+}
+
+async function saveSched() {
+  schedSaving.value = true
+  try {
+    await saveKeepaliveConfig({ ...schedForm })
+    schedOpen.value = false
+    message.success(schedForm.enabled ? '排程已保存并启用' : '排程已保存（当前未启用）')
+    await refresh(true)
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || e?.message || '保存失败')
+  } finally {
+    schedSaving.value = false
+  }
+}
+
+// 触发式：POST 只负责点火（一轮可能跑几十秒），跑完的结果在横幅/明细里刷新可见
+async function onRunKeepalive() {
+  kaRunning.value = true
+  try {
+    await runKeepaliveOnce()
+    message.info('保活轮已启动：续票 → 签到 → 查余额 → 解冻，跑完刷新本页查看结果')
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || e?.message || '触发失败')
+  } finally {
+    setTimeout(() => { kaRunning.value = false }, 3000)
   }
 }
 
@@ -1940,7 +2309,7 @@ async function refresh(force = false) {
   loading.value = true
   error.value = ''
   try {
-    const [s, p, a, st, dy, db, u] = await Promise.all([
+    const [s, p, a, st, dy, db, u, h] = await Promise.all([
       client.get('/system/status'),
       // 桌面凭证不存在时（客户端已卸载）这两个接口必然 502——这是预期状态
       // 不是故障。它们只喂两张次要卡片，不能让 Promise.all 短路把整页数据
@@ -1953,6 +2322,8 @@ async function refresh(force = false) {
       // 今日用量：与千问/TRAE 同一数据源，保证三个通道显示同一组指标
       // （stats/summary 没有成功率与首字延迟，只有这里给全）
       client.get('/usage/overview?days=14&channel=dumate').catch(() => ({ data: null })),
+      // 健康横幅：端点失败静默降级为「不显示横幅」，不进 error 流
+      fetchKeepaliveHealth().catch(() => null),
     ])
     status.value = s.data
     points.value = p.data
@@ -1961,6 +2332,7 @@ async function refresh(force = false) {
     daily.value = dy.data.rows
     dash.value = db.data
     usage.value = u.data
+    health.value = h
     lastRefresh.value = new Date().toLocaleTimeString('zh-CN')
     // 等 DOM 更新后再渲染，否则 ref 还没挂上
     await nextTick()
@@ -2060,6 +2432,54 @@ function renderQdChart() {
   if (qdTokChartEl.value) {
     if (!qdTokChart) qdTokChart = echarts.init(qdTokChartEl.value)
     qdTokChart.setOption({
+      grid: { left: 56, right: 16, top: 8, bottom: 22 },
+      tooltip: tip((r) => `${r.day}<br/>Token <b>${exactNum(r.total_tokens)}</b>`),
+      xAxis: { ...xAxis, axisLabel: { color: INK.muted, fontSize: 11 } },
+      yAxis,
+      series: [lineSeries({ name: 'Token', data: rows.map((r) => r.total_tokens), color: SERIES[1], area: true })],
+    })
+  }
+}
+
+// WorkBuddy 趋势：与 TRAE/Qoder 完全同构（请求数 + Token 两张小倍数图），
+// 复用 renderQdChart 的画法而不是抄一份——与 Qoder 共用同一个 `usage` ref，
+// 只有挂载的 DOM 不同。抄一份必然漂移：改一处配色/网格就要改两处。
+const wbReqChartEl = ref<HTMLElement | null>(null)
+const wbTokChartEl = ref<HTMLElement | null>(null)
+let wbReqChart: echarts.ECharts | null = null
+let wbTokChart: echarts.ECharts | null = null
+
+function renderWbChart() {
+  const rows = wbDaily.value
+  if (!rows.length) return
+  const days = rows.map((r) => r.day.slice(5))
+  const xAxis = {
+    type: 'category' as const,
+    data: days,
+    boundaryGap: false,
+    axisLine: { show: true, lineStyle: { color: INK.axis } },
+    axisTick: { show: false },
+  }
+  const yAxis = { type: 'value' as const, ...axisStyle({ formatter: (v: number) => compactNum(v) }) }
+  const tip = (fmtRow: (r: any) => string) => ({
+    ...TOOLTIP_BASE,
+    trigger: 'axis' as const,
+    formatter: (params: any[]) => fmtRow(rows[params[0].dataIndex]),
+  })
+
+  if (wbReqChartEl.value) {
+    if (!wbReqChart) wbReqChart = echarts.init(wbReqChartEl.value)
+    wbReqChart.setOption({
+      grid: { left: 56, right: 16, top: 8, bottom: 4 },
+      tooltip: tip((r) => `${r.day}<br/>请求 <b>${exactNum(r.requests)}</b>${r.failed ? `<br/>失败 ${exactNum(r.failed)}` : ''}`),
+      xAxis: { ...xAxis, axisLabel: { show: false } },
+      yAxis,
+      series: [lineSeries({ name: '请求数', data: rows.map((r) => r.requests), color: SERIES[0], area: true })],
+    })
+  }
+  if (wbTokChartEl.value) {
+    if (!wbTokChart) wbTokChart = echarts.init(wbTokChartEl.value)
+    wbTokChart.setOption({
       grid: { left: 56, right: 16, top: 8, bottom: 22 },
       tooltip: tip((r) => `${r.day}<br/>Token <b>${exactNum(r.total_tokens)}</b>`),
       xAxis: { ...xAxis, axisLabel: { color: INK.muted, fontSize: 11 } },

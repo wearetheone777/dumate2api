@@ -93,8 +93,8 @@ function warmupModels() {
  * @param {boolean} hold 是否给正文加缓冲门（只有「带工具的流式请求」需要）
  * @returns {Promise<{events:Array, gate:object|null, streamErr:object|null, fatal:Error|null}>}
  */
-async function runAttempt(bodyJson, auth, model, emit, hold) {
-  const r = await chat.postStream(bodyJson, auth);
+async function runAttempt(bodyJson, auth, model, emit, hold, post = chat.postStream) {
+  const r = await post(bodyJson, auth);
   if (!r.stream) {
     return { fatal: new Error(`traework 请求失败: ${r.error || ('HTTP ' + r.status)}`) };
   }
@@ -249,6 +249,10 @@ async function send(payload, onChunk, opts = {}) {
   // 不让区域未限定的请求把它派给国际账号白撞一次上游 4001
   if (persona && opts.region !== 'cn') opts.region = 'cn';
   let model = rawModel.replace(/^(traework|traebao)\//, '');
+  // 调用方的 auto 意图（剥前缀后的原始名，在 DEFAULT_MODEL 填充前判定）。
+  // 不能看 payload.model——模块直调带 `traework/auto` 时它没剥前缀，
+  // remote 分流会误判成显式模型（2026-11-06 真机验证抓到）。
+  const isAuto = !model || model === 'auto';
   if (persona && (model === 'auto' || !model)) {
     // TRAE 宝自动档：**不传 config_name**，服务端自选（实测默认
     // deepseek-v4.1-flash__dev）。传了显式名反而换掉官方默认行为。
@@ -293,6 +297,17 @@ async function send(payload, onChunk, opts = {}) {
     if (cnKnown && !intlKnown) poolRegion = 'cn';
     else if (!cnKnown && intlKnown) poolRegion = 'intl';
   }
+  // SOLO/IDE raw 链路是**纯国内**（国际 JWT 打国内 raw 端点恒 1001，真机实测
+  // ——deepseek-v4.1-flash 两区都有、池把请求派给国际账号时 1001）。solo 启用
+  // 且本请求会走 solo（纯文本、REMOTE=2 未接管显式模型）时强制国内选号，
+  // 而不是选号后静默回落 utils_chat——那样 solo 对两区模型永远不生效。
+  // 选号后若仍选中国际账号（无国内可用），soloEligible 的 region 校验回落。
+  // remoteLevel/hasTools 声明在选号之后，这里用等价内联判定。
+  const soloWanted = process.env.DUMATE_TRAEWORK_SOLO === '1'
+    && !opts.personalAssistant && !!model
+    && String(process.env.DUMATE_TRAEWORK_REMOTE || '') !== '2'
+    && !(Array.isArray(payload && payload.tools) && payload.tools.length > 0);
+  if (!poolRegion && soloWanted) poolRegion = 'cn';
   const usable = accountsForRegion(authStore.findUsable(), poolRegion);
   if (!usable.length) {
     const e = poolRegion === 'intl'
@@ -318,8 +333,11 @@ async function send(payload, onChunk, opts = {}) {
   try {
     auth = await ensureFresh(sel.account);
   } catch (e) {
-    // 换票失败也进池：网络类按熔断计数，凭证失效类按防误杀计数（classify 判）
-    channelPool.noteError(CHANNEL, sel.account.id, { status: Number(e.statusCode) || 0, message: e.message, model });
+    // 换票失败也进池：网络类按熔断计数，凭证失效类按防误杀计数（classify 判）。
+    // 探针模式（opts.probe）不喂池——观测动作不把健康账号打成冷却。
+    if (!opts.probe) {
+      channelPool.noteError(CHANNEL, sel.account.id, { status: Number(e.statusCode) || 0, message: e.message, model });
+    }
     channelPool.release(uid);
     throw e;
   }
@@ -334,19 +352,66 @@ async function send(payload, onChunk, opts = {}) {
   try {
     // Remote 链路（2026-11-01，P2-16）：DUMATE_TRAEWORK_REMOTE=1 时，**纯文本的
     // auto 档请求**走 remote（逐轮账单可查、上游自选模型）。边界刻意收窄：
-    //   · 带 tools 的请求不收——remote 的工具调用矩阵未实测，收了就是赌；
-    //   · 显式模型名不收——remote 的 manual 策略要完整的 custom_model 对象
-    //     （Trae2api-cn 的 resolve_model_config），v1 未实现。显式名继续走
-    //     utils_chat——隐性换模型违背显式契约（计费倍率跟着变）。
+    //   · 带 tools 的请求**永不收**——remote 协议没有 tools 槽（Trae2api-cn
+    //     明文 "tools remain owned by the API caller"），把网关的 function
+    //     calling 降级进 query 没有实测证据上游会走原生 tool_calls。
+    //   · 显式模型名（2026-11-05，P2-13.1）：DUMATE_TRAEWORK_REMOTE=2 时经
+    //     **manual 策略**走 remote——Trae2api-cn 实测：manual 请求省略完整
+    //     custom_model 对象会被上游**静默落默认档**，所以必须带模型表的
+    //     上游原始 config（models.normalize 的 customModel 字段）。
+    //     表不可用/模型不在表 = 回落 utils_chat（显式名在 utils_chat 本来
+    //     就能跑，没有静默换模型问题）。
     // 实际模型由 model_config 事件上报（auto 档上游自选，实测 Doubao 系）。
-    const remoteEnabled = process.env.DUMATE_TRAEWORK_REMOTE === '1';
+    const remoteLevel = process.env.DUMATE_TRAEWORK_REMOTE === '1' ? 1
+      : process.env.DUMATE_TRAEWORK_REMOTE === '2' ? 2 : 0;
     const hasTools = Array.isArray(payload && payload.tools) && payload.tools.length > 0;
-    const isAuto = !payload || !payload.model || payload.model === 'auto';
+    // isAuto 在模型名解析处按剥前缀后的原始意图判定（本函数上方）
     // remote 链路是纯国内的（remoteBaseOf 对 intl 如实拒绝）——国际账号不走
-    const remoteEligible = remoteEnabled && !hasTools && isAuto && c.regionOf(auth) !== 'intl';
-    const result = remoteEligible
-      ? await runRemoteConversation(auth, payload, onChunk, opts, model)
-      : await runConversation(auth, payload, onChunk, opts, model);
+    const remoteEligible = remoteLevel > 0 && !hasTools && c.regionOf(auth) !== 'intl'
+      && (remoteLevel === 2 || isAuto);
+    // level 2 的显式模型：取模型表原始 config（取不到回落 utils_chat）。
+    // effortPayload：原始请求体——manual 策略下解析思考档位写入 custom_model。
+    // maxMode：单次 trae_max_mode / env 开关（descriptor 硬门在 createSession）
+    let remoteOpts = null;
+    if (remoteEligible && remoteLevel === 2) {
+      try {
+        const remoteMod = require('./remote');
+        const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn' });
+        const hit = (rows.models || []).find((m) => m.id === model);
+        if (hit && hit.customModel) {
+          remoteOpts = {
+            model, strategy: 'manual', customModelRow: hit, effortPayload: payload,
+            maxMode: remoteMod.maxModeRequested(model, payload),
+          };
+        }
+      } catch (e) { /* 表不可用回落 utils_chat */ }
+    }
+    // SOLO/IDE raw 链路（2026-11-06，#12）：DUMATE_TRAEWORK_SOLO=1 且显式模型
+    // 且模型表条目可用。**第一版只接纯文本**——tools 的原生槽形状待证据
+    // （带 tools 实测上游 400，仍走 utils_chat）；纯文本在 REMOTE 开启时仍
+    // 优先 remote（已验证 + 逐轮账单）。链路互斥：remote > solo(text) > utils_chat。
+    // **纯国内**（与 remote 同边界）：国际 JWT 打国内 raw 端点恒 1001
+    // （真机实测：deepseek-v4.1-flash 两区都有、池把请求派给国际账号时 1001）。
+    let soloTransport = null;
+    const soloEligible = process.env.DUMATE_TRAEWORK_SOLO === '1' && !persona && !!model
+      && !remoteOpts && !hasTools && !remoteEligible && c.regionOf(auth) !== 'intl';
+    if (soloEligible) {
+      try {
+        const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn' });
+        const hit = (rows.models || []).find((m) => m.id === model);
+        if (hit && hit.customModel) {
+          const solo = require('./solo');
+          const fn = 'solo_agent';
+          soloTransport = {
+            post: (b, a) => solo.postSoloStream(b, a, fn),
+            makeBody: (meta) => solo.buildBody(payload, hit, meta, { model, rawChatFunction: fn }),
+          };
+        }
+      } catch (e) { /* 表不可用回落 utils_chat */ }
+    }
+    const result = remoteEligible && (remoteLevel === 1 || remoteOpts)
+      ? await runRemoteConversation(auth, payload, onChunk, opts, model, remoteOpts)
+      : await runConversation(auth, payload, onChunk, opts, model, soloTransport);
     // 成功喂池：清熔断/软退避/防误杀计数（修复重试属于模型行为，不算失败）
     channelPool.noteSuccess(CHANNEL, auth.id);
     // lastError 是「最近一次结果」，不是「历史故障」（qwenwork 2026-10-02 同款
@@ -360,28 +425,58 @@ async function send(payload, onChunk, opts = {}) {
     }
     return result;
   } catch (e) {
-    channelPool.noteError(CHANNEL, auth.id, { status: Number(e.statusCode) || 0, message: e.message, model });
-    try { authStore.patch(auth.id, { lastError: normalizeError(e.message) }); } catch (err) { /* 记不下不影响 */ }
+    // 探针模式（opts.probe）不喂池、不写 lastError：错误照常上抛如实展示
+    if (!opts.probe) {
+      channelPool.noteError(CHANNEL, auth.id, { status: Number(e.statusCode) || 0, message: e.message, model });
+      try { authStore.patch(auth.id, { lastError: normalizeError(e.message) }); } catch (err) { /* 记不下不影响 */ }
+    }
     throw e;
   } finally {
     channelPool.release(uid);
   }
 }
 
+/** 档位观测：请求了档位就打一行——生效与被钳制都如实记录（Qoder P1 的
+ *  教训：档位静默丢失用户无感，排障时无从下手） */
+function logRemoteEffort(effort, model) {
+  if (!effort || !effort.requested) return;
+  console.log(effort.level
+    ? `[traework] remote 思考档位 ${effort.level}（请求 ${effort.requested}，model=${model || 'auto'}）`
+    : `[traework] remote 思考档位未生效：模型 descriptor 不支持 ${effort.requested}（model=${model || 'auto'}），上游落默认档`);
+}
+
+/** 1M Max 观测：请求了 max 就打一行——descriptor 没声明时如实说明 */
+function logRemoteMax(maxMode, model) {
+  if (!maxMode || !maxMode.requested) return;
+  console.log(maxMode.applied
+    ? `[traework] remote 1M Max 已启用（model=${model}，descriptor 显式声明 max_mode）`
+    : `[traework] remote 1M Max 未启用：模型 descriptor 未声明 max_mode（model=${model}），按普通档执行`);
+}
+
 /**
- * Remote 链路的一次完整对话（auto 档纯文本）。事件形状见 remote.js 顶部注释。
+ * Remote 链路的一次完整对话。auto 档（model 为空 = 上游自选）或显式模型
+ * （remoteOpts.strategy='manual'，Trae2api-cn：省略完整 custom_model 会被
+ * 上游静默落默认档）。事件形状见 remote.js 顶部注释。
  * 不做「播报即收尾」修复（remote 是执行型会话，观测形态不同，未实测不预编）；
  * 不做换号重试（会话粘在选定的账号上，失败如实抛给上层）。
  */
-async function runRemoteConversation(auth, payload, onChunk, opts, model) {
+async function runRemoteConversation(auth, payload, onChunk, opts, model, remoteOpts) {
   const remote = require('./remote');
   const startedAt = Date.now();
-  const settle = () => {
+  // turnId（2026-11-06）：remote 的记账键是创建会话返回的 message_id，settle
+  // 前就已可知——直接传给 capture 落 turn_id + 异步查逐轮精确扣费。
+  // 失败轮也传（事件流中途 error 时扣费可能已发生，messageId 失败分支同样有）
+  const settle = (turnId) => {
     require('./credits')
-      .capture(auth, { reqId: opts.reqId, model, startedAt })
+      .capture(auth, { reqId: opts.reqId, model, startedAt, ...(turnId ? { turnId } : {}) })
       .catch(() => { /* 采集失败绝不影响已发出的响应 */ });
   };
   const messages = Array.isArray(payload && payload.messages) ? payload.messages : [];
+  // createSession 的策略参数：auto 档 model 留空（上游自选）；manual 带请求
+  // 模型 + 原始 config（bound 校验在 remote.manualFieldsOf 里，失败明确报错）
+  const sessionOpts = remoteOpts && remoteOpts.strategy === 'manual'
+    ? { messages, model: remoteOpts.model, mode: 'code', strategy: 'manual', customModelRow: remoteOpts.customModelRow }
+    : { messages, model: '', mode: 'code' };
   const turnIdReport = (messageId) => {
     // Remote 的逐轮账单键是**创建会话返回的 message_id**（2026-11-01 真机实测：
     // 拿它查 get_session_usage 返回真实 amount_float 与明细——utils_chat 链路
@@ -393,13 +488,15 @@ async function runRemoteConversation(auth, payload, onChunk, opts, model) {
 
   // ---- 非流式：聚合整轮 ----
   if (!onChunk) {
-    const r = await remote.runTurn(auth, { messages, model: '', mode: 'code' });
-    settle();
+    const r = await remote.runTurn(auth, sessionOpts);
+    settle(r.messageId);
     if (!r.ok) {
       const e = new Error(r.error);
       e.statusCode = Number(r.status) || 502;
       throw e;
     }
+    logRemoteEffort(r.effort, sessionOpts.model);
+    logRemoteMax(r.maxMode, sessionOpts.model);
     turnIdReport(r.messageId);
     return r.aggregate;
   }
@@ -414,12 +511,14 @@ async function runRemoteConversation(auth, payload, onChunk, opts, model) {
   });
   let errData = null;
   let finishData = null;
-  const cs = await remote.createSession(auth, { messages, model: '', mode: 'code' });
+  const cs = await remote.createSession(auth, sessionOpts);
   if (!cs.ok) {
     const e = new Error(cs.error);
     e.statusCode = Number(cs.status) || 502;
     throw e;
   }
+  logRemoteEffort(cs.effort, sessionOpts.model);
+  logRemoteMax(cs.maxMode, sessionOpts.model);
   const sr = await remote.streamEvents(auth, cs.sessionId, cs.messageId, (ev) => {
     const d = ev.data || {};
     if (ev.event === 'plan_item') {
@@ -428,15 +527,11 @@ async function runRemoteConversation(auth, payload, onChunk, opts, model) {
       const rd = reasoning.push(d.reasoning_content);
       if (rd) onChunk(chunk({ reasoning_content: rd }));
     } else if (ev.event === 'token_usage') {
+      // 缓存字段透传与聚合出口同口径（remoteUsageOf：读命中镜像标准位、写缓存平铺）
       onChunk(JSON.stringify({
         id: 'traework', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model,
         choices: [],
-        usage: {
-          prompt_tokens: Number(d.prompt_tokens) || 0,
-          completion_tokens: Number(d.completion_tokens) || 0,
-          total_tokens: Number(d.total_tokens) || 0,
-          completion_tokens_details: { reasoning_tokens: Number(d.reasoning_tokens) || 0 },
-        },
+        usage: remote.remoteUsageOf(d),
       }));
     } else if (ev.event === 'done') {
       finishData = d;
@@ -446,7 +541,7 @@ async function runRemoteConversation(auth, payload, onChunk, opts, model) {
       errData = d;
     }
   }, {});
-  settle();
+  settle(cs.messageId);
   if (errData) {
     const e = new Error(`traework remote ${errData.code || ''}: ${errData.message || '上游错误'}`);
     e.statusCode = 502;
@@ -468,14 +563,32 @@ async function runRemoteConversation(auth, payload, onChunk, opts, model) {
 /**
  * 一次完整对话（原 send 主体）：选号之后的事——构造请求体、修复重试、
  * 积分归因采集。成败喂池统一在 send 里做，这里不碰池。
+ *
+ * transport（2026-11-06，#12）：SOLO/IDE raw 链路的接缝——
+ *   { post: (bodyJson, auth) => stream, makeBody: (meta) => {body}|{error} }
+ *   post 换成 solo.postSoloStream（端点候选链内聚在 solo.js），makeBody 延迟
+ *   构造 raw 请求体（meta.sessionId 账单键在本函数内生成后回传给调用方的
+ *   turnId 上报）。null = utils_chat（默认）。
  */
-async function runConversation(auth, payload, onChunk, opts, model) {
+async function runConversation(auth, payload, onChunk, opts, model, transport = null) {
   const meta = {};
   // persona（TRAE 宝）模式下 model 为空 = 自动档：buildBody 不写 config_name。
   // 埋点/账本的 model 字段用 'traebao/auto' 占位（空串会让归因行没法归因模型），
   // 协议体里保持无 config_name——显示名与协议名分开，别混。
   const persona = !!opts.personalAssistant;
-  const body = chat.buildBody(payload, model, meta, { persona });
+  let body;
+  if (transport && transport.makeBody) {
+    const built = transport.makeBody(meta);
+    if (built.error) {
+      const e = new Error(built.error);
+      e.statusCode = 400;
+      throw e;
+    }
+    body = built.body;
+  } else {
+    body = chat.buildBody(payload, model, meta, { persona });
+  }
+  const post = (transport && transport.post) || chat.postStream;
   const ledgerModel = persona && !model ? 'traebao/auto' : model;
   const startedAt = Date.now();
 
@@ -485,9 +598,18 @@ async function runConversation(auth, payload, onChunk, opts, model) {
   // 不 await —— 采集在响应发出后进行，不占请求延迟。
   // 记的是**本次实际使用的账号**（send 经池选出的那个），多账号下
   // 「池里的第一个」与「实际用的那个」不是一回事。
+  // turnId（2026-11-06）：buildBody 主动写的 session_id 是**请求级账单键**
+  // （上游按请求体 session_id 累计商业账单——Trae2api-cn 对旧版端点的实测；
+  // persona 链路 2026-11-03 同款实测）。buildBody 后即可知，两条 utils_chat
+  // 链路（persona/solo_work_lite）统一传；remote 链路用 message_id。
+  // 修复轮共用同一账单键，查回的是该序列的累计扣费，如实记录。
+  const ledgerTurnId = meta.sessionId || null;
   const settle = () => {
     require('./credits')
-      .capture(auth, { reqId: opts.reqId, model: ledgerModel, startedAt })
+      .capture(auth, {
+        reqId: opts.reqId, model: ledgerModel, startedAt,
+        ...(ledgerTurnId ? { turnId: ledgerTurnId } : {}),
+      })
       .catch(() => { /* 采集失败绝不影响已发出的响应 */ });
   };
 
@@ -499,7 +621,7 @@ async function runConversation(auth, payload, onChunk, opts, model) {
     let fatal = null;
     let lastEvents = null;
     for (;;) {
-      const r = await runAttempt(curBody, auth, ledgerModel, null, false);
+      const r = await runAttempt(curBody, auth, ledgerModel, null, false, post);
       settle();
       if (r.fatal) { fatal = r.fatal; break; }
       if (r.streamErr) { fatal = upstreamError(r.streamErr); break; }
@@ -517,12 +639,14 @@ async function runConversation(auth, payload, onChunk, opts, model) {
     if (fatal) throw fatal;
     // 逐轮账单的 turn id（计费自检探针用）：取**最终那一轮**的 id，
     // 修复轮的请求已重建，前面几轮的 id 与本次交付内容无关。
-    // TRAE 宝（persona）例外：buildBody 主动生成的 session_id 会被上游
-    // 按它记账（2026-11-03 实测 get_session_usage 查它返回真实 credits），
-    // 直接上报它；utils_chat（solo_work_lite）链路没有可用 id，走差值口径。
+    // buildBody 主动写的 meta.sessionId 是请求级账单键（两条 utils_chat
+    // 链路统一，2026-11-06 真机实测非 persona 查它返回真实 credits）；
+    // 流事件里若还有 reply_to_message_id/user_message_id 则优先取它
+    // （turnIdOf 的语义不变，session_id 只兜底——与 10-31「不拿 session_id
+    // 兜底」的区别：那是流 metadata 里上游自分配的 id，这里是主动写的键）。
     if (opts.onTurnId) {
       try {
-        const tid = persona && meta.sessionId ? meta.sessionId : chat.turnIdOf(lastEvents);
+        const tid = chat.turnIdOf(lastEvents) || (meta.sessionId || null);
         if (tid) opts.onTurnId(tid, auth);
       } catch (e) { /* 上报失败不影响响应 */ }
     }
@@ -535,7 +659,7 @@ async function runConversation(auth, payload, onChunk, opts, model) {
   let curBody = body;
   let res = null;
   for (;;) {
-    res = await runAttempt(curBody, auth, ledgerModel, onChunk, needsRepair(meta, ''));
+    res = await runAttempt(curBody, auth, ledgerModel, onChunk, needsRepair(meta, ''), post);
     settle();
     if (res.fatal || res.streamErr) break;
     if (!res.gate) break;

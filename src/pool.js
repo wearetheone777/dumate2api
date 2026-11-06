@@ -405,9 +405,12 @@ function createPool(opts = {}) {
   // 在途并发帽（运行态,不落盘）
   // ---------------------------------------------------------------------------
 
-  function acquire(id) {
+  function acquire(id, optsAcq) {
     const e = ensure(id);
-    if (e.in_flight >= o.inFlightMax) return false;
+    // inFlightMax 可按次覆盖（channel-pool 的通道级节奏闸门用）：0/未传 = 池默认
+    const cap = Number(optsAcq && optsAcq.inFlightMax) > 0
+      ? Number(optsAcq.inFlightMax) : o.inFlightMax;
+    if (e.in_flight >= cap) return false;
     e.in_flight++;
     return true;
   }

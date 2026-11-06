@@ -135,6 +135,8 @@ export interface QwLogin {
     refreshExpiresAt: number | null
     accessExpired: boolean
     refreshExpired: boolean
+    /** refresh token 临期（<24h）预警：过期即必须重新 device flow */
+    refreshExpiringSoon: boolean
   }
   ready: boolean
   wasm: string | null
@@ -179,6 +181,13 @@ export interface QwAccount {
   tokenExpiresAt: number | null
   refreshExpiresAt: number | null
   refreshExpired: boolean
+  /** refresh token 临期（<24h）预警：过期即必须重新 device flow，提前亮牌 */
+  refreshExpiringSoon: boolean
+  /**
+   * 凭证来源标记：refresh 被拒时从官方客户端 auth-v2.dat 收编救活的账号
+   * 带 'official-desktop'。正常 device flow 账号无此字段
+   */
+  adoptedFrom: string | null
   machineId: string
   lastError: string
   /** lastError 的写入时刻。界面据此显示「N 分钟前」并判断新鲜度——无则 null */
@@ -275,6 +284,10 @@ export const qwenworkApi = {
     tokenExpiresAt: string | null;
     refreshExpiresAt: string | null;
     refreshExpired: boolean;
+    /** refresh token 临期（<24h）预警 */
+    refreshExpiringSoon: boolean;
+    /** ACP 链路上游实定档位（最近一次建会话的 extra_data.mode；无会话 null） */
+    acpMode: string | null;
   }>('/qwenwork/status'),
   // 登录态详情（只读）
   login: () => client.get<QwLogin>('/qwenwork/account'),
@@ -293,6 +306,8 @@ export const qwenworkApi = {
     accounts: QwAccount[]
     /** 顶部指标卡用（账号总数 / 有效期内 / 即将过期 / 积分余额） */
     summary: QwAccountsSummary
+    /** FEFO 快照新鲜度（src/expiring.js info()）：at=null 表示从未落盘 */
+    fefo: { at: number | null; fresh: boolean; accounts: number; windowDays: number }
     error: string
   }>('/qwenwork/accounts'),
   // ---- 以下为多账号后的写接口 ----

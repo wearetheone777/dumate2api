@@ -44,9 +44,21 @@ export interface WorkBuddyCreditRow {
   unsupportedCheckin: boolean
   dailyCredit: number | null
   streakDays: number | null
-  /** 额度包剩余合计（billing 套餐包） */
+  /** 档位（计费摘要为唯一可信来源；取不到为 null） */
+  tier: { paid: boolean; package: string; at: number | null } | null
+  /** 额度包剩余合计（billing 套餐包，整数 remain 是 floor） */
   total: number | null
-  packages: Array<{ name: string; remain: number; size: number }>
+  /** 精确合计（上游 "…Precise" 字段，缺失为 null） */
+  totalPrecise?: number | null
+  packages: Array<{
+    name: string
+    remain: number
+    size: number
+    /** 到期时刻（北京时间 CycleEndTime 解析；缺失为 null） */
+    expireAt: number | null
+    /** 精确剩余（缺失为 null——整数 remain 是 floor） */
+    remainPrecise?: number | null
+  }>
   lastCheckin: number | null
   error: string
 }
@@ -79,6 +91,52 @@ export interface WorkBuddyModel {
   free: boolean
   badges: string[]
   reasoning: { efforts: string[]; defaultEffort: string | null; canDisableThinking: boolean | null } | null
+}
+
+/** 计费自检探针的结果（/workbuddy/billing-check）。口径同 TRAE：剩余额快照差值 */
+export interface WorkBuddyBillingCheck {
+  ok: boolean
+  /** 国际版没有 credits 接口时的如实标记 */
+  unsupported?: boolean
+  model: string
+  account?: string | null
+  accountId?: number | null
+  /** 模型表标称倍率（x0.00 = 免费，ratio 恒 null） */
+  expected: number | null
+  billed: number | null
+  ratio: number | null
+  /** 套餐剩余合计的前后差值（推断口径；没测到为 null，不编 0） */
+  delta: number | null
+  /** 整数积分口径下的测量分辨率（±积分/千token）= 1 ÷ (tokens/1000) */
+  resolution?: number | null
+  tokens: { input: number; output: number; total: number } | null
+  charged: Array<{ id: string; delta: number }>
+  singleAccount: boolean
+  free?: boolean
+  elapsedMs: number
+  error?: string
+  warning?: string
+  note?: string
+}
+
+/** OAuth 设备授权登录·第一步的返回（/workbuddy/login/url） */
+export interface WorkBuddyLoginStart {
+  ok: boolean
+  region?: string
+  /** 设备授权 state（第二步轮询要带回） */
+  state?: string
+  /** 官方登录页链接（浏览器打开完成登录） */
+  authUrl?: string
+  error?: string
+}
+
+/** OAuth 设备授权登录·轮询返回（/workbuddy/login/poll） */
+export interface WorkBuddyLoginPoll {
+  status: 'pending' | 'ok' | 'error' | 'expired'
+  message?: string
+  error?: string
+  /** status=ok 时已入池的账号 */
+  account?: WorkBuddyAccount
 }
 
 export const workbuddyApi = {
@@ -116,13 +174,26 @@ export const workbuddyApi = {
         unknown: number
         remainTotal: number
       }
+      /** FEFO 快照新鲜度（expiring.info()）：at 为空 = 没有快照；fresh=false = 超 TTL */
+      fefo?: { at: number | null; fresh: boolean; accounts: number; windowDays: number }
     }>(`/workbuddy/credits${region ? `?region=${region}` : ''}`),
   checkin: (id?: number) => client.post('/workbuddy/checkin', id ? { id } : {}),
+  /** 计费自检：最低倍率的付费模型发一条小请求，按套餐剩余额差值实测扣费 */
+  billingCheck: (model: string, region?: 'cn' | 'intl') =>
+    client.get<WorkBuddyBillingCheck>(
+      `/workbuddy/billing-check?model=${encodeURIComponent(model)}${region ? `&region=${region}` : ''}`,
+      { timeout: 120000 },
+    ),
   importClient: (region: 'cn' | 'intl') =>
     client.post<{ ok: boolean; account?: WorkBuddyAccount; error?: string; path?: string }>(
       '/workbuddy/import-client',
       { region },
     ),
+  /** OAuth 浏览器登录：生成授权链接 → 轮询直到浏览器完成登录 */
+  loginUrl: (region: 'cn' | 'intl') =>
+    client.post<WorkBuddyLoginStart>('/workbuddy/login/url', { region }),
+  loginPoll: (region: 'cn' | 'intl', state: string) =>
+    client.post<WorkBuddyLoginPoll>('/workbuddy/login/poll', { region, state }),
   importToken: (payload: {
     region: 'cn' | 'intl'
     accessToken: string

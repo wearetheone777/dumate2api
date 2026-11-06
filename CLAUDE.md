@@ -36,7 +36,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `qianfan/qwen3.5-35b-a3b` | **千帆原生透传**（`src/qianfan-raw.js`）：与搭子共用网页凭证与额度，但走 `/gateway/v2/chat/completions`。**只有这个端点支持 `response_format`（JSON mode）**；模型名必须是千帆原生名，应用别名（glm-5 等）在这里会 401 |
 | 未知前缀（如 `qwn/pro`） | **400 报错，不静默回落** |
 
-**通道 id 的单一来源是 `src/channels.js`**（`dumate` / `qwenwork` / `traework` / `qoder`）。
+**通道 id 的单一来源是 `src/channels.js`**（`dumate` / `qwenwork` / `traework` / `qoder` / `workbuddy`）。
 `keys.js`（网关鉴权）、`admin/routes/keys.js`（校验）、`usage.js` / `reqlogs.js`
 （筛选参数）四处都 require 同一份——加一条通道只改这一个文件。
 
@@ -393,7 +393,11 @@ verify-qoder-channel.js（档位归一化 9 项）、verify-qoder-throttle.js（
 send() 下发 deadline）；`DUMATE_QODER_QUEUE_POLL=0` 整体关闭（回到纯快速轮询）；
 `DUMATE_QODER_QUEUE_POLL_INTERVAL_MS` 仅供测试注入短间隔。等待期间流式客户端靠
 `: ping` 保活帧保持连接（与上一节的保活帧天然配合——ping 跑在 provider.send
-未返回的整个期间，覆盖排队等待）。
+未返回的整个期间，覆盖排队等待）。**2026-11-06 补：OpenAI 直通分支的头发出
+前完全静默**（`!translated && !headersSent` 挡住一切写入）——ACP 首帧 14~35s、
+qoder 大上下文 30~70s，静默窗口内保活等于没做。已改为 send 起跑 5s
+（`DUMATE_PING_QUIET_MS`）仍无首帧就先发头放开 ping：5s 足够快速错误以 4xx
+返回，之后失败走流内错误帧；真机 ACP 流式 10.9s 出 2 条 ping（改前 0 条）。
 
 离线验证：verify-qoder-throttle.js **第 5 节**（信封放行重发 + request_set_id 字节级
 判等、早停、端点不可用退盲等、静默形态立即查状态重发；剧本用**信封在流里 / 掐断
@@ -521,17 +525,29 @@ glm-5.2 ratio≈0.96（Δ1.79 / 2393 tokens，正常）；**DeepSeek-V4-Flash �
 不能用来反推单模型倍率——只有探针的前后快照是单请求的干净测量。）离线验证：
 `node --test test/unit/trae-billing.test.js`（11 项）。
 
-**TRAE 逐轮账单端点存在，但 `llm_utils_chat` 给不出入参 id（2026-10-31 实测定案）**。
-`POST /api/v1/commercial/get_session_usage` body `{session_id: <turn id>}` 确实存在
-（Trae2api-cn 的结论来自 **Remote** 链路，事件里带 `reply_to_message_id`）。
-我们这条链路的 `metadata` 只有 `session_id` 与 `prompt_completion_id`，**后者恒为
-0**，`token_usage.name` 为空——没有任何可当 turn id 的值。拿 `session_id` 去查，
-返回的是全零骨架（`amount_float=0`、`usage_group_details=[]`），等 8 秒仍然为 0。
-所以实现只保留、不启用：`billing.fetchSessionUsage` + `parseSessionUsage`
-（认实测字段 `amount_float`，全零骨架返回 `null` 而非 0）、`chat.turnIdOf`
-（**不拿 session_id 兜底**，避免每轮多打一次上游却永远拿不到数）。
-`billing-check` 在拿到 turn id 时自动切精确口径（`source: session_usage`），
-否则维持 consumed 差值。**接入 Remote 链路（P2）后自动生效，不需要再改这里。**
+**TRAE 逐轮账单：三条链路全部可查（2026-11-06 解决，推翻 10-31 定案）。**
+`POST /api/v1/commercial/get_session_usage` body `{session_id: <turn id>}` 按**请求体里
+主动写的 session_id** 记账——10-31 定案「`llm_utils_chat` 给不出入参 id」的根因是当时
+查的是**流 metadata 里上游自分配的 id**（那个不进账单键，所以全零骨架）；正确做法是
+`buildBody` 主动写 `session_id`（ObjectId 形状，`chat.oidSessionId()`）。三条链路实测：
+
+- **utils_chat**（solo_work_lite / persona 统一）：`meta.sessionId` 查回真实 credits
+  （实测 0.07，input/output 与流内 usage 精确一致）；修复轮复用同一 body → 同一
+  账单键（同一次 send 的重试序列合并计费，如实记录）。
+- **Remote**（remote.js）：账单键是创建会话返回的 `message_id`（实测 0.13）。
+- **SOLO raw**（solo.js）：`conversation_id`/`session_id` 同样按请求体记账（实测 0.13）。
+
+逐轮精确积分管线（`credits.capture` 的 `turnId` 入参）：落行带 `turn_id` → 异步查
+账单（3 次 1.5s/3s 退避，`DUMATE_TRAEWORK_SESSION_BILLING=0` 关）→ 追加
+`session_usage` 补充行（含 `cache_read/cache_write/input_tokens/output_tokens`——
+**SSE 的缓存 0 不能证明未命中**，真机实测 SSE 两轮全 0、账单 `cache_read_token=25344`）。
+`computeCosts` 合并：精确值覆盖差值、补充行不进 rows、并发标注只豁免精确行自己。
+`attachCosts`/`creditRecords` 带 `source`（`session_usage`/`consumed_delta`）。
+`billing-check` 探针的 turn id 优先级：`chat.turnIdOf`（流内 reply_to_message_id/
+user_message_id）→ `meta.sessionId` 兜底（10-31「不拿 session_id 兜底」的旧口径只
+适用于上游自分配 id，主动写的账单键正是要兜的）。副产品：账号**首条请求**（无差值
+参照点）现在也有成本了。离线验证：`node --test test/unit/trae-billing-usage.test.js`
+（20 项：精确覆盖差值、并发豁免边界、null 忽略、attachCosts 口径、parseBillCache）。
 
 **额度包要按官方收银台口径过滤，签到两份额度不能相加（2026-10-31）**。
 `parsePacks` 剔除 `product_type=3`（促销）/ `is_hide` / `status=3` 三类包——
@@ -587,8 +603,13 @@ aggregate 出口同修（chat.aggregate 的 usage 在返回前归一）。
 buildBody 的 modelConfig/model_config 两处 `is_reasoning` 硬编码 false——曾想
 按 Qoder P1 的思路做成档位开关，对照实测（qwen/pro 同一水壶谜题 × 2+2）：
 false 组 reasoning 2788/16336，true 组 **1482/1**（方向相反、噪声级）——上游
-忽略该字段或它不是推理开关语义。与搭子「调参数无效」、TRAE「档位字段被忽略」
-同款结论：**四条通道里只有 Qoder 的思考档位真实可控**。
+忽略该字段或它不是推理开关语义。与搭子「调参数无效」同款结论。
+**2026-11-06 修订「只有 Qoder 档位可控」的旧口径**：TRAE 的 **Remote/manual 与
+SOLO raw 链路的思考档位也可控**（`custom_model.reasoning_effort`，原生
+light/high/extra_high，Trae2api-cn 实测 + 我们的协议实现对齐）——旧的「TRAE
+档位字段被忽略」是在 utils_chat 链路上实测的，不是链路无关的结论。可控 = Qoder
+（parameters.reasoning_effort）+ TRAE remote/solo（custom_model.reasoning_effort，
+仅 manual 策略；utils_chat 仍不可控）。
 
 **`cosy.encode` 是同步的，它一慢就「假死」整个网关（2026-10-03 修，性能级）。**
 自定义 base64 编码在 `runOnce` 里**直接同步调用**，所以它的耗时会**阻塞事件循环**：
@@ -659,6 +680,17 @@ inspector，再用 WebSocket 连 `:9229` 发 `Debugger.pause` 抓调用栈。
 与版本漂移（`COSY_VERSION` 我们写 1.1.52，客户端 worker runtime 已是 1.1.71，
 且官方请求带 `X-QwenWork-Version` / `-Release-Version` / `-Build` / `-Platform` /
 `-Arch` / `-Channel` / `-App-Mode` 一整套身份头）。
+
+**ACP 链路的计费实证（2026-11-05，第六批）**：ACP 会话**真实扣费**且**全落
+monthly 池**（daily/longterm 零动），结算 <1.5s。同 prompt 四轮实测
+0.1919 / 0.2294 / 0.075 / 0.1376 credits——**方差 3 倍**：ACP 按会话内实际
+推理轮数扣费，单次探针读不准，判读必须多跑几轮。ACP 帧不带 token 计量
+（40 帧真机样本 0 处计量字段），三池差值法是唯一计量途径。计费自检探针
+因此多了一条 ACP 活路：`?model=qwen-acp/auto` 走 `acp.send`——**必须不传
+onChunk**（「onChunk 存在 = 流式」分叉，传函数返回 `{streamed:true}` 拿不到
+usage），tokens 如实全 0、billed 恒 null。这条路线的价值：chat 桥被账号级
+模型权限拦住时（403 `Model is not available for this user`，账号 3 现状，
+网关侧无解）ACP 仍可用——同一 accessToken 两条链路可以一封一通。
 
 **版本漂移已于 2026-10-31 同日对齐**（真机 1.1.71 + 新头正常出流）：
 `COSY_VERSION=1.1.71`、`IDE_VERSION=1.4.0`、`RELEASE_VERSION=1.4.0-26102705`
@@ -781,10 +813,12 @@ CustomModel 声明决定」自洽。想提升推理深度只能靠提示词。**
 （同账号池、同 Cloud-IDE-JWT 凭证、同后端网关），只换对话身份
 `function=personal_assistant`（TRAE 宝）。四条实测定案：
 
-1. **免费豁免绑定在 function 上**（对照实验，同一账号同一请求）：
-   `personal_assistant` 消耗 0 credits、`solo_agent_lite` 0.05。OAuth 自取
-   账号同样享受（快照前后 consumed 不变）。活动期后豁免是否延续未知，
-   `traework-credits.jsonl` 照记，豁免消失会自动体现在 credits 里。
+1. **~~免费豁免~~已失效（2026-11-04 复核实测）**：11-03 的对照实验里
+   `personal_assistant` 消耗 0 credits、`solo_agent_lite` 0.05；**11-04 大输出
+   决定性测量：traebao 1022 输出 tokens 扣 0.17（每千 token ≈0.157，与 solo
+   同量级）——豁免已结束**（小请求 Δ 0/0.01 交替是被两位小数量化淹没的噪声，
+   判豁免必须用大输出）。`traework-credits.jsonl` 照记；界面「（免费）」文案
+   已撤（测试台模型名、模型页标签）。traebao 仍可用，只是正常计费。
 2. **明文链路，不碰 agent/v3 加密**。TRAE 客户端对 agent/v3 的
    create_agent_task 等走 aha 桥接 AES-GCM 加密（请求密文、响应明文 SSE），
    但 `llm_utils_chat` 明文即可——body 必带 `app_id`（UUID）与
@@ -889,12 +923,25 @@ keys.js 的 region 绑定自 2026-11-01 就位，本次补齐的是「国际账�
    session not found"/12153 → session_dead；**11140 → restricted（账号级风控，
    换号有意义）**——send() 内做受限换号循环（区内轮完一圈），403 明确报错。
    **码值匹配带负向数字断言**（`"code":11140(?!\d)`）——裸 includes 会误吃 111400。
-4. **登录流程后置**（用户要求）：账号来源是「导入官方客户端认证文件」
-   （`workbuddy-desktop[-ai].info`，实测本机在 CodeBuddyExtension 的 auth 目录，
+4. **账号来源**：**浏览器 OAuth 设备授权登录（2026-11-04 接入，推荐）**——
+   `POST {chatBase}/v2/plugin/auth/state?platform=CLI` → `{state, authUrl}` →
+   浏览器登录 → `GET /v2/plugin/auth/token?state=`（等待中的业务码 **11217**）→
+   `accessToken/refreshToken/expiresAt|expiresIn/domain` → `GET /v2/plugin/login/account`
+   取 uid/nickname（失败回落 JWT `sub`）。**浏览器只是授权面，token 由上游按
+   platform=CLI 签发**——不是抓网页 cookie；多账号 = 每个账号各走一遍（换账号或
+   无痕窗口）。协议由 `linguo2625469/workbuddy2api-panel`（Go `cmd/login/main.go`）
+   与 `ardeyouxipianyi/workbuddy2api-hub`（Python `wb_accounts.py`
+   start_login/poll_login）两个实现交叉验证；state 端点本机实测 200。
+   实现 `src/workbuddy/login.js` + 管理端 `POST /workbuddy/login/{url,poll}` +
+   账号页「浏览器登录」按钮（2 秒轮询、10 分钟窗口）。
+   替代来源保持不变：**导入官方客户端认证文件**（`workbuddy-desktop[-ai].info`，
    结构 `{account, auth:{accessToken, refreshToken, expiresAt, domain}}`，
-   `POST /workbuddy/import-client {region}`）或「手动粘贴 token」
-   （`/workbuddy/import-token`）。区域红线：凭据 domain 必须与目标区域一致，
-   不符拒绝导入。**刷新单飞 + 到期续期**照 TRAE 同构。
+   `POST /workbuddy/import-client {region}`；注意新版国内客户端对 token/nickname
+   做了 at-rest 加密，明文导入可能拿不到 token——hub 有 desktop_decrypt_tokens
+   实现，我们未接）或**手动粘贴 token**（`/workbuddy/import-token`）。区域红线：
+   凭据域必须与目标区域一致，不符拒绝导入。**刷新单飞 + 到期续期**照 TRAE 同构；
+   刷新头按区域区分（2026-11-04 对齐 hub）：国内 `X-Auth-Refresh-Source: workbuddy`，
+   国际 `plugin`，另带 `X-User-Id`/`X-Domain`/`X-CodeBuddy-Request`/`Accept-Language`。
 5. **签到仅国内版**（`/v2/billing/meter/checkin-activity-status` 回退
    `checkin-status`、领取 `daily-checkin`；幂等，"已签到"按成功）；国际版
    明确报「该版本暂不支持自动签到」（`unsupported`，界面显示「不支持」不是错误）。
@@ -907,6 +954,65 @@ keys.js 的 region 绑定自 2026-11-01 就位，本次补齐的是「国际账�
    国内客户端登录态 9/18 已死（12153 refresh invalid），待用户重登客户端再导入。
    离线验证 `node --test test/verify-workbuddy.js`（9 项：规范化/会话注入/
    缓存键/三头红线/分类含 11140 负向断言/区域表/倍率解析白名单）。
+7. **「播报即收尾」修复 + 计费自检（2026-11-04）**：`runConversation` 接入共享修复
+   （带工具的请求才启用；流式正文过 `createChunkGate`、非流式聚合后判定；
+   `DUMATE_WORKBUDDY_REPAIR_RETRY` / `_HOLD_CAP`）。**顺带修掉流式结束帧的既有
+   bug**——原来发 `data: [DONE]\n\n`，经 server.js 会再补一次前缀变成
+   `data: data: [DONE]`（标准哨兵匹配不上），改为与千问/Qoder 一致的裸 `[DONE]`
+   由桥统一包装。计费自检 `GET /api/admin/workbuddy/billing-check?model=`：
+   套餐**剩余额**前后差值（**消耗 = 前 − 后**——与 TRAE 的 consumed 递增口径
+   相反，照抄会把消耗全算成负数，2026-11-04 单测当场抓到）；国际版没有 credits
+   接口，如实 `unsupported`。纯函数在 `workbuddy/billing.js`，模型页有「计费自检」
+   按钮（挑最低倍率的付费模型，免费档不做除法）。离线验证：
+   `node test/verify-workbuddy-repair.js`（39 项）+ `test/unit/workbuddy-billing.test.js`
+   （7 项）。
+8. **浏览器 OAuth 登录（2026-11-04，多账号的正路）**：`src/workbuddy/login.js`
+   实现设备授权登录（协议细节见上文第 4 条），管理端
+   `POST /workbuddy/login/{url,poll}`，账号页「浏览器登录」按钮（2 秒轮询、
+   10 分钟窗口）。落盘 `source='oauth'`；uid 取 `login/account`（失败回落 JWT
+   `sub`）；`expiresAt` 认毫秒/秒/`expiresIn`/JWT `exp` 四种口径；区域红线按
+   hub 的域名标记（cn: `copilot.tencent.com` / `codebuddy.cn` / `workbuddy.cn`；
+   intl: `workbuddy.ai` / `codebuddy.ai`）。**这解决了「官方客户端同一时刻只有
+   一份登录态、没法多账号」的问题**——浏览器授权天然可重复，每个账号各走一遍
+   即可（换账号或无痕窗口）。离线验证：`test/unit/workbuddy-login.test.js`
+   （8 项：信封解析/pending=11217/到期归一/区域红线/JWT 回落/端到端入池）。
+   至此国内账号不再依赖 9/18 已死的客户端登录态。**真机（2026-11-04）**：
+   浏览器 OAuth 登录成功入池（`source=oauth`），`glm-5.3` 对话 →「收到」1.9s。
+   两条实测顺带定案：① **usage 缓存字段无需归一**——同一长 prompt 二次请求
+   `prompt_cache_hit_tokens=1024` 与标准位 `cached_tokens=1024` 同步填充，
+   上游本来就是标准 OpenAI 形状（此前按 DeepSeek 风格推断是错的，未改代码）；
+   ② `usage.credit` 在付费档短请求下仍为 0，**不能当单请求扣费**——计费自检
+   维持「套餐剩余额前后差值」口径。**计费自检的真机口径补充（同日 UI 实测）**：
+   套餐剩余额是**整数积分**（真机 80 个裂变包、remain 全整数），单请求 Δ 最小
+   只到 1——倍率测量的分辨率 = 1 ÷ (tokens/1000)，1012 tokens 时 ±0.988，
+   比标称 0.08 粗一个数量级，此时 ratio 是量化伪影（首次探针 Δ=1 更可能是
+   早先对话的结算延迟串入）。`/billing-check` 响应带 `resolution` 字段、界面显示；
+   分辨率 > 标称一半时 warning 明确写「比值不可判读」；`?count=2000`（约 10k
+   tokens）可做大样本复测。**计费自检 UI 与整条链路已用 bsk 驱动 Edge 真机走通**：
+   OAuth 登录 → 仪表盘账号在线 → 模型页 15 个模型 → 计费自检按钮 → 账号页
+   「浏览器登录/导入账号」；网关侧 OpenAI 流式/非流式与 Anthropic 流式/非流式
+   均 200，`[DONE]` 正常。
+9. **FEFO + 保活 + 图像 + 精确余额（2026-11-04 第三批，全部真机验证）**：
+   - **图像输入**：`glm-5.3` / `deepseek-v4.1-flash` 发 64×64 红色 PNG data URI
+     都答「红色」——透传天然支持，无需 assertImageSupport（P1-5 关闭）。
+   - **fetchCredits 升级**：解析 `CycleEndTime`（**北京时间字符串**，
+     `parseBeijingTime` 的结果与 `DeductionEndTime` 毫秒值逐位对照过）与
+     `CycleCapacityRemainPrecise`（**精确余额**，整数 remain 是它的 floor——
+     真机 "8.8" vs 8）。返回值新增 `totalPrecise` / `preciseDecimals` /
+     `packages[].expireAt`。字段缺失不是 0（`num(undefined)=0` 会污染合计，
+     单测当场抓到；局部 `num` 是按键取值、别拿它做按值转换，同款坑踩两次）。
+   - **FEFO 接入**：`expiring.js` 加 workbuddy 窗口 7 天；`/credits` 按**全量
+     账号**写快照（区域视图只过滤展示，traework 同口径）；`index.js` 的
+     `fefoUidSet` → `pickCandidate({expiring})`。真机：账号 1 有今天 09:00
+     到期的包，快照 `accounts:{"1":…}`、`fefoUidSet=['workbuddy:1']`。
+   - **keepalive 加 workbuddy adapter**（refresh/balance/checkin）：国内号每日
+     低峰自动续期+签到+余额快照；国际版 checkin 如实 unsupported，不假装成功。
+   - **重要口径：国内 CLI 对话当前不实时扣套餐**——连打多次请求
+     `totalPrecise` 纹丝不动（11288.98），与 `usage.credit=0` 一致（公测/
+     活动口径）。计费探针 `delta=null` 是**真实测量结果**，警告已写实
+     （「不实时扣套餐…非故障」）；FEFO 的临期优先仍然有意义（包会到期作废）。
+   - 离线：`workbuddy-billing` 13 项（真机夹具）、`expiring-fefo` workbuddy
+     窗口、`verify-expiring-fefo.js` workbuddy 段（8 项全绿）。
 
 **全页面的国内/国际区分（2026-11-03 同日，bsk 逐页真机验证过）**。用户
 要求「每个页面都区分」，落地清单：
@@ -976,6 +1082,50 @@ utils_chat（工具矩阵与 manual 策略未实现，边界刻意收窄）。�
 `parseSessionUsage` 由此激活，计费自检自动切精确口径。实现见
 `src/traework/remote.js`，单测 `test/unit/trae-remote.test.js`。
 
+**TRAE 融合批次（2026-11-06，GitHub 检索 Trae2api-cn/trae2api-hub 后逐项落地，六件）。**
+
+1. **思考档位可控（remote/manual）**：`reasoning_effort`（全入口写法归一）→
+   `custom_model.reasoning_effort`，原生三档 `light/high/extra_high`。钳制是
+   **向下**的（不高于请求档的最高支持档）；descriptor 必须 `support_thinking===true`
+   且给 `options`——51 个模型里 31 个 `support_thinking:false`，唯一支持的
+   minimax-m3.1-flash 在 remote 上游 4001（**等上游放开自动生效**）。字段按模型
+   对象已有键二选一（`reasoning_effort_level` 优先），不支持时删残留字段防降档。
+   仅 manual 策略（REMOTE=2）；auto 档无 custom_model 槽不下发。观测走
+   `logRemoteEffort`（生效/未生效都打一行——档位静默丢失用户无感）。
+2. **1M Max 模式**：`payload.trae_max_mode` 或 `DUMATE_TRAEWORK_REMOTE_MAX_MODE=1`
+   （+ `_MAX_MODELS` 白名单）→ `model_selection_strategy:"max"` + descriptor 显式
+   上限（`max_mode===true` + ≥1M + prompt_max_tokens/max_tokens>0 三项齐备，缺一
+   不启用——**不合成 1M 参数**）；会话键加 max 变体。当前上游 0/51 模型声明
+   `max_mode`，协议就绪等放开。
+3. **remote 缓存透传**：`cache_read_input_tokens` → OpenAI 标准位
+   `prompt_tokens_details.cached_tokens`（utils_chat 同口径），写缓存平铺保留。
+   **SSE 的缓存 0 不能证明未命中**（实测两轮全 0、账单 25344）——账本层以
+   `get_session_usage` 的 `extra_info` 为权威（`credits.parseBillCache`）。
+4. **事件名驼峰归一**：上游事件名有驼峰形态（`tokenUsage`/`responseDone`/
+   `streamDone`），只做小写会漏进 message 分支——`normEventName` 驼峰→蛇形 +
+   别名表。
+5. **`isAuto` 修复**：`send` 的 remote 分流看 `payload.model`（未剥前缀），模块
+   直调 `traework/auto` 时静默退回 utils_chat——改为按剥前缀后的原始意图判定。
+6. **4028 端点信号**：errtext 翻译「该模型在此链路不可用，改走其他链路」——
+   Trae2api-cn 实测部分模型（deepseek-v4-pro）在 Remote/raw 上固定 4028/502，
+   换账号/重试无效。
+
+**TRAE SOLO/IDE raw 链路已通（2026-11-06，#12 第一版，`DUMATE_TRAEWORK_SOLO=1` 默认关）。**
+`/api/ide/v2/llm_raw_chat`（v2→v1→api5-normal 候选链），帧形状与 utils_chat
+**完全同族**（metadata/timing_cost/output/token_usage/done）——chat.js 的
+readStream/aggregate/gate **零改动复用**。三个硬门槛（三轮真机探测的教训）：
+① `model_name` 必须用 `model_detail_list` 的 `__dev` 全名（剥后缀/族名都 4001）；
+② `encrypted_model_params`（上游下发的现成加密信封）**字符串原样**，解析成对象
+被 400 拒；③ **版本身份必须与 JWT 一致**——`X-Ide-Version` 用我们自己的
+`0.1.43`+动态版本码，Trae2api-cn 的 3.4.4 是它的凭证身份，套到我们的
+TraeWork JWT 上判 1001。**纯国内链路**（国际 JWT 恒 1001）：solo 启用时池层
+强制国内选号（不能选号后静默回落 utils_chat——那样 solo 对两区模型永不生效）。
+账单键 `conversation_id`/`session_id` 与 utils_chat 同机制（`get_session_usage`
+实测 0.13）。raw v2 协议上有原生 tools 槽（`parameters` 保持对象、assistant 历史
+用 `function_call` 包装），但带 tools 实测 400——形状证据不足不预编，带工具仍走
+utils_chat。实现 `src/traework/solo.js`，单测 `test/unit/trae-solo.test.js`（7 项）。
+链路优先级：REMOTE=2 manual > solo（纯文本）> utils_chat（互斥不叠加）。
+
 **TRAE（llm_utils_chat）的错误形态实测（2026-10-30）——错误码分类按实测过的做，别照抄 raw 链路的码表。**
 trae2api-hub 的码表（1001/4001/4015/4019/4023/3003）是 agent/v3 业务码体系，但
 **我们链路上实测只出现两种形态**：
@@ -1041,16 +1191,20 @@ DeepSeek 系模型偶尔把工具调用以**文本标记**写进正文（`<dsml:
 踩过的坑：`exec` 循环的正则**必须带 `g` 标志**（无 `g` 的 exec 永远返回第一个
 匹配，while 循环死循环挂死进程——单测超时就是这么暴露的）。
 
-**DSML fail-closed 三分判据（2026-10-31，hub#120 推广到三通道，解析器收敛到
-`src/repair.js`）**。Qoder/千问同跑 DeepSeek 系，一样会犯——只救「正文还在缓冲
+**DSML fail-closed 三分判据（2026-10-31，hub#120 推广到三条 COSY 系通道，解析器
+收敛到 `src/repair.js`；2026-11-04 WorkBuddy 的门也接同一兜底）**。Qoder/千问同跑
+DeepSeek 系，一样会犯——只救「正文还在缓冲
 （未转直发）」的场景。分类器 `repair.classifyDsml(text)`：
 `recovered`（完整 calls 块还原成 tool_calls + 干净正文，finish 的 stop 纠正）、
 `empty`（标签闭合但没有 invoke 的空壳——剥离标记 + WARN，**不剥离会被
 「播报即收尾」的判据反复捞出形成无限重试**）、`leak`（calls/invoke/parameter
 开了没收——**报错 fail-closed**，把半截协议喂给客户端比明确失败更糟）。
 代码围栏内的 DSML 是模型在讨论格式，不碰（`stripFences` 先判）。TRAE 门
-（createTextGate）与千问/Qoder 共享门（createChunkGate，finish 阶段兜底，
-需传 `{model, channel}`）同一语义；非流式在各自 aggregate 出口接。traework
+（createTextGate）与千问/Qoder/WorkBuddy 共享门（createChunkGate，finish 阶段兜底，
+需传 `{model, channel}`）同一语义；**非流式在各自 aggregate 出口接
+`repair.aggregateDsmlFallback`（2026-11-04 收敛成共享助手：qoder 内联收编、
+qwenwork 补齐当年漏掉的非流式出口、workbuddy 新接；recovered 时调用方把
+finish 的 stop 纠正成 tool_calls）**。traework
 流式的 leak 抛错已标 `e.sent=true`（reasoning 早已直发，不标会让上层换号
 重试导致客户端看到两段内容）。离线验证：`node --test
 test/unit/dsml-failclosed.test.js`（11 项）。
@@ -1080,10 +1234,12 @@ traework2api-panel）**：Free 号打订阅模型上游回 403/业务码 1005—
 `upstream-errors.classify` 里、5xx 分支之前（1005 > 500 会被 breaker 误吃）；
 真机暂无订阅模型可打，分类为对齐实现、待首个真实样本校准。
 
-**「播报即收尾」现在是三通道共用一条修法（2026-10-30，收敛到 `src/repair.js`）**。
-TRAE 2026-10-05 的实测结论（见下一条）推广到千问与 Qoder：两家同样会「只播报进度
-不调工具就收尾」，同一份判定与缓冲门在三条直连通道上语义一致，只差上游帧形状
-（TRAE 是 `event:output`，两条 COSY 通道是标准 OpenAI chunk）。
+**「播报即收尾」现在是四通道共用一条修法（2026-10-30 收敛到 `src/repair.js`，
+2026-11-04 WorkBuddy 接入）**。
+TRAE 2026-10-05 的实测结论（见下一条）推广到千问、Qoder 与 WorkBuddy：同样会「只播报
+进度不调工具就收尾」，同一份判定与缓冲门在四条直连通道上语义一致，只差上游帧形状
+（TRAE 是 `event:output`，千问/Qoder/WorkBuddy 是标准 OpenAI chunk——WorkBuddy 的上游
+本身就是标准 OpenAI SSE，直接复用 `createChunkGate`，连解析层都不用改）。
 
 - **判定**（`looksUnfinished`）：`无工具调用 + 正文 < HOLD_CAP + 命中「下一步/next step」`
   （空正文也算）。**不要放宽成「只要没有工具调用就重试」**——真·收尾也会被逼着
@@ -1105,13 +1261,14 @@ TRAE 2026-10-05 的实测结论（见下一条）推广到千问与 Qoder：两�
   与额度错误帧**留在 `sawUp=false`**，否则排队等待轮的 `!sawUp` 守卫直接失效
   （这是收敛时踩到的真 bug：`sawUp` 一度写在错误判定之前）。
 
-配置按通道独立：`DUMATE_TRAEWORK_*` / `DUMATE_QWENWORK_*` / `DUMATE_QODER_*` 的
-`HOLD_CAP` 与 `REPAIR_RETRY`（见环境变量表）。离线验证：`node --test
-test/unit/repair-gate.test.js`（共享模块 11 项）+ `node test/verify-qwen-repair.js`
-（36 项）+ `node test/verify-qoder-repair.js`（36 项）+ 原有的
-`node test/verify-traework-repair.js`（38 项）。三者都打桩 `chat.postStream` /
-`chat.post`，不需要账号与网络；**池状态必须隔离**（脚本自带 `DUMATE_POOL_STATE`
-临时文件，且失败用例之间要 `pool.revive()`——402/500 会让账号进冷却）。
+配置按通道独立：`DUMATE_TRAEWORK_*` / `DUMATE_QWENWORK_*` / `DUMATE_QODER_*` /
+`DUMATE_WORKBUDDY_*` 的 `HOLD_CAP` 与 `REPAIR_RETRY`（见环境变量表）。离线验证：
+`node --test test/unit/repair-gate.test.js`（共享模块 11 项）+
+`node test/verify-qwen-repair.js`（36 项）+ `node test/verify-qoder-repair.js`
+（36 项）+ `node test/verify-traework-repair.js`（38 项）+
+`node test/verify-workbuddy-repair.js`（39 项，2026-11-04）。五者都打桩
+`chat.postStream` / `chat.post`，不需要账号与网络；**池状态必须隔离**（脚本自带
+`DUMATE_POOL_STATE` 临时文件，且失败用例之间要 `pool.revive()`——402/500 会让账号进冷却）。
 
 **真机首批结果（2026-10-30）**：
 - **Qoder（qfmodel）**：正常请求经门后行为不变（3.2s / 39 帧 / 正文完整 / `finish=stop`）；
@@ -1496,10 +1653,11 @@ DUMATE2API_PORT=9082 node src/server.js
 以及 `node --test test/unit/trae-billing.test.js`（计费自检的纯函数：期望倍率选择、
 实测倍率换算、消耗增量归属）。
 
-**「播报即收尾」的三通道验证**（都离线、都打桩 `chat.postStream`/`chat.post`）：
+**「播报即收尾」的四通道验证**（都离线、都打桩 `chat.postStream`/`chat.post`）：
 `node --test test/unit/repair-gate.test.js`（共享模块：判据、配置、追加修复指令、
 标准 OpenAI chunk 缓冲门 11 项）、`node test/verify-qwen-repair.js`（36 项）、
-`node test/verify-qoder-repair.js`（36 项）。三者都自带 `DUMATE_POOL_STATE` 临时文件，
+`node test/verify-qoder-repair.js`（36 项）、`node test/verify-workbuddy-repair.js`
+（39 项，2026-11-04）。四者都自带 `DUMATE_POOL_STATE` 临时文件，
 但**用例之间仍要 `pool.revive()`**——驱动 402/500 的用例会把账号打进冷却，
 后面的用例会先撞「没有可用账号」而测不到目标路径。
 
@@ -1929,6 +2087,11 @@ per-key 限流（低价值场景）。
 | `DUMATE_TRAEWORK_HOLD_CAP` | `600` | 正文缓冲门的阈值（字符）。超过就转直发，避免长回答被扣住等判定 |
 | `DUMATE_QWENWORK_REPAIR_RETRY` / `DUMATE_QODER_REPAIR_RETRY` | `1` | 同上，千问与 Qoder 各一套（`src/repair.js` 的 `envCaps`）。互不影响 |
 | `DUMATE_QWENWORK_HOLD_CAP` / `DUMATE_QODER_HOLD_CAP` | `600` | 同上，千问与 Qoder 各一套 |
+| `DUMATE_WORKBUDDY_REPAIR_RETRY` / `_HOLD_CAP` | `1` / `600` | 同上，WorkBuddy 一套（2026-11-04 接入共享修复） |
+| `DUMATE_WORKBUDDY_MIN_MAX_TOKENS` | `16384` | WorkBuddy 输出预算下限（`budget.js` 的 `WB_FLOOR`，reasoning 与正文抢预算） |
+| `DUMATE_WORKBUDDY_MODELS_CACHE_MS` | `600000` | WorkBuddy 模型表缓存时长（10 分钟，按区域分缓存） |
+| `DUMATE_WORKBUDDY_APP_VERSION` | 未设（按区域兜底 5.5.6 / 5.5.2） | 覆盖客户端版本号（进 `X-IDE-Version` 与 chat UA） |
+| `DUMATE_WORKBUDDY_CLI_UA` | `CLI/2.63.2 CodeBuddy/2.63.2` | 模型目录/刷新请求的 UA（上游按它识别 CLI 客户端形态） |
 | `DUMATE_QODER_FIRST_BYTE_MS` | `60000` | Qoder 上游**首字节**超时（ms），挡「连响应头都不给」的挂起。`0` 关闭 |
 | `DUMATE_QODER_CONTENT_MS` | `90000` | Qoder 上游**无内容**超时（ms）：排队时上游先回一个空 ack 帧再沉默，首字节计时器会被它清掉，只有这个计时器兜底。只在**还没转发过真实内容**时计时，有内容即撤销。**90s 的依据是成功请求首字实测 > 6s 占 14.4%、> 30s 占 7.6%、max 63.9s**——旧的 12s/6s 会把大上下文 prefill 当成排队误杀（详见上文）。真排队由 10605 信封在 200~680ms 内识别，不走这个计时器。`0` 关闭 |
 | `DUMATE_QODER_QUEUE_PATIENCE_MS` | `6000` | 排队重试的**总预算**（ms）。实测推翻了「按上游时长耐心等」的旧结论：排队是请求级随机，等 30 秒也不保证放行，所以改为快速轮询几轮（信封本身 150~1000ms 就到）仍失败就如实回 429。`0` = 拿到限流立刻回 429 |
@@ -1941,7 +2104,7 @@ per-key 限流（低价值场景）。
 | `DUMATE_QODER_OS_HEADERS` | 未设（发送） | 设 `0` 关闭 `cosy-machineos` / `cosy-machinehostname` 两个身份头（见上文 2026-10-30 段） |
 | `DUMATE_QODER_INTL_GATEWAY` | 未设（候选链） | 钉死国际版推理主机（替代 api3→api2→api1 候选链）。上游服务端「选举」导流端点时用它 |
 | `DUMATE_QODER_FEFO_DAYS` | `3` | FEFO 选号的临期窗口（天）：账号有 N 天内到期的积分批次时优先接流量。`0` 关闭 |
-| `DUMATE_DUMATE_FEFO_DAYS` / `DUMATE_TRAEWORK_FEFO_DAYS` / `DUMATE_QWENWORK_FEFO_DAYS` | `30` / `7` / `30` | 另外三条通道的 FEFO 窗口（天），`0` 关闭。数据源是管理端刷新的临期快照 `data/expiring-snapshot.json`（`DUMATE_EXPIRING_SNAPSHOT_TTL_MS` 默认 6 小时陈旧退回普通轮询；`DUMATE_EXPIRING_SNAPSHOT_FILE` 改路径，测试用） |
+| `DUMATE_DUMATE_FEFO_DAYS` / `DUMATE_TRAEWORK_FEFO_DAYS` / `DUMATE_QWENWORK_FEFO_DAYS` / `DUMATE_WORKBUDDY_FEFO_DAYS` | `30` / `7` / `30` / `7` | 各通道的 FEFO 窗口（天），`0` 关闭。数据源是管理端刷新的临期快照 `data/expiring-snapshot.json`（`DUMATE_EXPIRING_SNAPSHOT_TTL_MS` 默认 6 小时陈旧退回普通轮询；`DUMATE_EXPIRING_SNAPSHOT_FILE` 改路径，测试用） |
 | `DUMATE_QODER_QUEUE_POLL` | 未设（开启） | 设 `0` 关闭官方排队轮询协议（信封型限流按 `retryAfterSeconds` 睡眠后重发 + queue/status 放行信号），回到纯快速轮询（429 交还客户端） |
 | `DUMATE_QODER_QUEUE_POLL_BUDGET_MS` | `60000` | 排队等待的**整次请求**预算（ms，所有账号共享）。耗尽后 throttle 错误按旧路交回（429） |
 | `DUMATE_QODER_QUEUE_POLL_INTERVAL_MS` | 按 `retryAfterSeconds`（夹 [5s, 20s]） | 每轮排队等待的睡眠时长。仅供测试注入短间隔，生产别调小——上游明说的等待要尊重 |
@@ -1959,6 +2122,10 @@ per-key 限流（低价值场景）。
 | `DUMATE_TOOL_OUTPUT_CAP` | 未设（关闭） | 历史 role:'tool' 输出超过此字符数截断并标注原始长度（0/未设关闭） |
 | `DUMATE_TRAEWORK_CONNECT_TIMEOUT_MS` | `10000` | TRAE 基址候选轮转的连接超时（tnc.js 候选链；黑洞主机不占满 600s） |
 | `DUMATE_TRAEWORK_REMOTE` | 未设（关闭） | 设 `1` 开启 TRAE Remote 链路（auto 档纯文本；见「TRAE Remote 链路已通」节）。utils_chat 仍是默认主力 |
+| `DUMATE_TRAEWORK_SOLO` | 未设（关闭） | 设 `1` 开启 TRAE SOLO/IDE raw 链路（`llm_raw_chat`，显式模型纯文本；原生 tools 槽待证据暂不接）。**纯国内链路**——启用时池层强制国内选号 |
+| `DUMATE_TRAEWORK_SESSION_BILLING` | 开启 | TRAE 逐轮精确账单（`get_session_usage` 查单请求扣费 + 缓存计数）异步 enrichment；设 `0` 关闭（退回纯差值口径） |
+| `DUMATE_TRAEWORK_REMOTE_MAX_MODE` | 未设（关闭） | 设 `1` 全局开启 remote 1M Max 档（descriptor `max_mode` 硬门仍生效）；`_MAX_MODELS` 白名单（逗号分隔，`*` 全放行）；`_MAX_MODE_TYPE` 默认 `1` |
+| `DUMATE_TRAEWORK_9074_RETRY_SECONDS` / `_MAX_BACKOFF_SECONDS` | `60` / `3600` | 签到 9074 自愈的退避基数 / 封顶（换一代设备立即重试一次，仍失败才进退避） |
 | `DUMATE_TRAEWORK_REMOTE_CONNECT_MS` / `_FIRST_EVENT_MS` | `15000` / `120000` | Remote 建会话连接超时 / 首模型事件超时（排队与心跳帧不算模型活动） |
 | `DUMATE_DUMATE_CAPS_FILE` | 未设 | 搭子按模型 max_tokens 上限学习表的落盘路径覆盖（测试用） |
 | `DUMATE_MEDIA_POLL_TIMEOUT_MS` | `120000` | 生图异步任务的轮询总超时（ms），超时回 504 |
@@ -1988,9 +2155,10 @@ per-key 限流（低价值场景）。
 | `qwenwork-accounts.json` | 千问自持凭证账号池（**含 refresh token，等同密码**） |
 | `qoder-accounts.json` | Qoder 自持凭证账号池（device flow 换取，含 refresh token） |
 | `qoder-grants.jsonl` | Qoder 积分批次账本（**签到领取记录**，用于过期提醒；上游无逐批余额接口） |
-| `expiring-snapshot.json` | 三家通道（搭子/TRAE/千问）的临期积分快照：管理端 /credits 顺带写、网关选号读（FEFO）。陈旧即退回普通轮询，进程间靠它通信，不通过 IPC（`src/expiring.js`） |
+| `expiring-snapshot.json` | 四家通道（搭子/TRAE/千问/WorkBuddy）的临期积分快照：管理端 /credits 顺带写、网关选号读（FEFO）。WorkBuddy 的到期来自套餐 `CycleEndTime`（北京时间，2026-11-04 接入）。陈旧即退回普通轮询，进程间靠它通信，不通过 IPC（`src/expiring.js`） |
 | `dumate-caps.json` | 搭子按模型 max_tokens 上限的自学习记录（7 天 TTL，`src/dumate-caps.js`；静态实测表在代码里） |
 | `traework-accounts.json` | TRAE 自持凭证账号池（OAuth 换取，含轮换的 refreshToken） |
+| `workbuddy-accounts.json` | WorkBuddy 自持凭证账号池（客户端认证文件导入或手动粘贴 token，含 refresh token；区域字段 cn/global） |
 | `traework-credits.jsonl` | TRAE 逐请求积分归因（按账号的 consumed 游标，见 `traework/credits.js`） |
 | `points-cursor.jsonl` | 搭子的余额游标（每请求一条，相邻差值即该请求成本） |
 | `browser-profile/` | 浏览器登录器用的受控 profile 目录（`DUMATE_BROWSER_PATH` 找不到浏览器时才用） |
@@ -2042,17 +2210,20 @@ per-key 限流（低价值场景）。
 
 **千问登录态只读，管理端绝不写入。** 它存在官方客户端的 `auth-v2.dat` 里（Electron safeStorage：DPAPI 解 `Local State` 的 `encrypted_key` → 32B AES key → AES-256-GCM 解密）。官方客户端和我们各写一次会互相把对方的登录态刷掉，所以换账号必须开客户端操作。**不复制这个文件到 `data/`**——它会过期，复制一份立刻失效。`refresh_token` 过期（`refreshExpired`）要提前告警：access token 到期后无法自动续期。
 
-**API Key 区域绑定（2026-11-01，四通道 × 国内/国际）**：`keys.js` 的 `region`
+**API Key 区域绑定（2026-11-01 落地；2026-11-03/04 随 TRAE 国际版与 WorkBuddy 补全，
+五通道 × 国内/国际）**：`keys.js` 的 `region`
 字段（`''` 不限 / `cn` / `intl`）。**intl key 打纯国内通道（dumate/qwenwork）
 在 validate 直接拒** `region_not_available`——上游连国际端点都不存在；qoder/
-traework 的区域约束落在**账号池选择**（`accountsForRegion`，send 里过滤——
-模型名不编码区域，约束只能落在这里；qoder 的 intl 映射到 global 术语，
-traework intl → 明确「未接入」503）。无 model 字段的工具端点按路径归通道
+traework/workbuddy 的区域约束落在**账号池选择**（`accountsForRegion`，send 里过滤——
+模型名不编码区域，约束只能落在这里；qoder 与 workbuddy 的 intl 映射到 global
+术语，**TRAE 国际版 2026-11-03 起已全链路接入，traework-intl key 不再是空预留**）。
+无 model 字段的工具端点按路径归通道
 （搜索/语音润色/文件上传=千问、媒体=搭子），否则区域 key 可绕过判定。
 **区域约束随鉴权强制生效**（2026-11-01 起鉴权恒开，不存在未校验形态）
 预留六把 key：dumate / qwenwork / qoder-cn / qoder-intl / traework-cn /
-traework-intl（明文已交付；traework-intl 是真预留——国际链路未接入，
-用时明确报错）。搭子与千问**没有国际版**（纯国内产品）。
+traework-intl（明文已交付；traework-intl 自国际版接入起可用）。WorkBuddy 未单独
+预留——用通用 key + `channel`/`region` 字段绑定即可。搭子与千问**没有国际版**
+（纯国内产品）。
 
 **API Key 可选绑定通道**（`keys.js` 的 `channel` 字段，`''` = 不限）。网关鉴权段用 `upstream-router.resolve(model).channel` 解析请求走哪条通道再传给 `validate()`——设了 `qwenwork` 的 key 调搭子模型会被 403 `channel_not_allowed`。注意鉴权段**只在 key 真的配了模型白名单或通道绑定时才预读请求体**，否则给默认路径凭空加一次完整读取。key 用量按通道分开统计（`usage.channels`），因为网关按模型名前缀分流、不按 key 分流，同一把 key 可能两条通道都在用。
 
@@ -2149,3 +2320,51 @@ Vue 3 + Vite + ant-design-vue 4 + Tailwind + ECharts（按需引入，不用全�
 **cookie 本身不由本项目处理**——它仍留在 `auth.json` 里由 Go 后端自己读，本项目不接触也不复制凭证。因此 **cookie 过期后必须打开一次 DuMate 客户端重新登录**，这个绕不过去。
 
 更细的逆向结论与实测数据见 [ARCHITECTURE.md](ARCHITECTURE.md)（含端口发现三级降级、预算实测表、SSE 状态机细节）。
+
+## 2026-11-05 落地（GitHub 融合批次）
+
+> 参照仓库快照在 `%TEMP%\fusion-refs\`（workbuddy2api-hub / Trae2api-cn 浅克隆）；hub 三天三个 release（v1.7.20-22）的功能形态直接融合进网关。
+
+**Qoder 节奏闸门（channel-pool，默认全关）**：`DUMATE_QODER_INFLIGHT_MAX`（通道级在途帽，覆盖池默认 4，`pool.acquire` 支持按次覆盖）与 `DUMATE_QODER_MIN_INTERVAL_MS`（账号最小请求间隔，判据是**上次 pick 时刻**——约束发射节奏不是请求时长；间隔内跳过与 busy 同语义不惩罚）。先埋点看 10605 率再定阈值，不配 env 行为与之前逐字节一致。
+
+**探针无副作用（hub v1.7.20 #134 教训）**：五通道 `billing-check` 全部带 `opts.probe`——失败跳过池惩罚（noteError/markFailure/lastError），错误照常上抛。`test/unit/probe-no-punish.test.js` 锁住「默认路径仍喂池（回归锚）+ probe 不喂」两态。
+
+**工具调用回显（tool echo，hub #135）**：上游把工具调用当**纯 JSON 载荷**吐进正文（Qwen3.8-Flash 实测），客户端静默结束。`repair.js` 新增 `parseToolEchoPayload`（强判据：纯载荷 + 工具名名单锚，与 DSML 的 XML 形状互补）+ gate `echoFixup` + 聚合出口 `aggregateToolEchoFallback`，三通道接线。`DUMATE_TOOL_ECHO_MODE` off（默认，本地无真实样本不改现状）/lenient（还原成 tool_calls）/strict（fail-closed 502）。
+
+**积分三段拆分 + 全价请求（hub v1.7.21/22）**：`reqlog.pickUsage` 提取缓存命中并带 `cached_reported`（区分「确认零命中」与「上游没回报」——全价统计只认前者）；新 `src/credit-split.js`（Qoder 专属三段折算，系数 1.069/0.086/4.277 每千 token，`DUMATE_QODER_CREDIT_COEF` 可覆盖，缓存未回报时缓存段/合计为 null 不编）；usage-agg 桶加 `ci/cc/c0/c0p` 四字段，`snapshot.full_price` 报「prompt≥阈值且确认零缓存且成功」的次数/tokens/占比（`DUMATE_FULL_PRICE_PROMPT_MIN` 默认 100K；积分占比不做——各通道口径不同不编数）。前端：用量页「全价请求洞察」卡、请求详情页 Qoder 三段拆分行。
+
+**千问 ACP 会话通道（P2-17 最小闭环）**：`src/qwenwork/{wsframe,wsclient,acp}.js`——REST `POST /api/chat-sessions` 建会话 + WS `wss://qwenwork.cn/api/chat-ws`（**裸域不是 gateway**）带信封 JSON-RPC（`{"type":"control"|"data","payload":{…}}`，裸 RPC 回 -32700）；结束判据「见过 running 或正文增量之后的 idle」；单条消息 32768 字节硬上限（压缩救不了，`promptOf` 裁剪：保 system+最新、丢最老、留标记）；模型档位由账号/套餐决定（`qwen-acp/auto` 只是标签）——**2026-11-06 三重实测定案**：`session/set_model` RPC 不存在（-32700 Unknown control method）、createSession body 的 model/modelId/model_key 全被忽略（`extra_data.mode` 恒为账号侧档位，账号 3=flash）、`extra_data.mode` 可作会话真实档位观测字段；每请求新会话（复用=上游 agent 会话重跑整段上下文，重复计费），**同账号并发建会话 409 CONCURRENT_OPERATION**（间隔 ≥4s）。附件链路（barn→ACP file_uuid 引用）**阻塞**：发送侧 file_uuid 来源无证据（barn 完成体只有 storage_path；path 直引 404；解包源随客户端卸载消失），等抓包。`qwen-acp/` 前缀独立 provider（qianfan-raw 同款），不进 chat 桥。协议证据：tang-bugu/dsh-connect-qwenwork 实测 README + 本项目探测（假 token 握手回 401 JWT verification fails，端点与鉴权形态独立印证）。真实回合待真机账号。
+
+**TRAE remote manual 策略（P2-13.1 修正定案）**：参照 Trae2api-cn 源码证实 remote 协议**没有 tools 槽**（"tools remain owned by the API caller"）——「带 tools 走 remote」不成立，带工具请求仍走 utils_chat。落地的是**显式模型名**：`DUMATE_TRAEWORK_REMOTE=2` 时显式模型经 manual 策略走 remote（`remote.manualFieldsOf`：bound 校验拒绝静默落默认档，五件套 model_name/config_source/is_preset/provider/custom_model 原始对象，`models.normalize` 新增 `customModel` 原始行）；`=1` 仍是 auto 档纯文本（真机已验证的行为不变）。
+
+**WorkBuddy 每日活跃双通道**：国内版 `src/workbuddy/activity.js`——`/v2/report` 一条 `chat_request_send` 事件点亮 growth 连登（**必须带 userId** 否则 200 但静默丢弃；当日幂等，账号档案 `lastActivityReport`；keepalive 签到后顺带）。国际版 `src/workbuddy/webagent.js`——网页 agent 会话打卡（ACP over streamable HTTP：建会话→取沙箱 link/token→SSE 通道 Acp-Connection-Id→initialize→session/load→**session/set_model**（不设会按网页默认 Auto 付费档计费）→session/prompt→轮询 completed；活跃会话上限 10（429/10105），成功 stop 保留、失败 delete 清理；当日幂等 `lastWebActivity`）。keepalive 的 global 分支由「不支持签到」改为网页打卡。
+
+**前端构建**：`cd web && npm run build` 通过（vue-tsc 0 错误）。全量回归 `npm run verify` 40 项通过。
+
+**2026-11-05 凌晨真机批次**：千问 ACP 真机回合跑通（P2-17 闭环），帧形状按 40 帧采样修正（sessionStatus 在 params、update 事件名在 sessionUpdate 键、文本在 update.content.text、沙箱生命周期帧 ignore）；TRAE `REMOTE=2` 显式模型真机跑通（glm-5.2 manual 钉模）；WorkBuddy 网页 agent 打卡 cn 区真机跑通（178 段输出 6.4s）。千问 billing-check 仍受阻：账号 2 refresh token 失效需重登、账号 3 chat 桥 403「Model is not available for this user」（账号级）——**但账号 3 的 ACP 会话是通的，ACP 与 chat 桥可用性分离，`qwen-acp/auto` 可作千问对话备用链路**。
+
+## 2026-11-06 落地（WorkBuddy 融合批次：hub v1.7.22 → v1.10.11 差集的 P0/P1）
+
+> 参照仓库快照刷新在 `%TEMP%\fusion-refs\wb-hub-latest\`（v1.10.11 浅克隆）；旧快照 `wb\`（v1.7.22）保留。hub 10-23 起挂维护状态：上游对非官方客户端识别持续收紧，本批 P0 是保命项不是优化项。
+
+**11-128 渠道指纹清洗（`src/workbuddy/sanitize.js`，最高优先）**。上游按 system/assistant 里的**连续文本指纹**判非官方客户端回 400/11128，而本项目整个跑在 DSH 生态里——Codex/CC 的 system prompt 必带这些串，原样转发是必撞。全套规则与措辞照 hub v1.10.11 的 wb_proxy.py 移植（指纹边界都是社区 A/B 实测定死的，不猜）：身份句族（7 种动词、名词可省、0~3 修饰词，整句中性化）；DSH GUI 段（只调 A 句尾语序）；DSH 文件引用段（A 句补一个 `that` 打断整段连续匹配）；`DeepSeek Harness` 品牌词缩成 `DeepSeek`（连字符/下划线路径不动）；Codex/Claude Code 自述首段整句换掉（hub 教训：改写式清洗曾把指纹注入出站 body）；billing 头与 `cc_*` kv 清洗。**角色作用域**：identity 只对 system/developer/assistant（assistant 历史同样命中，#574）；user/tool 是用户数据不改写。`chat.js` 的 `buildChatBody` 在首条 system 注入后清洗——清洗不改 user 内容，convId/前缀缓存键稳定。tool arguments 非字符串强制 JSON 序列化（Go struct 11101）。`DUMATE_WORKBUDDY_PRESERVE_CONTRACT=1` 跳过 tool 内容改写（默认关）。离线验证 `node --test test/unit/workbuddy-sanitize.test.js`（13 项，对照 hub `_test_sanitize_fingerprint.py` 收敛 + 出站链路接线断言）。
+
+**风控连坐保护（hub #422 社区复盘代码化，行为级变更）**。**11140 不再默认换号**——原来「受限换号区内轮完一圈」正是 hub 实测把 7 个号在一次任务里全送走的路径：设备/出口指纹被扫到时换号等于把同一指纹挨个报给风控。处置：`noteAccountRestriction` 记窗口内受限账号（默认 900s 窗、2 个不同账号即触发），触发后**整区域暂停 1800s** 快速失败 503；换号数默认 0（`DUMATE_WORKBUDDY_RESTRICTED_ROTATE_MAX` 可调）。暂停是进程内紧急状态不落盘。**新增分类 `model_cap`（6004，hub v1.9.0 #668）**：上游 429 + body code 6004 是 (账号, 模型) 级窗口额度用满，唯一带重置墙钟——`parseRateLimitReset` 认 cn/intl 两种文案（含 `\u` 转义形态，按 UTC 解析再减偏移，不能用 `Date.parse` 裸解析否则宿主机时区带偏几小时），喂池走 `scope:'model'`（复用 Qoder 的 `applyModelSoftCooldown` 机制，`model_cooldowns` 持久化进 pool-state.json），**换号继续打同模型**，绝不按账号级 429 封整号。**401 先刷新再换号（hub #441）**：裸 401 归 `session_dead`（原来落 `client` 没有刷新入口），`errorActionOf` 给 refresh → `authStore.exchange` 成功同账号重试（不喂池——刷新成功=账号健康，喂池会把 token 过期记成 session_dead 计数）、失败才判死喂池换号。挑战头 `WWW-Authenticate: ... error="invalid_token"` 拼进分类输入（hub #686，APISIX 的 401 死因只在头里）。**参数错误不喂池（hub v1.10.11 #794）**：400 + param-invalid 文案 `paramError`，如实 400 不惩罚账号。**max_tokens 按模型目录上限 clamp**（`models.maxOutputOf`，未预热/不在表=0 不 clamp）+ 字符串 `stop` 归一化数组。**`readStream` 的 `[DONE]` 即终态**（hub v1.9.1 的默认开版本）：上游 [DONE] 后保持连接不关，原实现聚合路径一直白等——见哨兵即 destroy + resolve，`DUMATE_WORKBUDDY_STOP_AT_DONE=0` 可关。离线验证 `node --test test/unit/workbuddy-error-surface.test.js`（9 项：6004/401/连坐/errorActionOf/parseRateLimitReset/clamp/停读）；`verify-workbuddy.js`（9 项）与 workbuddy 全部单测（32 项）回归通过。
+
+**账本原子追加排查（hub wb_usage_io 教训，结论：无需改）**：本项目六处 jsonl 写入（jsonl/records/reqlog/task-runner/checkin-ledger/qoder-grants）全部是**单次 `fs.appendFileSync`**——一次调用=一次 O_APPEND 写（NTFS FILE_APPEND_DATA 与 POSIX 均内核级原子），hub 丢行 7.3% 是 Python 文本模式缓冲切分特有形态，本项目无此问题。
+
+**融合遗留（清单见会话，按性价比排序）**：小账号池固定选号（hub #718，防前缀缓存丢失与 token 翻倍）；账号档位权威来源 `get-user-resource-summary`（v1.7.27 #505，国内版零新增请求）；生图/生视频媒体路由（v1.10.6 `wb_media*.py`，COS 预签名上传参考素材 + 按（模型,分辨率,是否带参考素材）分档计价）；CodeArts 第三 realm（v1.10.x，大工程按需）；跨出口回退（v1.7.25 #564，默认关）；growth 任务扩充与网页活跃随机提示词池。**P0-2 出站身份头族对齐（wb_fingerprint 5.8.4 抓包）未做**——现有头族过协议校验（真机 chat 通），等 11-128 复现再对齐头族，避免无抓包依据的盲改。
+
+**网页打卡的 11140 避让与证书降级（webagent.js，hub v1.9.0 / v1.8.0）**：打卡撞 11140 把账号档案记 `webBlockedUntil`（**次日 00:10** 自动恢复——过 0 点边缘，连登按新的一天计），避让期内打卡按 `{ok:true, skipped:true, phase:'restricted'}` 跳过（keepalive 映射成 already，不算失败）；`DUMATE_WORKBUDDY_WEB_CERT_FALLBACK=1`（默认关，与 hub 面板开关同口径）开启后，证书类失败（EdgeOne 给 ACP 沙箱域下发 `*.cdn.myqcloud.com` 通配证书，TLS 层必然拒绝，判据 `altname|certificate|ssl|unable to verify`）降级走 activity 的主域 `POST /v2/report`——打卡目标（点亮连登）不变、路径降级，成功记 `lastWebActivity` 防两路径同日重复。webagent 测试桩新增 error 事件通道（证书/连接类错误在 end 时触发）。
+
+## 2026-11-06 第二批（会话暖账号列表 + 账号档位）
+
+**sticky 单值绑定升级为暖账号列表（`src/sticky.js` + `channel-pool.pickCandidate`，hub #718 的 SessionAffinity）**。原实现 front 唯一：绑定账号冷却/在途满就 unbind + 池轮询随机换号——长会话每轮丢上游前缀缓存重算 prefill，Token 消耗翻倍。现在每会话记 front + 最多 2 个 fallback（`recent(sessionKey)` 按最近使用排序）：front 不可用时**先试会话的其他暖账号**（它们可能还持有上游前缀缓存），全不可用才池轮询，选中的 promote 到 front、原 front 自动降为 fallback（真实换号也保留暖副本）。两处旧 `unbind` 移除（全清暖列表=丢所有暖副本）；只有绑定账号被区域/调用方显式排除才全清。`bind/lookup` API 向后兼容（lookup 仍返回 front 单值），四通道共用一份。hub #718 的「页大小覆盖全池」分支本地无对应物（我们无分页轮转），等价价值就在暖列表。测试 `test/unit/sticky-warm.test.js`（3 项：promote 语义/TTL/池层暖 fallback 接力）。
+
+**账号档位权威来源（`billing.js`，hub v1.7.27 #505）**：`POST {billingBase}/v2/billing/meter/get-user-resource-summary`（body `{}`，**`X-Client-Platform: web`**）的 `IsPaidUser`/`SubscriptionPackageName`/`IsProtectedPriceUser`/`ProTrialStatus` → `parseTierSummary` 纯函数。三条硬口径照抄 hub：**响应没有 `IsPaidUser` 字段 = 没有答案返回 null**（绝不写成「免费」；`IsPaidUser:false` 是「确认免费」，两者不同）；401/非 0 code/网络错误/impl 抛异常 → null，旧值与时间戳原样保留；**企业账号（enterpriseId）跳过**——上游对它们的 IsPaidUser 语义未验证。TTL 24h（`tierIsFresh`），接线在管理端 `/workbuddy/credits`（每账号顺带刷新，不新开定时器），`auth.list()` 带 tier 展示，`_setFetchTier` 注入点可测。注意我们与 hub 的路径差异：hub 的 CN 详细积分路径本来就在打这个端点可复用响应，我们的 `fetchCredits` 走 `get-user-resource`——所以两区都是每账号每天一次摘要请求，成本可接受。测试并入 `workbuddy-billing.test.js`（+5 项）。
+
+**网页打卡随机提示词池（webagent.js，hub wb_webprompts）**：固定 "Hi" 本身是指纹（每天同一账号同一句的会话序列太好认）。`DUMATE_WORKBUDDY_WEB_PROMPTS`（逗号/分号/换行分隔）优先，没配用内置等价问候池；`opts.prompt` 显式指定仍最高优先。活跃计数只看会话跑完不看提示词内容（hub 实测口径）。
+
+**回归基线（第二批后）**：workbuddy 全家桶 50 项 + 池回归 21 项全绿。`npm run verify` 37/40 的 3 个失败单跑全部通过（`verify-qoder-encode-perf` 是性能阈值测试在全量并发负载下超阈、`verify-channel` 环境串扰、单测组同因），与第一批同模式：全量跑的失败要单跑复核，单跑绿就不是回归。
+
+**回归基线（2026-11-06）**：`npm run verify` 37/40——3 个失败均来自工作区**既有未提交改动**、与本批正交：`verify-traework-toolshape.js` 崩在 `traework/chat.js` 的 `meta.sessionId`（meta 未传时 TypeError，用户在改 TRAE 账单键）；搭子 5 个单测断言不同步（mapModel/dumateRows，用户在改 model-info/upstream-router）；`verify-channel.js` 单跑通过（run-all 串扰）。WorkBuddy 全部测试绿。

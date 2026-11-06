@@ -779,7 +779,7 @@ function postStream(url, body, headers, onChunk, opts = {}) {
  */
 // 归一化实现提升到 src/usage-norm.js（千问通道同缺口同修，见该文件头注释）。
 
-function aggregate(payloads, model) {
+function aggregate(payloads, model, opts = {}) {
   let content = '';
   let reasoning = '';
   let finish = 'stop';
@@ -812,31 +812,18 @@ function aggregate(payloads, model) {
       }
     } catch (e) { /* 非 JSON 帧跳过 */ }
   }
-  // DSML fail-closed 兜底（2026-10-31，hub#120 推广）：Qoder 同跑 DeepSeek 系，
-  // 一样会把工具调用写成正文里的 DSML 标记。三分判据见 src/repair.js
-  // classifyDsml——recovered 还原成结构化调用；空壳剥离 + WARN；未闭合结构
-  // 报错（半截协议喂给客户端比明确失败更糟）。原生调用永远优先，不碰正文。
-  if (!calls.size && content && /dsml/i.test(require('../repair').stripFences(content))) {
-    const cls = require('../repair').classifyDsml(content);
-    if (cls.kind === 'recovered') {
-      content = cls.clean;
-      cls.calls.forEach((cc, i) => {
-        calls.set(i, {
-          id: `call_dsml_${Date.now().toString(36)}${i}`,
-          type: 'function',
-          function: { name: cc.name, arguments: cc.arguments },
-        });
-      });
-    } else if (cls.kind === 'empty') {
-      content = require('../repair').stripDsmlTags(content);
-      require('../repair').logDsml('qoder', 'empty', content);
-    } else {
-      require('../repair').logDsml('qoder', 'leak', content);
-      const err = new Error('DSML 协议残片无法还原：正文带未闭合的 tool 调用结构（fail-closed，本轮丢弃）');
-      err.statusCode = 502;
-      throw err;
-    }
-  }
+  // DSML fail-closed 兜底（2026-10-31 引入，2026-11-04 收敛到共享实现
+  // repair.aggregateDsmlFallback——qwenwork/workbuddy 的 aggregate 同一份）。
+  // recovered 时把 stop 纠正成 tool_calls（模型没走原生调用，上游必然报 stop）。
+  // 其后是 tool echo 兜底（hub#135）：纯 JSON 载荷形状，与 DSML 互补；
+  // opts.toolNames 缺省（off）时零行为变化。
+  const repair = require('../repair');
+  const dsml = repair.aggregateDsmlFallback('qoder', content, calls);
+  content = dsml.content;
+  if (dsml.recovered && finish === 'stop') finish = 'tool_calls';
+  const echo = repair.aggregateToolEchoFallback('qoder', content, calls, opts.toolNames, opts.echoMode);
+  content = echo.content;
+  if (echo.recovered && finish === 'stop') finish = 'tool_calls';
   const message = { role: 'assistant', content };
   if (reasoning) message.reasoning_content = reasoning;
   if (calls.size) {

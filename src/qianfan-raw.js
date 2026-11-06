@@ -27,6 +27,34 @@ const TIMEOUT_MS = 600000;
 // 验证过的那个。其它模型名原样透传——上游会明确报 invalid_model。
 const KNOWN_MODELS = ['qwen3.5-35b-a3b'];
 
+// 实测元数据（2026-11-06，probe-qianfan-caps.js，六发探针的实测矩阵）：
+//
+//   输入 tokens   max_tokens   结果
+//   126,512       1            200 通过
+//   506,012       1            400 "input token limit is 258048"
+//   258,050       1            200 通过（超文案数字 2 个 token）
+//   258,050       65,536       200 通过（max_tokens 不参与联合校验）
+//   262,200       1            400 "input token limit is 258048"（固定文案）
+//   100,000,000   -            400 "max_tokens range is [1, 65536]"
+//
+// 结论：
+//   真实窗口 262,144（256K）。文案的 258048 = 262,144 − 4,096，是扣掉
+//   默认输出预留的**标称输入限额**，无论超多少都报同一个数——不能按字面
+//   当硬边界（258,050 实测通过）。contextWindow 按保守的标称值声明。
+//   max_tokens 上限 65,536（比 glm-5 的 131072 小一半，与 35B-A3B 小杯
+//   定位一致）；计费 input/output 分价 0.5 / 4.0 积分/千token（两点定标）。
+//   400 错误链同时证实上游是千帆官方 API（qianfan.baidubce.com/v2）。
+const MODEL_META = {
+  'qwen3.5-35b-a3b': {
+    contextWindow: 258048,
+    contextNote: '窗口 262,144（256K）；上游文案 "input token limit is 258048" = 262,144−4,096 默认输出预留的标称值（实测 258,050 输入通过、262,200 拒绝），客户端声明按保守标称 258,048',
+    maxTokens: 65536,
+    maxTokensNote: '上游 400 明示 "max_tokens range is [1, 65536]"（比 glm-5 的 131072 小一半）；max_tokens 不与输入做联合校验（258,050 输入 + 65,536 max_tokens 实测通过），网关不 clamp',
+    rateIn: 0.5,
+    rateOut: 4.0,
+  },
+};
+
 function status() {
   try {
     const p = webPool.pick(new Set());
@@ -212,4 +240,4 @@ async function send(payload, onChunk, opts = {}) {
   throw lastErr || new Error('qianfan 没有可用账号');
 }
 
-module.exports = { status, listModels, send, buildRequest, KNOWN_MODELS };
+module.exports = { status, listModels, send, buildRequest, KNOWN_MODELS, MODEL_META };

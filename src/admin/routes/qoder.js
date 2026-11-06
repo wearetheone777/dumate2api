@@ -369,25 +369,39 @@ const routes = [
     method: 'GET',
     path: '/billing-check',
     handler: async ({ req, res }) => {
-      const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || '')).replace(/^qoder\//, '').trim();
-      if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=qfmodel）' });
-      // 区域（2026-11-03 页面区分）：global 时选号限定国际账号——国际模型
-      // 拿国内账号打必然失败，不让池子随机派
+      // 区域先解析（自动挑模型要按区域取表）：global 时选号限定国际账号——
+      // 国际模型拿国内账号打必然失败，不让池子随机派
       const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
       const region = regionRaw === 'global' || regionRaw === 'intl' ? 'global' : (regionRaw === 'cn' ? 'cn' : '');
       const credits = require('../../qoder/credits');
+      const modelRaw = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || '')).replace(/^qoder\//, '').trim();
       // 标称倍率从 model-info 的归一化行取（两种上游形状都已摊平）；
       // 表不可用时 expected 如实 null——探针仍然跑，只报实测值
       let expected = null;
+      let rows = null;
       try {
-        const rows = await require('../../model-info').qoderRows({ region });
+        rows = await require('../../model-info').qoderRows({ region });
+      } catch (e) { /* 表不可用按 null */ }
+      // model 缺省时自动挑默认模型（hub v1.7.20 #134：真 0 价优先，否则最小
+      // 正倍率；表不可用不猜，要求显式传 model）
+      let model = modelRaw;
+      let autoPicked = null;
+      if (!model) {
+        const picked = require('../../qoder/probe-model').pickProbeModel(rows);
+        if (!picked) {
+          return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=qfmodel）；模型表不可用，无法自动挑选 0 价模型' });
+        }
+        model = picked.key;
+        autoPicked = picked;
+      }
+      if (rows) {
         const hit = rows.find((m) => m.key === model || m.name === model);
         if (hit) {
           if (Number.isFinite(hit.rate) && hit.rate > 0) expected = hit.rate;
           else if (Number.isFinite(hit.rateOriginal) && hit.rateOriginal > 0) expected = hit.rateOriginal;
           else if (Number.isFinite(hit.rate)) expected = hit.rate;
         }
-      } catch (e) { /* 表不可用按 null */ }
+      }
       const reqId = `billcheck_${Date.now().toString(36)}`;
       const startedAt = Date.now();
       try {
@@ -395,7 +409,7 @@ const routes = [
           model: `qoder/${model}`,
           messages: [{ role: 'user', content: 'reply with exactly: pong' }],
           max_tokens: 64,
-        }, null, { reqId, region: region === 'global' ? 'intl' : region });
+        }, null, { reqId, probe: true, region: region === 'global' ? 'intl' : region });
       } catch (e) {
         return sendJSON(res, 200, {
           ok: false, model, expected, error: e.message,
@@ -409,6 +423,7 @@ const routes = [
       return sendJSON(res, 200, {
         ok: true,
         model,
+        ...(autoPicked ? { auto_picked: autoPicked } : {}),
         account: row ? row.account : null,
         expected,
         billed,

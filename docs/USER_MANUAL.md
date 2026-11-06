@@ -22,14 +22,15 @@
 
 ## 1. 系统简介
 
-DuMate2API 是运行在本机的**模型网关 + 进程管理器**，它把四条上游统一转成标准 API：
+DuMate2API 是运行在本机的**模型网关 + 进程管理器**，它把五条上游统一转成标准 API：
 
 | 通道 | 上游 | 凭证 | 是否需要官方客户端 |
 |---|---|---|---|
 | **百度搭子**（DuMate） | 本地 :8980 后端（千帆 GLM） | 桌面登录态 或 网页 cookie | 桌面链路需要；网页链路不需要 |
 | **千问办公**（QwenWork） | 云端网关，进程内直连 | 自持（OAuth Device Flow） | **不需要**（签名纯本地算法） |
-| **TRAE Work** | 云端网关，进程内直连 | 自持（OAuth） | 不需要 |
-| **Qoder** | 云端网关，进程内直连 | 自持（OAuth Device Flow） | **不需要**（签名纯本地算法） |
+| **TRAE Work** | 云端网关，进程内直连 | 自持（OAuth，国内/国际双区域） | 不需要 |
+| **Qoder** | 云端网关，进程内直连 | 自持（OAuth Device Flow，国内/国际） | **不需要**（签名纯本地算法） |
+| **WorkBuddy** | 云端网关，进程内直连 | 自持（导入客户端认证文件或粘贴 token，国内/国际） | 运行时不需要（导入时用一次客户端登录态） |
 
 调用方（Codex CLI、Claude Code、cc-switch、任意 OpenAI/Anthropic/Google 兼容客户端）按**模型名前缀**选择通道，见[第 6 节](#6-模型名与路由规则)。
 
@@ -103,22 +104,31 @@ npm run admin        # 管理端 :9081（另开终端）
 - **TRAE**：「登录态」页两步 OAuth（生成链接 → 粘贴回调）。也可命令行自测：`node test/traework-login.js login|checkin|chat`。
 - **Qoder**：设备流登录（国内/国际区）。命令行：`node test/qoder-cli.js login [cn|global]`。
 
-### 3.3 签发 API Key（可选）
+**WorkBuddy**（推荐**浏览器 OAuth 登录**，天然支持多账号）：
 
-网关默认**不校验密钥**（仅监听 127.0.0.1，本机使用安全）。对外暴露前必须：
+- **浏览器登录（推荐）**：管理端「账号管理」→ WorkBuddy → 「浏览器登录」→ 在弹出的官方登录页完成登录（手机号/微信均可），页面自动轮询并导入账号。**要加多个账号就换一个账号再点一次**（浏览器已登录当前账号时可开无痕窗口）。
+- **导入客户端认证文件**：没有浏览器条件时的替代。读本机 `workbuddy-desktop[-ai].info`（在 CodeBuddyExtension 的 auth 目录），必须先在客户端里登录对应区域的账号。
+- **手动粘贴 token**：最后的替代方式，直接粘 access/refresh token。
+- 国际版没有签到与 credits 接口（订阅按请求数计）；国内版有签到（每日一次，幂等）。
 
-1. 启动时设 `DUMATE_REQUIRE_KEY=1`
-2. 管理端「API Key」页签发密钥，可绑定：
+### 3.3 签发 API Key（必须）
+
+**模型端点强制鉴权**（2026-11-01 起，不存在「不校验密钥」的形态）：没有合法 key 的模型请求一律 401。
+
+1. 管理端「API Key」页签发密钥，可绑定：
    - **IP 白名单**（CIDR，写错一条会对所有来源拒绝——fail-closed）
    - **模型白名单**
    - **通道绑定**（如只允许千问，调搭子模型返回 403）
-3. 密钥明文只在创建时显示一次，库里只存 sha256。
+   - **区域绑定**（`cn` / `intl`；只对有国际版的通道有意义，intl key 打纯国内通道直接拒绝）
+2. 密钥库里存 sha256（校验用）+ 明文（2026-11-01 起管理员可随时查看/复制；启用前创建的旧 key 无明文）。
+3. 也可用环境变量 `DUMATE2API_KEY` 直设一把常时密钥。
 
 ---
 
 ## 4. 管理端页面指南
 
-顶栏可切换查看通道（搭子 / 千问 / TRAE / Qoder），各页面显示当前通道的数据。**四条通道的账相互独立，数字不能相加。**
+顶栏可切换查看通道（搭子 / 千问 / TRAE / Qoder / WorkBuddy），各页面显示当前通道的数据。**五条通道的账相互独立，数字不能相加。**
+TRAE / Qoder / WorkBuddy 还有**区域视图**（顶栏「国内版 / 国际版」）：切到哪个区域，所有页面只显示那个区域的数据。
 
 <p align="center">
   <img src="../assets/screenshots/dashboard.png" alt="仪表盘" width="640" />
@@ -184,7 +194,7 @@ Anthropic 协议接入 `http://127.0.0.1:9080`（裸路径 `/messages` 已支持
 | `POST /v1/messages` 或 `/messages` 或 `/api/v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | Token 计数（估算） |
 | `GET /v1beta/models`、`POST .../generateContent` | Google Generative Language |
-| `GET /v1/models` | 模型列表（四通道） |
+| `GET /v1/models` | 模型列表（五通道） |
 | `GET /health` | 健康检查（含各通道就绪状态） |
 
 ---
@@ -199,6 +209,7 @@ Anthropic 协议接入 `http://127.0.0.1:9080`（裸路径 `/messages` 已支持
 | `qwen/pro` / `qwen/flash` | 千问办公 | 重创作/长任务用 `pro`；`flash` 只适合轻量问答 |
 | `traework/…` | TRAE Work | 模型名见管理端模型表 |
 | `qoder/gfmodel` 等 | Qoder | 调试用 0.1 倍率档：`qfmodel`/`qmodel`/`q37fmodel`/`dfmodel`/`gfmodel` |
+| `workbuddy/glm-5.3` 等 | WorkBuddy | 模型名见管理端模型表（按区域，国内/国际目录不同） |
 | 未知前缀（如 `qwn/pro`） | **400 报错** | 不静默回落，防止「看起来成功但不是想要的结果」 |
 
 > 为什么用前缀：搭子有 `glm-5`，千问上游也是 GLM 系，猜错了两侧都返回 200，从响应里根本看不出来。
@@ -211,7 +222,7 @@ Anthropic 协议接入 `http://127.0.0.1:9080`（裸路径 `/messages` 已支持
 
 ### 签到
 
-- **手动**：管理端「账号管理」逐账号签到，或「登录态」页按通道签到（TRAE / Qoder）。
+- **手动**：管理端「账号管理」逐账号签到，或「登录态」页按通道签到（TRAE / Qoder / WorkBuddy 国内版）。
 - **自动**：设环境变量后每日定时执行（默认 9:17）：
   ```bash
   DUMATE_AUTO_CHECKIN_HOUR=9 DUMATE_AUTO_CHECKIN_MINUTE=17   # 两个都要设
@@ -324,13 +335,13 @@ node test/qoder-cli.js login [cn|global] | status | quota | checkin | chat "你�
 
 | 数据 | 存储位置 | 策略 |
 |---|---|---|
-| API Key | `data/keys.json` | **只存 sha256**，明文仅创建时显示一次 |
+| API Key | `data/keys.json` | 存 sha256（校验用）+ 明文（管理员可查看；旧 key 可能无明文） |
 | 网页账号 cookie | `data/web-accounts.json` | **明文存**（上游要求原样重放） |
-| 直连凭证（千问/TRAE/Qoder） | `data/*-accounts.json` | 含 refresh token，**等同密码** |
+| 直连凭证（千问/TRAE/Qoder/WorkBuddy） | `data/*-accounts.json` | 含 refresh token，**等同密码** |
 | 管理员口令 | `data/admin-users.json` + `admin.secret` | scrypt 加密 + 独立签名密钥 |
 
 - `data/` 已在 `.gitignore`，**绝不提交、绝不放进备份镜像**——cookie 与直连凭证被复制走是直接可用的。
-- 网关/管理端默认只监听 `127.0.0.1`。挂反代对外暴露前：启用 `DUMATE_REQUIRE_KEY=1`，并了解管理端**没有 TRUST_PROXY 判定**（限流会按代理 IP 统计）。
+- 网关/管理端默认只监听 `127.0.0.1`。**模型端点已强制鉴权**（无合法 key 一律 401）；挂反代对外暴露时仍需了解管理端**没有 TRUST_PROXY 判定**（限流会按代理 IP 统计）。
 - 所有凭证与日志只存本机，系统**不上报任何数据**。
 
 ---

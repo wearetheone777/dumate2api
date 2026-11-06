@@ -218,6 +218,9 @@ const routes = [
                   tokenExpiresAt: a.expiresAt || null,
                   refreshExpiresAt: a.refreshExpiresAt || null,
                   refreshExpired: !!(a.refreshExpiresAt && Date.now() >= a.refreshExpiresAt),
+                  // <24h 临期预警：过期即必须重新 device flow，提前亮牌
+                  refreshExpiringSoon: !!(a.refreshExpiresAt && a.refreshExpiresAt > Date.now()
+                    && a.refreshExpiresAt - Date.now() < 24 * 3600 * 1000),
                 };
               }
             } catch (e) { /* 账号池读不到就只报通道状态 */ }
@@ -225,6 +228,8 @@ const routes = [
               id: 'qwenwork', label: '千问办公', kind: 'direct',
               ready: st.ready, wasm: st.wasm ? st.wasm.version : null,
               loggedIn: !!st.loggedIn, error: st.error || '',
+              // ACP 链路上游实定档位（最近一次建会话的 extra_data.mode）
+              acpMode: st.acpMode || null,
               ...acct,
             };
           } catch (e) {

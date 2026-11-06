@@ -65,6 +65,46 @@ function stickyUsable(uid, model) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// 节奏闸门（2026-11-04，DEV-CHECKLIST #15 / 融合 qoder2api-hub 风控文档）
+//
+// 两层，都**默认关**（不配 env 时行为与之前逐字节一致）：
+//   1. 通道级在途帽 DUMATE_{CHANNEL}_INFLIGHT_MAX —— 覆盖池默认的
+//      inFlightMax（4）。Qoder 的 10605 排队是 (账号, 模型) 粒度的请求级
+//      随机，但单账号并发过高会推高风控画像；hub 的处置等级里「单号并发
+//      闸门」是防 10605 的第一道。
+//   2. 账号最小请求间隔 DUMATE_{CHANNEL}_MIN_INTERVAL_MS —— 上次选号后
+//      不足间隔的账号本轮跳过（busy，不惩罚）。判据是「上次 pick 时刻」
+//      而不是「上次 release」：间隔约束的是发射节奏，不是请求时长。
+// 两个值都只在 pickCandidate / availability 里消费；先埋点观察 10605 率
+// 再定阈值，所以默认全关。
+// ---------------------------------------------------------------------------
+
+function envInt(name) {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** 通道级在途帽（0 = 用池默认） */
+function inflightMaxOf(channel) {
+  return envInt(`DUMATE_${String(channel).toUpperCase()}_INFLIGHT_MAX`);
+}
+
+/** 账号最小请求间隔毫秒（0 = 关） */
+function minIntervalMsOf(channel) {
+  return envInt(`DUMATE_${String(channel).toUpperCase()}_MIN_INTERVAL_MS`);
+}
+
+// 上次选号时刻（uid → ts）。进程内即弃——节奏闸门是运行态观测，不落盘。
+const lastPickAt = new Map();
+
+/** 该账号是否还在最小间隔内（true = 本轮跳过） */
+function withinInterval(uid, minMs, now) {
+  if (!minMs) return false;
+  const last = lastPickAt.get(uid) || 0;
+  return now - last < minMs;
+}
+
 /**
  * 选一个候选账号：粘性命中优先，否则池轮询（冷却/熔断/禁用/暂停/在途满/
  * 模型负缓存/保底拦截全部跳过）。命中即占用一个在途名额。
@@ -85,15 +125,33 @@ function pickCandidate(channel, candidates, opts = {}) {
   const exclude = opts.exclude ? new Set([...opts.exclude].map((id) => uidOf(channel, id))) : new Set();
   const sessionKey = opts.sessionKey || '';
   const busy = new Set();
+  const minMs = minIntervalMsOf(channel);
+  const inFlightMax = inflightMaxOf(channel);
+  const now = Date.now();
 
   for (;;) {
     let uid = null;
     if (sessionKey) {
+      // 会话暖账号列表优先（front → fallback，hub #718 的 SessionAffinity）：
+      // 绑定账号不可用时先试会话的其他暖账号——它们可能还持有上游前缀缓存；
+      // 直接跳回池轮询会让长会话每轮换号丢缓存重算 prefill，Token 消耗翻倍。
+      for (const warm of sticky.recent(sessionKey)) {
+        if (exclude.has(warm) || busy.has(warm)) continue;
+        if (!byUid.has(warm)) continue;          // 不在候选内（区域/FEFO/调用方过滤）
+        if (withinInterval(warm, minMs, now)) continue;
+        if (!stickyUsable(warm, opts.model)) continue;
+        if (pool.acquire(warm, inFlightMax ? { inFlightMax } : undefined)) {
+          lastPickAt.set(warm, now);
+          sticky.bind(sessionKey, warm);         // promote 到 front，原 front 降为 fallback
+          return { account: byUid.get(warm), uid: warm, sessionKey };
+        }
+        busy.add(warm);                          // 在途满：本轮跳过，不惩罚
+      }
+      // 暖列表全不可用 → 池轮询重选。暖列表不整体清空：池选中的账号会
+      // promote 到 front，原 front 自动降为 fallback（真实换号也保留暖副本）。
+      // 只有绑定账号被区域/调用方显式排除时才全清重开。
       const bound = sticky.lookup(sessionKey);
-      if (bound && byUid.has(bound) && !exclude.has(bound) && !busy.has(bound)
-        && stickyUsable(bound, opts.model)) {
-        uid = bound;
-      } else {
+      if (bound && (!byUid.has(bound) || exclude.has(bound))) {
         sticky.unbind(sessionKey);
       }
     }
@@ -106,15 +164,26 @@ function pickCandidate(channel, candidates, opts = {}) {
         // 非空时池把候选限制在集合内（pool.pick 的 expiring 语义），把临期
         // 额度先烧掉。集合为空/null 时无感。
         expiring: opts.expiring,
+        // 通道级在途帽（env 配了才生效；0 = 池默认）
+        ...(inFlightMax ? { inFlightMax } : {}),
       });
       if (uid == null) return null;
+      // 闸门放在池选择之后（池还不知道间隔这回事）：选中的账号若在最小
+      // 间隔内，本轮跳过它继续找——不是账号的错，与 busy 同语义
+      if (withinInterval(uid, minMs, now)) {
+        busy.add(uid);
+        // 不 unbind：暖列表保留（下一轮 promote 时自动重排），全清会丢暖副本
+        if (busy.size >= uids.length) return null;
+        continue;
+      }
     }
-    if (pool.acquire(uid)) {
+    if (pool.acquire(uid, inFlightMax ? { inFlightMax } : undefined)) {
+      lastPickAt.set(uid, now);
       if (sessionKey) sticky.bind(sessionKey, uid);
       return { account: byUid.get(uid), uid, sessionKey };
     }
     busy.add(uid);
-    if (sessionKey) sticky.unbind(sessionKey);
+    // 不 unbind：同上，promote 到 front 的账号下一轮被 busy 挡住，暖副本保留
     if (busy.size >= uids.length) return null;
   }
 }
@@ -138,7 +207,10 @@ function release(uid) {
  */
 function availability(channel, candidates, opts = {}) {
   const list = (candidates || []).filter((a) => a && a.id !== undefined);
-  const maxInFlight = Number(opts.inFlightMax) > 0 ? Number(opts.inFlightMax) : DEFAULTS.inFlightMax;
+  const maxInFlight = Number(opts.inFlightMax) > 0 ? Number(opts.inFlightMax)
+    : (inflightMaxOf(channel) || DEFAULTS.inFlightMax);
+  const minMs = minIntervalMsOf(channel);
+  const now = Date.now();
   let nextInMs = 0;
   let softOnly = true;
   let busy = false;
@@ -152,7 +224,9 @@ function availability(channel, candidates, opts = {}) {
     const mc = opts.model ? (st.model_cooldowns || []).find((m) => m.model === opts.model) : null;
     const modelCooled = !!mc;
     if (st.state === 'healthy' && !st.floor_blocked && !modelCooled) {
-      if ((st.in_flight || 0) >= maxInFlight) { busy = true; softOnly = false; continue; }
+      if (withinInterval(uid, minMs, now) || (st.in_flight || 0) >= maxInFlight) {
+        busy = true; softOnly = false; continue;
+      }
       return { usable: true, nextInMs: 0, softOnly: false, busy };
     }
     // 账号健康、只是**这个模型**在排队：属于「稍后再来」（429 + 可重试），

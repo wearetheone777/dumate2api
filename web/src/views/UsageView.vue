@@ -42,20 +42,22 @@
 
       <a-col :xs="24" :sm="12" :xl="6">
         <a-card :bordered="false" class="h-full">
-          <!-- 三条通道三种账：搭子是上游账单（今日实付）、千问是剩余积分、
-               TRAE 是按账号独立的剩余额度。同一张卡按通道换语义，
-               但都要标出数字来源，否则额度政策一变没人知道数字错在哪 -->
-          <a-spin v-if="(isQw && loading && !qw) || (isTw && loading && !twLoaded) || (!isQw && !isTw && loading && !data)" size="small" />
+          <!-- 四条通道四种账：搭子是上游账单（今日实付）、千问是剩余积分、
+               TRAE 是按账号独立的剩余额度、WorkBuddy 是套餐包合计（国际版订阅制无口径）。
+               同一张卡按通道换语义，但都要标出数字来源，否则额度政策一变没人知道数字错在哪 -->
+          <a-spin v-if="(isQw && loading && !qw) || (isTw && loading && !twLoaded) || (isWb && loading && !wbLoaded) || (!isQw && !isTw && !isWb && loading && !data)" size="small" />
           <template v-else>
             <a-statistic
-              :title="isTw ? '剩余额度' : isQw ? '剩余积分' : '今日实付'"
+              :title="isTw ? '剩余额度' : isQw ? '剩余积分' : isWb ? '剩余积分' : '今日实付'"
               :value="isTw
                 ? (twTotals.remain ?? '—')
                 : isQw
                   ? (qw?.ok ? fmtQw(qw.total) : '—')
-                  : (data?.cards.today.consumed_points ?? '—')"
-              :precision="isQw || isTw || data?.cards.today.consumed_points == null ? undefined : 2"
-              :value-style="isQw || isTw ? 'color:var(--lab-primary)' : undefined"
+                  : isWb
+                    ? (wbTotals.remain ?? '—')
+                    : (data?.cards.today.consumed_points ?? '—')"
+              :precision="isQw || isTw || isWb || data?.cards.today.consumed_points == null ? undefined : 2"
+              :value-style="isQw || isTw || isWb ? 'color:var(--lab-primary)' : undefined"
             />
             <div class="text-xs text-slate-500 mt-2">
               <template v-if="isTw">
@@ -82,6 +84,20 @@
                   <template v-if="qw.resetAt"> · {{ fmtReset(qw.resetAt) }} 刷新</template>
                 </template>
                 <span v-else>{{ qw?.error || '取不到千问积分' }}</span>
+              </template>
+              <template v-else-if="isWb">
+                <!-- 国际版是订阅制（按请求数计）：没有套餐包，与「取不到」是两回事 -->
+                <template v-if="isIntlRegion() && wbLoaded && !wbRows.some((r) => r.total != null)">
+                  <a-tag color="purple" class="mr-1">订阅制</a-tag>
+                  按请求数计，无积分口径
+                </template>
+                <template v-else-if="wbTotals.remain != null">
+                  billing 套餐包按账号独立
+                  <template v-if="wbExpiring > 0">
+                    · <span class="text-orange-700">7 天内到期 <span class="num">{{ wbExpiring }}</span></span>
+                  </template>
+                </template>
+                <span v-else>取不到 WorkBuddy 额度</span>
               </template>
               <template v-else-if="data">{{ data.cards.today.point_records }} 条计费记录</template>
               <span v-else>—</span>
@@ -191,6 +207,44 @@
           </div>
         </div>
       </template>
+    </a-card>
+
+    <!-- 全价请求洞察（hub v1.7.21 融合）：prompt ≥ 阈值且确认零缓存的请求——
+         换前缀 / 新开会话 / 压缩后首轮的高成本形态，单行日志看不出来。 -->
+    <a-card title="全价请求洞察" :bordered="false" class="mt-4">
+      <template #extra>
+        <span class="text-xs text-slate-400">阈值 ≥ {{ compact(agg?.full_price?.threshold ?? 100000) }} prompt token 且确认零缓存</span>
+      </template>
+      <a-spin v-if="loading && !agg" size="small" />
+      <template v-else-if="agg?.full_price && agg.full_price.requests > 0">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div>
+            <div class="block-label">请求次数</div>
+            <div class="num text-lg">{{ fmt(agg.full_price.requests) }}</div>
+          </div>
+          <div>
+            <div class="block-label">Prompt Token</div>
+            <div class="num text-lg">{{ compact(agg.full_price.prompt_tokens) }}</div>
+          </div>
+          <div>
+            <div class="block-label">占窗口 prompt 比例</div>
+            <div class="num text-lg">{{ (agg.full_price.prompt_share * 100).toFixed(1) }}%</div>
+          </div>
+          <div>
+            <div class="block-label">窗口内三段 Token</div>
+            <div class="num text-sm">
+              非缓存输入 {{ compact(agg.totals?.input_noncached_tokens ?? 0) }} /
+              缓存命中 {{ compact(agg.totals?.cached_tokens ?? 0) }}
+            </div>
+          </div>
+        </div>
+        <div class="text-xs text-slate-400 mt-2">
+          降本做法：保持会话前缀稳定（Qoder 已做前缀缓存亲和）、走压缩而不是重开会话；
+          「确认零缓存」只统计上游回报了缓存字段且为 0 的成功请求——没回报的算未知，不虚增占比。
+          积分占比不做：各通道积分口径不同且埋点无统一 credits 字段，不编数。
+        </div>
+      </template>
+      <a-empty v-else description="窗口内没有全价请求——前缀复用良好" />
     </a-card>
 
     <a-alert
@@ -374,9 +428,64 @@
       </template>
     </a-card>
 
+    <!-- WorkBuddy 的额度。与千问的三个池子、TRAE 的单一 credits 都是不同的账：
+         国内是套餐包（各包独立到期），国际是订阅制（无积分口径） -->
+    <a-card v-if="isWb" title="WorkBuddy 额度" :bordered="false" class="mt-4">
+      <a-spin v-if="loading && !wbLoaded" size="small" />
+      <a-empty
+        v-else-if="!wbRows.length"
+        :description="`还没有${isIntlRegion() ? '国际' : '国内'}版账号`"
+      />
+      <template v-else>
+        <a-table
+          size="small"
+          :pagination="false"
+          :data-source="wbRows"
+          :columns="wbColumns"
+          row-key="id"
+        >
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.key === 'name'">
+              {{ record.nickname || record.uid || '未命名' }}
+              <div v-if="record.error" class="text-xs text-red-600">{{ record.error }}</div>
+            </template>
+            <template v-else-if="column.key === 'region'">
+              <a-tag :color="record.region === 'global' ? 'purple' : 'blue'" class="mr-0">
+                {{ record.region === 'global' ? '国际' : '国内' }}
+              </a-tag>
+            </template>
+            <template v-else-if="column.key === 'remain'">
+              <!-- 国际版订阅制：没有套餐包，显示口径说明而不是 0 -->
+              <span v-if="record.total == null" class="text-slate-400">—</span>
+              <span v-else class="font-medium num">
+                {{ record.totalPrecise != null ? record.totalPrecise : record.total }}
+              </span>
+            </template>
+            <template v-else-if="column.key === 'expiring'">
+              <span v-if="wbRowExpiring(record) > 0" class="num text-orange-700">
+                {{ wbRowExpiring(record) }}
+              </span>
+              <span v-else class="text-slate-400">—</span>
+            </template>
+            <template v-else-if="column.key === 'checkin'">
+              <a-tag v-if="record.unsupportedCheckin || record.region === 'global'" color="default">不支持</a-tag>
+              <a-tag v-else-if="record.checkedIn == null" color="default">—</a-tag>
+              <a-tag v-else :color="record.checkedIn ? 'green' : 'orange'">
+                {{ record.checkedIn ? '已签到' : '未签到' }}
+              </a-tag>
+            </template>
+          </template>
+        </a-table>
+        <div class="text-xs text-slate-400 mt-2">
+          套餐包按账号独立，不共享；到期即作废，已用完的包不计入临期。
+          取不到时显示 —，不补 0。
+        </div>
+      </template>
+    </a-card>
+
     <!-- 按账号积分消耗：只有搭子有上游计费账单。直连通道的账在各自的
          池子里，挂一张空表出来只会让人以为「这条通道没消耗」 -->
-    <a-card v-if="!isQw && !isTw" title="按账号积分消耗" :bordered="false" class="mt-4">
+    <a-card v-if="!isQw && !isTw && !isWb" title="按账号积分消耗" :bordered="false" class="mt-4">
       <div class="text-xs text-slate-500 mb-2">
         来自上游计费记录（近 {{ data?.days ?? days }} 天）——本地日志算不出扣费，单价在上游。
       </div>
@@ -412,11 +521,13 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import client from '@/api/client'
-import { channelStore, CHANNELS, isTraework, isQwenwork, channelParam } from '@/stores/channel'
-import { regionParam } from '@/stores/region'
+import { channelStore, CHANNELS, isTraework, isQwenwork, isWorkBuddy, channelParam } from '@/stores/channel'
+import { regionParam, isIntlRegion } from '@/stores/region'
 import { qwenworkApi } from '@/api/qwenwork'
 import { traeworkApi } from '@/api/traework'
+import { workbuddyApi } from '@/api/workbuddy'
 import type { TraeworkCreditRow } from '@/api/traework'
+import type { WorkBuddyCreditRow } from '@/api/workbuddy'
 import type { QwCredits } from '@/api/qwenwork'
 import type { UsageOverview } from '@/api/usage'
 
@@ -434,6 +545,20 @@ const loading = ref(false)
 const lastRefresh = ref('')
 const days = ref(30)
 
+// 全价请求洞察（/usage/agg 的 full_price 段）：与 overview 同窗口（days 天）。
+// 聚合失败不挡用量主视图——静默给空，卡片回落到「没有全价请求」的空态。
+interface FullPrice {
+  threshold: number
+  requests: number
+  prompt_tokens: number
+  prompt_share: number
+}
+interface AggSnapshot {
+  full_price?: FullPrice
+  totals?: { input_noncached_tokens?: number; cached_tokens?: number }
+}
+const agg = ref<AggSnapshot | null>(null)
+
 // 当前通道。**服务端按通道过滤**而不是前端筛已聚合的数字——
 // 卡片、折线、按模型表都建立在同一批行上，前端筛只能筛掉表里的行，
 // 顶部卡片的数字仍是全通道的，两者会对不上。
@@ -442,6 +567,7 @@ const days = ref(30)
 // 不能合并显示——合并出来的数字没有任何一处对得上。
 const isTw = computed(() => isTraework())
 const isQw = computed(() => isQwenwork())
+const isWb = computed(() => isWorkBuddy())
 const chLabel = computed(() => CHANNELS.find((c) => c.id === channelStore.current)?.label || channelStore.current)
 
 // 千问积分。它是**另一套账**：搭子的扣费在上游账单里（pointsUsage），
@@ -468,6 +594,52 @@ const twIntlPlanName = computed(() => {
   const hit = twRows.value.find((r) => r.intlPlan)
   return hit ? hit.intlPlan!.name : ''
 })
+
+// WorkBuddy 的额度：按账号独立的套餐包（国内）或订阅制（国际）。
+// 与 TRAE 同构但口径不同：没有 limit 分母，临期合计按包的 expireAt 算。
+const wbRows = ref<WorkBuddyCreditRow[]>([])
+// 首次拉取完成前 wbRows 为空不代表「没有账号」——空态要等 loaded 才能下结论
+const wbLoaded = ref(false)
+const wbTotals = computed(() => {
+  let remain: number | null = null
+  let checked = 0
+  for (const r of wbRows.value) {
+    if (r.total != null) remain = (remain ?? 0) + (r.totalPrecise != null ? r.totalPrecise : r.total)
+    if (r.checkedIn === true) checked++
+  }
+  return { remain, checked }
+})
+// 7 天内到期合计（已用完的包不计入——到期不构成损失）
+const wbExpiring = computed(() => {
+  const now = Date.now()
+  let amount = 0
+  for (const r of wbRows.value) {
+    for (const p of r.packages || []) {
+      if (p.expireAt && p.expireAt > now && p.expireAt <= now + 7 * 86400000 && p.remain > 0) {
+        amount += p.remainPrecise != null ? p.remainPrecise : p.remain
+      }
+    }
+  }
+  return amount
+})
+const wbRowExpiring = (r: WorkBuddyCreditRow) => {
+  const now = Date.now()
+  let sum = 0
+  for (const p of r.packages || []) {
+    if (p.expireAt && p.expireAt > now && p.expireAt <= now + 7 * 86400000 && p.remain > 0) {
+      sum += p.remainPrecise != null ? p.remainPrecise : p.remain
+    }
+  }
+  return sum
+}
+
+const wbColumns = [
+  { title: '账号', key: 'name', width: '28%' },
+  { title: '区域', key: 'region', width: '10%' },
+  { title: '套餐剩余', key: 'remain', width: '16%' },
+  { title: '7 天内到期', key: 'expiring', width: '15%' },
+  { title: '今日签到', key: 'checkin' },
+]
 
 // 积分保留 2~4 位：实测单次消耗 0.0025，按 2 位显示会变成 0
 const fmtQw = (n: number | null | undefined) =>
@@ -587,16 +759,25 @@ async function load() {
     const r = regionParam()
     const rQ = r ? `&region=${r}` : ''
     // 额度与用量并行拉：两者互不依赖，串行只会白等一个来回
-    const [usage, credits] = await Promise.all([
+    const [usage, credits, aggRes] = await Promise.all([
       client.get(`/usage/overview?days=${days.value}&channel=${ch}${rQ}`),
       isTw.value ? traeworkApi.credits(r as 'cn' | 'intl').catch(() => ({ data: { count: 0, rows: [] } }))
-        : isQw.value ? qwenworkApi.credits() : Promise.resolve(null),
+        : isQw.value ? qwenworkApi.credits()
+        : isWb.value ? workbuddyApi.credits(r as 'cn' | 'intl').catch(() => ({ data: { count: 0, rows: [] } }))
+        : Promise.resolve(null),
+      // 全价窗口与 overview 对齐（hours=days*24）；失败不影响主视图
+      client.get(`/usage/agg?hours=${days.value * 24}${ch ? `&channel=${ch}` : ''}`).catch(() => null),
     ])
     data.value = usage.data
+    agg.value = (aggRes as any)?.data || null
     if (isTw.value) {
       twRows.value = (credits as any)?.data?.rows || []
       twLoaded.value = true
     } else if (isQw.value) qw.value = (credits as any).data
+    else if (isWb.value) {
+      wbRows.value = (credits as any)?.data?.rows || []
+      wbLoaded.value = true
+    }
     lastRefresh.value = new Date().toLocaleTimeString('zh-CN')
     await nextTick()
     renderChart()

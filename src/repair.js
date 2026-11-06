@@ -1,4 +1,4 @@
-// src/repair.js - 「播报即收尾」共享修复模块（千问 / Qoder / TRAE 三通道共用）
+// src/repair.js - 「播报即收尾」共享修复模块（千问 / Qoder / TRAE / WorkBuddy 四通道共用）
 //
 // 现象：上游是对话型产品（千问办公 / Qoder / TRAE 脚手架都鼓励「每完成一步
 // 汇报一句」），与 Codex 的 AGENTS.md 进度播报叠加后，模型会把播报当成一次
@@ -44,6 +44,7 @@ const DEFAULT_REPAIR_MAX = 1;
  *   TRAEWORK  → DUMATE_TRAEWORK_HOLD_CAP / DUMATE_TRAEWORK_REPAIR_RETRY
  *   QWENWORK  → DUMATE_QWENWORK_HOLD_CAP / DUMATE_QWENWORK_REPAIR_RETRY
  *   QODER     → DUMATE_QODER_HOLD_CAP / DUMATE_QODER_REPAIR_RETRY
+ *   WORKBUDDY → DUMATE_WORKBUDDY_HOLD_CAP / DUMATE_WORKBUDDY_REPAIR_RETRY
  *
  * 空串的重试值按 0 处理（Number('')===0，与 TRAE 旧口径一致）。
  */
@@ -183,12 +184,181 @@ function stripDsmlTags(text) {
   return String(text || '').replace(/<[^>]*dsml[^>]*>/gi, '').trim();
 }
 
+/**
+ * 非流式聚合出口的 DSML 兜底（qoder / qwenwork / workbuddy 的 aggregate 共用；
+ * 2026-11-04 收敛——此前 qoder 内联一份、qwenwork 整个漏掉）。
+ *
+ * @param {string} channel 日志前缀
+ * @param {string} content 聚合正文
+ * @param {Map} calls 聚合出的 tool_calls（index → call），就地修改
+ * @returns {{content:string, calls:Map, recovered:boolean}}
+ *   原生调用存在时原样返回（recovered=false，正文不碰——那可能是模型在讨论格式）；
+ *   leak 抛 502（fail-closed，半截协议喂给客户端比明确失败更糟）。
+ *   调用方在 recovered 时把 finish_reason 的 stop 纠正成 tool_calls。
+ */
+function aggregateDsmlFallback(channel, content, calls) {
+  if ((calls && calls.size) || !content || !/dsml/i.test(stripFences(content))) {
+    return { content, calls, recovered: false };
+  }
+  const cls = classifyDsml(content);
+  if (cls.kind === 'recovered') {
+    cls.calls.forEach((cc, i) => {
+      calls.set(i, {
+        id: `call_dsml_${Date.now().toString(36)}${i}`,
+        type: 'function',
+        function: { name: cc.name, arguments: cc.arguments },
+      });
+    });
+    return { content: cls.clean, calls, recovered: true };
+  }
+  if (cls.kind === 'empty') {
+    logDsml(channel, 'empty', content);
+    return { content: stripDsmlTags(content), calls, recovered: false };
+  }
+  logDsml(channel, 'leak', content);
+  const err = new Error('DSML 协议残片无法还原：正文带未闭合的 tool 调用结构（fail-closed，本轮丢弃）');
+  err.statusCode = 502;
+  throw err;
+}
+
 /** empty/leak 处置的统一日志（channel 拼前缀，hub#120 的 WARN 语义） */
 function logDsml(channel, kind, text) {
   try {
     const snip = String(text || '').replace(/\s+/g, ' ').slice(0, 120);
     console.warn(`[${channel}] DSML ${kind}：${kind === 'leak' ? '未闭合协议结构，本轮按 fail-closed 丢弃' : '空壳残片已剥离'}｜正文片段=「${snip}」`);
   } catch (e) { /* 日志失败不影响请求 */ }
+}
+
+// ---------------------------------------------------------------------------
+// 工具调用回显（tool echo）检测（hub#135 融合，2026-11-04）
+//
+// 现象（hub #135，Qwen3.8-Flash 实测）：上游把工具调用当**正文**吐出——整轮
+// 输出就是一段工具调用载荷 JSON（{"name":…,"arguments":…}），不走原生
+// tool_calls。客户端收到纯文本、没有工具调用，按「回合完成」**静默结束**——
+// 即「说到一半自己结束」。DSML 分类器管的是 XML 标记形状，管不到纯 JSON
+// 载荷形状，两者互补。
+//
+// 判据（强判据，防误伤「模型在讨论 JSON」）：
+//   1. 请求带了 function tools（有名单才有判定）；
+//   2. 整轮正文 trim 后可 JSON.parse（**纯载荷**——前后多一个字都不算，
+//      讨论形态由 DSML/代码围栏管）；
+//   3. 解析结果匹配工具调用载荷形状之一：
+//      {name, arguments?} / {function:{name,arguments}} / {tool_calls:[…]}；
+//   4. name 在请求的 tools 名单里（形状对上但名字不在名单 = 模型在编示例，
+//      不当 echo）。
+//
+// 处置（DUMATE_TOOL_ECHO_MODE，默认 off——本地暂无真实上游样本，默认不改
+// 现有行为；开关是预案，真撞上再开）：
+//   off     现状：正文原样转发
+//   lenient 还原成结构化 tool_calls 正常收尾（finish stop→tool_calls 纠正，
+//           与 DSML recovered 同口径）
+//   strict  fail-closed 抛 502（对齐 hub 的 response.failed：明确失败优于
+//           客户端静默结束）
+// ---------------------------------------------------------------------------
+
+const ECHO_PAYLOAD_MAX = 64 * 1024;   // 工具调用载荷不该超大；超长按正文处理
+
+/** 读处置开关。非法值按 off（不猜） */
+function toolEchoMode() {
+  const v = String(process.env.DUMATE_TOOL_ECHO_MODE || '').trim().toLowerCase();
+  return v === 'lenient' || v === 'strict' ? v : 'off';
+}
+
+/**
+ * 从正文解析工具调用回显载荷。
+ * @param {string} text 整轮正文（缓冲值）
+ * @param {Iterable<string>|Set<string>} toolNames 请求的 function 工具名名单
+ * @returns {Array<{name:string,arguments:string}>|null} null = 不是 echo
+ */
+function parseToolEchoPayload(text, toolNames) {
+  const s = String(text || '').trim();
+  if (!s || s.length > ECHO_PAYLOAD_MAX) return null;
+  if (!s.startsWith('{') || !s.endsWith('}')) return null;
+  const names = toolNames instanceof Set ? toolNames : new Set(toolNames || []);
+  if (!names.size) return null;
+  let o;
+  try { o = JSON.parse(s); } catch (e) { return null; }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+  const calls = [];
+  const one = (name, args) => {
+    if (typeof name !== 'string' || !names.has(name)) return false;
+    let a = '{}';
+    if (args == null) a = '{}';
+    else if (typeof args === 'string') a = args;
+    else if (typeof args === 'object') {
+      try { a = JSON.stringify(args); } catch (e) { return false; }
+    } else return false;
+    calls.push({ name, arguments: a });
+    return true;
+  };
+  if (Array.isArray(o.tool_calls)) {
+    for (const tc of o.tool_calls) {
+      if (!tc || typeof tc !== 'object') return null;
+      const fn = tc.function && typeof tc.function === 'object' ? tc.function : tc;
+      if (!one(fn.name, fn.arguments)) return null; // 任一元素不匹配 → 整体不是 echo
+    }
+    return calls.length ? calls : null;
+  }
+  const fn = o.function && typeof o.function === 'object' ? o.function : o;
+  return one(fn.name, fn.arguments) ? calls : null;
+}
+
+/** strict 模式的 fail-closed 错误（与 DSML leak 同一形态：statusCode 502） */
+function toolEchoError() {
+  const err = new Error('上游把工具调用当正文输出（tool echo，strict 模式 fail-closed，本轮丢弃）；'
+    + '如需还原为工具调用可设 DUMATE_TOOL_ECHO_MODE=lenient');
+  err.statusCode = 502;
+  return err;
+}
+
+/**
+ * 从 OpenAI payload 提取 function 工具名名单（echo 判据的名字锚）。
+ * 非 function 形状（namespace / web_search 等上游不认的）天然排除。
+ */
+function toolNamesOf(payload) {
+  try {
+    const tools = (payload && Array.isArray(payload.tools)) ? payload.tools : [];
+    return tools
+      .filter((t) => t && t.type === 'function' && t.function && typeof t.function.name === 'string')
+      .map((t) => t.function.name);
+  } catch (e) { return []; }
+}
+
+function logToolEcho(channel, text) {
+  try {
+    const snip = String(text || '').replace(/\s+/g, ' ').slice(0, 120);
+    console.warn(`[${channel}] tool echo：正文是工具调用载荷，已还原为结构化 tool_calls｜片段=「${snip}」`);
+  } catch (e) { /* 日志失败不影响请求 */ }
+}
+
+/**
+ * 非流式聚合出口的 tool echo 兜底（与 aggregateDsmlFallback 同形互补：
+ * DSML 先认 XML 标记形状，这里认纯 JSON 载荷形状）。
+ *
+ * @param {string} channel 日志前缀
+ * @param {string} content 聚合正文
+ * @param {Map} calls 聚合出的 tool_calls（index → call），就地修改
+ * @param {Iterable<string>} toolNames 请求的 function 工具名名单
+ * @param {string} [mode] off/lenient/strict（缺省读环境变量）
+ * @returns {{content:string, calls:Map, recovered:boolean}}
+ */
+function aggregateToolEchoFallback(channel, content, calls, toolNames, mode) {
+  const m = mode || toolEchoMode();
+  if (m === 'off' || (calls && calls.size) || !content) {
+    return { content, calls, recovered: false };
+  }
+  const parsed = parseToolEchoPayload(content, toolNames);
+  if (!parsed) return { content, calls, recovered: false };
+  if (m === 'strict') throw toolEchoError();
+  logToolEcho(channel, content);
+  parsed.forEach((cc, i) => {
+    calls.set(i, {
+      id: `call_echo_${Date.now().toString(36)}${i}`,
+      type: 'function',
+      function: { name: cc.name, arguments: cc.arguments },
+    });
+  });
+  return { content: '', calls, recovered: true };   // 正文就是载荷，还原后不再发
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +402,10 @@ function chunkKind(o) {
  * @param {function} emit 下游回调（收 OpenAI chunk 的 JSON 串）
  * @param {boolean} hold 是否缓冲（只在「带工具的请求」上启用）
  * @param {number} [cap] content 缓冲上限
- * @param {object} [opts] { model, channel } —— model 用于 finish 阶段合成
- *   DSML 还原帧；channel 用于日志前缀。两者都给才启用 DSML fail-closed。
+ * @param {object} [opts] { model, channel, toolNames, echoMode } —— model 用于
+ *   finish 阶段合成 DSML 还原帧；channel 用于日志前缀。两者都给才启用 DSML
+ *   fail-closed。toolNames（请求的 function 工具名名单）与 echoMode
+ *   ('lenient'|'strict'，缺省读 DUMATE_TOOL_ECHO_MODE) 启用 tool echo 处置。
  */
 function createChunkGate(emit, hold, cap, opts = {}) {
   cap = cap || DEFAULT_HOLD_CAP;
@@ -308,6 +480,39 @@ function createChunkGate(emit, hold, cap, opts = {}) {
     throw err;
   };
 
+  /**
+   * finish 阶段的 tool echo 兜底（hub#135）：整轮正文是纯 JSON 工具调用载荷、
+   * 零原生调用、正文还在缓冲时才有救（与 dsmlFixup 同前提，形状互补）。
+   * lenient = 还原成结构化 tool_calls；strict = fail-closed 抛 502。
+   */
+  const echoFixup = () => {
+    const mode = opts.echoMode || toolEchoMode();
+    if (mode === 'off' || !opts.toolNames) return false;
+    if (live || toolCalls > 0 || !pendingFrames.length || !pendingText) return false;
+    const parsed = parseToolEchoPayload(pendingText, opts.toolNames);
+    if (!parsed) return false;
+    if (mode === 'strict') throw toolEchoError();
+    logToolEcho(opts.channel || 'gate', pendingText);
+    pendingFrames = [];
+    pendingText = '';
+    parsed.forEach((cc, i) => {
+      fwd(mkChunk({ tool_calls: [{ index: i, id: `call_echo_${Date.now().toString(36)}${i}`, type: 'function', function: { name: cc.name, arguments: cc.arguments } }] }));
+    });
+    toolCalls = parsed.length;
+    // 上游 finish 帧若报 stop，纠正成 tool_calls（与 DSML recovered 同口径）
+    for (let i = 0; i < held.length; i++) {
+      try {
+        const h = JSON.parse(held[i]);
+        const fr = h.choices && h.choices[0] && h.choices[0].finish_reason;
+        if (fr === 'stop') {
+          h.choices[0].finish_reason = 'tool_calls';
+          held[i] = JSON.stringify(h);
+        }
+      } catch (e) { /* 非原串帧跳过 */ }
+    }
+    return true;
+  };
+
   return {
     /** 收一帧解出的内层 payload（原串或 '[DONE]' 哨兵） */
     onInner(inner) {
@@ -347,6 +552,7 @@ function createChunkGate(emit, hold, cap, opts = {}) {
     /** 收尾：把还没下发的正文与暂扣的帧补发出去 */
     finish() {
       dsmlFixup();
+      echoFixup();
       flush();
       for (const f of held) fwd(f);
       if (doneSeen) fwd('[DONE]');
@@ -359,4 +565,7 @@ module.exports = {
   envCaps, looksUnfinished, appendRepairNudge, logRepair,
   chunkKind, createChunkGate,
   parseDsmlToolCalls, classifyDsml, stripFences, stripDsmlTags, logDsml,
+  aggregateDsmlFallback,
+  toolEchoMode, parseToolEchoPayload, aggregateToolEchoFallback, toolEchoError,
+  toolNamesOf,
 };

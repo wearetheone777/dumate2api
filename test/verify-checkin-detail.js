@@ -2,6 +2,10 @@
 //
 // 离线：打桩账号 / 操作流水 / 上游 sign_in_days / Qoder 领取账本，
 // 账本目录用临时目录，不碰真实数据、不联网。
+//
+// **日期全部相对「现在」生成**：/detail 的搭子上游分支只在查询月 === 当前月时
+// 触发（上游只给当月），硬编码 2026-10 的旧版在月份翻页后集体失效——
+// 时间炸弹测试（2026-11-04 修复）。
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -22,9 +26,19 @@ function stub(rel, exports) {
 
 const at = (y, mo, d, h = 9) => new Date(y, mo - 1, d, h, 0, 0).getTime();
 
+// ---- 相对日期：搭子段的「当月」必须是真的当前月 ----
+const NOW = new Date();
+const Y = NOW.getFullYear();
+const M = NOW.getMonth() + 1;              // 1..12
+const PM = M === 1 ? 12 : M - 1;           // 上月
+const PY = M === 1 ? Y - 1 : Y;            // 上月所在年
+const pad2 = (n) => String(n).padStart(2, '0');
+const D = (d) => `${Y}-${pad2(M)}-${pad2(d)}`;         // 当月第 d 天
+const PD = (d) => `${PY}-${pad2(PM)}-${pad2(d)}`;      // 上月第 d 天
+
 // ---- 搭子：两个账号，一个上游可用、一个查询失败 ----
 const ACCOUNTS = [
-  { id: 1, name: '张三', enabled: true, cookie: 'c1', checkin: { last_at: at(2026, 10, 20) } },
+  { id: 1, name: '张三', enabled: true, cookie: 'c1', checkin: { last_at: at(Y, M, 20) } },
   { id: 2, name: '账号 2', enabled: true, cookie: 'c2', nickname: '李四', checkin: {} },
 ];
 stub('src/accounts', {
@@ -39,19 +53,21 @@ stub('src/accounts', {
 stub('src/records', {
   read: ({ type }) => ({
     rows: type === 'checkin' ? [
-      { ts: at(2026, 9, 22), type: 'checkin', account_id: 1, ok: true, points_delta: 500 },
-      { ts: at(2026, 9, 23), type: 'checkin', account_id: 1, ok: false },
+      { ts: at(PY, PM, 22), type: 'checkin', account_id: 1, ok: true, points_delta: 500 },
+      { ts: at(PY, PM, 23), type: 'checkin', account_id: 1, ok: false },
     ] : [],
   }),
 });
 stub('src/dumate-web', {
+  // agentFor：路由取出站代理用（E 包收口），打桩给 null=直连
+  agentFor: () => null,
   api: {
     loginBonusInfo: async (cookie) => (cookie === 'c1'
-      ? { ok: true, sign_in_days: ['2026-10-01', '2026-10-02'], has_issued: true, total_times: 5 }
+      ? { ok: true, sign_in_days: [D(1), D(2)], has_issued: true, total_times: 5 }
       : { ok: false, error: 'cookie expired' }),
   },
 });
-// ---- TRAE / Qoder 账号与领取账本 ----
+// ---- TRAE / Qoder 账号与领取账本（不依赖当前时间，固定日期即可）----
 stub('src/traework/auth', {
   load: () => ({ accounts: [{ id: 7, uid: 'tw', nickname: 'TRAE 号', enabled: true, lastCheckin: at(2026, 10, 21) }] }),
 });
@@ -90,13 +106,13 @@ function check(label, fn) {
 (async () => {
   console.log('== 账本：按天幂等 ==');
   check('同一天重复写只留一条', () => {
-    assert.strictEqual(ledger.append({ channel: 'dumate', account_id: 1, day: '2026-10-03', source: 'claim', credits: 10 }), true);
-    assert.strictEqual(ledger.append({ channel: 'dumate', account_id: 1, day: '2026-10-03', source: 'claim', credits: 10 }), false);
-    assert.strictEqual(ledger.rowsInRange({ channel: 'dumate', fromDay: '2026-10-01', toDay: '2026-10-31' }).length, 1);
+    assert.strictEqual(ledger.append({ channel: 'dumate', account_id: 1, day: D(3), source: 'claim', credits: 10 }), true);
+    assert.strictEqual(ledger.append({ channel: 'dumate', account_id: 1, day: D(3), source: 'claim', credits: 10 }), false);
+    assert.strictEqual(ledger.rowsInRange({ channel: 'dumate', fromDay: D(1), toDay: `${Y}-${pad2(M)}-31` }).length, 1);
   });
   check('不同通道/账号互不影响', () => {
     assert.strictEqual(ledger.append({ channel: 'qoder', account_id: 1, day: '2026-10-03', source: 'claim' }), true);
-    assert.strictEqual(ledger.append({ channel: 'dumate', account_id: 2, day: '2026-10-03', source: 'claim' }), true);
+    assert.strictEqual(ledger.append({ channel: 'dumate', account_id: 2, day: D(3), source: 'claim' }), true);
   });
   check('appendMany 批量去重', () => {
     const n = ledger.appendMany([
@@ -117,32 +133,33 @@ function check(label, fn) {
 
   console.log('');
   console.log('== 搭子：上游当月 + 操作流水 + 账本 + lastCheckin 合并 ==');
-  const d = await call('/detail?channel=dumate&year=2026&month=10');
+  const d = await call(`/detail?channel=dumate&year=${Y}&month=${M}`);
   check('HTTP 200', () => assert.strictEqual(d.status, 200, JSON.stringify(d.body)));
   const a1 = d.body.accounts.find((a) => a.id === 1);
   check('上游当月已签日进账（source=upstream）', () => {
-    assert.strictEqual(a1.days['2026-10-01'].source, 'upstream');
-    assert.strictEqual(a1.days['2026-10-02'].source, 'upstream');
+    assert.strictEqual(a1.days[D(1)].source, 'upstream');
+    assert.strictEqual(a1.days[D(2)].source, 'upstream');
   });
   check('本地账本与操作流水也合并', () => {
-    assert.ok(a1.days['2026-10-03'], '缺账本 10-03');
-    assert.ok(a1.days['2026-09-22'], '缺流水 09-22');
+    assert.ok(a1.days[D(3)], `缺账本 ${D(3)}`);
+    assert.ok(a1.days[PD(22)], `缺流水 ${PD(22)}`);
   });
-  check('失败的签到不算「签过」', () => assert.ok(!a1.days['2026-09-23']));
-  check('lastCheckin 兜底补一天', () => assert.strictEqual(a1.days['2026-10-20'].source, 'account'));
-  // 10-01/02 上游、10-03 账本、10-20 lastCheckin
+  check('失败的签到不算「签过」', () => assert.ok(!a1.days[PD(23)]));
+  check('lastCheckin 兜底补一天', () => assert.strictEqual(a1.days[D(20)].source, 'account'));
+  // D1/D2 上游、D3 账本、D20 lastCheckin——全在当月
   check('本月天数只数当月', () => assert.strictEqual(a1.daysInMonth, 4));
   check('上游查询失败如实报出', () => {
     assert.strictEqual(d.body.upstream.failed, 1);
     assert.strictEqual(d.body.upstream.ok, 1);
   });
-  check('按年汇总：9 月 1 天、10 月 4 天', () => {
-    const m9 = d.body.months.find((m) => m.month === 9);
-    const m10 = d.body.months.find((m) => m.month === 10);
-    assert.strictEqual(m9.days, 1);
-    assert.strictEqual(m10.days, 4);
+  check('按年汇总：上月 1 天、本月 4 天', () => {
+    // 上月在跨年时（M===1）落在去年，不在今年 12 个月的汇总里
+    const mPrev = d.body.months.find((m) => m.month === PM);
+    const mCur = d.body.months.find((m) => m.month === M);
+    if (PY === Y) assert.strictEqual(mPrev.days, 1, '上月应只有流水那 1 天');
+    assert.strictEqual(mCur.days, 4, '本月 D1/D2/D3/D20 四天');
   });
-  check('覆盖范围取最早数据点（含操作流水）', () => assert.strictEqual(d.body.coverage.since, '2026-09-22'));
+  check('覆盖范围取最早数据点（含操作流水）', () => assert.strictEqual(d.body.coverage.since, PD(22)));
 
   console.log('');
   console.log('== Qoder：领取账本 + lastCheckin ==');

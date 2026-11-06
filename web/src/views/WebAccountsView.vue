@@ -491,6 +491,9 @@
         </template>
       </a-spin>
     </a-drawer>
+
+    <!-- 会话浏览器：网页端只读查询（会话/项目/connector），与账号管理同源凭证 -->
+    <SessionBrowser />
     </template>
   </div>
 </template>
@@ -505,6 +508,7 @@ import TraeworkAccounts from '@/components/traework/TraeworkAccounts.vue'
 import QwenworkAccounts from '@/components/qwenwork/QwenworkAccounts.vue'
 import QoderAccounts from '@/components/qoder/QoderAccounts.vue'
 import WorkBuddyAccounts from '@/components/workbuddy/WorkBuddyAccounts.vue'
+import SessionBrowser from '@/components/SessionBrowser.vue'
 import type { WebAccount, AccountStatus, PoolData, PoolAccount } from '@/api/webaccounts'
 
 // message 走 App.useApp() 的实例（App.vue 已包 <a-app>），静态 import 拿不到上下文

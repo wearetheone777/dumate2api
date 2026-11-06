@@ -68,6 +68,19 @@ console.log('=== TRAE 通道 fefoUidSet ===');
   });
 }
 
+console.log('=== WorkBuddy 通道 fefoUidSet ===');
+{
+  snap.update('workbuddy', [
+    { accountId: 3, nearest: Date.now() + 5 * HOUR },
+  ]);
+  const wb = require('../src/workbuddy/index.js');
+  const set = wb.fefoUidSet();
+  check('临期账号转成 workbuddy:<id>', () => {
+    assert.ok(set.has('workbuddy:3'), `应含 workbuddy:3，实得 ${[...set]}`);
+    assert.strictEqual(set.has('traework:7'), false, '不能串到别的通道');
+  });
+}
+
 console.log('=== 搭子 web-pool FEFO（数字 id 形式）===');
 {
   // 搭子 pool.pick 的候选是数字 id，快照字符串 id 要 Map 成数字

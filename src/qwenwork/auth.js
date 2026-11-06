@@ -90,6 +90,14 @@ function list() {
     hasRefresh: !!a.refreshToken,
     hasAccess: !!a.accessToken,
     refreshTail: a.refreshToken ? String(a.refreshToken).slice(-6) : '',
+    // 凭证来源标记：refresh 被拒时从官方客户端 auth-v2.dat 收编救活的账号带
+    // 'official-desktop'（exchange 的兜底写入）。排障时能看出「这个号是靠
+    // 客户端登录态救活的」，正常 device flow 的账号没有这个字段
+    adoptedFrom: a.adoptedFrom || null,
+    // refresh token 临期预警（<24h）：过期即必须重新 device flow，
+    // 提前一天亮牌比过期后账号变不可用再排查强（与 admin /accounts 同口径）
+    refreshExpiringSoon: !!(a.refreshExpiresAt && a.refreshExpiresAt > Date.now()
+      && a.refreshExpiresAt - Date.now() < 24 * 3600 * 1000),
   }));
 }
 
@@ -274,7 +282,7 @@ function requestJson(pathname, method, body, headers, timeout = 20000, opts = {}
 }
 
 /**
- * 用 refreshToken 换 device_token。
+ * 用 refreshToken 换 device_token（单次，不含兜底）。
  *
  * **不落盘**：返回 patch 字段由调用方写回，保持「读-改-写」在一次调用里，
  * 避免并发刷新时后写的覆盖掉先写的（traework/auth.js 同一约定）。
@@ -282,11 +290,11 @@ function requestJson(pathname, method, body, headers, timeout = 20000, opts = {}
  * refresh token 是轮换的：每次返回新的，必须存下来。实测旧 token 不会被
  * 立即作废（同一 RT 连用多次都成功），但那不能当成设计保证——新的一定存。
  */
-async function exchange(a) {
-  if (!a || !a.refreshToken) return { ok: false, error: '缺少 refreshToken' };
+async function exchangeOnce(a) {
+  if (!a || !a.refreshToken) return { ok: false, error: '缺少 refreshToken', status: 0, errorCode: '' };
   let agent = null;
   try { agent = require('../proxy-agent').getAgentFor(a); } catch (e) {
-    return { ok: false, error: `出站代理配置错误: ${e.message}` };
+    return { ok: false, error: `出站代理配置错误: ${e.message}`, status: 0, errorCode: '' };
   }
   const r = await requestJson(c.REFRESH_PATH, 'POST', { refresh_token: a.refreshToken, target: 'c' }, {
     'Content-Type': 'application/json',
@@ -302,7 +310,14 @@ async function exchange(a) {
     // 报「未返回 device_token」会让人去查网络，其实该做的是重新登录一次。
     const code = (r.data && (r.data.errorCode || r.data.error)) || `HTTP ${r.status}`;
     const detail = (r.data && (r.data.errorMessage || r.data.message)) || String(r.raw || '').slice(0, 120);
-    return { ok: false, error: `换票失败（${code}${detail ? ': ' + detail : ''}）`, expired: true };
+    return {
+      ok: false,
+      error: `换票失败（${code}${detail ? ': ' + detail : ''}）`,
+      expired: true,
+      // 供 exchange 的兜底判定：401/403 是「refresh 被明确拒绝」，收编才有意义
+      status: r.status,
+      errorCode: String((r.data && r.data.errorCode) || ''),
+    };
   }
 
   const out = { accessToken: token };
@@ -316,6 +331,83 @@ async function exchange(a) {
   }
   out.lastError = '';
   return { ok: true, patch: out };
+}
+
+/**
+ * 官方登录态收编（融合自 Buddy2api v2.2.17 token.py 的 _official_replacement /
+ * _adopt_official，2026-11-06）：refresh 被上游明确拒绝时，本机官方客户端若
+ * **重新登录过**，它的 auth-v2.dat 里就有一份我们没有的新 refresh token——
+ * 收编过来再刷一次，账号就不需要人工重新走 device flow。
+ *
+ * 收编成功后**必须把轮换出的新 token 写回官方文件**：refresh token 是轮换的，
+ * 我们刷一次，官方客户端手里那份旧的就作废了——不写回去等于把用户从官方
+ * 客户端里登出（反向事故）。写回失败只丢日志语义，不影响本次返回。
+ *
+ * 三道防线：
+ *   - 官方文件读不到 / 解不开 → 不收编（本机没装客户端是常态）；
+ *   - refreshToken 与存档相同 → 收编无意义（官方也没重新登录）；
+ *   - uid 双侧都有且不一致 → 官方登录的是**另一个账号**，收编会张冠李戴。
+ */
+function adoptOfficialAndRefresh(a, deps = {}) {
+  const cred = deps.credentials || require('./credentials');
+  const refreshOnce = deps.exchangeOnce || exchangeOnce;
+  let doc;
+  try { doc = cred.decryptAuth(); } catch (e) { return null; }
+  const officialRt = String(doc.refreshToken || doc.refresh_token || '');
+  const officialTok = String(doc.token || '');
+  if (!officialRt || officialRt === String((a && a.refreshToken) || '')) return null;
+  const officialUid = String(doc.uid || (doc.user && (doc.user.id || doc.user.uid)) || '');
+  if (officialUid && a && a.uid && officialUid !== String(a.uid)) return null;
+  return (async () => {
+    // 带上官方 access token 一起试：它可能仍然有效，能省一次「刷新再失败」
+    const retry = await refreshOnce({ ...a, refreshToken: officialRt, accessToken: officialTok });
+    if (!retry.ok) return null;
+    try {
+      cred.encryptAuth({
+        ...doc,
+        token: retry.patch.accessToken,
+        refreshToken: retry.patch.refreshToken || officialRt,
+        expiresAt: retry.patch.expiresAt
+          ? new Date(retry.patch.expiresAt).toISOString()
+          : doc.expiresAt,
+      });
+    } catch (e) { /* 写回失败不影响收编结果（下次刷新会再对齐） */ }
+    return { ok: true, patch: { ...retry.patch, adoptedFrom: 'official-desktop' } };
+  })();
+}
+
+/**
+ * 换票（带兜底）。所有调用方入口。
+ *
+ * 失败时做两件事：
+ *   1. **文案分层**：access 仍在有效期时，错误里带「仍可用到 HH:MM」——
+ *      refresh 失效与通道整体不可用是两种故障，混成一句会让人把还能用的账号
+ *      也去重新登录（Buddy2api token.py 的 _invalid_refresh_message 同款口径）。
+ *   2. **官方登录态收编**：refresh 被明确拒绝（401/403 或 INVALID_REFRESH_TOKEN /
+ *      invalid_grant）时尝试 adoptOfficialAndRefresh——网络抖动 / 5xx 不触发，
+ *      那种失败换 token 也没用。
+ */
+async function exchange(a, opts = {}) {
+  // deps 注入仅供测试（exchangeOnce / credentials），生产路径零感知
+  const deps = opts.deps || {};
+  const once = deps.exchangeOnce || exchangeOnce;
+  const r = await once(a);
+  if (r.ok || opts.noAdopt) return r;
+
+  const exp = Number(a && a.expiresAt);
+  if (Number.isFinite(exp) && exp > Date.now()) {
+    r.error += `；访问令牌仍可用到 ${new Date(exp).toLocaleTimeString('zh-CN', { hour12: false })}，网关请求暂不受影响`;
+  }
+
+  const rejected = r.status === 401 || r.status === 403
+    || /INVALID_REFRESH_TOKEN|invalid_grant/i.test(r.error || '');
+  if (rejected) {
+    try {
+      const adopted = await adoptOfficialAndRefresh(a, { ...deps, exchangeOnce: once });
+      if (adopted) return adopted;
+    } catch (e) { /* 收编异常不吞原错误 */ }
+  }
+  return r;
 }
 
 /**
@@ -420,6 +512,7 @@ function maskPhone(p) {
 
 module.exports = {
   FILE, filePath, dataDir, load, save, list, get, findUsable, preferred,
-  upsert, remove, patch, needsRefresh, exchange, jwtExp, fetchUserInfo,
+  upsert, remove, patch, needsRefresh, exchange, exchangeOnce,
+  adoptOfficialAndRefresh, jwtExp, fetchUserInfo,
   fetchPhone, maskPhone, genMachineId,
 };

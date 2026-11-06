@@ -299,6 +299,10 @@ function loginDetail() {
     refreshExpiresAt: rExp,
     accessExpired: aExp !== null && Date.now() >= aExp,
     refreshExpired: rExp !== null && Date.now() >= rExp,
+    // 临期预警（对齐 xrp-cosy 的 refresh token <24h 告警口径，2026-11-06）：
+    // refresh token 服务端绝对过期，过期即必须重新 device flow——提前一天
+    // 提示「明天要重登」，比过期后账号变不可用再排查强。无过期时刻不预警。
+    refreshExpiringSoon: rExp !== null && rExp > Date.now() && rExp - Date.now() < 24 * 3600 * 1000,
   };
   out.machineId = a.machineId || '';
   out.ok = true;
@@ -370,6 +374,11 @@ const routes = [
       if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=flash）' });
       const billing = require('../../qwenwork/billing');
       const qw = require('../../qwenwork');
+      // ACP 链路（?model=qwen-acp/auto）：chat 桥被账号级模型权限拦住时（403
+      // "Model is not available for this user"），ACP 仍可用（2026-11-05 实测，
+      // 同一 accessToken 两条链路一封一通）。ACP 扣 monthly 池、帧不带 token
+      // 计量——tokens 恒全 0、billed 恒 null，cost 仍是三池差值。
+      const isAcp = /^qwen-acp\//.test(model);
 
       const usable = authStore.findUsable();
       if (!usable.length) return sendJSON(res, 200, { ok: false, model, error: NO_ACCOUNT });
@@ -399,15 +408,23 @@ const routes = [
       let servedName = '';
       let tokens = null;
       try {
-        const agg = await qw.send({
-          model: `qwen/${model}`,
+        const sendPayload = {
           // 输出足够长才能让四位小数的余额差值远离量化误差（成本量级见 note）
           messages: [{ role: 'user', content: '请从 1 数到 400，每个数字之间用一个空格分隔，只输出数字本身，不要输出任何其他文字。' }],
           max_tokens: 4096,
-        }, undefined, {
+        };
+        const sendOpts = {
           reqId,
+          // 探针不惩罚账号：撞限流/额度码时不给账号写冷却（hub v1.7.20 #134）
+          probe: true,
           onAccount: (name, id) => { servedName = name || ''; if (id != null) servedId = id; },
-        });
+        };
+        // ACP 的 send 按「onChunk 存在 = 流式」分叉：不传才走非流式聚合，
+        // 聚合出口带 usage:{}（全 0）——探针要的就是这个形状（ACP 帧无计量，
+        // tokens 如实全 0、billed null）；传了函数反而返回 {streamed:true}。
+        const agg = isAcp
+          ? await require('../../qwenwork/acp').send({ model, ...sendPayload }, undefined, sendOpts)
+          : await qw.send({ model: `qwen/${model}`, ...sendPayload }, undefined, sendOpts);
         const u = (agg && agg.usage) || null;
         if (u) tokens = { input: u.prompt_tokens || 0, output: u.completion_tokens || 0, total: u.total_tokens || 0 };
       } catch (e) {
@@ -452,7 +469,9 @@ const routes = [
           + 'cost 取三池余额差值（与逐笔归因同口径），billed 是折算的每千 token 成本。'
           + '实测量级 flash 约 0.002~0.01 credits / 千 token；余额 4 位小数，短请求的偏差主要来自精度。'
           + '注意 2026-11-01 起上游不再发放每日免费额度，daily 池恒为 0，'
-          + '本探针的消耗全部落在 monthly（pools.daily 恒 0 是上游现状，不是测量失败）。',
+          + '本探针的消耗全部落在 monthly（pools.daily 恒 0 是上游现状，不是测量失败）。'
+          + 'ACP 链路（model 带 qwen-acp/ 前缀）的会话帧不带 token 计量，billed 恒 null，'
+          + 'cost 仍是三池差值；2026-11-05 实测 ACP 一轮「数到 400」扣 0.1919 credits，全落 monthly。',
       });
     },
   },
@@ -513,6 +532,10 @@ const routes = [
           tokenExpiresAt: a.expiresAt || null,
           refreshExpiresAt: a.refreshExpiresAt || null,
           refreshExpired: !!(a.refreshExpiresAt && Date.now() >= a.refreshExpiresAt),
+          // 临期预警（<24h）：refresh token 过期即必须重新 device flow，
+          // 提前一天亮牌比过期后排查强（与上方 token 状态卡同口径）
+          refreshExpiringSoon: !!(a.refreshExpiresAt && a.refreshExpiresAt > Date.now()
+            && a.refreshExpiresAt - Date.now() < 24 * 3600 * 1000),
           machineId: a.machineId || '',
           lastError: a.lastError || '',
           // lastError 的写入时刻，界面显示「N 分钟前」用。没有它会把几小时前
@@ -689,6 +712,9 @@ const routes = [
           tokenExpiresAt: a.expiresAt ? new Date(a.expiresAt).toISOString() : null,
           refreshExpiresAt: a.refreshExpiresAt ? new Date(a.refreshExpiresAt).toISOString() : null,
           refreshExpired: !!(a.refreshExpiresAt && Date.now() >= a.refreshExpiresAt),
+          // <24h 临期预警（与 /accounts 同口径）
+          refreshExpiringSoon: !!(a.refreshExpiresAt && a.refreshExpiresAt > Date.now()
+            && a.refreshExpiresAt - Date.now() < 24 * 3600 * 1000),
           tokenExpired: !!(a.expiresAt && Date.now() >= a.expiresAt),
         } : {};
       } catch (e) {

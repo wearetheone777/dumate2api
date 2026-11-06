@@ -16,6 +16,7 @@
 const https = require('https');
 const crypto = require('crypto');
 const c = require('./constants');
+const sanitize = require('./sanitize');
 
 /** 24-hex 稳定会话 id：从首条 user 内容指纹派生（同会话跨轮稳定，无锚回落随机） */
 function stableConversationId(messages) {
@@ -37,6 +38,15 @@ function promptCacheKey(uid, convId) {
   h.update(String(convId || ''));
   const hex = h.digest('hex');
   return `wb-${u.slice(0, 8)}-${hex.slice(0, 16)}`;
+}
+
+/**
+ * 带 function 形状工具的个数。「播报即收尾」修复只对**带工具的请求**启用，
+ * 判定口径与 qwenwork/chat.js 的同名函数一致（改过滤规则时两边不要漂移）。
+ */
+function hasFunctionTools(payload) {
+  const t = Array.isArray(payload && payload.tools) ? payload.tools : [];
+  return t.filter((x) => x && x.type === 'function' && x.function && x.function.name).length;
 }
 
 /**
@@ -87,6 +97,11 @@ function buildChatBody(payload, region, account) {
   if (!first || first.role !== 'system') {
     body.messages.unshift({ role: 'system', content: c.INTERNATIONAL_SYSTEM_PROMPT });
   }
+
+  // 11-128 指纹清洗（hub v1.7.25/26 + v1.9.0）：DSH 生态的 system/assistant
+  // 必带身份句与提示词指纹，出站前中性化。放在会话 id 派生之前——清洗不改写
+  // user 内容，convId（取首条 user）不受影响，前缀缓存键稳定
+  body.messages = sanitize.sanitizeMessages(body.messages);
 
   // 会话 id：跨轮稳定（前缀缓存不被打散），三头与 body 同源
   const convId = stableConversationId(body.messages);
@@ -173,7 +188,7 @@ function postStream(region, account, payload) {
       // 长流不能设总超时，否则 SSE 会被掐断（与其它直连通道同口径）
       timeout: 600000,
       ...(agent ? { agent } : {}),
-    }, (res) => resolve({ stream: res, status: res.statusCode, convId }));
+    }, (res) => resolve({ stream: res, status: res.statusCode, headers: res.headers, convId }));
     req.on('error', (e) => resolve({ stream: null, status: 0, error: e.message, convId }));
     req.on('timeout', () => { req.destroy(); resolve({ stream: null, status: 0, error: 'timeout', convId }); });
     req.write(body);
@@ -184,40 +199,61 @@ function postStream(region, account, payload) {
 /**
  * 解析标准 OpenAI SSE（data: 行 + [DONE] 哨兵）。onChunk 收每条 data 的
  * JSON 对象（[DONE] 以 null 传入）。跨 chunk 汉字用 StringDecoder。
+ *
+ * [DONE] 即终态（hub v1.9.1 WB_STOP_AT_SSE_DONE 的默认开版本）：上游在
+ * [DONE] 后会保持连接不关，聚合路径 readStream 不 resolve 就一直白等。
+ * 见哨兵即销毁连接并 resolve——usage/finish 帧按协议都在 [DONE] 之前，
+ * 之后不存在还值得等的数据。DUMATE_WORKBUDDY_STOP_AT_DONE=0 可关（兜底）。
  */
 async function readStream(stream, onData) {
   const { StringDecoder } = require('string_decoder');
   const dec = new StringDecoder('utf8');
   let buf = '';
+  let settled = false;
+  const stopAtDone = process.env.DUMATE_WORKBUDDY_STOP_AT_DONE !== '0';
   return new Promise((resolve, reject) => {
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
     const flushLine = (line) => {
       const s = line.trim();
       if (!s.startsWith('data:')) return;
       const payload = s.slice(5).trim();
       if (!payload) return;
-      if (payload === '[DONE]') { onData(null); return; }
+      if (payload === '[DONE]') {
+        onData(null);
+        if (stopAtDone) {
+          try { stream.destroy(); } catch (e) { /* 已结束 */ }
+          finish();
+        }
+        return;
+      }
       try { onData(JSON.parse(payload)); } catch (e) { /* 非 JSON 行跳过 */ }
     };
     stream.on('data', (chunk) => {
+      if (settled) return;
       buf += dec.write(chunk);
       let idx;
       while ((idx = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, idx);
         buf = buf.slice(idx + 1);
         flushLine(line);
+        if (settled) return;
       }
     });
     stream.on('end', () => {
       buf += dec.end();
       if (buf.trim()) flushLine(buf);
-      resolve();
+      finish();
     });
-    stream.on('error', reject);
+    stream.on('error', (e) => { if (!settled) reject(e); });
   });
 }
 
 /** 聚合整轮结果（非流式路径）：标准 OpenAI chunk 流 → 一个 chat.completion */
-function aggregate(chunks, model) {
+function aggregate(chunks, model, opts = {}) {
   let content = '';
   let reasoning = '';
   let finish = 'stop';
@@ -244,6 +280,17 @@ function aggregate(chunks, model) {
     if (choice.finish_reason) finish = choice.finish_reason;
     if (ch.usage) usage = ch.usage;
   }
+  // DSML fail-closed 兜底（共享实现 repair.aggregateDsmlFallback；WorkBuddy 的
+  // 国际目录同样跑 DeepSeek 系，一样可能把工具调用写进正文）。
+  // recovered 时把 stop 纠正成 tool_calls（模型没走原生调用，上游必然报 stop）。
+  // 其后是 tool echo 兜底（hub#135）：纯 JSON 载荷形状，与 DSML 互补。
+  const repair = require('../repair');
+  const dsml = repair.aggregateDsmlFallback('workbuddy', content, calls);
+  content = dsml.content;
+  if (dsml.recovered && finish === 'stop') finish = 'tool_calls';
+  const echo = repair.aggregateToolEchoFallback('workbuddy', content, calls, opts.toolNames, opts.echoMode);
+  content = echo.content;
+  if (echo.recovered && finish === 'stop') finish = 'tool_calls';
   const message = { role: 'assistant', content };
   if (reasoning) message.reasoning_content = reasoning;
   if (calls.size) {
@@ -267,6 +314,6 @@ function aggregate(chunks, model) {
 }
 
 module.exports = {
-  stableConversationId, promptCacheKey, buildChatBody, chatHeaders, chatUserAgent,
+  stableConversationId, promptCacheKey, hasFunctionTools, buildChatBody, chatHeaders, chatUserAgent,
   postStream, readStream, aggregate,
 };

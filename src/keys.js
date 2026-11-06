@@ -121,17 +121,17 @@ function normalizeList(items) {
 
 // 通道绑定。'' / null = 不限通道（兼容已有 key：网关按模型名前缀分流，
 // 不按 key 分流）。设成具体通道后，这把 key 只能调该通道的模型。
-// 四条通道：dumate（本地转发）、qwenwork（直连）、traework（直连，凭证自持）、
-// qoder（直连，纯本地签名）
+// 五条通道：dumate（本地转发）、qwenwork（直连）、traework（直连，凭证自持）、
+// qoder（直连，纯本地签名）、workbuddy（直连，双区域）
 const { CHANNELS, normalize } = require('./channels');
 function normalizeChannel(v) {
   return normalize(v);
 }
 
 // 区域维度（2026-11-01）：'' = 不限 / 'cn' = 仅国内账号 / 'intl' = 仅国际账号。
-// 只对有国际版的通道有意义——qoder（global 端点已接）、traework（国际链路
-// 未接入，intl key 会拿到明确的「未接入」报错）；dumate 与 qwenwork 是纯国内
-// 产品（上游连国际端点都没有），intl key 打它们在 validate 就拒，不进运行时。
+// 只对有国际版的通道有意义——qoder（global 端点）、traework（2026-11-03 国际版
+// 已接入）、workbuddy（双区域）；dumate 与 qwenwork 是纯国内产品（上游连国际
+// 端点都没有），intl key 打它们在 validate 就拒，不进运行时。
 const KEY_REGIONS = ['', 'cn', 'intl'];
 function normalizeRegionKey(v) {
   const s = String(v || '').trim().toLowerCase();

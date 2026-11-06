@@ -71,9 +71,19 @@ function available() {
  *   emitter 伪上游响应；done 最终结果；ready 等状态码；flush 释放缓冲。
  */
 function callWebPool(body, opts = {}) {
+  // 模型名归一到**云端名空间**（2026-11-06 实测）：入参 body.model 是本地链路
+  // 归一过的名字（glm-5 / model-artifact-validate / dm-auto-model/*……），云端
+  // /gateway/apis/v1 只认 cloud_upstream 六个路由名，glm-5 原样打过去必 404。
+  // toCloudModel 只改写不认识的名字，model-text / 云端真名原样保留。
+  // 浅拷贝后再改——不篡改调用方的请求体（qoder 缓存亲和的同一纪律）。
+  const modelmap = require('./modelmap');
+  const cloudBody = body && typeof body === 'object' && body.model
+    ? { ...body, model: modelmap.toCloudModel(body.model) }
+    : body;
+
   const emitter = new EventEmitter();
   emitter.statusCode = 200;
-  emitter.headers = { 'content-type': body.stream ? 'text/event-stream' : 'application/json' };
+  emitter.headers = { 'content-type': cloudBody.stream ? 'text/event-stream' : 'application/json' };
 
   let settled = false;
   let flushing = false;
@@ -170,7 +180,7 @@ function callWebPool(body, opts = {}) {
   const done = new Promise((resolve) => {
     const finish = (r) => resolve(r);
 
-    const run = body.stream
+    const run = cloudBody.stream
       ? pool.callStreamWithFailover('/chat/completions', 'POST', body, onChunkSniff, {
         timeout: 600000,
         // 真实模型回调（X-Dumate-Gw-Realmodel）：池子在响应头到达时上报
@@ -221,7 +231,7 @@ function callWebPool(body, opts = {}) {
         // Prompt 请求返回 `{"error":...}{"error":...}` 即此因）。
         settle(r.status || 502);
         emitter.headers = { 'content-type': 'application/json' };
-        if (!body.stream || !pushedAny) {
+        if (!cloudBody.stream || !pushedAny) {
           // 非流式（或还没推过任何字节）：有上游错误体就**原样透传**——
           // 里面的 message（如「Prompt 超长」）才是真实原因；包一层
           // 'web fallback failed' 会把原因抹掉。
@@ -234,7 +244,7 @@ function callWebPool(body, opts = {}) {
         return finish({ ok: false, status: emitter.statusCode, error: r.error, json: r.json });
       }
 
-      if (!body.stream) {
+      if (!cloudBody.stream) {
         // 非流式：一次性把完整 JSON 交给下游（它的分支就是累加后解析）
         settle(200);
         push(r.raw || JSON.stringify(r.json || {}));

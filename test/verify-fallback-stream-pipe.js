@@ -107,6 +107,8 @@ process.env.DUMATE2API_PORT = String(PORT);
 process.env.DUMATE2API_HOST = '127.0.0.1';
 process.env.DUMATE_AUTOSTART = 'off';
 process.env.DUMATE_ADMIN_DATA = path.join(ROOT, 'data');
+// 2026-11-01 起模型端点强制鉴权——测试用 env 密钥，post() 里带上
+process.env.DUMATE2API_KEY = 'test-key-fallback';
 require(path.join(ROOT, 'src/server.js'));
 
 // ---- 3. 断言 ----
@@ -118,6 +120,7 @@ function post(pathname, body, headers) {
       headers: Object.assign({
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(data),
+        'Authorization': 'Bearer test-key-fallback',
       }, headers || {}),
     }, (res) => {
       let t = '';

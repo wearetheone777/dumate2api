@@ -64,6 +64,10 @@ function status() {
     wasm: w ? { file: w.file, version: w.version } : null,
     loggedIn: usable.length > 0,
     accounts: usable.length,
+    // ACP 链路上游实定档位（最近一次建会话的 extra_data.mode；无会话 null）
+    acpMode: (() => {
+      try { return require('./acp').lastMode(); } catch (e) { return null; }
+    })(),
     error: !signerReady
       ? 'wasm 未找到（DUMATE_QWENWORK_USE_WASM=1 时才需要它）'
       : (usable.length ? '' : '尚未添加千问账号（需先登录一次）'),
@@ -195,7 +199,11 @@ async function runOnce(account, payload, onChunk, opts) {
       // 每轮新开一扇门：重试轮要丢弃上一轮的缓冲（含暂扣的 usage/finish）。
       // opts 带模型与通道名：finish 阶段的 DSML fail-closed 兜底要用
       // （recovered 帧要合成 OpenAI chunk，leak 日志要通道前缀）
-      gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP, { model: modelKey, channel: 'qwenwork' }) : null;
+      gate = repairable ? repair.createChunkGate(down, true, caps.HOLD_CAP, {
+        model: modelKey, channel: 'qwenwork',
+        toolNames: repair.toolNamesOf(payload),
+        echoMode: repair.toolEchoMode(),
+      }) : null;
       const deliver = gate ? (inner) => gate.onInner(inner) : down;
       try {
         res = await chat.postStream(built.url, built.body, built.headers, (inner) => {
@@ -280,7 +288,10 @@ async function runOnce(account, payload, onChunk, opts) {
       payloads.push(...chat.unwrap(raw));
     }
     settle();
-    const agg = chat.aggregate(payloads, modelKey);
+    const agg = chat.aggregate(payloads, modelKey, {
+      toolNames: repair.toolNamesOf(payload),
+      echoMode: repair.toolEchoMode(),
+    });
     const msg = (agg.choices && agg.choices[0] && agg.choices[0].message) || {};
     const hasCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
     if (hasCalls || !repairable || attempt >= caps.REPAIR_MAX
@@ -359,9 +370,13 @@ async function send(payload, onChunk, opts = {}) {
       return result;
     } catch (e) {
       const code = Number(e.statusCode) || 0;
-      // 失败喂池：类别判定在 upstream-errors.classify，池动作按类别分发
-      channelPool.noteError(CHANNEL, account.id, { status: code, message: e.message, model });
-      markFailure(account, e.message);
+      // 失败喂池：类别判定在 upstream-errors.classify，池动作按类别分发。
+      // **探针模式（opts.probe）跳过写型惩罚**——billing-check 是观测动作，
+      // 不把健康账号打成冷却（hub v1.7.20 #134 的教训），错误照常上抛。
+      if (!opts.probe) {
+        channelPool.noteError(CHANNEL, account.id, { status: code, message: e.message, model });
+        markFailure(account, e.message);
+      }
       // 限流要单独标出来：千问的限流是 **HTTP 403 + 信封 10605**，只看状态码
       // 会把它和「签名错/无权限」混为一谈（isThrottle 才是判据）。
       errors.push({

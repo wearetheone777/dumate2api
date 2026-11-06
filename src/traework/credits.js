@@ -20,6 +20,73 @@ const jsonl = require('../jsonl');
 
 const FILE = 'traework-credits.jsonl';
 
+// 逐轮账单 enrichment（2026-11-06，Remote 链路收官）：capture 落行后异步查
+// get_session_usage（TRAE 唯一的单请求账单口径），把精确扣费追加成**补充行**。
+// 差值口径保留不动：精确值只在确有上游账单时覆盖（computeCosts 合并），
+// 查不到不补行不编 0——「没查到」与「没花钱」必须可区分。
+// DUMATE_TRAEWORK_SESSION_BILLING=0 关闭（节流窗口与探针行为不受影响）。
+const SESSION_BILLING_ENABLED = process.env.DUMATE_TRAEWORK_SESSION_BILLING !== '0';
+// 账单落库有延迟（探针实测秒级），重试间隔 1.5s/3s 退避；全失败就放弃该行
+const SESSION_BILLING_RETRIES = Math.max(1,
+  parseInt(process.env.DUMATE_TRAEWORK_SESSION_BILLING_RETRIES || '3', 10) || 3);
+
+/**
+ * 从账单响应抽缓存计数（2026-11-06 真机形状）：
+ * user_usage_group_by_session.extra_info.{cache_read_token, cache_write_token,
+ * input_token, output_token}，usage_group_details 每组一份（取第一组）。
+ * 全零骨架（无 input/output）返回 null——免费/未结算请求的 0 与「真没缓存」
+ * 不可区分，不补。
+ */
+function parseBillCache(data) {
+  const d = data && data.data && typeof data.data === 'object' ? data.data : data;
+  const g = d && (d.user_usage_group_by_session || (d.usage && d.usage.user_usage_group_by_session));
+  if (!g || typeof g !== 'object') return null;
+  const details = Array.isArray(g.usage_group_details) ? g.usage_group_details : [];
+  const src = (g.extra_info && typeof g.extra_info === 'object' && details.length ? g.extra_info : null)
+    || (details.length && details[0] && details[0].extra_info && typeof details[0].extra_info === 'object'
+      ? details[0].extra_info : null);
+  if (!src) return null;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const out = {
+    cacheRead: n(src.cache_read_token),
+    cacheWrite: n(src.cache_write_token),
+    inputTokens: n(src.input_token),
+    outputTokens: n(src.output_token),
+  };
+  if (!out.inputTokens && !out.outputTokens) return null;
+  return out;
+}
+
+async function enrichSessionUsage(account, { reqId, turnId }) {
+  if (!SESSION_BILLING_ENABLED || !reqId || !turnId) return;
+  const billing = require('./billing');
+  for (let i = 0; i < SESSION_BILLING_RETRIES; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, 1500 * i));
+    const r = await billing.fetchSessionUsage(account, turnId)
+      .catch((e) => ({ ok: false, error: e.message }));
+    if (r.ok && r.credits != null) {
+      // 缓存计数随精确账单顺手落行（账单是权威源：SSE 的缓存 0 不能证明
+      // 未命中——真机实测 SSE 两轮全 0、账单 cache_read_token=25344）
+      const cache = parseBillCache(r.raw);
+      append({
+        type: 'session_usage',
+        ts: Date.now(),
+        req_id: String(reqId),
+        account_id: account.id,
+        turn_id: String(turnId),
+        credits: r.credits,
+        ...(cache ? {
+          cache_read: cache.cacheRead,
+          cache_write: cache.cacheWrite,
+          input_tokens: cache.inputTokens,
+          output_tokens: cache.outputTokens,
+        } : {}),
+      });
+      return;
+    }
+  }
+}
+
 function dataDir() {
   return process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', '..', 'data');
 }
@@ -54,6 +121,9 @@ const lastCaptureAt = new Map();
  *   归因要等额度接口返回，ts 必然晚于埋点，靠时间猜会串账。
  * @param {string} [opts.model] 模型名
  * @param {number} [opts.startedAt] 请求开始时刻
+ * @param {string} [opts.turnId] 逐轮账单键（remote 链路的 message_id / persona
+ *   的 session_id）。给了就落 turn_id 并异步查精确扣费；没有（utils_chat
+ *   普通链路拿不到 id）保持差值口径
  * @returns {Promise<object|null>}
  */
 function capture(account, opts = {}) {
@@ -85,8 +155,15 @@ function capture(account, opts = {}) {
       remain: u.remain,
       limit: u.limit,
       ...(isIntl ? { intl: true } : {}),
+      ...(opts.turnId ? { turn_id: String(opts.turnId) } : {}),
     };
     append(entry);
+    // 逐轮账单 enrichment：**不进串行队列**（1~3 次上游查询会拖慢下一条
+    // 差值采集），fire-and-forget——失败静默，差值口径照常兜底
+    if (opts.turnId) {
+      enrichSessionUsage(account, { reqId: opts.reqId, turnId: opts.turnId })
+        .catch(() => { /* enrichment 失败不影响账本主行 */ });
+    }
     return entry;
   };
   const prev = queues.get(key) || Promise.resolve();
@@ -120,12 +197,25 @@ function indexByReqId() {
  * 逐笔明细），三处各写一遍必然漂移——某处改了负值处理而另一处没改，
  * 同一份数据在界面上会出现两个数。
  *
- * @returns {{rows: object[], delta: object, inexact: Set<string>}}
- *   rows 是全量归因记录；delta 按 req_id 给出成本；inexact 是与相邻
- *   请求并发、差值可能含对方消耗的那批 req_id。
+ * @returns {{rows: object[], delta: object, inexact: Set<string>, exactIds: Set<string>}}
+ *   rows 是全量归因记录（session_usage 补充行**不混入**——它没有 consumed
+ *   游标语义，混进逐笔明细会变成幽灵行、请求计数会重复）；delta 按 req_id
+ *   给出成本（有精确账单时已被覆盖）；inexact 是与相邻请求并发、差值可能
+ *   含对方消耗的那批 req_id（精确行豁免，但**只豁免自己**——并发对端的
+ *   差值仍可能含本次消耗，标注保留）；exactIds 是成本来自单请求账单的集合。
  */
 function computeCosts() {
-  const rows = readHistory();
+  const all = readHistory();
+  const exactCredits = new Map();
+  const rows = [];
+  for (const r of all) {
+    if (r && r.type === 'session_usage') {
+      // 同 req_id 多条（重试/进程重启后重复查询）取最后一条，Map 天然幂等
+      if (r.req_id && r.credits != null) exactCredits.set(String(r.req_id), r);
+      continue;
+    }
+    rows.push(r);
+  }
   const byAcc = {};
   for (const r of rows) {
     const k = String(r.account_id);
@@ -158,7 +248,15 @@ function computeCosts() {
       }
     }
   }
-  return { rows, delta, inexact };
+  // 精确优先：单请求账单不受结算延迟/量化/并发干扰，覆盖差值。
+  // 对端行的 inexact 标注保留——它的差值仍可能含本请求的消耗。
+  const exactIds = new Set();
+  for (const [reqId, ex] of exactCredits) {
+    delta[reqId] = ex.credits;
+    exactIds.add(reqId);
+    inexact.delete(reqId);
+  }
+  return { rows, delta, inexact, exactIds };
 }
 
 /** 本地日期键 YYYY-MM-DD。按本地时区切天，与界面显示的日期一致 */
@@ -237,7 +335,7 @@ function todayUsage() {
 
 /** 逐笔明细（按时间倒序），供仪表盘表格 */
 function creditRecords(limit) {
-  const { rows, delta, inexact } = computeCosts();
+  const { rows, delta, inexact, exactIds } = computeCosts();
   // 区域随行给（2026-11-03 国际版）：积分明细/用量按国内/国际区分的数据源。
   // 按账号 id 回查；账号已删除的旧行如实空串，不猜。
   let regions = null;
@@ -259,7 +357,9 @@ function creditRecords(limit) {
       ms: r.ms ?? null,
       // 成本可能为 null（首条无参照点），如实留空而不是补 0
       cost: r.req_id in delta ? delta[r.req_id] : null,
-      exact: !inexact.has(r.req_id),
+      exact: exactIds.has(r.req_id) ? true : !inexact.has(r.req_id),
+      // 成本口径：session_usage = 上游单请求账单（精确）；consumed_delta = 差值（推断）
+      source: r.req_id in delta ? (exactIds.has(r.req_id) ? 'session_usage' : 'consumed_delta') : null,
       consumed: r.consumed ?? null,
       remain: r.remain ?? null,
       limit: r.limit ?? null,
@@ -276,7 +376,7 @@ function creditRecords(limit) {
  * 对方的消耗算进来，总和正确、单项不准，标记出来而不是假装精确。
  */
 function attachCosts(pageRows) {
-  const { rows, delta, inexact } = computeCosts();
+  const { rows, delta, inexact, exactIds } = computeCosts();
   if (!rows.length) return pageRows;
 
   const idx = indexByReqId();
@@ -294,7 +394,9 @@ function attachCosts(pageRows) {
     };
     if (r.req_id in delta) {
       out.tw_cost = delta[r.req_id];
-      out.tw_exact = !inexact.has(r.req_id);
+      // 精确口径（单请求账单）不受并发干扰，恒 exact；差值口径才需要并发标注
+      out.tw_exact = exactIds.has(r.req_id) ? true : !inexact.has(r.req_id);
+      out.tw_source = exactIds.has(r.req_id) ? 'session_usage' : 'consumed_delta';
     }
     return out;
   });
@@ -303,5 +405,6 @@ function attachCosts(pageRows) {
 module.exports = {
   capture, readHistory, indexByReqId, attachCosts,
   computeCosts, dailyUsage, todayUsage, creditRecords, dayKey,
+  parseBillCache,
   FILE, filePath,
 };

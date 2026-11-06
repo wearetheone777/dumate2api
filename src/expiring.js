@@ -26,7 +26,9 @@ const path = require('path');
 //    也按 7 天（SOON_MS）过滤，两边同窗
 //  - qwenwork：上游 expiring_soon 本身就是信号（管理端照单全收），窗口只
 //    是兜底，给 30 天与另外两家对齐
-const DEFAULT_WINDOW_DAYS = { dumate: 30, traework: 7, qwenwork: 30 };
+//  - workbuddy：到期来自套餐 CycleEndTime（北京时间字符串，2026-11-04 真机
+//    实证）；裂变包以月周期为主但也有短包，窗口给 7 天与 traework 同口径
+const DEFAULT_WINDOW_DAYS = { dumate: 30, traework: 7, qwenwork: 30, workbuddy: 7 };
 
 // 通道的临期窗口（天）。env 每次读——Qoder read-idle 当年在模块加载时读死
 // env 值的教训（改配置必须重启才生效），这里不重犯。

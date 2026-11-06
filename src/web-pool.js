@@ -140,6 +140,13 @@ async function getToken(account, force = false, agent = null) {
     if (r.status !== 200 || !r.json || !r.json.result || !r.json.result.token) {
       const msg = r.json && r.json.message ? r.json.message : (r.raw || `HTTP ${r.status}`);
       st.last_error = `取 token 失败：${msg}`;
+      // token/get 回 401 = cookie 已失效，旧票随之必死——当场清缓存。不清的话
+      // 后续请求会先拿僵尸票打模型网关吃 401、再触发强刷回到 token/get 再失败
+      // 一次，每个请求都两连败；清了之后失败路径缩短为一次 token/get。
+      if (r.status === 401) {
+        st.token = null;
+        st.token_expire_at = 0;
+      }
       return { ok: false, error: st.last_error, expired: r.status === 401 };
     }
 
@@ -242,6 +249,84 @@ async function callModel(account, path, method, body, opts = {}) {
   }
 }
 
+// 流式单次尝试（不含 401 编排与在途帽，外部请走 callModelStream）。
+// opts._swallow401 = true 时把 401 错误体吞掉不上 onChunk——错误体一旦进了
+// 调用方的嗅探层（fallback-web 首块嗅探 / guardedChunk 的 committed 置位），
+// 包装层的强刷重试与故障转移就全被短路了。
+async function streamOnce(account, path, method, body, onChunk, agent, opts) {
+  return await new Promise((resolve) => {
+    getToken(account, opts.forceToken, agent).then((t) => {
+      if (!t.ok) return resolve({ ok: false, status: 401, error: t.error, expired: t.expired, account });
+
+      const payload = JSON.stringify(body);
+      const req = https.request(
+        {
+          hostname: GATEWAY_HOST,
+          path: GATEWAY_PREFIX + path,
+          method,
+          timeout: opts.timeout || 600000,
+          ...(agent ? { agent } : {}),
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+            Authorization: `Bearer ${t.token}`,
+            'X-Dumate-Client-Type': 'web',
+            'X-Dumate-Account-Id': 'global',
+            'Content-Length': Buffer.byteLength(payload),
+          },
+        },
+        (res) => {
+          // 401 拦截（仅首次尝试）：token 可能在本地 expired_at 之前被服务端
+          // 作废（同账号在别处重新登录会顶掉旧票）。丢弃错误体、交包装层强刷
+          // 重试——这次尝试对外不存在，onStatus/onChunk 都不触发。
+          if (res.statusCode === 401 && opts._swallow401) {
+            res.resume();
+            return resolve({ ok: false, status: 401, swallowed: true, account });
+          }
+          // 响应头一到就回调：调用方要在「还没转发任何内容」时决定
+          // 是否接受这次响应（否则只能等整条流结束，那就没法做故障转移了）
+          if (typeof opts.onStatus === 'function') {
+            try { opts.onStatus(res.statusCode); } catch (e) { /* 忽略 */ }
+          }
+          // 云端网关回传的真实后端模型（X-Dumate-Gw-Realmodel）。响应头
+          // 一到就上报——埋点在流结束时落笔，晚一步就赶不上
+          const realModel = res.headers['x-dumate-gw-realmodel'] || '';
+          if (realModel && typeof opts.onRealModel === 'function') {
+            try { opts.onRealModel(realModel); } catch (e) { /* 忽略 */ }
+          }
+          // text 只用于日志/usage 扫描（usage 在流的最后），转发走 onChunk。
+          // 原实现全量累积（审计 P1-1c：号称「不缓冲」实际整条 SSE 又存一份），
+          // 这里改为尾部固定窗口——语义不变，内存有界。
+          const TEXT_TAIL = 1024 * 1024;
+          let text = '';
+          res.setEncoding('utf8');
+          res.on('data', (c) => {
+            text += c;
+            if (text.length > TEXT_TAIL) text = text.slice(-TEXT_TAIL);
+            try { onChunk(c); } catch (e) { /* 下游写失败不影响上游读取 */ }
+          });
+          res.on('end', () => {
+            const ok = res.statusCode >= 200 && res.statusCode < 300;
+            resolve({
+              ok, status: res.statusCode, text, account, streamed: true,
+              realModel: res.headers['x-dumate-gw-realmodel'] || '',
+            });
+          });
+        },
+      );
+      req.on('error', (e) => {
+        resolve({ ok: false, status: 0, error: e.message, account });
+      });
+      req.on('timeout', () => {
+        req.destroy();
+        resolve({ ok: false, status: 0, error: 'timeout', account });
+      });
+      req.write(payload);
+      req.end();
+    }).catch((e) => resolve({ ok: false, status: 0, error: e.message, account }));
+  });
+}
+
 // 流式调用：把上游的 SSE 原样透传给调用方，不缓冲。
 // 与 callModel 的区别是这里不做 JSON 解析——流式响应的价值就在于
 // 首字能尽早到达，整体缓冲会把它变成非流式。
@@ -252,6 +337,10 @@ async function callModel(account, path, method, body, opts = {}) {
 // 成败标记不在本函数做：旧实现在这里与故障转移循环各记一次，同一次失败
 // 被计两遍；现在统一由带故障转移语义的调用方（callStreamWithFailover/probe）
 // 喂池，直连调用方（chatlab 实验）不污染账号状态。
+//
+// 401 自愈（与 callModel 对齐，2026-11-06）：首次尝试的 401 错误体被
+// streamOnce 吞掉（不喂 onChunk、不触发 onStatus），这里强刷 token 重试一次；
+// 重试仍 401 时错误体按原样经 onChunk 交给调用方（真失效重试也没用，不无限循环）。
 async function callModelStream(account, path, method, body, onChunk, opts = {}) {
   if (!pool.acquire(account.id)) {
     return { ok: false, status: 0, error: '账号在途请求已达上限', busy: true, account, streamed: true };
@@ -261,70 +350,13 @@ async function callModelStream(account, path, method, body, onChunk, opts = {}) 
     try { agent = agentFor(account); } catch (e) {
       return { ok: false, status: 0, error: `出站代理配置错误: ${e.message}`, account, streamed: true };
     }
-    return await new Promise((resolve) => {
-      getToken(account, opts.forceToken, agent).then((t) => {
-        if (!t.ok) return resolve({ ok: false, status: 401, error: t.error, expired: t.expired, account });
-
-        const payload = JSON.stringify(body);
-        const req = https.request(
-          {
-            hostname: GATEWAY_HOST,
-            path: GATEWAY_PREFIX + path,
-            method,
-            timeout: opts.timeout || 600000,
-            ...(agent ? { agent } : {}),
-            headers: {
-              'Content-Type': 'application/json',
-              Accept: 'text/event-stream',
-              Authorization: `Bearer ${t.token}`,
-              'X-Dumate-Client-Type': 'web',
-              'X-Dumate-Account-Id': 'global',
-              'Content-Length': Buffer.byteLength(payload),
-            },
-          },
-          (res) => {
-            // 响应头一到就回调：调用方要在「还没转发任何内容」时决定
-            // 是否接受这次响应（否则只能等整条流结束，那就没法做故障转移了）
-            if (typeof opts.onStatus === 'function') {
-              try { opts.onStatus(res.statusCode); } catch (e) { /* 忽略 */ }
-            }
-            // 云端网关回传的真实后端模型（X-Dumate-Gw-Realmodel）。响应头
-            // 一到就上报——埋点在流结束时落笔，晚一步就赶不上
-            const realModel = res.headers['x-dumate-gw-realmodel'] || '';
-            if (realModel && typeof opts.onRealModel === 'function') {
-              try { opts.onRealModel(realModel); } catch (e) { /* 忽略 */ }
-            }
-            // text 只用于日志/usage 扫描（usage 在流的最后），转发走 onChunk。
-            // 原实现全量累积（审计 P1-1c：号称「不缓冲」实际整条 SSE 又存一份），
-            // 这里改为尾部固定窗口——语义不变，内存有界。
-            const TEXT_TAIL = 1024 * 1024;
-            let text = '';
-            res.setEncoding('utf8');
-            res.on('data', (c) => {
-              text += c;
-              if (text.length > TEXT_TAIL) text = text.slice(-TEXT_TAIL);
-              try { onChunk(c); } catch (e) { /* 下游写失败不影响上游读取 */ }
-            });
-            res.on('end', () => {
-              const ok = res.statusCode >= 200 && res.statusCode < 300;
-              resolve({
-                ok, status: res.statusCode, text, account, streamed: true,
-                realModel: res.headers['x-dumate-gw-realmodel'] || '',
-              });
-            });
-          },
-        );
-        req.on('error', (e) => {
-          resolve({ ok: false, status: 0, error: e.message, account });
-        });
-        req.on('timeout', () => {
-          req.destroy();
-          resolve({ ok: false, status: 0, error: 'timeout', account });
-        });
-        req.write(payload);
-        req.end();
-      }).catch((e) => resolve({ ok: false, status: 0, error: e.message, account }));
-    });
+    const first = await streamOnce(account, path, method, body, onChunk, agent,
+      { ...opts, _swallow401: !opts._retried });
+    if (first.swallowed && !opts._retried) {
+      return await streamOnce(account, path, method, body, onChunk, agent,
+        { ...opts, forceToken: true, _retried: true });
+    }
+    return first;
   } finally {
     pool.release(account.id);
   }
@@ -371,12 +403,17 @@ async function callWithFailover(path, method, body, opts = {}) {
       return { ...r, attempts: i + 1, no_retry: true };
     }
 
-    markFailure(item.account.id, {
-      status,
-      code: r.json && r.json.error && r.json.error.code,
-      message: r.error || (r.json && r.json.error && r.json.error.message) || `HTTP ${status}`,
-      model,
-    });
+    // markFailure 是写型惩罚（冷却/负缓存）。**探针模式（opts.probe）跳过**：
+    // billing-check 是观测动作，撞限流把账号写进冷却等于健康检查伤号
+    // （hub v1.7.20 #134 的教训）。错误照常进 errors 如实返回。
+    if (!opts.probe) {
+      markFailure(item.account.id, {
+        status,
+        code: r.json && r.json.error && r.json.error.code,
+        message: r.error || (r.json && r.json.error && r.json.error.message) || `HTTP ${status}`,
+        model,
+      });
+    }
     errors.push({ account: accounts.displayName(item.account), status, error: r.error || r.last_error });
   }
 

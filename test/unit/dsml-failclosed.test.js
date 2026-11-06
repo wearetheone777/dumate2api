@@ -95,3 +95,52 @@ test('共享 chunk 门：不传 opts.model 时不启用 DSML 兜底（向后兼�
   gate.finish();
   assert.ok(out.some((s) => s.includes('dsml')), '原样转发');
 });
+
+// ---------------------------------------------------------------------------
+// 非流式聚合出口的共享兜底（2026-11-04 收敛：qoder 内联 → 三通道同一份；
+// qwenwork 当年整个漏接非流式，这里一并锁住）
+// ---------------------------------------------------------------------------
+
+test('aggregateDsmlFallback: recovered → 结构化调用 + 干净正文', () => {
+  const calls = new Map();
+  const r = repair.aggregateDsmlFallback('qoder', '我先看一下。' + CALLS, calls);
+  assert.strictEqual(r.recovered, true);
+  assert.strictEqual(r.content, '我先看一下。');
+  assert.strictEqual(r.calls.get(0).function.name, 'read_file');
+  assert.strictEqual(JSON.parse(r.calls.get(0).function.arguments).path, '/tmp/a.txt');
+});
+
+test('aggregateDsmlFallback: 原生调用优先——有 calls 时正文不碰', () => {
+  const calls = new Map([[0, { id: 'c1', type: 'function', function: { name: 'x', arguments: '{}' } }]]);
+  const body = '正文 ' + CALLS;
+  const r = repair.aggregateDsmlFallback('qoder', body, calls);
+  assert.strictEqual(r.recovered, false);
+  assert.strictEqual(r.content, body, '可能是模型在讨论格式，原样保留');
+  assert.strictEqual(r.calls.get(0).function.name, 'x');
+});
+
+test('aggregateDsmlFallback: 围栏内 DSML 原样返回', () => {
+  const body = '格式讨论：\n```xml\n' + CALLS + '\n```';
+  const r = repair.aggregateDsmlFallback('qwenwork', body, new Map());
+  assert.strictEqual(r.recovered, false);
+  assert.strictEqual(r.content, body);
+});
+
+test('aggregateDsmlFallback: empty → 剥标签 + WARN（不剥离会被判据反复捞出）', () => {
+  const r = repair.aggregateDsmlFallback('workbuddy', '<dsml:calls></dsml:calls>', new Map());
+  assert.strictEqual(r.recovered, false);
+  assert.strictEqual(r.content, '');
+});
+
+test('aggregateDsmlFallback: leak → 抛 502（fail-closed）', () => {
+  assert.throws(
+    () => repair.aggregateDsmlFallback('workbuddy', '<dsml:calls><dsml:invoke name="x">', new Map()),
+    (e) => e.statusCode === 502 && /fail-closed/.test(e.message),
+  );
+});
+
+test('aggregateDsmlFallback: 无标记正文原样（含 calls.size 守卫短路）', () => {
+  const r = repair.aggregateDsmlFallback('qwenwork', '普通回答', new Map());
+  assert.strictEqual(r.content, '普通回答');
+  assert.strictEqual(r.recovered, false);
+});

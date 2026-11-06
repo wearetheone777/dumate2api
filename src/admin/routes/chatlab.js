@@ -212,7 +212,9 @@ async function handleDirect(req, res, ctx) {
     });
   };
 
-  const costNote = `${channel === 'qoder' ? 'Qoder' : channel === 'traework' ? 'TRAE' : '千问'} 的计费不在搭子余额里，本条消耗请到该通道的额度页看`;
+  // 通道显示名走 channels.js 单一来源——硬编码三元是 WorkBuddy 接入前写的，
+  // 新通道全落进「千问」（2026-11-04 WorkBuddy 测试台实测抓到）
+  const costNote = `${require('../../channels').label(channel)} 的计费不在搭子余额里，本条消耗请到该通道的额度页看`;
 
   // TRAE 宝身份走 opts（payload.model 已去前缀，provider 认不出）；
   // 千问/Qoder 的 send 不认识这个字段，多传无害。

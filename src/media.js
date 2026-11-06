@@ -435,4 +435,6 @@ module.exports = {
   buildImagePayload, buildTtsPayload, buildVideoPayload, normalizeImageModel, normalizeVideoModel,
   IMAGE_ENDPOINTS, DEFAULT_IMAGE_MODEL, DEFAULT_TTS_MODEL, DEFAULT_VIDEO_MODEL, VOICE_MAP, AUDIO_TYPES,
   VIDEO_PATH, VIDEO_POLL_TIMEOUT_MS,
+  // 探测循环与后续工具端点实现共用（带 token 的 JSON 请求壳）
+  requestJson,
 };

@@ -342,7 +342,19 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
           clearInterval(pingTimer);
           return;
         }
-        if (!translated && !res.headersSent) return;
+        if (!res.headersSent) {
+          // OpenAI 直通分支（2026-11-06 补）：首帧可能 14~70s 才到（ACP 实测
+          // 14~35s、qoder 大上下文 30~70s），此前一条 ping 都发不出——中间
+          // 代理的空闲超时照样断连，保活等于没做。改为：send 起跑 5s 仍无
+          // 首帧，先发头放开 ping。5s 足够上游的快速错误（排队信封 ~0.5s、
+          // 402/403）以 4xx 返回；5s 后失败走 catch 的流内错误帧路径（已
+          // 实现），客户端照样能看到原因——静默窗口从 30s+ 压到 ≤10s。
+          // 翻译器分支维持原语义：头由翻译器首帧触发，发出前不写。
+          if (!translated) {
+            if (Date.now() - startedAt >= Number(process.env.DUMATE_PING_QUIET_MS || 5000)) writeSSEHead();
+            else return;
+          } else return;
+        }
         try { shim.write(': ping\n\n'); } catch (e) { clearInterval(pingTimer); }
       }, 5000);
     }
@@ -747,6 +759,16 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     input_tokens: u.input || 0,
     output_tokens: u.output || 0,
     total_tokens: u.total || 0,
+    // 缓存命中与「上游是否回报了缓存字段」（hub v1.7.22 的 cached_reported
+    // 口径）：reported=false 时 cached 恒 0 是「未知」，不是「确认零命中」——
+    // 全价请求统计（usage-agg）只认前者，把没回报的算成零命中会虚增全价占比。
+    cached_tokens: u.cached || 0,
+    cached_reported: !!u.cachedReported,
+    // 计量口径（2026-11-06）：qwen-acp 的会话帧不带 token 计量（tokens 恒 0），
+    // 扣费真实发生（三池差值实证）但逐笔金额网关侧拿不到——差值法每请求要
+    // 多 2 次上游调用，不值得。标 wallet-delta 让界面显示「无计量」，
+    // 否则 0 token 会被读成「没花钱」。
+    metering: /^qwen-acp\//.test(info.model || '') ? 'wallet-delta' : '',
     ip: reqlog.clientIP(req),
     // 客户端标识：区分 Codex / Claude Code / 其它调用方，排查兼容问题时最先看这个
     ua: String(h['user-agent'] || '').slice(0, 200),
@@ -831,6 +853,20 @@ async function handleOpenAIModels(req, res) {
           name: e.name || e.key,
           ...(e.contextWindow ? { contextWindow: e.contextWindow, maxContextWindow: e.contextWindow } : {}),
           ...(e.multimodal ? { multimodal: true } : {}),
+        });
+      }
+      // ACP 会话通道（2026-11-04，P2-17）：agent 型会话，模型档位由账号/套餐
+      // 决定（new_prompt 不接受逐轮指定），只列 auto 一个标签。凭证与千问
+      // 同池——有可用账号才列。
+      const acp = require('./qwenwork/acp');
+      const acpSt = acp.status();
+      if (acpSt.ready) {
+        data.push({
+          id: 'qwen-acp/auto',
+          object: 'model',
+          created,
+          owned_by: 'qwenwork',
+          name: '千问 ACP 会话（agent 型，档位随账号套餐）',
         });
       }
     } catch (e) { /* 通道不可用，不列 */ }

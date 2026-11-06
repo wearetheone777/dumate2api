@@ -38,6 +38,8 @@ const WORKBUDDY_PREFIX = 'workbuddy';
  * 存在的理由：只有这个端点支持 `response_format`（JSON mode / json_schema）。
  */
 const QIANFAN_PREFIX = 'qianfan';
+// 千问 ACP 会话通道前缀（2026-11-04，P2-17）：agent 型会话，见 resolve 分支
+const QWEN_ACP_PREFIX = 'qwen-acp';
 /**
  * TRAE 宝（开发者个人助理，2026-11-03 接入）的前缀。
  *
@@ -216,6 +218,25 @@ function resolve(model) {
         },
       };
     }
+    // 千问 ACP 会话通道（2026-11-04，P2-17）：agent 型会话协议（REST 建会话
+    // + WS 信封 JSON-RPC），与 chat 桥不是一类东西——独立 provider。通道归属
+    // 仍是 qwenwork（同一份凭证与额度池）；模型档位由账号/套餐决定，前缀下
+    // 的模型名只是调用方标签。
+    if (head === QWEN_ACP_PREFIX) {
+      const t = targetOf(UPSTREAMS.qwenwork);
+      return {
+        channel: 'qwenwork',
+        model: rest,
+        target: {
+          ...t,
+          direct: true,
+          provider: './qwenwork/acp',
+          needsModelMap: false,
+          needsBudget: false,
+          budgetKind: '',
+        },
+      };
+    }
     for (const up of Object.values(UPSTREAMS)) {
       if (up.prefix && up.prefix === head) {
         return { channel: up.id, target: targetOf(up), model: rest };
@@ -337,6 +358,7 @@ module.exports = {
   TRAEWORK_PREFIX,
   QODER_PREFIX,
   QIANFAN_PREFIX,
+  QWEN_ACP_PREFIX,
   TRAEBAO_PREFIX,
   DUMATE_AUTO_PREFIX,
   UPSTREAMS,

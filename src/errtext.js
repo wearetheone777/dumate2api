@@ -112,6 +112,11 @@ const TRAE_ERROR = [
   [/traework\s+3004\b/i, '上游限流（traework 3004），稍后自动恢复；网关已按软冷却处置并换号重试'],
   [/traework\s+3003\b/i, 'TRAE 额度/权益不足（traework 3003），换其他账号可用'],
   [/traework\s+4008\b/i, 'TRAE 额度耗尽（traework 4008，国际版）'],
+  // 4028（2026-11-06，Trae2api-cn 实测同款边界）：部分模型在 Remote/raw 链路
+  // 上游固定拒绝（换账号/重试无效）——不是风控也不是额度，是端点-模型组合
+  // 不可用。指引改走其他链路，别让用户在错误码上猜。
+  [/traework\s+(remote\s+)?4028\b/i,
+    'TRAE 该模型在此链路不可用（4028，Trae2api-cn 实测部分模型在 Remote/raw 上固定失败）；改走其他链路（去掉 DUMATE_TRAEWORK_REMOTE/SOLO 开关即回落 utils_chat）或换模型'],
 ];
 
 /**

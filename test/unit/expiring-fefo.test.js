@@ -85,6 +85,17 @@ test('千问默认窗口 30 天兜底（上游 expiring_soon 自带信号）', (
   assert.ok(snap.accountIds('qwenwork', NOW).has('7'));
 });
 
+test('WorkBuddy 默认窗口 7 天（套餐 CycleEndTime，2026-11-04 真机实证）', () => {
+  snap.update('workbuddy', [
+    { accountId: 11, nearest: NOW + 6 * 86400000 },
+    { accountId: 12, nearest: NOW + 9 * 86400000 },
+  ], { now: NOW });
+  const ids = snap.accountIds('workbuddy', NOW);
+  assert.ok(ids.has('11'), '6 天后到期应算临期');
+  assert.strictEqual(ids.has('12'), false, '9 天后到期超出 7 天窗口');
+  assert.strictEqual(snap.windowDays('workbuddy'), 7);
+});
+
 test('快照陈旧（超 TTL）→ null，退回普通轮询不报错', () => {
   snap.update('dumate', [{ accountId: 1, nearest: NOW + HOUR }], { now: NOW - 7 * HOUR });
   assert.deepStrictEqual(snap.accountIds('dumate', NOW), null, 'TTL 默认 6 小时，7 小时前写的算陈旧');

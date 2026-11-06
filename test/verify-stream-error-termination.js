@@ -99,6 +99,8 @@ process.env.DUMATE_AUTOSTART = 'off';
 // 埋点写到临时目录：既隔离真实请求日志（开发实例可能同时在写），
 // 也让下面的断言能只看本次运行的几行。
 process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-reqlog-'));
+// 2026-11-01 起模型端点强制鉴权——测试用 env 密钥，post() 里带上
+process.env.DUMATE2API_KEY = 'test-key-errterm';
 require(path.join(ROOT, 'src/server.js'));
 
 // ---- 3. 断言 ----
@@ -107,7 +109,11 @@ function post(pathname, body) {
     const data = JSON.stringify(body);
     const req = http.request({
       host: '127.0.0.1', port: PORT, path: pathname, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+        'Authorization': 'Bearer test-key-errterm',
+      },
     }, (res) => {
       let t = '';
       res.on('data', (c) => { t += c; });

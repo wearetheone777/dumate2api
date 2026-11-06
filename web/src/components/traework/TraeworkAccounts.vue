@@ -143,6 +143,13 @@
                 <div class="text-xs" :class="tokenExpired(a) ? 'text-red-600' : ''">
                   {{ a.expiresAt ? dateText(a.expiresAt) : '—' }}
                 </div>
+                <!-- 预刷新提示：到期前 24h 内 needsRefresh 会自动换票，不是故障 -->
+                <div
+                  v-if="a.expiresAt && !tokenExpired(a) && a.expiresAt - Date.now() < 24 * 3600 * 1000"
+                  class="text-xs text-slate-400"
+                >
+                  将自动预刷新
+                </div>
               </div>
             </div>
 
@@ -155,6 +162,12 @@
 
             <div class="mt-2 text-xs text-slate-400 font-mono break-all">
               设备 {{ a.deviceId ? a.deviceId.slice(0, 12) + '…' : '—' }}
+              <a-tooltip
+                v-if="a.deviceGeneration != null && a.deviceGeneration > 0"
+                title="9074 自愈换过设备：gen 代数表示按账号种子重派生了多少代设备标识"
+              >
+                <span class="text-orange-500 ml-1">gen {{ a.deviceGeneration }}</span>
+              </a-tooltip>
             </div>
             <div class="text-xs text-slate-400">
               refresh …{{ a.refreshTail || '—' }}

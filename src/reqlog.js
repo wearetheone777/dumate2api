@@ -83,18 +83,34 @@ function newReqId() {
 // 从上游 usage 里取 token 数。OpenAI 风格是 prompt_tokens/completion_tokens，
 // Anthropic 风格是 input_tokens/output_tokens，Google 是 promptTokenCount/
 // candidatesTokenCount，三条路径共用这一个函数。
+//
+// 缓存命中（2026-11-04，融合 hub v1.7.22 的 cached_reported 口径）：五种形状
+// 都认（标准位 / DeepSeek / Qwen / Anthropic 出口 / 散装）。**reported 区分
+// 「上游报了缓存且为 0」与「上游根本没回报缓存字段」**——两者在成本归因里
+// 是两回事：前者是「确认零缓存」（全价请求），后者是「未知」（不能当 0 算）。
 function pickUsage(u) {
-  if (!u || typeof u !== 'object') return { input: 0, output: 0, total: 0 };
+  if (!u || typeof u !== 'object') {
+    return { input: 0, output: 0, total: 0, cached: 0, cachedReported: false };
+  }
   const input = Number(u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0) || 0;
   const output = Number(u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0) || 0;
   const total = Number(u.total_tokens ?? u.totalTokenCount ?? 0) || (input + output);
-  return { input, output, total };
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+  const cands = [
+    num(u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens),
+    num(u.prompt_cache_hit_tokens),
+    num(u.completion_tokens_details && u.completion_tokens_details.cached_tokens),
+    num(u.cache_read_input_tokens),
+    num(u.cached_tokens),
+  ].filter((v) => v != null);
+  const cached = cands.length ? Math.max(...cands) : 0;
+  return { input, output, total, cached, cachedReported: cands.length > 0 };
 }
 
 // 从 SSE 文本里扫出 usage。流式响应没有单一的 usage 字段，
 // 必须逐行解析 data: 负载，取最后一个带 usage 的块。
 function usageFromSSE(text) {
-  let best = { input: 0, output: 0, total: 0 };
+  let best = { input: 0, output: 0, total: 0, cached: 0, cachedReported: false };
   for (const line of text.split('\n')) {
     if (!line.startsWith('data:')) continue;
     const payload = line.slice(5).trim();

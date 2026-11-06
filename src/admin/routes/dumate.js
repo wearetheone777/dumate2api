@@ -115,7 +115,8 @@ const routes = [
       };
       let r;
       try {
-        r = await pool.callWithFailover('/chat/completions', 'POST', payload, { timeout: 120000 });
+        // probe: 探针失败不惩罚网页池账号（观测动作不伤号，hub v1.7.20 #134）
+        r = await pool.callWithFailover('/chat/completions', 'POST', payload, { timeout: 120000, probe: true });
       } catch (e) {
         return sendJSON(res, 200, { ok: false, model: raw || 'model-text', mapped, error: e.message, elapsedMs: Date.now() - startedAt });
       }

@@ -60,17 +60,22 @@ function buildBody(payload, model, meta, opts = {}) {
     // TRAE 宝自动档：不写 model/config_name，服务端自选官方默认
     // （实测 deepseek-v4.1-flash__dev）。其余清理照走。
     delete obj.model;
-    // 主动生成并记录 session_id（ObjectId 形状，与客户端生成的一致）：
-    // 上游按它记账，管理端计费自检靠它查 get_session_usage 的精确口径。
-    // 修复轮（withRepairNudge）复用同一 body → 同一 session_id——同一段
-    // 对话的下一句，账单也归到同一会话。
-    if (!meta.sessionId) meta.sessionId = oidSessionId();
-    obj.session_id = meta.sessionId;
   } else {
     const modelName = String(model || obj.model || c.DEFAULT_MODEL).trim() || c.DEFAULT_MODEL;
     obj.model = modelName;
     obj.config_name = modelName;
   }
+  // 主动写 session_id（ObjectId 形状，与客户端生成的一致）：上游按**请求体的
+  // session_id** 累计商业账单（Trae2api-cn 对旧版端点的实测结论；persona 链路
+  // 2026-11-03 实测查它返回真实 credits）。不写时上游自分配的 id 不进账单键，
+  // get_session_usage 查回全零骨架——这是 2026-10-31「拿 session_id 查只回
+  // 全零」定案的根因：当时查的是流 metadata 里上游自分配的 id，不是主动写的
+  // 账单键。修复轮（withRepairNudge）复用同一 body → 同一账单键，同一次
+  // send 的重试序列合并计费。
+  // 账单键写进请求体；meta 缺省（部分直调只造请求体不回读 meta）时兜底
+  if (!meta) meta = {};
+  if (!meta.sessionId) meta.sessionId = oidSessionId();
+  obj.session_id = meta.sessionId;
 
   // messages：content 字符串 → 数组；assistant 的 tool_calls → function_call
   if (Array.isArray(obj.messages)) {
@@ -757,8 +762,7 @@ function aggregate(events, model) {
   return out;
 }
 
-module.exports = {
-  buildBody, postStream, readStream, toOpenAIChunk, deltaOf, aggregate, eventError, normalizeToolCall,
+module.exports = {  buildBody, postStream, readStream, toOpenAIChunk, deltaOf, aggregate, eventError, normalizeToolCall,
   createTextGate, looksUnfinished, withRepairNudge, REPAIR_NUDGE, REPAIR_MAX, HOLD_CAP,
-  parseDsmlToolCalls, turnIdOf,
+  parseDsmlToolCalls, turnIdOf, oidSessionId,
 };

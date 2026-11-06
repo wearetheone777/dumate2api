@@ -78,6 +78,20 @@ function attachQoderCredits(rows) {
 }
 
 /**
+ * 给 Qoder 通道的行附上三段积分拆分（hub v1.7.22 融合）。
+ * 按 token 折算「非缓存输入 / 缓存输入 / 输出」，缓存未回报时缓存段 null。
+ * 其他通道的积分口径不同（套餐余额差值），不适用——行不加该字段。
+ */
+function attachCreditSplit(rows) {
+  const { splitOf } = require('../../credit-split');
+  return rows.map((r) => {
+    if (r.channel !== 'qoder') return r;
+    const split = splitOf(r);
+    return split ? { ...r, credit_split: split } : r;
+  });
+}
+
+/**
  * 摘掉直连通道行上的搭子余额游标字段。
  *
  * points-cursor 的差值来自**搭子账号**的余额，对直连通道没有意义。
@@ -159,9 +173,9 @@ const routes = [
         // 附上实测扣费（余额差）。没有游标的行如实留空——
         // 第一条请求没有参照点，补 0 会被读成「这条没花钱」
         // 千问/TRAE 的行另按 req_id 附各自的积分明细（三套账，见上面两个 attach）
-        rows: attachQoderCredits(attachTwCredits(attachQwCredits(
+        rows: attachCreditSplit(attachQoderCredits(attachTwCredits(attachQwCredits(
           stripDumateCursor(pointsCursor.attachCosts(rows, allInWindow)),
-        ))),
+        )))),
         total,
         limit,
         offset,
@@ -266,9 +280,9 @@ const routes = [
       // 传全量行，并发判定才准（详情页同样要标出「差值可能含别人消耗」）。
       // 与列表接口走**同一条 attach 链**：少一环就会出现「列表显示 TRAE 消耗、
       // 点进详情却是搭子的游标差」这种自相矛盾
-      const [withCost] = attachQoderCredits(attachTwCredits(attachQwCredits(
+      const [withCost] = attachCreditSplit(attachQoderCredits(attachTwCredits(attachQwCredits(
         stripDumateCursor(pointsCursor.attachCosts([row], rows)),
-      )));
+      ))));
       return sendJSON(res, 200, withCost);
     },
   },

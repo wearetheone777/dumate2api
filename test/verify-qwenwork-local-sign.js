@@ -147,14 +147,15 @@ check('qoder/cosy.js 与 src/cosy.js 共用同一份算法实现', () => {
   assert.strictEqual(qoderCosy.SERVER_PUBKEY_PEM, core.SERVER_PUBKEY_PEM, '公钥不是同一份');
 });
 
-check('两个通道的 cosyVersion 各自独立（千问 1.1.52 / Qoder 1.1.75）', () => {
+check('两个通道的 cosyVersion 各自独立（千问 1.1.71 对齐官方 1.4.0 / Qoder 1.1.75）', () => {
   const qoderPayload = JSON.parse(Buffer.from(
     qoderCosy.buildPayloadB64('dummy-info'), 'base64',
   ).toString('utf8'));
   const qwPayload = JSON.parse(Buffer.from(
     built.headers.authorization.slice('Bearer COSY.'.length).split('.')[0], 'base64',
   ).toString('utf8'));
-  assert.strictEqual(qwPayload.cosyVersion, '1.1.52', '千问的 cosyVersion 应为 1.1.52');
+  // 2026-10-31 起千问对齐官方 1.4.0 客户端的 1.1.71（解包取证），别再回 1.1.52
+  assert.strictEqual(qwPayload.cosyVersion, constants.COSY_VERSION, `千问的 cosyVersion 应为 ${constants.COSY_VERSION}`);
   assert.strictEqual(qoderPayload.cosyVersion, '1.1.75', 'Qoder 的 cosyVersion 应为 1.1.75（5d6f271 对齐官方 CLI）');
 });
 
@@ -196,8 +197,14 @@ check('千问与 Qoder 的 header 集合同构（仅身份取值不同）', () =
   for (const k of qoderKeys) {
     assert.ok(k in built.headers, `千问 headers 缺少 ${k}——与 Qoder 不再同构`);
   }
-  // 差异项：千问不带 machinetype/machinetoken（wasm 的 clientMetadata 里没有它们）
-  assert.ok(!('cosy-machinetype' in built.headers), '千问不该带 cosy-machinetype');
+  // 2026-11-06 反转（Buddy2api v2.2.17 融合，1.0.4 客户端实测组合）：千问带
+  // cosy-machinetype=5（官方桌面枚举）。Qoder 侧没有对应证据，不给 Qoder 加——
+  // 同构从此是「基底 11 头 + 千问差异头」，不是逐字相等。
+  // x-internal-model-key 同批加入（模型键第三镜像）；Cosy-MachineToken 仍不发
+  // （Buddy2api 用 machineId 原样当 token，我们无独立证据）。
+  assert.strictEqual(built.headers['cosy-machinetype'], '5', '千问应带 cosy-machinetype=5');
+  assert.strictEqual(built.headers['x-internal-model-key'], FAKE.modelKey);
+  assert.ok(!('cosy-machinetoken' in built.headers), '千问仍不发 cosy-machinetoken');
 });
 
 const pass = results.filter((x) => x.ok).length;

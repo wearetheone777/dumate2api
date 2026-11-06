@@ -99,10 +99,65 @@ const SESSION_DEAD_MARKERS = ['Offline user session not found', '12153'];
 const RESTRICTED_CODE_RE = /"code"\s*:\s*11140(?!\d)|\bcode 11140(?!\d)/i;
 const RESTRICTED_TEXT_MARKERS = ['账号存在异常行为', 'unusual activity', '已被限制使用'];
 
+// **模型窗口额度用满**（6004，hub v1.9.0 #668/#672）：上游 429 + body 带
+// code 6004——唯一带重置墙钟的额度判定，且粒度是 (账号, 模型)：该模型撞线
+// 同账号其他模型照常可用。处置是**模型级冷却**（scope:model 喂池）+ 换号
+// 打同模型，绝不能按账号级 429 把整个账号封掉。码值同样带负向数字断言。
+const MODEL_CAP_CODE_RE = /"code"\s*:\s*"?6004"?(?!\d)/;
+const MODEL_CAP_TEXT_MARKERS = [
+  'usage exceeds frequency limit',          // intl 实测文案
+  '使用量已超出频率限制',                     // cn 实测文案
+];
+// 认网关的 WWW-Authenticate 判死 401（hub v1.9.0 #686）：国内版上游是 APISIX，
+// 凭证被拒时回的是 <html>401 Authorization Required</html>，死因只在响应头
+// `Bearer realm="copilot", error="invalid_token"` 里。RFC 6750 的 invalid_token
+// 是真失效的证据，挑战头优先于一切 body 判据。
+const WWW_AUTH_INVALID_TOKEN_RE = /invalid[-_]token/i;
+// 请求参数错误（hub v1.10.11 #794）：`The request param is invalid` 等——请求
+// 本身的问题，换号/冷却整个账号池都无意义，下游如实 400。
+const PARAM_ERROR_TEXT_RE = /request param is invalid|invalid request param|params? (is|are) invalid/i;
+
+/**
+ * 从上游 429 正文里解析重置墙钟（hub parse_rate_limit_reset 移植）。
+ * 上游只在 6004 里写，两种实测形状：
+ *   intl: "... your usage will reset at 2026-09-19 18:29:03 UTC+8 ..."
+ *   cn:   "您的使用量已超出频率限制，将在 2026-10-02 16:00:34 UTC+8 重置 ..."
+ * 墙钟是正文自己 UTC 偏移下的时刻：按 UTC 解析再减偏移（等价 hub 的
+ * timegm——不能用 Date.parse 裸解析，会被宿主机时区带偏几个小时）。
+ * 措辞不认识时兜底认「YYYY-MM-DD HH:MM:SS UTC±N」搭配。返回 epoch 秒或 null。
+ */
+function unescapeBody(detail) {
+  const s = String(detail || '');
+  if (!s.includes('\\u')) return s;
+  // 只还原 \uXXXX（中间层把 UTF-8 中文转成 JSON 转义形态）；\n \t 等其余
+  // 序列不动——整串 unicode_escape 会把正常文本解成乱码
+  return s.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
+
+function parseRateLimitReset(detail) {
+  const text = unescapeBody(detail);
+  if (!text) return null;
+  const m = /(?:reset at|将在)\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/i.exec(text)
+    || /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})\s*UTC[+-]\d{1,2}/.exec(text);
+  if (!m) return null;
+  const stamp = m[1].replace('T', ' ');
+  const tz = /UTC([+-]\d{1,2})(?::?(\d{2}))?/.exec(text);
+  let offset = 0;
+  if (tz) {
+    const h = parseInt(tz[1], 10);
+    const mins = parseInt(tz[2] || '0', 10) || 0;
+    offset = h * 3600 + (h >= 0 ? mins * 60 : -mins * 60);
+  }
+  const t = Date.parse(`${stamp.split(' ')[0]}T${stamp.split(' ')[1]}Z`);
+  if (!Number.isFinite(t)) return null;
+  return Math.floor(t / 1000) - offset;
+}
+
 /**
  * 上游失败分类（严格按参照实现的判定顺序）：402 优先于 body 标记 →
- * 硬额度标记 → 会话作废标记 → **账号风控** → 429 → 404 → 5xx → 其余 client。
- * @returns {'hard_credit'|'session_dead'|'restricted'|'soft_rate'|'not_found'|'server'|'client'}
+ * 硬额度标记 → 会话作废标记 → **裸 401 判死** → **账号风控** → **模型窗口
+ * 额度用满（6004）** → 429 → 404 → 5xx → 其余 client。
+ * @returns {'hard_credit'|'session_dead'|'restricted'|'model_cap'|'soft_rate'|'not_found'|'server'|'client'}
  */
 function classifyStatus(status, body) {
   if (status === 402) return 'hard_credit';
@@ -113,9 +168,17 @@ function classifyStatus(status, body) {
   for (const m of SESSION_DEAD_MARKERS) {
     if (String(body || '').includes(m)) return 'session_dead';
   }
+  // 裸 401 也是凭证判死（上游拒绝这份 accessToken）——原来落到 'client'，
+  // send 层无法区分「刷新能救」与「协议错」，401 刷新重试就没有入口
+  if (status === 401) return 'session_dead';
   if (RESTRICTED_CODE_RE.test(String(body || ''))) return 'restricted';
   for (const m of RESTRICTED_TEXT_MARKERS) {
     if (lower.includes(m.toLowerCase()) || String(body || '').includes(m)) return 'restricted';
+  }
+  // 6004 必须在 429 之前判：它是模型级额度事实，处置与账号级 soft_rate 完全不同
+  if (MODEL_CAP_CODE_RE.test(String(body || ''))) return 'model_cap';
+  for (const m of MODEL_CAP_TEXT_MARKERS) {
+    if (lower.includes(m.toLowerCase())) return 'model_cap';
   }
   if (status === 429) return 'soft_rate';
   if (status === 404) return 'not_found';
@@ -134,5 +197,7 @@ module.exports = {
   authFileCandidates,
   EP_CHAT, EP_REFRESH, CHECKIN_API_PREFIX,
   EP_CHECKIN_STATUS, EP_CHECKIN_STATUS_FALLBACK, EP_CHECKIN_CLAIM, EP_CREDITS,
-  HARD_CREDIT_MARKERS, SESSION_DEAD_MARKERS, RESTRICTED_CODE_RE, RESTRICTED_TEXT_MARKERS, classifyStatus,
+  HARD_CREDIT_MARKERS, SESSION_DEAD_MARKERS, RESTRICTED_CODE_RE, RESTRICTED_TEXT_MARKERS,
+  MODEL_CAP_CODE_RE, MODEL_CAP_TEXT_MARKERS, WWW_AUTH_INVALID_TOKEN_RE, PARAM_ERROR_TEXT_RE,
+  parseRateLimitReset, classifyStatus,
 };

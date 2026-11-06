@@ -28,6 +28,9 @@ export interface ReqLogRow {
   // 区域（2026-11-03 国际版）：traework/qoder 随实际服务账号记录。
   // 旧行与纯国内通道（搭子/千问）没有这个字段——空缺不读成国内
   region?: 'cn' | 'intl' | ''
+  // 计量口径（2026-11-06）：wallet-delta = 上游会话帧不带 token 计量（ACP 链路），
+  // tokens 恒 0 是「没数」不是「没花钱」——界面显示「无计量」而不是 0。
+  metering?: '' | 'wallet-delta'
   // 实际扣费：由「请求后余额 - 上一条请求后余额」实测得出，非估算。
   // points_exact=false 表示这条与相邻请求并发，差值里可能混了别人的消耗。
   points_delta?: number
@@ -52,6 +55,8 @@ export interface ReqLogRow {
   tw_account?: string
   /** 这条请求的真实消耗 = 同账号上一条与本条的累计消耗之差 */
   tw_cost?: number
+  /** 成本口径（2026-11-06）：session_usage=上游单请求账单（精确）；consumed_delta=差值推断 */
+  tw_source?: 'session_usage' | 'consumed_delta'
   /** false = 与同账号相邻请求并发，差值可能含对方的消耗 */
   tw_exact?: boolean
   /** 请求后的累计已消耗 / 剩余 / 额度上限 */
@@ -65,6 +70,17 @@ export interface ReqLogRow {
   qoder_account?: string
   /** 这条请求消耗的真实 credits，上游直给 */
   qoder_cost?: number
+  // ---- Qoder 的三段积分拆分（hub v1.7.22 融合，2026-11-04）----
+  // 按 token 折算「非缓存输入 / 缓存输入 / 输出」。缓存段 null = 上游没回报
+  // 缓存字段（不是零命中）；sum 缺缓存段时也是 null——少一段不假装完整。
+  credit_split?: {
+    input: number
+    cached: number | null
+    output: number
+    sum: number | null
+    tokens: { noncached_input: number; cached: number; output: number }
+    coef: [number, number, number]
+  }
 }
 
 export interface ReqLogsData {

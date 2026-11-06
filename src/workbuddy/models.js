@@ -204,4 +204,21 @@ function cachedModelIds(region = 'cn') {
   return reg === 'global' ? [] : ['glm-5.3'];
 }
 
-module.exports = { fetchModels, parseCatalog, parseCreditsRate, cachedModelIds, CACHE_MS };
+/**
+ * 同步取某模型的 maxOutputTokens（hub v1.10.11 #794：max_tokens 超目录上限
+ * 上游回参数错误，出站前 clamp）。未预热 / 模型不在表 / 无上限数据返回 0
+ * （调用方不 clamp）。rows 参数仅供测试注入，生产读缓存。
+ */
+function maxOutputOf(region = 'cn', modelId = '', rows = null) {
+  const reg = c.normalizeRegion(region);
+  let list = rows;
+  if (!list) {
+    const hit = caches.get(reg);
+    list = hit && hit.data ? hit.data.models : null;
+  }
+  if (!Array.isArray(list)) return 0;
+  const m = list.find((x) => x && x.id === modelId);
+  return m ? (Number(m.maxTokens) || 0) : 0;
+}
+
+module.exports = { fetchModels, parseCatalog, parseCreditsRate, cachedModelIds, maxOutputOf, CACHE_MS };

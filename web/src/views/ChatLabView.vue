@@ -280,15 +280,16 @@ async function loadTwModels() {
       (m) => m.visible && (m.usage === 'chat_completion' || !m.usage),
     )
     const list = chat.map((m) => ({ id: m.id, name: m.name, prefixed: m.prefixed }))
-    // TRAE 宝（traebao/ 前缀 → personal_assistant 身份，当前免费豁免）。
+    // TRAE 宝（traebao/ 前缀 → personal_assistant 身份）。
     // 实测白名单只有 deepseek-v4.1-flash（其余上游 4001），不列调不通的。
-    // **国内身份**：国际区域不列（personal_assistant 的豁免绑国内活动域）
+    // **国内身份**：国际区域不列。免费豁免已于 2026-11-04 实测失效
+    // （1022 输出 tokens 扣 0.17，与 solo 同量级），不再标「免费」。
     if (regionStore.current === 'cn') {
-      list.push({ id: 'auto', name: 'TRAE 宝自动档（免费）', prefixed: 'traebao/auto' })
+      list.push({ id: 'auto', name: 'TRAE 宝自动档', prefixed: 'traebao/auto' })
       if (chat.some((m) => m.id === 'deepseek-v4.1-flash')) {
         list.push({
           id: 'deepseek-v4.1-flash',
-          name: 'TRAE 宝 · DeepSeek-V4.1-Flash（免费）',
+          name: 'TRAE 宝 · DeepSeek-V4.1-Flash',
           prefixed: 'traebao/deepseek-v4.1-flash',
         })
       }
@@ -304,7 +305,13 @@ async function loadQwModels() {
   qwModelsLoading.value = true
   try {
     const { data } = await qwenApi.models()
-    qwModels.value = data.models || []
+    const list = data.models || []
+    // ACP 是独立会话链路（REST 建会话 + WebSocket），模型页的计费自检也走它。
+    // chat 桥被账号级模型权限拦住（403 Model is not available for this user）
+    // 时 ACP 仍可用——同一 accessToken 两条链路可以一封一通。这里把它加进
+    // 列表，测试台才能直接试 ACP；上游按账号/套餐定档，id 只是调用方标签。
+    const acpEntry = { id: 'acp/auto', name: 'ACP 会话（agent 链路）', prefixed: 'qwen-acp/auto' }
+    qwModels.value = list.some((m) => m.prefixed === 'qwen-acp/auto') ? list : [...list, acpEntry]
   } catch { /* 拿不到就空列表，不阻断 */ } finally {
     qwModelsLoading.value = false
   }
@@ -319,8 +326,8 @@ async function applyChannel(id: string) {
     model.value = qwModels.value[0]?.prefixed || ''
   } else if (id === 'traework') {
     if (!twModels.value.length) await loadTwModels()
-    // 默认 TRAE 宝自动档：当前免费豁免，试调不该默认烧积分（与 Qoder
-    // 分支默认挑 0.1 档同一逻辑）；活动结束或列表异常时退第一个
+    // 默认 TRAE 宝自动档：deepseek-flash 档位最便宜，试调不该默认烧贵的
+    // （豁免 2026-11-04 已失效，但仍是最省的默认）；活动异常时退第一个
     model.value = twModels.value.find((m) => m.prefixed === 'traebao/auto')?.prefixed
       || twModels.value[0]?.prefixed || ''
   } else if (id === 'qoder') {

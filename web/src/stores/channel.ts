@@ -26,6 +26,10 @@ export interface ChannelInfo {
   tokenExpiresAt?: string | null
   refreshExpiresAt?: string | null
   refreshExpired?: boolean
+  /** refresh token 临期（<24h）预警。目前只有千问 /status 给 */
+  refreshExpiringSoon?: boolean
+  /** ACP 链路上游实定档位（千问 /status；无 ACP 会话为 null） */
+  acpMode?: string | null
   /** 账号数。TRAE Work 是多账号自持凭证，徽标与仪表盘要显示「可用几个」 */
   accounts?: number
   /**

@@ -100,8 +100,16 @@
             <div v-if="record.first_token_ms" class="num text-xs text-slate-500">首字 {{ fmtMs(record.first_token_ms) }}</div>
           </template>
           <template v-else-if="column.key === 'tokens'">
-            <span class="num text-xs">{{ compact(record.total_tokens) }}</span>
-            <div class="num text-xs text-slate-500">{{ compact(record.input_tokens) }} / {{ compact(record.output_tokens) }}</div>
+            <!-- 无计量（wallet-delta）：ACP 会话帧不带 token 计量，0 是「上游
+                 没给数」不是「没花钱」——显示成无计量，别让人读成空转 -->
+            <template v-if="record.metering === 'wallet-delta'">
+              <a-tag color="purple" class="text-xs">无计量</a-tag>
+              <div class="text-xs text-slate-500">ACP 按会话实际推理扣费（三池差值）</div>
+            </template>
+            <template v-else>
+              <span class="num text-xs">{{ compact(record.total_tokens) }}</span>
+              <div class="num text-xs text-slate-500">{{ compact(record.input_tokens) }} / {{ compact(record.output_tokens) }}</div>
+            </template>
           </template>
           <template v-else-if="column.key === 'client'">
             <span class="text-xs">{{ record.key || (record.key_id ? `key-${record.key_id}` : '未用密钥') }}</span>
@@ -132,7 +140,11 @@
             <template v-else-if="record.channel === 'traework'">
               <span v-if="record.tw_cost !== undefined" class="text-xs">
                 <span class="num text-purple-500">{{ fmtQw(record.tw_cost) }}</span>
-                <a-tooltip v-if="record.tw_exact === false" title="与同账号相邻请求并发，差值可能含对方的消耗">
+                <!-- 口径标记（2026-11-06）：单请求账单精确；差值才有并发问题 -->
+                <a-tooltip v-if="record.tw_source === 'session_usage'" title="上游逐轮账单（get_session_usage），单请求精确扣费">
+                  <span class="text-xs text-emerald-600">精确</span>
+                </a-tooltip>
+                <a-tooltip v-else-if="record.tw_exact === false" title="与同账号相邻请求并发，差值可能含对方的消耗">
                   <span class="text-xs text-orange-700">并发</span>
                 </a-tooltip>
               </span>
@@ -274,6 +286,32 @@
           <div class="detail-label">Completion Token</div>
           <div class="detail-value">{{ fmtNum(detail.output_tokens) }}</div>
 
+          <!-- Qoder 行的三段拆分（hub v1.7.22 融合）：成本落在哪一段一眼可见。
+               缓存段「?」= 上游没回报缓存字段（cached_reported=false），不是零命中；
+               sum 少一段不能假装完整，缺缓存段时不显示合计。 -->
+          <template v-if="detail.channel === 'qoder' && detail.credit_split">
+            <div class="detail-label">积分三段拆分</div>
+            <div class="detail-value">
+              <span class="num">输入 {{ detail.credit_split.input }}</span>
+              <span class="text-slate-400"> / </span>
+              <template v-if="detail.credit_split.cached !== null">
+                <span class="num">缓存 {{ detail.credit_split.cached }}</span>
+              </template>
+              <template v-else>
+                <span class="num text-slate-400">缓存 ?</span>
+              </template>
+              <span class="text-slate-400"> / </span>
+              <span class="num">输出 {{ detail.credit_split.output }}</span>
+              <template v-if="detail.credit_split.sum !== null">
+                <span class="text-slate-400"> ≈ </span>
+                <span class="num">{{ detail.credit_split.sum }} 积分</span>
+              </template>
+              <div class="text-xs text-slate-400 mt-1">
+                按 token 折算（非缓存输入/缓存/输出，系数可配）；缓存「?」= 上游没回报缓存字段
+              </div>
+            </div>
+          </template>
+
           <div class="detail-label">实际扣费</div>
           <div class="detail-value">
             <!-- 千问：扣的是千问自己的付费池，与搭子的余额游标是两套账，
@@ -306,6 +344,9 @@
             <template v-else-if="detail.channel === 'traework'">
               <template v-if="detail.tw_cost !== undefined">
                 {{ fmtQw(detail.tw_cost) }} 额度
+                <div v-if="detail.tw_source === 'session_usage'" class="text-xs text-emerald-700 mt-1">
+                  上游逐轮账单（单请求精确扣费）
+                </div>
                 <div v-if="detail.tw_consumed != null" class="text-xs text-slate-500 mt-1">
                   请求后累计已消耗 {{ fmtQw(detail.tw_consumed) }}
                   <template v-if="detail.tw_limit != null">
@@ -315,7 +356,7 @@
                 <div v-if="detail.tw_remain != null" class="text-xs text-slate-500">
                   剩余 {{ fmtQw(detail.tw_remain) }}
                 </div>
-                <div v-if="detail.tw_exact === false" class="text-xs text-orange-700">
+                <div v-if="detail.tw_source !== 'session_usage' && detail.tw_exact === false" class="text-xs text-orange-700">
                   与同账号相邻请求并发，差值可能含对方的消耗
                 </div>
               </template>

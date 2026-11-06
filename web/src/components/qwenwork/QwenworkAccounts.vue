@@ -122,6 +122,7 @@
                 <div class="text-xs text-slate-400">refresh token 到期</div>
                 <div class="text-xs">
                   {{ a.refreshExpiresAt ? dateText(a.refreshExpiresAt) : '未知' }}
+                  <a-tag v-if="a.refreshExpiringSoon" color="orange" class="ml-1">临期</a-tag>
                 </div>
               </div>
             </div>
@@ -141,7 +142,17 @@
             <div class="mt-2 text-xs text-slate-400">
               机器码 {{ a.machineId ? a.machineId.slice(0, 12) + '…' : '—' }}
               · refresh …{{ a.refreshTail || '—' }}
+              <a-tag v-if="a.adoptedFrom === 'official-desktop'" color="purple" class="ml-1">官方收编</a-tag>
             </div>
+
+            <a-alert
+              v-if="a.refreshExpiringSoon && !a.refreshExpired"
+              type="warning"
+              show-icon
+              class="mt-2"
+              message="refresh token 24 小时内过期"
+              description="过期后无法自动续期，账号会变成不可用——请尽快删除后重新登录这个账号。"
+            />
 
             <a-alert
               v-if="a.refreshExpired"

@@ -12,6 +12,7 @@ const cors = require('../cors');
 const { ensureDir } = require('./store');
 const { routes: authRoutes } = require('./routes/auth');
 const { routes: systemRoutes } = require('./routes/system');
+const { routes: keepaliveRoutes } = require('./routes/keepalive');
 const { routes: pointsRoutes } = require('./routes/points');
 const { routes: statsRoutes } = require('./routes/stats');
 const { routes: usageRoutes } = require('./routes/usage');
@@ -115,6 +116,7 @@ function sendJSON(res, status, data) {
 
 router.mount(PREFIX + '/auth', authRoutes.map((r) => ({ ...r, path: r.path.replace(/^\/auth/, '') })));
 router.mount(PREFIX + '/system', systemRoutes);
+router.mount(PREFIX + '/keepalive', keepaliveRoutes);
 router.mount(PREFIX + '/points', pointsRoutes);
 router.mount(PREFIX + '/stats', statsRoutes);
 router.mount(PREFIX + '/usage', usageRoutes);

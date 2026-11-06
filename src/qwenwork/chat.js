@@ -188,7 +188,9 @@ function buildBody(modelKey, payload, out = {}) {
       display_name: modelKey,
       model: '',
       format: 'openai',
-      is_vl: modelKey === 'pro' || modelKey === 'flash',
+      // is_vl 白名单对照 Buddy2api v2.2.17（1.0.4 客户端实测组合，2026-11-06 融合）：
+      // qwen3.8-max-preview 也算多模态档，原实现漏了它（当时只实测过 pro/flash）。
+      is_vl: modelKey === 'pro' || modelKey === 'flash' || modelKey === 'qwen3.8-max-preview',
       is_reasoning: false,
       api_key: '',
       url: '',
@@ -335,7 +337,7 @@ function postStream(url, body, headers, onChunk, opts = {}) {
 }
 
 /** 非流式：聚合 SSE 成一个 chat.completion */
-function aggregate(payloads, model) {
+function aggregate(payloads, model, opts = {}) {
   let content = '';
   let reasoning = '';
   let finish = 'stop';
@@ -371,6 +373,17 @@ function aggregate(payloads, model) {
       }
     } catch (e) { /* 非 JSON 帧跳过 */ }
   }
+  // DSML fail-closed 兜底（2026-11-04 补齐——10-31 收敛时千问非流式漏接，
+  // 只有流式门有；共享实现见 repair.aggregateDsmlFallback）。
+  // recovered 时把 stop 纠正成 tool_calls（模型没走原生调用，上游必然报 stop）。
+  // 其后是 tool echo 兜底（hub#135）：纯 JSON 载荷形状，与 DSML 互补。
+  const repair = require('../repair');
+  const dsml = repair.aggregateDsmlFallback('qwenwork', content, calls);
+  content = dsml.content;
+  if (dsml.recovered && finish === 'stop') finish = 'tool_calls';
+  const echo = repair.aggregateToolEchoFallback('qwenwork', content, calls, opts.toolNames, opts.echoMode);
+  content = echo.content;
+  if (echo.recovered && finish === 'stop') finish = 'tool_calls';
   const message = { role: 'assistant', content };
   if (reasoning) message.reasoning_content = reasoning;
   if (calls.size) {

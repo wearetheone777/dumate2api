@@ -4,7 +4,8 @@
       title="登录态"
       :sub="isTw ? 'TRAE Work 登录态（凭证自持）'
         : isQd ? 'Qoder 登录态（凭证自持，无需客户端）'
-        : isQw ? '千问办公客户端登录态（只读）' : '客户端当前状态（只读）'"
+        : isQw ? '千问办公客户端登录态（只读）'
+        : isWb ? 'WorkBuddy 登录态（凭证自持，双区域）' : '客户端当前状态（只读）'"
     />
 
     <!-- ============ TRAE Work：凭证自持，可自动续期（与千问的只读相反） ============ -->
@@ -12,6 +13,9 @@
 
     <!-- ============ Qoder：凭证自持（device flow），不需要任何客户端 ============ -->
     <QoderLoginState v-else-if="isQd" />
+
+    <!-- ============ WorkBuddy：凭证自持（OAuth / 客户端导入 / 手动 token），双区域 ============ -->
+    <WorkBuddyLoginState v-else-if="isWb" />
 
     <!-- ============ 千问办公：单账号直连，登录态在官方客户端的 auth-v2.dat ============ -->
     <template v-else-if="isQw">
@@ -121,14 +125,22 @@
                   </span>
                 </a-descriptions-item>
                 <a-descriptions-item label="refresh token">
-                  <a-tag :color="qw.token.refreshExpired ? 'red' : 'green'">
-                    {{ qw.token.refreshExpired ? '已过期' : '有效' }}
+                  <a-tag :color="qw.token.refreshExpired ? 'red' : qw.token.refreshExpiringSoon ? 'orange' : 'green'">
+                    {{ qw.token.refreshExpired ? '已过期' : qw.token.refreshExpiringSoon ? '临期' : '有效' }}
                   </a-tag>
                   <span class="text-xs text-slate-500 ml-1 num">
                     {{ qw.token.refreshExpiresAt ? dateText(qw.token.refreshExpiresAt) : '—' }}
                   </span>
                 </a-descriptions-item>
               </a-descriptions>
+              <a-alert
+                v-if="qw.token.refreshExpiringSoon && !qw.token.refreshExpired"
+                type="warning"
+                show-icon
+                class="mt-3"
+                message="refresh token 24 小时内过期"
+                description="过期后无法自动续期——请到「账号管理」重新登录这个账号。"
+              />
               <a-alert
                 v-if="qw.token.refreshExpired"
                 type="warning"
@@ -350,9 +362,10 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import client from '@/api/client'
-import { channelStore, isTraework, isQwenwork, isQoder } from '@/stores/channel'
+import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
 import TraeworkLoginState from '@/components/traework/TraeworkLoginState.vue'
 import QoderLoginState from '@/components/qoder/QoderLoginState.vue'
+import WorkBuddyLoginState from '@/components/workbuddy/WorkBuddyLoginState.vue'
 import { qwenworkApi } from '@/api/qwenwork'
 import type { QwLogin } from '@/api/qwenwork'
 import type { AccountData } from '@/api/account'
@@ -361,12 +374,13 @@ const data = ref<AccountData | null>(null)
 // 千问办公的登录态：来自官方客户端 auth-v2.dat，只读
 const qw = ref<QwLogin | null>(null)
 
-// 三条通道三种形态：搭子（有后端进程）、千问（单账号只读）、TRAE（多账号自持）。
-// isDirectChannel 只分「搭子 vs 直连」，直连内部还要再分一次——千问与 TRAE
-// 的凭证来源与续期方式完全相反，共用一套模板会把「能不能自动续」说反。
+// 四条通道四种形态：搭子（有后端进程）、千问（单账号只读）、TRAE/Qoder（多账号自持）、
+// WorkBuddy（多账号自持，双区域）。isDirectChannel 只分「搭子 vs 直连」，直连内部
+// 还要再分——各通道的凭证来源与续期方式不同，共用一套模板会把「能不能自动续」说反。
 const isTw = computed(() => isTraework())
 const isQw = computed(() => isQwenwork())
 const isQd = computed(() => isQoder())
+const isWb = computed(() => isWorkBuddy())
 
 const accountColumns = [
   { title: '账号', key: 'name' },

@@ -132,6 +132,10 @@ function normalize(m) {
     // 它们不是顶层 config_name，模型名前置校验要把它们也算「已知」，
     // 否则用自定义模型的请求会被误判成「模型不在表中」
     customModelIds: Array.isArray(m.custom_models) ? m.custom_models.map((x) => String(x)) : [],
+    // **上游原始对象**（remote manual 策略的 custom_model 字段要它的完整
+    // 形状——Trae2api-cn 的 resolve_model_config 产物就是上游返回的整行，
+    // 归一化字段子集重构不出来）。只读引用，归一化行不序列化落盘。
+    customModel: m || null,
   };
 }
 

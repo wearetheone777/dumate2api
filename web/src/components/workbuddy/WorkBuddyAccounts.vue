@@ -6,7 +6,10 @@
           一键签到
         </a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="load">刷新</a-button>
-        <a-button type="primary" size="small" @click="importOpen = true">导入账号</a-button>
+        <a-button type="primary" size="small" :loading="oauthLoading" :disabled="oauthPolling" @click="startOauthLogin">
+          浏览器登录
+        </a-button>
+        <a-button size="small" @click="importOpen = true">导入账号</a-button>
       </template>
     </PageHeader>
 
@@ -15,8 +18,9 @@
       <template #message>WorkBuddy {{ isIntl ? '国际版' : '国内版' }}的凭证由本项目自己持有</template>
       <template #description>
         <div>
-          凭证存于 <code>data/workbuddy-accounts.json</code>。登录流程后置：
-          账号来源是<b>官方客户端认证文件导入</b>或<b>手动粘贴 token</b>。
+          凭证存于 <code>data/workbuddy-accounts.json</code>。账号来源：
+          <b>浏览器 OAuth 登录</b>（推荐，多账号就是每个账号各登录一次）、
+          官方客户端认证文件导入、或手动粘贴 token。
         </div>
         <div class="mt-1 text-xs">
           <template v-if="isIntl">
@@ -38,6 +42,15 @@
       :message="status.error || '通道不可用'"
     />
 
+    <!-- OAuth 登录进行中：说明轮询状态与多账号做法 -->
+    <a-alert v-if="oauthPolling" type="info" show-icon>
+      <template #message>等待浏览器完成登录…（最长 10 分钟，每 2 秒检查一次）</template>
+      <template #description>
+        在弹出的官方登录页里完成登录即会自动导入。
+        要加<b>多个账号</b>：完成一个后，换另一个账号（或开无痕窗口）再点一次「浏览器登录」。
+      </template>
+    </a-alert>
+
     <a-card :bordered="false">
       <div class="flex items-center justify-between mb-3">
         <div>
@@ -47,7 +60,8 @@
       </div>
 
       <a-empty v-if="!rows.length && !loading" :description="`还没有${isIntl ? '国际' : '国内'}版账号`">
-        <a-button type="primary" @click="importOpen = true">导入第一个账号</a-button>
+        <a-button type="primary" :loading="oauthLoading" @click="startOauthLogin">浏览器登录添加账号</a-button>
+        <a-button class="ml-2" @click="importOpen = true">其他方式导入</a-button>
       </a-empty>
 
       <a-skeleton v-if="loading && !rows.length" active :paragraph="{ rows: 4 }" />
@@ -118,7 +132,7 @@
             </div>
 
             <div class="mt-2 text-xs text-slate-400">
-              来源 {{ a.source === 'client-import' ? '客户端导入' : a.source === 'manual' ? '手动粘贴' : (a.source || '—') }}
+              来源 {{ sourceText(a.source) }}
               · refresh …{{ a.refreshTail || '—' }}
             </div>
           </a-card>
@@ -131,8 +145,9 @@
       <a-alert type="info" show-icon class="mb-3">
         <template #message>当前导入到{{ isIntl ? '国际版' : '国内版' }}</template>
         <template #description>
-          两套账号不通用。客户端导入读的是本机 WorkBuddy 客户端的登录态文件，
-          必须先在客户端里登录对应区域的账号。
+          两套账号不通用。推荐用页面右上角的<b>「浏览器登录」</b>（OAuth 设备授权，
+          多账号就是每个账号各登录一次）；这里的两种方式是没有浏览器登录条件时的替代——
+          客户端导入读的是本机客户端的登录态文件，必须先在客户端里登录对应区域的账号。
         </template>
       </a-alert>
       <a-button type="primary" block :loading="importLoading" @click="doImportClient">
@@ -171,7 +186,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { App } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { channelStore, isWorkBuddy } from '@/stores/channel'
@@ -354,8 +369,65 @@ async function doImportToken() {
   }
 }
 
+// 来源标记的人话
+const sourceText = (s: string) =>
+  s === 'oauth' ? '浏览器登录'
+    : s === 'client-import' ? '客户端导入'
+      : s === 'manual' ? '手动粘贴' : (s || '—')
+
+// OAuth 设备授权登录（浏览器登录）：生成授权链接 → 打开浏览器 → 每 2 秒轮询，
+// 完成即自动导入。多账号 = 换账号后再点一次（浏览器已登录当前账号时用无痕窗口）。
+const oauthLoading = ref(false)
+const oauthPolling = ref(false)
+let oauthTimer: ReturnType<typeof setInterval> | null = null
+let oauthState = ''
+let oauthRegion: 'cn' | 'intl' = 'cn'
+
+function stopOauth(err = '') {
+  if (oauthTimer) { clearInterval(oauthTimer); oauthTimer = null }
+  oauthPolling.value = false
+  if (err) message.error(err)
+}
+
+async function startOauthLogin() {
+  if (oauthPolling.value) return
+  oauthLoading.value = true
+  const region = regionStore.current
+  try {
+    const { data } = await workbuddyApi.loginUrl(region)
+    if (!data.ok || !data.authUrl || !data.state) {
+      message.error(data.error || '生成授权链接失败')
+      return
+    }
+    window.open(data.authUrl, '_blank', 'noopener')
+    oauthState = data.state
+    oauthRegion = region
+    oauthPolling.value = true
+    message.info('已打开浏览器授权页；完成登录后会自动导入账号')
+    const deadline = Date.now() + 10 * 60 * 1000
+    oauthTimer = setInterval(async () => {
+      if (Date.now() > deadline) { stopOauth('登录窗口已超时，请重新发起'); return }
+      try {
+        const { data: r } = await workbuddyApi.loginPoll(oauthRegion, oauthState)
+        if (r.status === 'ok') {
+          stopOauth()
+          message.success(`已导入账号：${r.account?.nickname || r.account?.uid || ''}`)
+          await load()
+        } else if (r.status === 'error' || r.status === 'expired') {
+          stopOauth(r.error || r.message || '登录失败')
+        }
+      } catch (e) { /* 网络抖动忽略，下一轮继续 */ }
+    }, 2000)
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '生成授权链接失败')
+  } finally {
+    oauthLoading.value = false
+  }
+}
+
 // 本页只在 WorkBuddy 通道下有意义；区域切换也重新拉
 onMounted(() => { if (isWorkBuddy()) load() })
 watch(() => channelStore.current, () => { if (isWorkBuddy()) load() })
 watch(() => regionStore.current, () => { if (isWorkBuddy()) load() })
+onBeforeUnmount(() => stopOauth())
 </script>

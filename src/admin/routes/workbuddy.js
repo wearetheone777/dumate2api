@@ -77,6 +77,35 @@ const routes = [
     },
   },
   {
+    // OAuth 设备授权登录 · 第一步：生成授权链接（浏览器登录，天然多账号）。
+    // body: {region:'cn'|'global'}。协议见 src/workbuddy/login.js 头注释。
+    method: 'POST',
+    path: '/login/url',
+    handler: async ({ res, body }) => {
+      const login = require('../../workbuddy/login');
+      const region = constants.normalizeRegion((body && body.region) || 'cn');
+      const r = await login.startLogin(region);
+      return sendJSON(res, 200, r);
+    },
+  },
+  {
+    // OAuth 设备授权登录 · 第二步：轮询一次。
+    // body: {region, state}。pending 时前端隔 2 秒再调；ok 时账号已入池。
+    method: 'POST',
+    path: '/login/poll',
+    handler: async ({ res, body }) => {
+      const login = require('../../workbuddy/login');
+      const region = constants.normalizeRegion((body && body.region) || 'cn');
+      const state = String((body && body.state) || '').trim();
+      if (!state) return sendJSON(res, 400, { status: 'error', error: '缺 state（先调 login/url）' });
+      const r = await login.pollLogin(region, state);
+      if (r.status === 'ok' && r.account) {
+        try { require('../auth').audit('admin', 'workbuddy_oauth_login', String(r.account.id), `region=${region}`); } catch (e) { /* 审计失败不影响结果 */ }
+      }
+      return sendJSON(res, 200, r);
+    },
+  },
+  {
     // 模型表（只读，上游下发，双区域目录）
     method: 'GET',
     path: '/models',
@@ -100,13 +129,18 @@ const routes = [
   },
   {
     // 全部账号的签到状态与额度。?region= 区域视图
+    //
+    // **快照按全量账号更新**（traework 同口径）：区域视图只过滤返回行，不缩窄
+    // 查询/写入范围——否则国内视图会把国际临期条目忘干净，反过来也一样。
+    // 国际版的 checkinStatus / fetchCredits 都是 immediate unsupported（不打
+    // 上游），全量查询的额外成本只有国内号本身。
     method: 'GET',
     path: '/credits',
     handler: async ({ res, req }) => {
       const region = regionOf(req.url || '');
       const proxyAgent = require('../../proxy-agent');
       const rows = [];
-      const all = authStore.findUsable().filter((a) => !region || constants.normalizeRegion(a.region) === region);
+      const all = authStore.findUsable();
       for (const raw of all) {
         const a = await authStore.ensureFresh(raw);
         let agent = null;
@@ -116,6 +150,10 @@ const routes = [
         }
         const st = await billing.checkinStatus(a.region, a).catch((e) => ({ ok: false, error: e.message }));
         const q = await billing.fetchCredits(a.region, a).catch((e) => ({ ok: false, error: e.message }));
+        // 档位（hub #505）：计费摘要是唯一可信的档位来源。TTL 24h 内读档案
+        // 缓存、过期才打上游（每账号每天最多一次）；失败保留旧值。与签到/
+        // 额度同一处顺带刷新，不新开定时器。
+        const tier = await billing.maybeRefreshTier(a).catch(() => (a.tier || null));
         rows.push({
           id: a.id,
           nickname: a.nickname || a.uid || `账号 ${a.id}`,
@@ -126,25 +164,49 @@ const routes = [
           unsupportedCheckin: !!st.unsupported,
           dailyCredit: st.ok ? st.dailyCredit : null,
           streakDays: st.ok ? st.streakDays : null,
-          // 额度包：total 是各套餐剩余之和；明细给界面拆
+          tier: tier ? { paid: !!tier.paid, package: tier.package || '', at: tier.at || null } : null,
+          // 额度包：total 是各套餐剩余之和；明细给界面拆。
+          // totalPrecise 是精确合计（整数 remain 是 floor），FEFO 快照也用它
           total: q.ok ? q.total : null,
+          totalPrecise: q.ok ? (q.totalPrecise != null ? q.totalPrecise : null) : null,
           packages: q.ok ? q.packages : [],
           lastCheckin: a.lastCheckin || null,
           error: [st.ok ? '' : (st.unsupported ? '' : st.error), q.ok ? '' : q.error].filter(Boolean).join('；'),
         });
       }
-      const known = rows.filter((r) => r.total != null);
+
+      // FEFO 快照：到期取各套餐 CycleEndTime 的最早值，窗口内才进门（与读方
+      // 同窗）；查询失败的账号进 keepIds 保留旧条目——「查不到」不是「没有
+      // 临期」，写空会让 FEFO 在一次网络抖动后把临期账号忘干净。
+      const expiringSnap = require('../../expiring');
+      const winMs = expiringSnap.windowDays('workbuddy') * 86400000;
+      const nowMs = Date.now();
+      const fefoEntries = [];
+      const fefoKeep = [];
+      for (const r of rows) {
+        const expires = (r.packages || [])
+          .map((p) => p.expireAt)
+          .filter((x) => Number.isFinite(x) && x > nowMs && x <= nowMs + winMs);
+        if (r.total == null && r.error) fefoKeep.push(r.id);
+        else if (expires.length) fefoEntries.push({ accountId: r.id, nearest: Math.min(...expires) });
+      }
+      expiringSnap.update('workbuddy', fefoEntries, { keepIds: fefoKeep });
+
+      // 区域视图：返回的行 / 汇总都按该区域收窄（快照已按全量更新）
+      const shown = region ? rows.filter((r) => constants.normalizeRegion(r.region) === region) : rows;
+      const known = shown.filter((r) => r.total != null);
       return sendJSON(res, 200, {
-        count: rows.length,
+        count: shown.length,
         region: region || undefined,
-        rows,
+        rows: shown,
         summary: {
-          total: rows.length,
-          valid: rows.filter((r) => !r.error).length,
-          checkedIn: rows.filter((r) => r.checkedIn === true).length,
-          unknown: rows.length - known.length,
+          total: shown.length,
+          valid: shown.filter((r) => !r.error).length,
+          checkedIn: shown.filter((r) => r.checkedIn === true).length,
+          unknown: shown.length - known.length,
           remainTotal: Number(known.reduce((s, r) => s + (r.total || 0), 0).toFixed(2)),
         },
+        fefo: expiringSnap.info('workbuddy'),
       });
     },
   },
@@ -197,6 +259,154 @@ const routes = [
           refreshExpired: accounts.filter((a) => a.refreshExpired).length,
           errored: accounts.filter((a) => a.lastError).length,
         },
+      });
+    },
+  },
+  {
+    // 计费自检探针：按模型发一条小请求，用「套餐剩余合计」的前后快照差值
+    // 实测扣费，与模型表标称 credits 倍率并排返回（口径对齐 TRAE 的同名端点）。
+    // 国际版没有 credits 额度接口（订阅按请求数计）——如实 unsupported，不硬编。
+    method: 'GET',
+    path: '/billing-check',
+    handler: async ({ req, res }) => {
+      const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1] || ''))
+        .replace(/^workbuddy\//, '').trim();
+      if (!model) return sendJSON(res, 400, { ok: false, error: '缺 model 参数（如 ?model=glm-5.3）' });
+      // 输出规模：套餐积分是整数，Δ 的分辨率 = 1 ÷ (tokens/1000)。默认数到 400
+      // （约 1k tokens，快）；要压过量化噪声可传 ?count=2000（约 10k tokens）。
+      const count = Math.min(4000, Math.max(100,
+        Number((req.url.match(/[?&]count=(\d+)/) || [])[1]) || 400));
+      const region = regionOf(req.url || '');
+      if (region === 'global') {
+        return sendJSON(res, 200, {
+          ok: false,
+          unsupported: true,
+          model,
+          expected: null,
+          error: '国际版没有 credits 额度接口（订阅制按请求数计），无法测扣费',
+        });
+      }
+
+      // 标称倍率：模型表可用的就取归一化行；取不到如实 null，探针仍然跑
+      let expected = null;
+      let free = false;
+      try {
+        const r = await models.fetchModels({ region: 'cn' });
+        const meta = (r.models || []).find((m) => m.id === model) || null;
+        if (meta) {
+          expected = meta.rate != null ? Number(meta.rate) : null;
+          free = meta.free === true;
+        }
+      } catch (e) { /* 表不可用按 null */ }
+
+      const usable = authStore.findUsable()
+        .filter((a) => constants.normalizeRegion(a.region) === 'cn');
+      if (!usable.length) {
+        return sendJSON(res, 200, { ok: false, unsupported: true, model, expected, error: '没有可用的国内账号' });
+      }
+
+      // 快照所有国内账号的套餐剩余合计：选号交给池，探针事先不知道用哪个号。
+      // 取不到额度的账号不进 map——后面按缺失跳过，不补 0。
+      // **优先精确余额**（totalPrecise，来自上游 "…Precise" 字段）：整数 remain
+      // 是 floor，会把小请求的扣费吞成 0/1（2026-11-04 首次探针的教训）。
+      let preciseDecimals = null;
+      const snapshot = async () => {
+        const remain = new Map();
+        for (const raw of usable) {
+          try {
+            const a = await authStore.ensureFresh(raw);
+            const q = await billing.fetchCredits('cn', a);
+            if (q.ok && q.total != null) {
+              remain.set(String(a.id), q.totalPrecise != null ? q.totalPrecise : q.total);
+              if (q.preciseDecimals != null && (preciseDecimals == null || q.preciseDecimals > preciseDecimals)) {
+                preciseDecimals = q.preciseDecimals;
+              }
+            }
+          } catch (e) { /* 单账号失败不影响快照其余账号 */ }
+        }
+        return remain;
+      };
+
+      const before = await snapshot();
+      const startedAt = Date.now();
+      let servedId = null;
+      let servedName = '';
+      let tokens = null;
+      try {
+        const agg = await wb.send({
+          model: `workbuddy/${model}`,
+          // 让输出足够长：余额是两位小数，几百 token 的输出才能把量化误差
+          // 压到可判读的范围内（与 TRAE / 千问探针同一个理由）
+          messages: [{ role: 'user', content: `请从 1 数到 ${count}，每个数字之间用一个空格分隔，只输出数字本身，不要输出任何其他文字。` }],
+          max_tokens: 4096,
+        }, undefined, {
+          region: 'cn',
+          // 探针不惩罚账号：撞风控/限流时不给账号写冷却与 lastError（hub v1.7.20 #134）
+          probe: true,
+          onAccount: (name, id) => { servedName = name || ''; if (id != null) servedId = id; },
+        });
+        const u = (agg && agg.usage) || null;
+        if (u) tokens = { input: u.prompt_tokens || 0, output: u.completion_tokens || 0, total: u.total_tokens || 0 };
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, model, expected, error: e.message, elapsedMs: Date.now() - startedAt });
+      }
+
+      // 结算延迟：剩余额不会在响应返回的瞬间更新。轮询到增量出现为止
+      // （4 次尝试共约 8 秒）；仍没有就如实报 null——不把「没测到」编成 0。
+      let delta = null;
+      let charged = [];
+      let singleAccount = false;
+      let last = null;
+      for (let i = 0; i < 4; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, [1500, 2500, 4000][i - 1]));
+        const after = await snapshot();
+        last = billing.attributeDelta(before, after, servedId);
+        if (last.delta != null && last.delta > 0) break;
+        // 别的账号先涨（并发流量）也停——再等只会把对方的消耗卷进来
+        if (last.charged.length) break;
+      }
+      delta = last ? last.delta : null;
+      charged = last ? last.charged : [];
+      singleAccount = last ? last.singleAccount : false;
+
+      const billed = billing.billedRate(delta, tokens && tokens.total);
+      const ratio = billing.ratioOf(billed, expected);
+      // 量化分辨率：套餐剩余额的粒度 = 上游小数位（precise 缺失时按整数 1）。
+      // 单请求可分辨的最小倍率 = 粒度 ÷ (tokens/1000)——大于标称一半时 ratio
+      // 只是量化伪影（2026-11-04 首次探针 1012 tokens ±0.988 的教训）。
+      // 真机补充：该账号 8 位小数的 precise 包让粒度到 1e-8，量化可忽略——
+      // 但**对话当前根本不实时扣这些套餐**（连打数请求 totalPrecise 纹丝不动，
+      // 与 usage.credit=0 一致，公测/活动口径），delta=null 是真实测量结果。
+      const unit = preciseDecimals != null ? Math.pow(10, -preciseDecimals) : 1;
+      const resolution = tokens && tokens.total > 0
+        ? Number((unit / (tokens.total / 1000)).toPrecision(2)) : null;
+      const unresolved = resolution != null && expected != null && expected > 0 && resolution > expected / 2;
+      return sendJSON(res, 200, {
+        ok: true,
+        model,
+        account: servedName || null,
+        accountId: servedId,
+        expected,
+        billed,
+        ratio,
+        delta,
+        tokens,
+        resolution,
+        charged,
+        singleAccount,
+        free,
+        elapsedMs: Date.now() - startedAt,
+        warning: delta == null
+          ? '请求成功，但 8 秒内未观测到套餐剩余额的变化——真机实证该账号的对话当前不实时扣套餐（公测/活动口径，与 usage.credit=0 一致），此为真实测量结果而非故障；免费模型不扣费同理'
+          : (free ? '该模型标称免费（x0.00）——测到扣费说明上游可能改了计费口径'
+            : (unresolved
+              ? `套餐积分按整数扣减：本次 Δ=${delta}（${tokens.total} tokens），测量分辨率 ±${resolution} 积分/千token，大于标称 ${expected} 的一半——比值不可判读；请用更大输出重测（?count=2000 约 10k tokens）`
+              : '')),
+        note: 'delta = 请求前剩余 − 请求后剩余（套餐剩余额下降即本次消耗；推断口径，受结算延迟/并发影响）。'
+          + '倍率 = delta ÷ (total_tokens/1000)；标称取模型表 credits（x0.34 credits → 0.34，x0.00 = 免费）。'
+          + '测量分辨率 = 剩余额粒度 ÷ (tokens/1000)（见 resolution 字段），'
+          + '分辨率大于标称一半时 ratio 只是量化伪影——用 ?count=2000 加大输出可压过。'
+          + '与 TRAE/Qoder 的倍率数字**不可跨通道互比**（各通道积分体系不同）。',
       });
     },
   },

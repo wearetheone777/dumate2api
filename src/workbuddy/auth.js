@@ -70,6 +70,11 @@ function list() {
     hasRefresh: !!a.refreshToken,
     hasAccess: !!a.accessToken,
     refreshTail: a.refreshToken ? String(a.refreshToken).slice(-6) : '',
+    // 档位（hub #505，计费摘要的权威口径）：paid/package + 读取时刻；
+    // 没有结论（从未刷到 / 上游失败）如实 null，不猜
+    tier: a.tier && Number(a.tier.at) > 0
+      ? { paid: !!a.tier.paid, package: String(a.tier.package || ''), at: Number(a.tier.at) }
+      : null,
   }));
 }
 
@@ -151,7 +156,8 @@ async function exchangeOnce(a) {
   try { agent = require('../proxy-agent').getAgentFor(a); } catch (e) {
     return { ok: false, error: `出站代理配置错误: ${e.message}` };
   }
-  const spec = c.specOf(c.normalizeRegion(a.region));
+  const reg = c.normalizeRegion(a.region);
+  const spec = c.specOf(reg);
   const u = new URL(spec.chatBase + c.EP_REFRESH);
   const headers = {
     Accept: 'application/json, text/plain, */*',
@@ -161,11 +167,17 @@ async function exchangeOnce(a) {
     'User-Agent': c.CLIENT_UA,
     'Content-Type': 'application/json',
     'X-Refresh-Token': String(a.refreshToken),
-    // 官方客户端的刷新渠道标识（参照 upstream.rs；ithtelab/workbuddy-manager
-    // 观测同值，方向一致才采用）
-    'X-Auth-Refresh-Source': 'workbuddy',
+    // 刷新渠道标识按区域不同（参照 workbuddy2api-hub 实测）：国内 'workbuddy'，
+    // 国际 'plugin'。此前两区都用 'workbuddy'——国内实测正常，国际未单独验证。
+    'X-Auth-Refresh-Source': reg === 'cn' ? 'workbuddy' : 'plugin',
+    'X-CodeBuddy-Request': '1',
+    'Accept-Language': reg === 'global' ? 'en-US' : 'zh-CN',
   };
   if (a.enterpriseId) headers['X-Enterprise-Id'] = a.enterpriseId;
+  if (a.uid) headers['X-User-Id'] = String(a.uid);
+  // X-Domain 兜底与参照实现一致：账号自己的 domain 优先，缺省按区域给
+  const domain = a.domain || (reg === 'global' ? 'www.workbuddy.ai' : 'copilot.tencent.com');
+  if (domain) headers['X-Domain'] = domain;
   const r = await new Promise((resolve) => {
     const req = require('https').request({
       hostname: u.hostname, path: u.pathname + u.search, method: 'POST', headers,

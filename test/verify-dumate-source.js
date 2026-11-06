@@ -88,6 +88,9 @@ process.env.DUMATE2API_PORT = String(PORT);
 process.env.DUMATE2API_HOST = '127.0.0.1';
 process.env.DUMATE_AUTOSTART = 'off';
 process.env.DUMATE_ADMIN_DATA = path.join(ROOT, 'data');
+// 2026-11-01 起模型端点强制鉴权——测试用 env 密钥，post() 里带上
+//（/ping、/health 豁免，get() 不需要；子进程只看启动日志，也不需要）
+process.env.DUMATE2API_KEY = 'test-key-source';
 delete process.env.DUMATE_DUMATE_SOURCE;
 require(path.join(ROOT, 'src/server.js'));
 
@@ -98,7 +101,11 @@ function post() {
     const d = JSON.stringify({ model: 'glm-5', messages: [{ role: 'user', content: 'hi' }], max_tokens: 16, stream: true });
     const rq = http.request({
       host: '127.0.0.1', port: PORT, path: '/v1/chat/completions', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(d) },
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(d),
+        'Authorization': 'Bearer test-key-source',
+      },
     }, (res) => {
       let t = '';
       res.on('data', (c) => { t += c; });
