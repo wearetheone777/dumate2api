@@ -47,10 +47,12 @@ $ErrorActionPreference = 'Continue'
 $script:Root        = Split-Path -Parent $PSScriptRoot
 $script:GatewayPort = 9082
 $script:AdminPort   = 9083
+$script:StablePort  = 9080
 $script:AdminUrl    = "http://127.0.0.1:$($script:AdminPort)"
 $script:DataDir     = Join-Path $script:Root 'data'
 $script:LogGateway  = Join-Path $script:DataDir 'launcher-9082.log'
 $script:LogAdmin    = Join-Path $script:DataDir 'launcher-9083.log'
+$script:LogStable   = Join-Path $script:DataDir 'launcher-9080.log'
 $script:IconPath    = Join-Path $script:Root 'assets\dumate2api.ico'
 
 $script:Offsets     = @{}     # 日志文件 -> 已读到的字节偏移
@@ -63,7 +65,7 @@ $script:MaxLogChars = 400000  # 富文本框上限，超了裁掉前半段防止
 function Add-Log {
     param(
         [string]$Text,
-        [ValidateSet('info', 'ok', 'warn', 'err', 'gateway', 'admin')]
+        [ValidateSet('info', 'ok', 'warn', 'err', 'gateway', 'admin', 'stable')]
         [string]$Kind = 'info'
     )
     if ($null -eq $script:LogBox) { return }
@@ -77,6 +79,7 @@ function Add-Log {
         'err'     { [System.Drawing.Color]::FromArgb(240, 100, 100) }
         'gateway' { [System.Drawing.Color]::FromArgb(140, 200, 255) }
         'admin'   { [System.Drawing.Color]::FromArgb(200, 170, 255) }
+        'stable'  { [System.Drawing.Color]::FromArgb(255, 190, 140) }
         default   { [System.Drawing.Color]::FromArgb(200, 200, 200) }
     }
 
@@ -122,6 +125,7 @@ function Stop-ProcTree {
 
 function Test-GatewayUp { return (Get-PortOwner $script:GatewayPort) -ne 0 }
 function Test-AdminUp   { return (Get-PortOwner $script:AdminPort)   -ne 0 }
+function Test-StableUp  { return (Get-PortOwner $script:StablePort)  -ne 0 }
 
 # ---------------------------------------------------------------- 启停服务
 
@@ -263,6 +267,67 @@ function Open-AdminPage {
     }
 }
 
+# ---------------------------------------------------------------- 9080 稳定版
+
+# 启动 9080 稳定版（对外生产服务）。与 dev 两进程完全独立：
+#   - 跑的是 stable\src（发布快照），不是主目录 src
+#   - env 与 stable\start-stable.bat 同款（DUMATE_ADMIN_DATA 指向仓库 data，
+#     与 dev 共享 keys.json / 账号文件——两个网关看到同一批 key 与账号池）
+# 启动前预检：9080 被非 node 进程占着就放弃（同 dev 纪律，绝不杀别人的进程）。
+function Start-Stable {
+    if ($script:StartingStable) { return }
+    $script:StartingStable = $true
+    try {
+        $pid80 = Get-PortOwner $script:StablePort
+        if ($pid80 -ne 0) {
+            $name = Get-ProcName $pid80
+            if ($name -ne 'node') {
+                Add-Log ("端口 {0} 被 {1}(PID {2}) 占用，不是 node，已放弃启动。" -f $script:StablePort, $name, $pid80) 'err'
+                return
+            }
+            Add-Log ("清理 9080 残留 PID {0}" -f $pid80) 'warn'
+            Stop-ProcTree $pid80
+            Start-Sleep -Milliseconds 600
+        }
+        if (-not (Test-Path (Join-Path $script:Root 'stable\src\server.js'))) {
+            Add-Log 'stable\src\server.js 不存在——先做快照同步再启动 9080。' 'err'
+            return
+        }
+        Reset-LogFile $script:LogStable
+        Add-Log '启动稳定版 9080（stable\src，对外服务）…'
+        $p = Start-NodeHidden 'stable\src\server.js' @{
+            DUMATE2API_PORT    = $script:StablePort
+            DUMATE_ADMIN_DATA  = $script:DataDir
+            DUMATE_REQUIRE_KEY = '1'
+        } $script:LogStable
+        if ($p) { $script:Procs += $p }
+        Start-Sleep -Milliseconds 1500
+        if (Test-StableUp) { Add-Log "稳定版已监听 $($script:StablePort)" 'ok' }
+        else { Add-Log '稳定版未在预期时间内监听，请看上面的日志。' 'warn' }
+    } finally {
+        $script:StartingStable = $false
+        Update-Status
+    }
+}
+
+# 停止 9080。**独立按钮**的原因：9080 是对外生产服务，「关闭服务」和
+# 「完全退出」都绝不顺带杀它——生产服务的停止必须是显式动作。
+function Stop-Stable {
+    $pid80 = Get-PortOwner $script:StablePort
+    if ($pid80 -eq 0) { Add-Log '稳定版 9080 未在运行。' 'warn'; return }
+    $name = Get-ProcName $pid80
+    if ($name -ne 'node') {
+        Add-Log ("端口 {0} 被 {1}(PID {2}) 占用，不是我们的进程，未处理。" -f $script:StablePort, $name, $pid80) 'warn'
+        return
+    }
+    Add-Log ("停止稳定版 9080（node PID {0}）" -f $pid80) 'warn'
+    Stop-ProcTree $pid80
+    Start-Sleep -Milliseconds 700
+    if (Test-StableUp) { Add-Log '9080 仍在监听，请检查日志。' 'err' }
+    else { Add-Log '稳定版 9080 已停止。' 'ok' }
+    Update-Status
+}
+
 function Exit-App {
     if ($script:Exiting) { return }
     Add-Log '退出中：先停止服务 …' 'warn'
@@ -316,12 +381,14 @@ function Pump-Logs {
     if ($delta) { foreach ($line in ($delta -split "`r?`n")) { if ($line.Trim()) { Add-Log $line 'gateway' } } }
     $delta = Read-Log-Delta $script:LogAdmin
     if ($delta) { foreach ($line in ($delta -split "`r?`n")) { if ($line.Trim()) { Add-Log $line 'admin' } } }
+    $delta = Read-Log-Delta $script:LogStable
+    if ($delta) { foreach ($line in ($delta -split "`r?`n")) { if ($line.Trim()) { Add-Log $line 'stable' } } }
 }
 
 # ---------------------------------------------------------------- 界面
 
 $script:Form = New-Object System.Windows.Forms.Form
-$script:Form.Text = 'dumate2api 控制台 · 网关 9082 / 管理端 9083'
+$script:Form.Text = 'dumate2api 控制台 · 网关 9082 / 管理端 9083 / 稳定版 9080'
 $script:Form.Size = New-Object System.Drawing.Size(940, 600)
 $script:Form.MinimumSize = New-Object System.Drawing.Size(720, 420)
 $script:Form.StartPosition = 'CenterScreen'
@@ -361,6 +428,10 @@ $script:BtnStop  = New-Button '关闭服务' 92 { Stop-Services }
 $script:BtnAdmin = New-Button '打开管理端' 104 { Open-AdminPage }
 $script:BtnClear = New-Button '清空日志' 92 { $script:LogBox.Clear() }
 $script:BtnExit  = New-Button '完全退出' 92 { Exit-App }
+# 9080 稳定版独立成对：它是对外生产服务，启停都显式——「关闭服务」与
+# 「完全退出」不碰它（Exit-App 只收 dev 两进程）
+$script:BtnStableStart = New-Button '启动 9080' 96 { Start-Stable }
+$script:BtnStableStop  = New-Button '停止 9080' 96 { Stop-Stable }
 
 # ---- 状态栏（贴底）
 $status = New-Object System.Windows.Forms.Label
@@ -390,11 +461,14 @@ function Update-Status {
     if ($null -eq $script:StatusLabel) { return }
     $gw = if (Test-GatewayUp) { "网关 $($script:GatewayPort)：运行中" } else { "网关 $($script:GatewayPort)：已停止" }
     $ad = if (Test-AdminUp)   { "管理端 $($script:AdminPort)：运行中" } else { "管理端 $($script:AdminPort)：已停止" }
-    $script:StatusLabel.Text = "$gw　|　$ad　|　关闭窗口 = 收进托盘"
+    $st = if (Test-StableUp)  { "稳定版 $($script:StablePort)：运行中" } else { "稳定版 $($script:StablePort)：已停止" }
+    $script:StatusLabel.Text = "$gw　|　$ad　|　$st　|　关闭窗口 = 收进托盘"
 
     if ($null -ne $script:BtnStart) {
         $script:BtnStart.Enabled = -not (Test-GatewayUp)
         $script:BtnStop.Enabled = (Test-GatewayUp -or (Test-AdminUp))
+        $script:BtnStableStart.Enabled = -not (Test-StableUp)
+        $script:BtnStableStop.Enabled = (Test-StableUp)
     }
 }
 
@@ -421,6 +495,9 @@ $null = New-MenuItem '显示窗口' { Show-Window }
 $null = New-MenuItem '启动服务' { Start-Services }
 $null = New-MenuItem '关闭服务' { Stop-Services }
 $null = New-MenuItem '打开管理端页面' { Open-AdminPage }
+$null = $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+$null = New-MenuItem '启动 9080（稳定版）' { Start-Stable }
+$null = New-MenuItem '停止 9080（稳定版）' { Stop-Stable }
 $null = $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $null = New-MenuItem '完全退出' { Exit-App }
 $script:Tray.ContextMenuStrip = $menu
