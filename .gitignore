@@ -1,4 +1,4 @@
-﻿# --- DuMate ecosystem runtime assets (56M / 22M, shipped by the client) ---
+# --- DuMate ecosystem runtime assets (56M / 22M, shipped by the client) ---
 skills/
 plugins/
 
@@ -27,7 +27,13 @@ test/_archive/
 .skills_tmp/
 
 # --- deps ---
+# 包管理器统一 pnpm（根 + web），pnpm-lock.yaml 入库。
+# npm 的 package-lock.json 一律忽略：两套锁文件并存会让「装到哪个版本」
+# 变成取决于谁最后跑过 install。
 node_modules/
+package-lock.json
+web/package-lock.json
+.pnpm-store/
 
 # --- OS ---
 Thumbs.db

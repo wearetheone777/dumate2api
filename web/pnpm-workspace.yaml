@@ -1,0 +1,9 @@
+# pnpm 12 构建脚本白名单（唯一配置源，取代 package.json 里的 pnpm 字段）。
+# 未列出的包一律禁止跑脚本，缺项会在 install 时报 ERR_PNPM_IGNORED_BUILDS。
+#
+# esbuild：vite 的依赖，装的是预编译二进制，postinstall 只做平台校验/软链，
+#   必须允许，否则 vite build 起不来。
+# core-js：postinstall 只打印赞助信息，不产出任何构建产物——禁止，减少供应链面。
+allowBuilds:
+  esbuild: true
+  core-js: false
