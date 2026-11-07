@@ -406,6 +406,8 @@ const routes = [
       res.writeHead(200, {
         'Content-Type': 'application/json',
         'Content-Disposition': `attachment; filename="dumate2api-backup-${new Date().toISOString().slice(0, 10)}.json"`,
+        'Cache-Control': 'no-store',
+        'Pragma': 'no-cache',
       });
       return res.end(JSON.stringify({
         exported_at: new Date().toISOString(),
@@ -436,6 +438,24 @@ const routes = [
         });
       });
       return require('../router').sendJSON(res, 200, { ok: true, version, hint: version ? null : '注册表查询失败或未安装（5 秒超时也可能只是机器忙）' });
+    },
+  },
+  {
+    // 配置恢复（调研 P1-8）：与 /backup 成对。恢复前自动把当前配置打进
+    // data/config-backup/，逐文件原子写，非法整包一口拒掉（不做半恢复）。
+    // 响应带 no-store——备份/恢复体含 key 明文与口令哈希。
+    method: 'POST',
+    path: '/restore',
+    handler: ({ res, body, user }) => {
+      const out = require('../../config-restore').restore(body);
+      if (!out.ok) return require('../router').sendJSON(res, 400, out);
+      try {
+        require('../auth').audit(user && user.username, 'config_restore', out.backup, `${out.restored.length} 个文件`);
+      } catch (e) { /* 审计失败不影响已完成的恢复 */ }
+      return require('../router').sendJSON(res, 200, {
+        ...out,
+        note: '已恢复配置类文件；账本 jsonl 与账号凭证不在恢复范围，需整目录拷贝。其他进程按 mtime 热读，无需重启。',
+      });
     },
   },
 ];

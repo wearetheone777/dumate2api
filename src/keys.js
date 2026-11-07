@@ -143,6 +143,36 @@ const CN_ONLY_CHANNELS = new Set(['dumate', 'qwenwork']);
 // ---- 校验 ----
 // 返回 { ok } 或 { ok:false, reason }。reason 直接面向使用者，
 // 所以要说清是哪一条规则挡住的，而不是笼统的「无效」。
+/**
+ * 模型白名单匹配（2026-11-08，TRAE 调研 P0-2 的增量）。
+ *
+ * 旧口径是精确字符串相等；上游模型名带版本后缀（`Gemini-*`）时，配一条
+ * 白名单就要穷举所有版本。这里支持 fnmatch 风格的 `*` / `?`，大小写不敏感
+ * ——**没有通配符时仍是精确匹配**，旧 key 的行为逐字节不变。
+ *
+ * 只把 `*` / `?` 当元字符，其余正则符号一律转义：白名单是模型名，不是正则；
+ * 不转义的话 `gpt-4o+` 会变成「一个或多个 o」这种没人预期的结果。
+ */
+function globToRegExp(pattern) {
+  let out = '^';
+  for (const ch of String(pattern)) {
+    if (ch === '*') out += '.*';
+    else if (ch === '?') out += '.';
+    else out += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`${out}$`, 'i');
+}
+
+function modelMatches(patterns, model) {
+  const name = String(model || '');
+  return (patterns || []).some((p) => {
+    const s = String(p || '');
+    if (!s) return false;
+    if (!/[*?]/.test(s)) return s.toLowerCase() === name.toLowerCase();
+    return globToRegExp(s).test(name);
+  });
+}
+
 function validate(key, ip, model, channel) {
   if (!key) return { ok: false, reason: 'unknown_key' };
   if (key.enabled === false) return { ok: false, reason: 'disabled' };
@@ -157,7 +187,7 @@ function validate(key, ip, model, channel) {
   }
 
   const models = normalizeList(key.model_allowlist);
-  if (models.length && model && !models.includes(model)) {
+  if (models.length && model && !modelMatches(models, model)) {
     return { ok: false, reason: 'model_not_allowed' };
   }
 
@@ -428,6 +458,8 @@ module.exports = {
   validate,
   validateCIDR,
   ipMatches,
+  modelMatches,
+  globToRegExp,
   tokenFromHeaders,
   tokenMatches,
   hash,

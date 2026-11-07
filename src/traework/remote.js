@@ -826,18 +826,26 @@ async function runTurn(auth, opts = {}) {
 
 /** 请求是否要 max 档：单次 `trae_max_mode` 开关或 env 全局开关（白名单放行）。
  *  descriptor 硬门（supportsMaxMode）在 createSession 里做——这里只判意图。 */
-function maxModeRequested(model, payload) {
+function maxModeRequested(model, payload, runtime = null) {
   const p = payload && typeof payload === 'object' ? payload : {};
   let wanted = p.trae_max_mode === true || p.traeMaxMode === true;
   if (!wanted) {
     const env = String(process.env.DUMATE_TRAEWORK_REMOTE_MAX_MODE || '').trim().toLowerCase();
     wanted = env === '1' || env === 'true' || env === 'yes' || env === 'on';
+    // 运行期开关（管理端 → 运行时配置）：与 env 并联，任一开启即生效；
+    // 不需要重启网关（trae-runtime 按 mtime 热读）。
+    if (!wanted && runtime && runtime.enabled === true) wanted = true;
   }
   if (!wanted) return false;
   const configured = String(process.env.DUMATE_TRAEWORK_REMOTE_MAX_MODELS || '')
     .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  if (configured.length && !configured.includes('*')) {
-    return configured.includes(String(model || '').trim().toLowerCase());
+  const runtimeModels = runtime && Array.isArray(runtime.models) ? runtime.models : [];
+  // 运行期白名单优先：管理端「检测支持的模型 → 一键加入」写的就是这份名单。
+  // env 白名单仍在（部署时钉死用），两份不合并是避免「界面刚移除了模型，
+  // 环境变量还留着」这种互相矛盾的静默放行。
+  const list = runtimeModels.length ? runtimeModels.map((s) => String(s).trim().toLowerCase()).filter(Boolean) : configured;
+  if (list.length && !list.includes('*')) {
+    return list.includes(String(model || '').trim().toLowerCase());
   }
   return true;
 }

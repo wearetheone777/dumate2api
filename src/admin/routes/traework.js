@@ -14,6 +14,10 @@ const credits = require('../../traework/credits');
 const tw = require('../../traework');
 // 临期积分快照（FEFO 数据源）：写方在 /credits，读方在 traework/index.js
 const expiringSnap = require('../../expiring');
+// 调研融合批次（2026-11-08）：运行态配置、批量运维编排、额度预警
+const runtime = require('../../trae-runtime');
+const batch = require('../../traework/batch');
+const degrade = require('../../traework/degrade');
 
 // 区域过滤（2026-11-03 页面按区域整体切换）：'cn' / 'intl'。账号列表按
 // 区域出——国内/国际是两个独立视图，不是一页里混排打标签
@@ -38,8 +42,15 @@ const routes = [
         solo: process.env.DUMATE_TRAEWORK_SOLO === '1',
         // 逐轮精确账单（credits enrichment）开关——关了明细页就没有「精确」标记
         sessionBilling: process.env.DUMATE_TRAEWORK_SESSION_BILLING !== '0',
-        // 1M Max 全局开关（descriptor 硬门仍然生效）
-        remoteMaxMode: process.env.DUMATE_TRAEWORK_REMOTE_MAX_MODE === '1',
+        // 1M Max 全局开关（env 与运行期配置并联，任一开启即生效）
+        remoteMaxMode: process.env.DUMATE_TRAEWORK_REMOTE_MAX_MODE === '1'
+          || runtime.Load().maxMode.enabled === true,
+        // 运行期开关（管理端可热改，不需要重启）
+        runtime: {
+          maxMode: runtime.Load().maxMode,
+          degradeEnabled: runtime.Load().degrade.enabled === true,
+          pickStrategy: runtime.Load().pickStrategy,
+        },
         // 链路优先级说明（前端展示用）
         priority: 'REMOTE=2 manual > SOLO raw（纯文本）> utils_chat（默认主力）',
         // 各链路的能力边界（与 CLAUDE.md「TRAE 融合批次」节一致）
@@ -79,6 +90,14 @@ const routes = [
         // 明确告诉前端这条通道的结构：可增删，与千问的 single 模式不同
         mode: 'multi',
         modeNote: 'TRAE Work 的凭证由本项目自行 OAuth 换取并保存，可多账号并存、可增删。国内（trae.cn）与国际（trae.ai）账号不通用。',
+        // 侧栏角标（调研 P1-10）：跨页汇总，不用逐页点开才知道有几个号要处理
+        alerts: {
+          needRelogin: all.filter((a) => a.refreshExpiresAt && Date.now() >= a.refreshExpiresAt).length,
+          exhausted: all.filter((a) => a.credits != null && a.credits <= 0).length,
+          modelPaused: all.filter((a) => a.modelEnabled === false).length,
+          disabled: all.filter((a) => a.enabled === false).length,
+          creditsUnknown: all.filter((a) => a.credits == null).length,
+        },
         rows,
       });
     },
@@ -247,6 +266,8 @@ const routes = [
         expiringPoints: Number(shownExpiring.reduce((s, x) => s + x.remain, 0).toFixed(4)),
         // FEFO 快照的新鲜度（排障用：网关有没有在按临期优先选号）
         fefo: expiringSnap.info('traework'),
+        // 额度预警（调研 P0-3）：只读本轮已查到的 remain，余额未知不参与比较
+        warnings: degrade.warningsOf(runtime.Load().degrade, shown),
       });
     },
   },
@@ -656,6 +677,34 @@ const routes = [
     },
   },
   {
+    // 批量凭证运维（调研 P2-14）：多选 → 批量签到 / 探活 / 暂停 / 恢复 / 导出。
+    // 逐条隔离，单条失败不影响其余；「恢复」默认保留上游冷却，force 才清。
+    // **路由必须先于 /accounts/:id 类动态段注册**——router.find 按顺序匹配，
+    // 动态段会把 '/accounts/batch' 当成一个账号 id 吞掉。
+    method: 'POST',
+    path: '/accounts/batch',
+    handler: async ({ res, body, user }) => {
+      const payload = body || {};
+      const out = await batch.runBatch({
+        ids: payload.ids, action: payload.action, options: payload.options || {},
+        io: {
+          get: (id) => authStore.get(id),
+          patch: (id, fields) => authStore.patch(id, fields),
+          revive: (id) => require('../../pool').pool.revive(require('../../channel-pool').uidOf('traework', id)),
+          probe: async (a) => {
+            const fresh = await checkin.withFreshToken(a);
+            const st = await authStore.checkLogin(fresh);
+            return { ok: !!st.ok, error: st.error || (st.isLogin ? '' : '上游未确认登录态'), detail: st.ok ? { isLogin: st.isLogin, deviceMatch: st.deviceMatch } : null };
+          },
+          checkin: async (a) => checkin.checkinAndSave(a, authStore),
+        },
+      });
+      try { require('../auth').audit(user && user.username, 'traework_accounts_batch', payload.action || '', `${out.succeeded || 0}/${out.total || 0}`); }
+      catch (e) { /* 审计失败不影响批量结果 */ }
+      return sendJSON(res, out.ok ? 200 : 400, out);
+    },
+  },
+  {
     method: 'DELETE',
     path: '/accounts/:id',
     handler: async ({ res, params }) => {
@@ -671,6 +720,8 @@ const routes = [
     handler: async ({ res, params, body }) => {
       const fields = {};
       if (body && body.enabled !== undefined) fields.enabled = !!body.enabled;
+      // 模型请求开关（调研 P0-4）：只拦新对话，签到/额度/状态刷新照常
+      if (body && body.modelEnabled !== undefined) fields.modelEnabled = !!body.modelEnabled;
       // 手动改昵称：上游 `GetUserInfo` 需要登录会话票据（我们只存了 access
       // token，实测恒返回 20310「未登录」），所以平台上的新名字**取不到**。
       // 重登时回调里的 ScreenName 才是唯一来源，但它可能是注册默认名。

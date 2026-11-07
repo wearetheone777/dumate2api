@@ -75,7 +75,11 @@ function list() {
     // 来源必须一起给——TRAE 这个号是从昵称推断的，不是接口下发的真手机号。
     // 界面要据此标注，否则用户会以为和千问一样是官方数据。
     phoneSource: a.phone ? (a.phoneSource || 'inferred-nickname') : '',
+    // 两态开关（调研 P0-4，2026-11-08）：enabled 是**总闸**（停用后签到、
+    // 状态刷新、余额查询都不接），modelEnabled 只拦新模型请求。缺省 true
+    // 保证全部存量账号行为不变；关掉聊天、积分继续领就是靠这两个字段分开。
     enabled: a.enabled !== false,
+    modelEnabled: a.modelEnabled !== false,
     // createdAt 供仪表盘的「账号存活天数」用（见 admin/routes/traework.js
     // 的 /dashboard）。不外传这个字段的话那边只能恒给 null。
     createdAt: a.createdAt || null,
@@ -100,6 +104,11 @@ function get(id) {
 
 function findUsable() {
   return load().accounts.filter((a) => a.enabled !== false && a.accessToken && a.refreshToken);
+}
+
+/** 只给对话路径：总闸 + 模型开关都要开（保活/签到继续用 findUsable） */
+function findModelUsable() {
+  return findUsable().filter((a) => a.modelEnabled !== false);
 }
 
 /** 新增或按 uid 覆盖 */
@@ -471,7 +480,7 @@ async function syncNickname(a) {
 }
 
 module.exports = {
-  FILE, filePath, dataDir, load, save, list, get, findUsable, upsert, remove, patch,
+  FILE, filePath, dataDir, load, save, list, get, findUsable, findModelUsable, upsert, remove, patch,
   needsRefresh, exchange, jwtExp, jwtUid, fetchUserInfo, ensureDevice, rotateDevice,
   checkLogin, parseCheckLogin,
   maskPhone, phoneFromNickname, genId, syncNickname,

@@ -77,6 +77,10 @@
           <a-tag :color="twLinks.solo ? 'blue' : 'default'">SOLO raw {{ twLinks.solo ? '开' : '关' }}</a-tag>
           <a-tag color="default">utils_chat（默认主力）</a-tag>
           <a-tag :color="twLinks.sessionBilling ? 'green' : 'orange'">逐轮精确账单 {{ twLinks.sessionBilling ? '开' : '关' }}</a-tag>
+          <!-- 运行期开关（热改，与 env 并联）：一眼看出 Max/降级是不是被管理端打开 -->
+          <a-tag v-if="twLinks.runtime?.maxMode.enabled" color="blue">Max 运行期开（{{ twLinks.runtime.maxMode.models.length || '全部' }}）</a-tag>
+          <a-tag v-if="twLinks.runtime?.degradeEnabled" color="orange">降级已启用</a-tag>
+          <a-tag v-if="twLinks.runtime?.pickStrategy === 'credits-desc'" color="purple">积分优先</a-tag>
           <span class="text-xs text-slate-500 ml-1">优先级：{{ twLinks.priority }}</span>
         </template>
         <template #description>

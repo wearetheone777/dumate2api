@@ -57,13 +57,24 @@
     />
 
     <a-card :bordered="false">
-      <div class="flex items-center justify-between mb-3">
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
         <div>
           <span class="section-title">账号列表</span>
           <span class="hint-text ml-2">
             共 {{ rows.length }} 个 · 启用 {{ enabledCount }} 个
           </span>
         </div>
+        <!-- 批量运维（调研 P2-14）：多选后一次对多个账号执行，逐条隔离，
+             单条失败不影响其余。「恢复」默认保留上游冷却，force 才清。 -->
+        <a-space v-if="selectedIds.length" size="6">
+          <span class="text-xs text-slate-400">已选 {{ selectedIds.length }} 个</span>
+          <a-button size="small" :loading="batchBusy" @click="runBatch('checkin')">批量签到</a-button>
+          <a-button size="small" :loading="batchBusy" @click="runBatch('probe')">探活</a-button>
+          <a-button size="small" :loading="batchBusy" @click="runBatch('pause')">暂停</a-button>
+          <a-button size="small" :loading="batchBusy" @click="runBatch('resume')">恢复</a-button>
+          <a-button size="small" :loading="batchBusy" @click="runBatch('export')">导出</a-button>
+          <a-button size="small" type="link" @click="selectedIds = []">取消选择</a-button>
+        </a-space>
       </div>
 
       <a-empty v-if="!rows.length && !loading" :description="`还没有${isIntlRegion() ? '国际' : '国内'}版 TRAE 账号`">
@@ -76,26 +87,57 @@
         <a-col v-for="a in rows" :key="a.id" :span="8" :xs="24" :md="8">
           <a-card size="small" :bordered="true" class="h-full">
             <div class="flex items-start justify-between">
-              <div class="min-w-0">
-                <div class="font-medium truncate">
-                  {{ a.nickname || a.uid || '未命名' }}
-                  <a-tag v-if="!a.enabled" color="default" class="ml-1">已停用</a-tag>
-                </div>
-                <div class="text-xs text-slate-400 font-mono mt-1 truncate">
-                  UID {{ a.uid || '—' }}
-                </div>
-                <!-- 手机号：TRAE 没有官方手机号接口，多数账号取不到。
-                     取不到就显示「手机号未知」，并说明原因——不猜、不补。 -->
-                <div class="text-xs text-slate-400 font-mono mt-1 truncate">
-                  <template v-if="a.phone">{{ a.phone }}</template>
-                  <span v-else class="text-slate-500" :title="PHONE_NOTE">手机号未知</span>
+              <div class="min-w-0 flex items-start gap-2">
+                <!-- 批量选择（P2-14）：勾上后页头出现批量操作条 -->
+                <a-checkbox
+                  :checked="selectedIds.includes(a.id)"
+                  class="mt-0.5 shrink-0"
+                  @change="(e: any) => toggleSelect(a.id, e.target.checked)"
+                />
+                <div class="min-w-0">
+                  <div class="font-medium truncate">
+                    {{ a.nickname || a.uid || '未命名' }}
+                    <a-tag v-if="!a.enabled" color="default" class="ml-1">已停用</a-tag>
+                    <!-- 两态开关：模型请求关掉后签到/额度照常，不与「停用」混淆 -->
+                    <a-tag v-else-if="a.modelEnabled === false" color="orange" class="ml-1">不接模型</a-tag>
+                  </div>
+                  <div class="text-xs text-slate-400 font-mono mt-1 truncate">
+                    UID {{ a.uid || '—' }}
+                  </div>
+                  <!-- 手机号：TRAE 没有官方手机号接口，多数账号取不到。
+                       取不到就显示「手机号未知」，并说明原因——不猜、不补。 -->
+                  <div class="text-xs text-slate-400 font-mono mt-1 truncate">
+                    <template v-if="a.phone">{{ a.phone }}</template>
+                    <span v-else class="text-slate-500" :title="PHONE_NOTE">手机号未知</span>
+                  </div>
                 </div>
               </div>
-              <a-switch
-                size="small"
-                :checked="a.enabled"
-                @change="(v: boolean) => toggle(a, v)"
-              />
+              <!-- 两个开关语义不同，必须各自带文字标签：
+                     · 总闸   停用后签到/额度/状态刷新全停
+                     · 模型   只拦新对话请求，签到与额度照常
+                   小尺寸 a-switch 不渲染 checked-children 文字，两个外观完全
+                   一样的开关相邻会被读成「只有一个开关」——所以标签写在外面。
+                   （2026-11-08 真机走查发现：DOM 里有两个，截图里看不出） -->
+              <div class="flex flex-col items-end gap-1.5 shrink-0">
+                <label class="flex items-center gap-1.5 cursor-pointer" title="总闸：停用后签到、额度查询、状态刷新全部停止">
+                  <span class="text-xs text-slate-400 whitespace-nowrap">启用</span>
+                  <a-switch
+                    size="small"
+                    :checked="a.enabled"
+                    :disabled="busy[a.id]"
+                    @change="(v: boolean) => toggle(a, v)"
+                  />
+                </label>
+                <label class="flex items-center gap-1.5 cursor-pointer" title="只拦新模型请求；签到、额度查询、状态刷新照常">
+                  <span class="text-xs whitespace-nowrap" :class="a.modelEnabled === false ? 'text-orange-500' : 'text-slate-400'">接模型</span>
+                  <a-switch
+                    size="small"
+                    :checked="a.modelEnabled !== false"
+                    :disabled="busy[a.id]"
+                    @change="(v: boolean) => toggleModel(a, v)"
+                  />
+                </label>
+              </div>
             </div>
 
             <a-alert
@@ -327,6 +369,54 @@ async function refreshPhone() {
 
 const busy = reactive<Record<number, boolean>>({})
 
+// 批量运维（调研 P2-14）：选中的账号 id。切区域/通道后列表会变，
+// 选中集合一并清空——否则会把 A 区域的账号带到 B 区域的批量操作里。
+const selectedIds = ref<number[]>([])
+const batchBusy = ref(false)
+
+function toggleSelect(id: number, checked: boolean) {
+  const set = new Set(selectedIds.value)
+  if (checked) set.add(id); else set.delete(id)
+  selectedIds.value = [...set]
+}
+
+/**
+ * 批量动作。逐条隔离由服务端保证（每条结果单独给 ok/error），
+ * 所以这里只负责把「哪几条成功、哪几条为什么失败」如实摊出来。
+ */
+async function runBatch(action: 'checkin' | 'probe' | 'pause' | 'resume' | 'export') {
+  if (!selectedIds.value.length) return
+  batchBusy.value = true
+  try {
+    const { data } = await traeworkApi.batchAccounts(selectedIds.value, action)
+    if (!data.ok) {
+      message.error(data.error || '批量操作失败')
+      return
+    }
+    const failed = data.results.filter((r) => !r.ok)
+    if (action === 'export') {
+      // 导出：把脱敏后的账号直接下成 JSON，不写进剪贴板（避免误粘贴到聊天窗口）
+      const blob = new Blob([JSON.stringify(data.results.map((r: any) => r.account).filter(Boolean), null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `traework-accounts-${new Date().toISOString().slice(0, 10)}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      message.success(`已导出 ${data.succeeded} 个账号（脱敏，不含 token）`)
+    } else if (failed.length) {
+      message.warning(`${data.succeeded} 成功，${failed.length} 失败：${failed.slice(0, 2).map((f) => `#${f.id} ${f.error}`).join('；')}`)
+    } else {
+      message.success(`${data.succeeded} 个账号处理完成`)
+    }
+    if (action !== 'export' && action !== 'probe') await load()
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '批量操作失败')
+  } finally {
+    batchBusy.value = false
+  }
+}
+
 // 登录弹窗
 const loginOpen = ref(false)
 const loginStep = ref(0)
@@ -423,6 +513,12 @@ async function load() {
 
 async function toggle(a: TraeworkAccount, v: boolean) {
   await traeworkApi.patchAccount(a.id, { enabled: v })
+  await load()
+}
+
+/** 模型请求开关（P0-4）：与总闸分开，关闭后账号仍能签到领积分 */
+async function toggleModel(a: TraeworkAccount, v: boolean) {
+  await traeworkApi.patchAccount(a.id, { modelEnabled: v })
   await load()
 }
 
@@ -545,7 +641,8 @@ async function submitCallback() {
 
 // 本页只在 TRAE 通道下有意义——其余通道由 WebAccountsView 的对应分支渲染
 onMounted(() => { if (isTraework()) load() })
-watch(() => channelStore.current, () => { if (isTraework()) load() })
-// 切区域重拉：账号列表与额度都按当前区域视图
-watch(() => regionStore.current, () => { if (isTraework()) load() })
+watch(() => channelStore.current, () => { selectedIds.value = []; if (isTraework()) load() })
+// 切区域重拉：账号列表与额度都按当前区域视图。选中集合一并清空——批量操作
+// 只应作用于当前视图里看得见的账号。
+watch(() => regionStore.current, () => { selectedIds.value = []; if (isTraework()) load() })
 </script>

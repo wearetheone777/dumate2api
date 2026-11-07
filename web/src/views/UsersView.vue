@@ -123,6 +123,14 @@
           <a-button size="small" :loading="opsBusy.relaunch">拉起上游 8980</a-button>
         </a-popconfirm>
         <a-button size="small" :loading="opsBusy.backup" @click="downloadBackup">导出配置备份</a-button>
+        <a-upload
+          v-if="isAdmin"
+          :show-upload-list="false"
+          accept="application/json,.json"
+          :before-upload="restoreBackup"
+        >
+          <a-button size="small" :loading="opsBusy.restore">恢复配置备份</a-button>
+        </a-upload>
       </a-space>
       <div class="text-xs text-slate-400 mt-2">
         备份只含配置类文件（model-map / keys / 用户等）+ 账本行数清单；账本本体（requests/credits 等）请直接拷贝 data/ 目录。备份文件含 key 明文与密码哈希，按敏感凭据保管。
@@ -387,7 +395,7 @@ async function saveLive() {
 
 // ── 运维动作（清单项 11/13/14）──
 const dupeVersion = ref('')
-const opsBusy = reactive({ revive: false, relaunch: false, backup: false })
+const opsBusy = reactive({ revive: false, relaunch: false, backup: false, restore: false })
 
 async function loadVersion() {
   try {
@@ -431,6 +439,26 @@ async function downloadBackup() {
   } catch (e: any) {
     message.error(e?.response?.data?.error || '导出失败')
   } finally { opsBusy.backup = false }
+}
+
+/**
+ * 恢复配置备份（调研 P1-8）。
+ * a-upload 的 before-upload 返回 false 阻止它自己上传；我们自己在前端读
+ * 文件、校验 JSON 形状后 POST /system/restore（服务端还会再校验一次白名单）。
+ * 服务端恢复前自动备份当前配置，界面把备份文件名摊出来——这是可回退依据。
+ */
+async function restoreBackup(file: File) {
+  opsBusy.restore = true
+  try {
+    const text = await file.text()
+    const payload = JSON.parse(text)
+    const { data } = await client.post('/system/restore', payload)
+    message.success(`已恢复 ${data.restored.length} 个配置文件；当前态已备份为 ${data.backup}`)
+    await loadLive()
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || e?.message || '恢复失败')
+  } finally { opsBusy.restore = false }
+  return false
 }
 
 onMounted(() => {

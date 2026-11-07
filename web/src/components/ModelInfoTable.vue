@@ -60,6 +60,11 @@
             <a-tag v-if="record.isNew" color="green" class="ml-1">新</a-tag>
             <a-tag v-if="record.isBeta" color="orange" class="ml-1">Beta</a-tag>
             <a-tag v-if="record.visible === false" color="default" class="ml-1">隐藏</a-tag>
+            <!-- 套餐门槛（P2-11）：只在上游 descriptor 显式声明时显示，
+                 不按隐藏状态/模型名猜，也不伪装成风控错误 -->
+            <a-tooltip v-if="record.upgradeRequired === true" title="上游模型目录明确标注需要升级套餐">
+              <a-tag color="gold" class="ml-1">需升级</a-tag>
+            </a-tooltip>
           </div>
           <div class="text-xs text-slate-500 font-mono">{{ record.id }}</div>
           <!-- 真实后端（搭子：X-Dumate-Gw-Realmodel 实测；其他通道上游直接给）

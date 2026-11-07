@@ -14,6 +14,9 @@ const ReqLogs = () => import('@/views/ReqLogsView.vue')
 const ChatLab = () => import('@/views/ChatLabView.vue')
 const AgentSetup = () => import('@/views/AgentSetupView.vue')
 const Users = () => import('@/views/UsersView.vue')
+const ServerLogs = () => import('@/views/ServerLogsView.vue')
+const TraeRuntime = () => import('@/views/TraeRuntimeView.vue')
+const OpsAlerts = () => import('@/views/OpsAlertsView.vue')
 
 const router = createRouter({
   history: createWebHashHistory(),
@@ -35,6 +38,12 @@ const router = createRouter({
         // 接入配置写本机客户端文件，只对 admin 有意义（与账户管理同款限制）
         { path: 'setup', component: AgentSetup, meta: { title: '接入配置', key: 'setup', adminOnly: true } },
         { path: 'users', component: Users, meta: { title: '账户管理', key: 'users', adminOnly: true } },
+        // 运行日志：进程内缓冲，读的是本管理端 console；admin 专属
+        { path: 'logs', component: ServerLogs, meta: { title: '运行日志', key: 'logs', adminOnly: true } },
+        // TRAE 运行策略：写运行期配置（降级/Max/护栏/暂停），admin 专属
+        { path: 'trae-runtime', component: TraeRuntime, meta: { title: 'TRAE 运行策略', key: 'trae-runtime', adminOnly: true } },
+        // 运维告警：七类规则阈值 + 活跃告警 + 指标端点。viewer 可看（只读），写操作服务端拦
+        { path: 'alerts', component: OpsAlerts, meta: { title: '运维告警', key: 'alerts' } },
         // 「任务记录」已并入「积分明细」（见 CLAUDE.md）。这里保留重定向：
         // 旧书签、浏览器历史、后退键都会命中 #/records，没有它会渲染成空白页
         // （MainLayout 在、<router-view/> 空），只有一个 console 警告。

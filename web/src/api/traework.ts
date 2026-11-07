@@ -25,6 +25,8 @@ export interface TraeworkAccount {
   /** 区域（2026-11-03 国际版接入）：国内 trae.cn / 国际 trae.ai，账号不通用 */
   region: 'cn' | 'intl'
   enabled: boolean
+  /** 两态开关（调研 P0-4）：只拦新模型请求；签到/额度/状态刷新照常 */
+  modelEnabled: boolean
   expiresAt: number | null
   refreshExpiresAt: number | null
   credits: number | null
@@ -164,6 +166,8 @@ export interface TraeworkModel {
   reasoningEfforts?: Array<'light' | 'high' | 'extra_high'> | null
   /** 1M Max（descriptor max_mode + 输入/输出上限齐备）。当前上游 0 个声明 */
   maxMode?: boolean
+  /** 套餐门槛：上游 descriptor 显式声明才 true，其余 null（不猜） */
+  upgradeRequired?: boolean | null
 }
 
 /** 仪表盘用：一个 TRAE Work 账号的健康快照（本地数据，不打上游） */
@@ -276,6 +280,12 @@ export interface TraeworkLinks {
   /** 逐轮精确账单 enrichment 开关（关了明细页没有「精确」标记） */
   sessionBilling: boolean
   remoteMaxMode: boolean
+  /** 运行期开关（管理端热改，不需重启；env 与其并联生效） */
+  runtime?: {
+    maxMode: { enabled: boolean; models: string[] }
+    degradeEnabled: boolean
+    pickStrategy: 'round-robin' | 'credits-desc'
+  }
   priority: string
   capabilities: {
     utilsChat: { tools: boolean; effort: boolean; billing: string }
@@ -343,8 +353,19 @@ export const traeworkApi = {
   loginCallback: (payload: { callback: string; deviceId: string; machineId: string; region: 'cn' | 'intl' }) =>
     client.post<{ ok: boolean; account?: TraeworkAccount; error?: string }>('/traework/login/callback', payload),
   removeAccount: (id: number) => client.delete(`/traework/accounts/${id}`),
-  patchAccount: (id: number, fields: { enabled?: boolean }) =>
+  patchAccount: (id: number, fields: { enabled?: boolean; modelEnabled?: boolean; nickname?: string }) =>
     client.patch(`/traework/accounts/${id}`, fields),
+  /** 批量运维：逐条隔离，恢复默认保留上游冷却（force=true 才清） */
+  batchAccounts: (ids: number[], action: 'checkin' | 'probe' | 'pause' | 'resume' | 'export', options: { force?: boolean } = {}) =>
+    client.post<{
+      ok: boolean
+      action: string
+      total: number
+      succeeded: number
+      failed: number
+      results: Array<{ id: number; ok: boolean; error?: string; [k: string]: any }>
+      error?: string
+    }>('/traework/accounts/batch', { ids, action, options }),
   /** 回填手机号（从昵称抽；TRAE 无官方手机号接口，多数情况抽不到） */
   refreshPhone: () =>
     client.post<{

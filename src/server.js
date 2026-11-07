@@ -41,6 +41,9 @@ const keysvc = require('./keys');
 const router = require('./upstream-router');
 // 热配置（F5）：/v1/models 与 /v1beta/models 输出侧的 hiddenModels 过滤
 const livecfg = require('./livecfg');
+// TRAE 运行期配置（2026-11-08 调研 P2-20）：全站暂停是网关侧的统一闸门，
+// 管理端进程可热改，网关按 mtime 重读，不需要重启。
+const traeRuntime = require('./trae-runtime');
 // 启动接线（集成阶段）：池状态机恢复 / 热配置 / 出站代理 / 计量挂钩探活。
 // 保活排程不在这里启动——它由管理端进程经 task-scheduler 持有（见 boot.js）。
 const boot = require('./boot');
@@ -208,6 +211,10 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   // 的拆分（请求日志、用量）才有数据源。区域解析失败不影响请求。
   const onAccount = (name, id) => {
     if (name) req._upstreamAccount = String(name);
+    // 账号 id 单独落一份（2026-11-08）：启用护栏要按 (通道, 账号 id) 聚合
+    // 每日用量的 token，而 name 是显示名（可改、可重名、可空），按它聚合
+    // 会把两个账号的用量并成一个桶。
+    if (id != null && Number.isFinite(Number(id))) req._upstreamAccountId = Number(id);
     if (id != null && (route.channel === 'traework' || route.channel === 'qoder' || route.channel === 'workbuddy')) {
       try {
         const store = route.channel === 'qoder' ? require('./qoder/auth')
@@ -233,16 +240,33 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   // 实际走哪条只有通道知道——req 上存一下，logRequest 落 link 字段。
   // 没有「链路」概念的通道不上报，字段留空，前端不显示。
   const onLink = (link) => { if (link) req._link = String(link); };
+  // 显式降级（调研 P0-3）：只由 TRAE provider 在降级成功后回调；网关统一
+  // 把它写成响应头，四种协议入口（OpenAI / Responses / Anthropic / Google）
+  // 都经过这里，不必各改一遍 writeHead。
+  const onDegraded = (text) => {
+    if (!text) return;
+    req._degraded = String(text);
+    // 降级只在**第二次尝试成功后**才确定，而三个翻译器有些一进函数就
+    // writeHead(200)。所以头已发出时改用 SSE 注释帧把事实给客户端——
+    // 注释帧是合法 no-op，四种协议入口都忽略它，排查仍能看到降级发生。
+    if (!res.headersSent) res.setHeader('X-Trae-Degraded', req._degraded);
+    else if (!res.writableEnded && !res.destroyed) {
+      try { res.write(`: X-Trae-Degraded: ${req._degraded}\n\n`); } catch (e) { /* 连接已断 */ }
+    }
+  };
 
   try {
     // TRAE 宝身份标记（2026-11-03）：resolve() 把 `traebao/` 前缀剥掉后才到
     // provider 手里，send() 靠 payload.model 认不出身份——显式经 opts 传。
     if (route.personalAssistant) req._personalAssistant = true;
-    const providerOpts = { reqId, onAccount, onModel, onLink, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
+    const providerOpts = { reqId, onAccount, onModel, onLink, onDegraded, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
       const result = await provider.send(payload, undefined, providerOpts);
       const out = kind === 'openai' ? result : result;
+      // 降级头：非流式整包还没发头时补进真正的响应头（流式若已发头，
+      // onDegraded 已改用 SSE 注释帧给出事实）。
+      if (req._degraded && !res.headersSent) res.setHeader('X-Trae-Degraded', req._degraded);
       if (kind === 'anthropic') {
         const anth = openAIToAnthropic(out, payload.model);
         logRequest(req, res, startedAt, info, 200, anth.usage || null);
@@ -793,6 +817,9 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // provider 没报时按通道读当前凭证兜底。都没有就留空——
     // 界面显示「—」，而不是编一个名字。
     account: req._upstreamAccount || require('./upstream-account').fallback(req._channel || 'dumate'),
+    // 账号 id（2026-11-08，护栏聚合键）：显示名可改可重名，按它算每日用量会串账。
+    // provider 没上报 id 时留 null——护栏对 null 不做判断（不知道是谁就不拦）。
+    account_id: req._upstreamAccountId ?? null,
     // 区域（2026-11-03 国际版）：traework/qoder 的直连请求随账号记录
     // cn/intl，请求日志与用量据此拆分。搭子/千问纯国内，不记（空串）。
     region: req._upstreamRegion || '',
@@ -2362,6 +2389,16 @@ const server = http.createServer(async (req, res) => {
         service: identity.service,
         role: identity.role,
       }, { 'X-Service': identity.service });
+    }
+
+    // ==================== 全站暂停（调研 P2-20，默认关闭）====================
+    // 只拦 `/v1` 数据面与管理端无关；/health /ping 继续可用（探活要能确认
+    // 「服务在、只是被暂停」）。显式 503 + 可读原因，不伪装成上游故障。
+    // 放在鉴权之前：暂停时连 key 都不该被消费/计数。
+    if (url !== '/health' && url !== '/ping' && traeRuntime.Load().gatewayPaused) {
+      return sendJSON(res, 503, {
+        error: { message: '服务已暂停（管理端 → 运行时开关解除）', type: 'api_error', code: 'service_paused' },
+      });
     }
 
     // ==================== API Key 鉴权（强制，2026-11-01）====================

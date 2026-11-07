@@ -537,6 +537,21 @@ discovery；鉴权固定 `Bearer nokey`。排障第一入口是
 
 **千问（直连通道）的 OpenAI 路径要自己补埋点。** 翻译器分支各自在 `done` 回调里记，只有 OpenAI 分支没有翻译器——漏了就一条都不记。补埋点时扫 usage 要注意：`provider.send` 回调给的是解信封后的裸 JSON，拼进 `seen` 时必须补上 `data: ` 前缀，否则 `usageFromSSE`（按 `data:` 行扫描）扫不到，token 恒为 0。
 
+**`index.html` 必须 `no-cache`，带 hash 的 chunk 才能长缓存（2026-11-08 踩过）。**
+管理端静态托管原来对两类资源一视同仁，什么缓存头都不发——浏览器于是启发式缓存
+`index.html`。而它是**入口清单**，里面写死本次构建的 chunk hash；新构建把旧 hash
+的 js 删掉后，用户浏览器仍按旧清单请求已不存在的文件，表现为「后端明明加了功能，
+界面上一个都没有」，而且普通刷新也不会好（只有 Ctrl+Shift+R 能救）。现在
+`sendFile` 按扩展名分流：`.html` → `Cache-Control: no-cache` + 内容 sha1 ETag
+（命中回 304，不整包重下）；其余 → `public, max-age=31536000, immutable`。
+ETag 用内容哈希而不是 `statSync` 的 mtime：后者在异步回调里阻塞事件循环、文件被外部删掉时还会抛。
+
+**小尺寸 `a-switch` 不渲染 `checked-children` 文字。** 两个 `size="small"` 的开关
+上下相邻、外观完全相同时，**DOM 里是两个、人眼里只有一个**——判定「功能没做」会
+误判，判定「做了」也是假的。多开关必须把标签写在开关外面（`<label><span>启用</span>
+<a-switch/></label>`），并给关闭态一个不同颜色的标签。同理：改完前端别只看接口
+返回，要用真实浏览器截图核对可见性（本次两处问题都是接口 200、界面无感）。
+
 **`count_tokens` 是字符数/4，不是字节数/4。** `estimateTokens` 用的是 `String.length`，即 UTF-16 码元数：100 个汉字和 100 个 ASCII 都算出 29 token（实测一致）。中文按真分词约 1 字 1 token，所以这个估算在中文场景下偏小约 4 倍——只够给客户端做上下文预算，不能当计费依据。文档里写「字节数/4」的地方都是错的。
 
 **测试断言校验「形状」而非字面值。** 早期断言写死 mock 的固定返回（"Hello world"、token 11/7），接真上游时一批失败。现在只断言「非空」「大于 0」这类形状，mock 和真上游都能过。新增断言请沿用这个原则。
@@ -639,6 +654,10 @@ per-key 限流（低价值场景）。
 | `DUMATE_TRAEWORK_REMOTE_MAX_MODE` | 未设（关闭） | 设 `1` 全局开启 remote 1M Max 档（descriptor `max_mode` 硬门仍生效）；`_MAX_MODELS` 白名单（逗号分隔，`*` 全放行）；`_MAX_MODE_TYPE` 默认 `1` |
 | `DUMATE_TRAEWORK_9074_RETRY_SECONDS` / `_MAX_BACKOFF_SECONDS` | `60` / `3600` | 签到 9074 自愈的退避基数 / 封顶（换一代设备立即重试一次，仍失败才进退避） |
 | `DUMATE_TRAEWORK_REMOTE_CONNECT_MS` / `_FIRST_EVENT_MS` | `15000` / `120000` | Remote 建会话连接超时 / 首模型事件超时（排队与心跳帧不算模型活动） |
+| `DUMATE_ALERTS_SCHEDULE_MINUTES` | `0`（关闭） | 运维告警后台规则评估间隔；`0` 只在管理端手动评估时跑。推送仍受 `/keepalive/notify` 的 webhook 配置控制 |
+| `DUMATE_METRICS_TOKEN` | 未设 | 设了才要求 `/api/admin/metrics` 带 `Bearer <token>`；未设时沿用管理端会话鉴权 |
+| `DUMATE_METRICS_WINDOW_MS` | `86400000` | `/metrics` 默认回看窗口（ms）；端点 `?hours=` 可单次覆盖 |
+| `DUMATE_ADMIN_DATA`（TRAE 运行期配置） | `data/traework-runtime.json` | 降级 / Max / 选号策略 / 护栏 / 全站暂停的落盘位置；管理端 `#/trae-runtime` 写入，网关按 mtime 热读，全部默认关闭 |
 | `DUMATE_DUMATE_CAPS_FILE` | 未设 | 搭子按模型 max_tokens 上限学习表的落盘路径覆盖（测试用） |
 | `DUMATE_MEDIA_POLL_TIMEOUT_MS` | `120000` | 生图异步任务的轮询总超时（ms），超时回 504 |
 | `DUMATE_MEDIA_POLL_INTERVAL_MS` | `1500` | 生图轮询间隔（ms） |
@@ -888,3 +907,23 @@ Vue 3 + Vite + ant-design-vue 4 + Tailwind + ECharts（按需引入，不用全�
 **融合落地第三批（2026-11-08，docs/DUMATE-GATEWAY-MERGE-FEATURES.md 收尾）**：三件。① **AgentSetupView 前端**（`web/src/views/AgentSetupView.vue` + `web/src/api/agentsetup.ts` + 路由 `#/setup`）：补齐第二批「前端视图未做」的尾巴——客户端卡片实时展示探测结果（Claude Code 指向 15721 时如实标「非本网关，apply 会覆盖」，不装作已配置）；写入弹窗的通道下拉按 `src/channels.js` 五条通道列出、API Key 下拉只列**明文已保存**的 key（鉴权强制后 nokey 必 401，默认值就该是能用的），并允许手填；成功后把备份路径/模型/推导出的上下文与输出上限摊在页面上（那是「依据」，不是弹窗里一闪而过的东西）。菜单入口只对 admin 显示（写本机文件属管理操作），与账户管理同款不走 menuKeys 白名单。② **首启凭证自举**（`keys.ensureFirstRun`，P2-9）：网关监听**非回环地址**且一把 key 都没有时自动签发 `first-run` 并把明文打印一次——本机 127.0.0.1 不触发（零打扰），端口暴露时空 key 集合等于所有请求 401，日志里那三行是唯一入口。③ **子 Key**（`keys.js` 的 `parent_id` + `key-quota.js` 家庭桶，P2-8）：父 Key 停用/删除/过期 → 子 Key `parent_revoked`（吊销级联）；**子 Key 的请求同时计入父 Key 的配额桶**（父的限制是全家共享上限，子自己的 daily_limit 是额外收紧），token 双记走「埋点带 `key_parent_id` → reqlog → `addTokens(..., {familyId})`」；只支持两级（父不能再有 parent），`update` 拒绝「自己当父」与「已当父的 Key 变子」。前端 KeysView 加父 Key 下拉（只列独立 Key、编辑时排除自己）、名称列「子 Key · 父 X」标签、删除确认动态提示子 Key 会一并失效。离线验证 `node --test test/unit/key-subkey-bootstrap.test.js`（9 项）；全量 629/629 绿；前端 `npm run build` 通过（vue-tsc 0 错误）。真机（9082/9083，OpenCLI 驱动已登录浏览器）：`#/setup` 渲染真实探测（Claude Code 指向 15721、Codex 无本网关 provider、cc-switch 指路）、写入弹窗通道与 Key 自动选中、`#/keys` 经 API 创建子 Key 后列表显示「子 Key · 父 dumate」，删除清理后恢复六把预置 key。
 
 ④ **跨通道额度总览卡**（P2-10，`src/channel-balance.js` + `admin/routes/channel-balance.js` + `ChannelBalanceCard.vue`）：一张卡并排列出五条通道的剩余额度、账号健康、临期账号数。**不跨通道相加**——单位不同（搭子/千问是积分，TRAE/Qoder 是 credits，WorkBuddy 国际版按请求数计），卡片明写「不可相加」且不给总计。口径四条：`remaining=null` 表示取不到（绝不填 0）；部分账号失败显示橙色 tag + tooltip 明细（只显示 `1/2 账号` 不给原因会被当成显示问题）；Qoder 团队共享池 `cap=-1` 标 `unlimited`（不是有限数字，不进合计）；进程内 60s TTL（`DUMATE_CHANNEL_BALANCE_TTL_MS`）。单通道适配器独立 try/catch + 15s 超时（一个通道上游挂了不拖垮整张卡）。搭子复用 `dumate-points.summaryCached`（网页池），千问/TRAE/Qoder/WorkBuddy 各自遍历账号池且**先用 get(id)/findUsable 拿完整账号再换票**——`authStore.list()` 是脱敏视图，直接喂 `session.ensureAccount` 会因拿不到 refreshToken 全 401（真机踩到：Qoder 两账号全 401 而 `/qoder/credits` 正常，差别就在这一行）。临期数据来自 `expiring.info`（四家快照，`info` 新增 `nearest` 字段）与 Qoder 的 grants 账本。卡片挂在五个通道分支**之外**（Dashboard 底部），页头刷新一并触发。离线验证 `node --test test/unit/channel-balance.test.js`（6 项：合计只累已知数值、失败不填 0、超时兜底、TTL、unlimited）；全量 635/635 绿。真机（9083）：五通道真实读数全出（搭子 23735.32 / 千问 14.52（1 账号 401 如实标）/ TRAE 6061.9 / Qoder 3601 / WorkBuddy 10471.61），切 TRAE 通道卡片仍在。
+
+## 2026-11-08 落地（TRAE 调研融合批次，docs/TRAE-GATEWAY-MERGE-FEATURES.md）
+
+> 逐项核对结论、证据与不实现项见 `docs/TRAE-FUSION-CHECKPOINT-2026-11-08.md`。调研文件的 20 项里有 5 项在生成时已有等价实现（9074 自愈、Key 配额/区域、Token 预刷新、图片输入、单号并发上限），未重复开发；P2-15 的「代理池哈希绑定」因无代理池配置证据不做，现有 `proxy-agent.js` 已按账号固定出口。
+
+**通道核心**：① `src/trae-runtime.js` 运行期配置（原子写 + mtime 热读，跨进程），默认全关。管理端 `#/trae-runtime` 可视化；端点 `/api/admin/trae-runtime`、`/max-mode/models`、`/max-mode/apply`。② **P0-4 两态开关**：`auth.js` 的 `modelEnabled` 只拦对话，`findModelUsable` 供 send 用；签到/额度/保活仍走 `findUsable`，全关时 `status().loggedIn=true` 且明确报「关闭了接模型请求」。前端账号卡第二个 switch。③ **P0-3 显式降级**：`traework/degrade.js` 只认 402 / 3003/3004/4008 / 1005 / 订阅专享等确证错误；429 限流、400 参数、内容审核一律不降级；第一尝试吐出任何内容后不降级；API Key 的区域绑定压过 `fallbackRegion`；成功回调 `onDegraded` → 网关非流式写 `X-Trae-Degraded` 头、流式若头已发则写 SSE 注释帧。双失败保留第一次根因。④ **P0-5 Max**：运行期开关 + 白名单与 env 并联，管理端「检测支持的模型 → 一键加入」只认 descriptor `max_mode`，不按名字猜。⑤ **P2-13/16**：积分优先轮询与保留积分护栏默认关；余额未知沉底但不跳过，绝不读成 0。⑥ `keys.modelMatches` 加 fnmatch `*`/`?`（大小写不敏感，无通配符仍是精确匹配），旧 key 行为不变。⑦ **P2-11**：`upgradeRequired` 只认上游 descriptor 显式字段，模型信息表显示「需升级」徽标，不伪装成风控。
+
+**运维与管理端**：⑧ 七类告警规则 + 静默窗/迟滞/恢复（`src/admin/alerts.js` + `/api/admin/alerts`），复用 `notify.js` 的五种 webhook；后台评估 `DUMATE_ALERTS_SCHEDULE_MINUTES`（默认 0 关闭）。⑨ 配置恢复 `POST /api/admin/system/restore`（`src/config-restore.js`）：配置白名单、恢复前自动备份当前态到 `data/config-backup/`（封顶 10 份）、非法整包一口拒掉、响应 no-store；`/system/backup` 补 no-store。⑩ 服务端运行日志：`src/admin/logbuffer.js` 环形 500 行，**入缓冲前整行脱敏**（敏感键/Bearer/sk-/key=value），`/api/admin/logs` 与 SSE `/logs/stream`（回放 + 4 订阅者上限）；前端 `#/logs`。⑪ 侧栏角标：`/traework/status` 的 `alerts` 汇总 + `MainLayout` 的 `a-badge`，余额未知单独计。⑫ 批量凭证运维 `POST /traework/accounts/batch`（`traework/batch.js`，≤200 条、逐条隔离、恢复默认保留上游冷却，`force` 才 `revive`；路由注册在 `/accounts/:id` 之前）。⑬ Prometheus `/metrics`（根路径，另挂 `/api/admin/metrics`；低基数标签、可选 `DUMATE_METRICS_TOKEN`，未配时根路径匿名、管理端路径仍要会话）与月度账单 `/api/admin/monthly-billing{,/export}`（CSV UTF-8 BOM + `= + - @` 公式注入防护，用量页导出按钮）。⑭ 全站 kill switch：`gatewayPaused` 默认关，网关在鉴权**之前**拦所有非 `/health` 请求回 503 `service_paused`，管理台照常。
+
+**验证**：新增 4 个离线单测文件 24 项；全量 `node --test "test/unit/*.test.js"` 655/655 绿；`npm run verify` 41/41 绿；`cd web && npm run build` 通过（vue-tsc 0 错误）。隔离管理端真机（9123，独立 `DUMATE_ADMIN_DATA`，未动 9080/9082/9083）：healthz 身份、七个新只读端点 200、未登录 401、非法运行态键/恢复包/批量 ids 全部 400、运行态 PUT 后热读生效并复位、批量导出脱敏、日志 SSE 回放、CSV 头带 BOM。降级真机链路（额度耗尽/备用模型/响应头）未跑——需要真实额度耗尽账号，编排正确性由打桩端到端单测锁定。
+
+**TRAE 调研收尾（2026-11-08 第四批，`docs/TRAE-GATEWAY-MERGE-FEATURES.md` 20/20 全落地）**：把上一轮标「不做」的 P2-15 与 P2-16 补完——复核后发现它们**不需要外部证据**，此前判断偏保守。
+
+① **P2-16 每日用量护栏**（`src/traework/guard.js`）：与「保留积分」互补——那个看余额快照（还有没有钱），这三项看当日已用量（今天是不是用过头了）：`dailyTokens` / `dailyCredits` / `modelTokens`（按 `(账号, 模型)`）。数据源是本进程落盘事实（`requests.jsonl` 的 `account_id` + `traework-credits.jsonl` 的 consumed 增量），**不打上游、不新增存储**。三条纪律：**未知不拦**（`account_id` 或用量读不到照常放行，把「不知道」当「用完了」会让整池静默不可用）、只拦新请求不打断在途、判定与展示**同一个 `usageOf` 函数**（两处各算一遍必然漂移）。`account_id` 缺失的行不进任何桶，不摊到别人头上。默认关，阈值走 `trae-runtime` 的 `accountGuard`；管理端「运行策略」页有三个输入框 + 「查看今日用量」表（`GET /api/admin/trae-runtime/usage`）。
+
+**前置修复**：埋点原来只记 `account`（显示名，可改可重名可空），没有账号 id。补 `req._upstreamAccountId` → 埋点 `account_id` 字段——按显示名聚合会把两个账号的用量并成一个桶。`onAccount(name, id)` 早就有 id，只是没落。
+
+② **P2-15 代理池稳定分配**（`proxy-agent.js`）：`DUMATE_PROXY_POOL`（逗号/换行分隔）→ `sha256(channel:id) % len` **稳定落点**。三要点：**稳定哈希不是轮询**（重启、增删别的账号不能让出口漂移——出口跳变本身就是异常信号）；**账号显式 `proxy` 永远优先**（手填的出口不被悄悄改掉）；**池空 = 行为不变**。非法条目启动时 fail-fast 抛错，不静默跳过（否则「以为配了 8 个出口、实际只有 3 个」无从发现）。键位用 `__channel` 显式传入——各通道 id 是各自文件里的自增数字，只用 id 会让不同通道的同号账号挤在一个出口。
+
+**验证**：新增 `test/unit/trae-guard.test.js`（8 项）+ `test/unit/proxy-pool.test.js`（8 项）；全量单测 **676/676**、`npm run verify` **41/41**、`npm run build` 通过。真机（9083）：`/trae-runtime/usage` 返回三账号当日用量，`null` 与 `0` 区分正确（无记录显示「—」，账本有记录但消耗为 0 才显示 0）；界面三输入框 + 用量表渲染正常，无前端报错。

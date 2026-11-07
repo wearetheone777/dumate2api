@@ -172,7 +172,38 @@
 
 ---
 
-## 五、建议的落地顺序
+## 五、落地进度（2026-11-08）
+
+> 逐项核对证据与不实现项见 [TRAE-FUSION-CHECKPOINT-2026-11-08.md](TRAE-FUSION-CHECKPOINT-2026-11-08.md)，实现结论见根 `CLAUDE.md`「2026-11-08 落地（TRAE 调研融合批次）」。
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| P0-1 9074 自愈 | ✅ 调研前已实现 | `checkin.claimWithRetry` / `auth.rotateDevice` / `task-scheduler` 错峰 |
+| P0-2 Key 治理 | ✅ 已有配额/白名单/通道/区域；本批补 fnmatch 通配 | `keys.modelMatches` |
+| P0-3 自动降级 | ✅ 本批（默认关） | `traework/degrade.js` + `send` 编排 + `X-Trae-Degraded` |
+| P0-4 账号模型开关 | ✅ 本批 | `auth.findModelUsable` / `PATCH /accounts/:id` / 前端双 switch |
+| P0-5 Max 可视化 | ✅ 本批 | `trae-runtime` + `/max-mode/models` / `/max-mode/apply` + `#/trae-runtime` |
+| P1-6 运维告警 | ✅ 本批（七规则/静默窗/迟滞/恢复，后台排程默认关） | `src/admin/alerts.js` + `/api/admin/alerts` |
+| P1-7 Token 预刷新 | ✅ 调研前已实现 | `keepalive` 四通道 adapter 24h 预刷新 |
+| P1-8 配置备份/恢复 | ✅ 本批补恢复（导出已有） | `src/config-restore.js` + `/system/restore` |
+| P1-9 服务端实时日志 | ✅ 本批 | `src/admin/logbuffer.js` + `/logs` `/logs/stream` + `#/logs` |
+| P1-10 侧栏角标 | ✅ 本批 | `/traework/status.alerts` + `MainLayout` badge |
+| P2-11 升级模型标记 | ✅ 本批（只认 descriptor 显式字段） | `models.normalize` + `ModelInfoTable` |
+| P2-12 每账号并发槽 | ✅ 调研前已实现 | `DUMATE_TRAEWORK_INFLIGHT_MAX` + `pool.acquire` |
+| P2-13 积分优先轮询 | ✅ 本批（默认关） | `traework/policy.js` |
+| P2-14 批量凭证运维 | ✅ 本批 | `traework/batch.js` + `/accounts/batch` |
+| P2-15 一号一出口 | ✅ 本批（`DUMATE_PROXY_POOL`，sha256 稳定分配） | `proxy-agent.setProxyPool` / `resolveProxyUrl` |
+| P2-16 凭证限额护栏 | ✅ 本批四项齐（保留积分 + 每日 token/积分/按模型 token，默认关） | `traework/policy.js` + `traework/guard.js` |
+| P2-17 /metrics | ✅ 本批 | 根 `/metrics` + `/api/admin/metrics` |
+| P2-18 月度账单 CSV | ✅ 本批 | `/api/admin/monthly-billing{,/export}` |
+| P2-19 图片输入 | ✅ 调研前已实现 | `index.assertImageSupport` + `images.hasImageContent` |
+| P2-20 全站 kill switch | ✅ 本批（默认关） | `gatewayPaused` 热配置 + 网关统一 503 |
+
+**验证**：新增 24 项离线单测；全量单测 655/655、`npm run verify` 41/41、前端 `npm run build` 通过；隔离管理端 9123 冒烟（只读端点、非法输入 400、批量导出脱敏、SSE 回放、CSV BOM）。降级真机链路未跑（需真实额度耗尽账号），编排由打桩端到端单测锁定。
+
+---
+
+## 六、建议的落地顺序（历史记录）
 
 1. **第一批(可用性)**:P0-1 9074 自愈 → P0-4 账号级模型开关 → P1-7 Token 预刷新(三者都是「账号坏了自己不知道」的补丁)
 2. **第二批(治理)**:P0-2 Key 配额/白名单 → P0-3 自动降级 → P2-20 kill switch

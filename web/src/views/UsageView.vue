@@ -10,6 +10,9 @@
              开关必然出现互相矛盾的状态。这里只显示当前在看哪条通道 -->
         <a-tag :color="isQw ? 'cyan' : 'blue'" class="mr-1">{{ chLabel }}</a-tag>
         <a-select v-model:value="days" size="small" style="width: 110px" :options="dayOptions" />
+        <!-- 月度账单 CSV（P2-18）：按当前页面选的月份导出，BOM + 公式注入防护在服务端 -->
+        <a-select v-model:value="billMonth" size="small" style="width: 130px" :options="billMonthOptions" />
+        <a-button size="small" class="ghost-btn" :loading="exporting" @click="exportMonthly">导出账单</a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="load">刷新</a-button>
       </template>
     </PageHeader>
@@ -530,6 +533,10 @@ import type { TraeworkCreditRow } from '@/api/traework'
 import type { WorkBuddyCreditRow } from '@/api/workbuddy'
 import type { QwCredits } from '@/api/qwenwork'
 import type { UsageOverview } from '@/api/usage'
+import { monthlyBillingApi } from '@/api/traeruntime'
+import { App } from 'ant-design-vue'
+
+const { message } = App.useApp()
 
 // ECharts 按需引入：只加载柱状图需要的模块
 import * as echarts from 'echarts/core'
@@ -544,6 +551,40 @@ const data = ref<UsageOverview | null>(null)
 const loading = ref(false)
 const lastRefresh = ref('')
 const days = ref(30)
+// 月度账单：月份列表来自服务端账本（只列真有数据的月份），空 = 全量
+const billMonth = ref('')
+const billMonths = ref<string[]>([])
+const exporting = ref(false)
+const billMonthOptions = computed(() => [
+  { label: '全部月份', value: '' },
+  ...billMonths.value.map((m) => ({ label: m, value: m })),
+])
+
+async function loadBillMonths() {
+  try {
+    const { data } = await monthlyBillingApi.list()
+    billMonths.value = data.months || []
+  } catch { /* 账单入口故障不影响主视图 */ }
+}
+
+async function exportMonthly() {
+  exporting.value = true
+  try {
+    // 走 axios 拿 blob：浏览器直接打开 URL 会丢掉管理端会话错误语义
+    const res = await client.get(monthlyBillingApi.exportUrl(billMonth.value, channelParam()), { responseType: 'blob' })
+    const url = URL.createObjectURL(res.data)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `dumate2api-billing-${billMonth.value || 'all'}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+    message.success('账单已导出（UTF-8 BOM）')
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '导出失败')
+  } finally {
+    exporting.value = false
+  }
+}
 
 // 全价请求洞察（/usage/agg 的 full_price 段）：与 overview 同窗口（days 天）。
 // 聚合失败不挡用量主视图——静默给空，卡片回落到「没有全价请求」的空态。
@@ -798,6 +839,7 @@ watch(() => channelStore.current, load)
 onMounted(() => {
   window.addEventListener('resize', onResize)
   load()
+  loadBillMonths()
 })
 
 onBeforeUnmount(() => {

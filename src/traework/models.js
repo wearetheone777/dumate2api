@@ -124,8 +124,13 @@ function normalize(m) {
     isBeta: !!dc.is_beta,
     isNew: !!dc.is_new,
     isDefault: !!m.is_default,
-    // 客户端可见性：隐藏的多是内部模型（子代理、自定义占位、压缩用的 summary）
+    // 客户端可见性：隐藏的多是内部模型（子代理、自定义占位、压缩用 summary）
     visible: !m.is_invisible_to_user,
+    // 套餐门槛（调研 P2-11）：**只认上游 descriptor 的显式字段**。
+    // 上游没给就是 null（界面不显示徽标），不按模型名/隐藏状态猜
+    // ——国际表里隐藏的也可能只是内部子代理，猜成「需升级」会误导。
+    upgradeRequired: (m.upgrade_required === true || m.require_upgrade === true
+      || m.subscription_only === true || m.paid_only === true) ? true : null,
     // 上游声明的用途，chat_completion 之外的多半不是给对话用的
     usage: m.usage || '',
     // 该条目名下的自定义模型名（如 "gemini//gemini-3-flash-preview"）。

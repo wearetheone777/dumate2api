@@ -27,6 +27,7 @@ const http = require('http');
 const https = require('https');
 const tls = require('tls');
 const net = require('net');
+const crypto = require('crypto');
 
 // CONNECT 打洞阶段的超时。TLS 握手与请求阶段的超时由调用方的请求
 // timeout 控制，这里只管「连上代理并拿到 200」这一段。
@@ -203,14 +204,72 @@ class HttpConnectAgent extends https.Agent {
 }
 
 /**
- * 解析账号生效的代理 URL：**账号 proxy 字段 > 全局默认**，两者皆无 → null。
- * account 也可以直接传代理 URL 字符串（接线点更顺手）。
+ * 代理池：按账号稳定哈希分配出口（调研 P2-15 / Coding2API 的 CREDENTIAL_PROXY_POOL）。
+ *
+ * 为什么需要：同一出口 IP 挂一批账号是风控敏感场景——上游看到的是「一个 IP
+ * 上十几个号在轮着用」，比单号异常更容易被整体处置。让每个账号固定走自己的
+ * 出口，把「一批号」拆成「几个互不相关的个体」。
+ *
+ * 三个设计要点：
+ *   1. **稳定哈希，不是轮询**（`sha256(channel:id) % len`）：重启、增删别的账号
+ *      都不能让某个账号的出口漂移——出口跳变本身就是异常信号。同一账号永远
+ *      落在同一个下标上。
+ *   2. **账号自己的 proxy 字段优先**：显式配置永远压过池子，否则用户手填的
+ *      出口会被悄悄改掉。池子只补「没配 proxy 的账号」。
+ *   3. **池子为空 = 保持原行为**（直连/全局代理），不引入任何变化。
+ *
+ * 池子来源 `DUMATE_PROXY_POOL`（逗号或换行分隔的 http:// 代理列表）。
+ * 非法条目在启动时就抛错（fail-fast），不静默跳过——跳过会让「以为配了 8 个
+ * 出口、实际只有 3 个」这种事故无从发现。
+ */
+let proxyPool = [];
+
+function setProxyPool(list) {
+  const items = Array.isArray(list) ? list : String(list || '').split(/[,\n]/);
+  const out = [];
+  for (const raw of items) {
+    const s = normalizeOptional(raw);
+    if (!s) continue;
+    // 逐条校验：非法条目直接抛，不静默跳过（见上面第 3 点）
+    out.push(normalizeProxyUrl(s));
+  }
+  proxyPool = out;
+  clearAgentCache();
+  return proxyPool.slice();
+}
+
+function getProxyPool() {
+  return proxyPool.slice();
+}
+
+/** 池子里的稳定分配：返回规范化代理 URL；池空返回 null。key 形如 `traework:3` */
+function poolProxyFor(key) {
+  if (!proxyPool.length) return null;
+  const h = crypto.createHash('sha256').update(String(key)).digest();
+  return proxyPool[h.readUInt32BE(0) % proxyPool.length];
+}
+
+/**
+ * 解析账号生效的代理 URL：**账号 proxy 字段 > 代理池（稳定哈希）> 全局默认**，
+ * 皆无 → null。account 也可以直接传代理 URL 字符串（接线点更顺手）。
  * 注意返回的是**含凭证的原始 URL**，只用于建连；落日志用 describeProxy。
  */
 function resolveProxyUrl(account) {
   const own = typeof account === 'string' ? account
     : (account && typeof account === 'object' ? normalizeOptional(account.proxy) : '');
   if (own) return own;
+  // 代理池只补「没配 proxy 的账号」，且必须按账号稳定落点。
+  // 键位里要带通道：各通道的 id 是各自文件里的自增数字，qa 的 1 与 traework
+  // 的 1 是两个不同账号，只用 id 会让它们固定挤在同一个出口上。
+  // **通道不接受账号对象自带字段**——调用方传的是原始账号记录，多数字段没有
+  // channel。用 `__channel` 显式传入（接线点已按通道分包，加一个字段比改
+  // 几十处调用便宜），缺省回落到 'acct'（池仍然稳定，只是跨通道可能共享）。
+  if (account && typeof account === 'object' && account.id != null) {
+    const channel = normalizeOptional(account.__channel || '');
+    const key = `${channel || 'acct'}:${account.id}`;
+    const pooled = poolProxyFor(key);
+    if (pooled) return pooled;
+  }
   return globalProxy || null;
 }
 
@@ -275,5 +334,16 @@ module.exports = {
   getAgentFor,
   setGlobalProxy,
   getGlobalProxy,
+  setProxyPool,
+  getProxyPool,
+  poolProxyFor,
   clearAgentCache,
 };
+
+// 启动时从 env 装载代理池。放在文件末尾而不是第 41 行附近：setProxyPool 用到
+// 的 normalizeProxyUrl / clearAgentCache 都是函数声明（会提升），但把「初始化
+// 副作用」集中在一处更容易审计——谁在什么时候改了进程级状态一目了然。
+// DUMATE_PROXY_POOL 非法条目会在这里抛错（fail-fast），与全局代理同一纪律。
+if (normalizeOptional(process.env.DUMATE_PROXY_POOL || '')) {
+  setProxyPool(process.env.DUMATE_PROXY_POOL);
+}

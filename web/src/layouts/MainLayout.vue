@@ -40,7 +40,26 @@
         </a-menu-item>
         <a-menu-item v-if="showMenu('web-accounts')" key="web-accounts">
           <template #icon><TeamOutlined /></template>
-          <span>账号管理</span>
+          <a-badge :count="accountAlerts" :show-zero="false" :offset="[10, 0]" :number-style="badgeStyle">
+            <span>账号管理</span>
+          </a-badge>
+        </a-menu-item>
+        <!-- TRAE 运行策略：写运行期配置，admin 专属、与通道无关 -->
+        <a-menu-item v-if="isAdmin" key="trae-runtime">
+          <template #icon><ControlOutlined /></template>
+          <span>运行策略</span>
+        </a-menu-item>
+        <!-- 运行日志：进程 console，admin 专属 -->
+        <a-menu-item v-if="isAdmin" key="logs">
+          <template #icon><CodeOutlined /></template>
+          <span>运行日志</span>
+        </a-menu-item>
+        <!-- 运维告警：viewer 也能看（阈值只读禁用），写由服务端拦 -->
+        <a-menu-item v-if="showMenu('alerts')" key="alerts">
+          <template #icon><AlertOutlined /></template>
+          <a-badge :count="activeAlertCount" :show-zero="false" :offset="[10, 0]" :number-style="badgeStyle">
+            <span>运维告警</span>
+          </a-badge>
         </a-menu-item>
         <!-- 接入配置：写本机 Claude Code / Codex 配置，admin 专属、与通道无关，
              不走 menuKeys 的通道白名单 -->
@@ -122,8 +141,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined } from '@ant-design/icons-vue'
+import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
+import client from '@/api/client'
 import { auth, isAdmin } from '@/stores/auth'
 import { channelStore, CHANNELS } from '@/stores/channel'
 import { regionStore, hasRegion } from '@/stores/region'
@@ -131,6 +151,32 @@ import { regionStore, hasRegion } from '@/stores/region'
 const collapsed = ref(false)
 const router = useRouter()
 const route = useRoute()
+
+// 侧栏角标（调研 P1-10）：TRAE /status 的 alerts 是账号健康跨页汇总，
+// 只在 TRAE 通道视图下取——其他通道的账号结构不同，硬套会报不存在的故障。
+// 角标颜色橙=待办，0 不显示；viewer 也能看（只读状态，不是配置）。
+const accountAlerts = ref(0)
+const badgeStyle = { backgroundColor: '#d97706', boxShadow: 'none' }
+async function loadAccountAlerts() {
+  if (channelStore.current !== 'traework') { accountAlerts.value = 0; return }
+  try {
+    const { data } = await client.get('/traework/status')
+    const a = data.alerts || {}
+    accountAlerts.value = (a.needRelogin || 0) + (a.exhausted || 0) + (a.disabled || 0)
+  } catch { accountAlerts.value = 0 }
+}
+
+// 运维告警角标：未恢复的告警数。与账号角标分开——这个是通道无关的运维面，
+// 通道无关所以不随顶栏切换器变化，只在进页面/手动刷新时更新。
+const activeAlertCount = ref(0)
+async function loadAlertCount() {
+  try {
+    const { data } = await client.get('/alerts')
+    // 只数 actionable（warn/crit）：info 级的「非工作时段请求」深夜自己用一下
+    // 就会命中，计入角标会让红灯天天常亮，等于把人训练成忽略告警。
+    activeAlertCount.value = Array.isArray(data.actionable) ? data.actionable.length : 0
+  } catch { activeAlertCount.value = 0 }
+}
 
 // 区域切换器只在有区域概念的通道显示（TRAE / Qoder）
 const regionVisible = computed(() => hasRegion())
@@ -206,10 +252,14 @@ onMounted(() => {
     if (rg === 'cn' || rg === 'intl') regionStore.set(rg)
   } catch { /* URL 解析失败不影响进入默认视图 */ }
   channelStore.load()
+  loadAccountAlerts()
+  loadAlertCount()
 })
+// 切通道时角标跟着换（TRAE 之外恒 0），切区域时 TRAE 账号集合也会变
+watch(() => channelStore.current, () => { loadAccountAlerts() })
 // 区域切换（顶栏国内版/国际版）：通道状态卡按区域重报（accounts 数与当前
 // 账号都按区域过滤），不重拉会显示上一个区域的数字
-watch(() => regionStore.current, () => { channelStore.load() })
+watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts() })
 </script>
 
 <style scoped>

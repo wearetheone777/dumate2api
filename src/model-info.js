@@ -425,6 +425,8 @@ async function traeworkRows({ visibleOnly = false, all = false, force = false, r
       // 据此显示「协议就绪等放开」的说明而不是空白。
       reasoningEfforts: m.reasoningEfforts || null,
       maxMode: m.maxMode === true,
+      // 套餐门槛：上游 descriptor 显式声明才 true，其余 null（不猜）
+      upgradeRequired: m.upgradeRequired === true ? true : null,
     })),
   };
 }

@@ -135,6 +135,22 @@ function assert(name, cond, detail) {
   console.log(`${cond ? '[PASS]' : '[FAIL]'} ${name}${cond ? '' : '  ← ' + (detail || '')}`);
 }
 
+/**
+ * 向 OS 要一个当前空闲的端口，拿到就立刻关掉。
+ * 用于把「上游不可达」变成确定前提：开发机上若真跑着 DuMate 后端（8980），
+ * 回落用例会连上真后端而不回落，测试随环境漂移。
+ */
+function deadPort() {
+  return new Promise((resolve, reject) => {
+    const srv = http.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 (async () => {
   let up = false;
   for (let i = 0; i < 60; i++) {
@@ -188,10 +204,18 @@ function assert(name, cond, detail) {
   assert('dumateSource(): 容忍首尾空白', router.dumateSource() === 'web', router.dumateSource());
 
   // ---- 切到 auto 仍能工作（回落路径没被改坏）----
+  // **把上游端口指向一个确定不可达的端口**，别依赖「本机 8980 恰好没在跑」。
+  // 这条用例验的是「桌面链路连不上 → 回落网页池」，如果开发机上真跑着 DuMate
+  // 后端（8980 LISTENING），请求会直连成功、不回落，用例就假失败——2026-11-08
+  // 实测踩到：同一份代码，8980 未跑时 26/26 通过，8980 在跑时 24/26。
+  // router 的 targetOf() 每次请求现读 DUMATE_UPSTREAM_PORT，所以这里改环境
+  // 变量即可生效，不需要重启 server.js。端口由 OS 分配后立即释放，保证无人监听
+  // （比硬编码 1 更稳：1 在某些 Windows 配置上是特权端口，行为不确定）。
   process.env.DUMATE_DUMATE_SOURCE = 'auto';
+  process.env.DUMATE_UPSTREAM_PORT = String(await deadPort());
   const beforeAuto = counters.discoverPort;
   const r3 = await post();
-  assert('auto 模式请求仍成功（连 8980 失败 → 回落网页池）',
+  assert('auto 模式请求仍成功（连上游失败 → 回落网页池）',
     r3.status === 200 && r3.text.includes('web'), `status ${r3.status}`);
   assert('auto 模式下请求期间同样零探测', counters.discoverPort === beforeAuto,
     `多探了 ${counters.discoverPort - beforeAuto} 次`);
@@ -199,6 +223,7 @@ function assert(name, cond, detail) {
   assert('health: auto 模式 source=auto', h3.channels.dumate.source === 'auto', JSON.stringify(h3.channels.dumate));
 
   delete process.env.DUMATE_DUMATE_SOURCE;
+  delete process.env.DUMATE_UPSTREAM_PORT;
 
   // ---- 启动阶段：默认跳过那次约 3 秒的初始探测；auto 模式才跑 ----
   // 用子进程跑，因为「是否跳过初始发现」只在启动时决定一次。

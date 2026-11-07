@@ -14,6 +14,12 @@ const channelPool = require('../channel-pool');
 const CHANNEL = 'traework';
 // FEFO（临期积分优先）：数据源 expiring.js（写方是管理端 /credits）
 const expiringSnap = require('../expiring');
+// 运行期配置 / 降级 / 选号策略（2026-11-08 调研融合批次）：全部默认关闭，
+// 配置由管理端写入 data/traework-runtime.json，本进程按 mtime 热读。
+const traeRuntime = require('../trae-runtime');
+const degrade = require('./degrade');
+const policy = require('./policy');
+const guard = require('./guard');
 
 // 临期账号的池 uid 集合（pool 键位 'traework:<id>'）。null = 走普通轮询。
 function fefoUidSet() {
@@ -24,15 +30,21 @@ function fefoUidSet() {
   return out;
 }
 
-/** 通道是否可用：至少有一个启用且凭证完整的账号。按区域分别计数（2026-11-03 国际版） */
+/** 通道是否可用：至少有一个启用、可接模型请求且凭证完整的账号。按区域分别计数 */
 function status() {
   const usable = authStore.findUsable();
-  const cn = usable.filter((a) => c.regionOf(a) === 'cn').length;
-  const intl = usable.filter((a) => c.regionOf(a) === 'intl').length;
-  if (!usable.length) {
-    return { ready: false, loggedIn: false, error: '没有可用账号（需先登录）', accounts: 0, cnAccounts: 0, intlAccounts: 0 };
+  const modelUsable = usable.filter((a) => a.modelEnabled !== false);
+  const cn = modelUsable.filter((a) => c.regionOf(a) === 'cn').length;
+  const intl = modelUsable.filter((a) => c.regionOf(a) === 'intl').length;
+  if (!modelUsable.length) {
+    return {
+      ready: false, loggedIn: usable.length > 0,
+      error: usable.length ? '所有账号都关闭了「接模型请求」' : '没有可用账号（需先登录）',
+      accounts: 0, cnAccounts: 0, intlAccounts: 0,
+      pausedModelAccounts: usable.length,
+    };
   }
-  return { ready: true, loggedIn: true, error: '', accounts: usable.length, cnAccounts: cn, intlAccounts: intl };
+  return { ready: true, loggedIn: true, error: '', accounts: modelUsable.length, cnAccounts: cn, intlAccounts: intl, pausedModelAccounts: usable.length - modelUsable.length };
 }
 
 /**
@@ -229,12 +241,55 @@ function accountsForRegion(usable, region) {
 }
 
 /**
- * 发对话请求。
+ * 发对话请求（对外入口）。
+ *
+ * 显式降级（调研 P0-3）：默认关闭。开启后**只对确证的额度耗尽/订阅升级
+ * 错误**再试一次备用模型或备用区域，且只限「第一尝试尚未吐出任何内容」。
+ * 降级事实经 `opts.onDegraded` 交给网关写成 X-Trae-Degraded 响应头，
+ * 绝不静默替换调用方指定的模型。
+ */
+async function send(payload, onChunk, opts = {}) {
+  const cfg = traeRuntime.Load().degrade;
+  if (cfg.enabled !== true) return sendOnce(payload, onChunk, opts);
+  let emitted = false;
+  const wrapped = onChunk ? (chunk) => { emitted = true; onChunk(chunk); } : null;
+  try {
+    return await sendOnce(payload, wrapped, opts);
+  } catch (err) {
+    if (emitted) throw err;                 // 客户端已经收到内容，收不回去
+    const plan = degrade.plan(cfg, err, {
+      model: payload && payload.model,
+      region: opts.region || '',
+      persona: !!opts.personalAssistant || String((payload && payload.model) || '').startsWith('traebao/'),
+    });
+    if (!plan) throw err;
+    const retryPayload = { ...payload, ...(plan.model ? { model: plan.model } : {}) };
+    const retryOpts = { ...opts, ...(plan.region ? { region: plan.region } : {}) };
+    try {
+      const out = await sendOnce(retryPayload, onChunk, retryOpts);
+      if (opts.onDegraded) {
+        try { opts.onDegraded(plan.header); } catch (e) { /* 上报失败不影响结果 */ }
+      }
+      return { ...out, degraded: { reason: plan.reason, model: plan.model, region: plan.region } };
+    } catch (e2) {
+      // 两次都失败：把第一次的真实错误交回去，别让备用模型的 400 盖住
+      // 「原模型额度耗尽」这个根因；备用错误附在 message 里如实给出。
+      const both = new Error(`${err.message}；降级到备用模型/区域后仍失败：${e2.message}`);
+      both.statusCode = e2.statusCode || err.statusCode || 502;
+      throw both;
+    }
+  }
+}
+
+/**
+ * 单次对话（原 send 主体）。
  * @param {object} payload OpenAI 格式请求体
  * @param {function} [onChunk] 流式回调（收到解出来的 OpenAI 行）
  * @param {object} [opts] { reqId } 请求埋点的 id，用于把积分归因与日志精确配对
  */
-async function send(payload, onChunk, opts = {}) {
+let sendOnce = async (payload, onChunk, opts = {}) => runSendOnce(payload, onChunk, opts);
+
+async function runSendOnce(payload, onChunk, opts = {}) {
   const rawModel = payload && payload.model ? String(payload.model) : '';
   // TRAE 宝身份（2026-11-03）：`traebao/` 前缀 → function=personal_assistant。
   // 与 traework/ **同一个账号池、同一份 Cloud-IDE-JWT 凭证、同一个后端**，
@@ -308,13 +363,45 @@ async function send(payload, onChunk, opts = {}) {
     && String(process.env.DUMATE_TRAEWORK_REMOTE || '') !== '2'
     && !(Array.isArray(payload && payload.tools) && payload.tools.length > 0);
   if (!poolRegion && soloWanted) poolRegion = 'cn';
-  const usable = accountsForRegion(authStore.findUsable(), poolRegion);
+  const runtime = traeRuntime.Load();
+  // 模型开关（P0-4）：findModelUsable 只影响对话；签到/额度刷新仍走 findUsable
+  const allUsable = accountsForRegion(authStore.findUsable(), poolRegion);
+  const regionUsable = allUsable.filter((a) => a.modelEnabled !== false);
+  // 积分优先 + 保留积分护栏（P2-13 / P2-16）：默认都关，行为逐字节不变
+  const reserved = policy.guardCandidates(regionUsable, runtime.accountGuard);
+  // 每日用量护栏（P2-16 另三项）：按当日已用 token / 积分 / (账号,模型) 拦截。
+  // 数据源是本进程的落盘事实（requests.jsonl + credits 账本），不打上游。
+  // **未知不拦**：account_id 或用量读不到的账号照常放行。
+  let guarded = reserved;
+  if (runtime.accountGuard.enabled === true
+      && (runtime.accountGuard.dailyTokens > 0 || runtime.accountGuard.dailyCredits > 0 || runtime.accountGuard.modelTokens > 0)) {
+    let usage = null;
+    let creditsByAccount = null;
+    try { usage = guard.usageNow({ channel: CHANNEL }); } catch (e) { usage = null; }
+    try { creditsByAccount = require('./credits').creditsTodayByAccount(); } catch (e) { creditsByAccount = null; }
+    if (usage) {
+      const daily = guard.applyDaily(reserved.rows, runtime.accountGuard, {
+        model, usage, creditsByAccount,
+      });
+      guarded = {
+        rows: daily.rows,
+        // 两类被拦原因合并给出，报错里能看出是「没钱」还是「用超了」
+        blocked: reserved.blocked,
+        blockedDaily: daily.blocked,
+      };
+    }
+  }
+  const usable = policy.orderCandidates(guarded.rows, runtime.pickStrategy);
   if (!usable.length) {
-    const e = poolRegion === 'intl'
+    const dailyMsg = guarded.blockedDaily && guarded.blockedDaily.length
+      ? guard.blockedReason(guarded.blockedDaily) : '';
+    const e = poolRegion === 'intl' && !allUsable.length
       ? new Error('TRAE 没有可用的国际账号（先到账号管理 → 添加账号 → 选「国际版」登录）。该请求的模型或 API Key 限定国际区域')
-      : poolRegion === 'cn'
-        ? new Error('traework 没有可用的国内账号')
-        : new Error('traework 没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
+      : new Error(dailyMsg || policy.unavailableReason({
+        total: allUsable.length,
+        modelUsable: regionUsable.length,
+        blocked: guarded.blocked,
+      }));
     e.statusCode = 503;
     throw e;
   }
@@ -395,7 +482,7 @@ async function send(payload, onChunk, opts = {}) {
         if (hit && hit.customModel) {
           remoteOpts = {
             model, strategy: 'manual', customModelRow: hit, effortPayload: payload,
-            maxMode: remoteMod.maxModeRequested(model, payload),
+            maxMode: remoteMod.maxModeRequested(model, payload, runtime.maxMode),
           };
         }
       } catch (e) { /* 表不可用回落 utils_chat */ }
@@ -737,5 +824,11 @@ module.exports = {
   status, send, listModels, listModelEntries, warmupModels, pickAccount,
   // FEFO 集合推导导出：端到端回归用（verify-expiring-fefo.js）
   fefoUidSet,
+  // 仅测试注入：降级编排的「单次尝试」接缝（不供生产调用方使用）。
+  // send 调的是 sendOnce，测试可临时替换它来验证「重试/不重试/响应头」三条路径。
+  internals: {
+    setSendOnce: (fn) => { if (typeof fn === 'function') sendOnce = fn; },
+    resetSendOnce: () => { sendOnce = runSendOnce; },
+  },
   DEFAULT_MODEL: c.DEFAULT_MODEL,
 };

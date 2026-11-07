@@ -49,28 +49,28 @@ export const CHANNELS = [
   {
     id: 'dumate',
     label: '百度搭子',
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts'],
+    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
   },
   {
     id: 'qwenwork',
     label: '千问办公',
     // 千问办公：单账号直连，没有「任务记录」（无签到/抽奖任务）。
     // 账号管理先只读展示当前账号，后续接入多账号再开放写入。
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts'],
+    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
   },
   {
     id: 'traework',
     label: 'TRAE Work',
     // TRAE Work：凭证自持（OAuth 换取），有签到体系，但积分结构与搭子不同
     // （是 credits 而非额度包），所以不显示搭子的「任务记录」。
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts'],
+    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
   },
   {
     id: 'qoder',
     label: 'Qoder',
     // Qoder：凭证自持（device flow 自取），与 TRAE 同构——多账号、有签到、
     // 单一 credits 结构。签名纯本地，不需要任何客户端。
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts'],
+    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
   },
   {
     id: 'workbuddy',
@@ -78,7 +78,7 @@ export const CHANNELS = [
     // WorkBuddy：第五通道（2026-11-03），标准 OpenAI 协议 + 双区域账号
     // （国内 copilot.tencent.com / 国际 workbuddy.ai）。凭证自持（登录流程
     // 后置期从客户端认证文件导入），有签到（仅国内版）。
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts'],
+    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
   },
 ] as const
 

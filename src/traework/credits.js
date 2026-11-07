@@ -402,7 +402,36 @@ function attachCosts(pageRows) {
   });
 }
 
+/**
+ * 当日各账号的积分消耗（护栏用，调研 P2-16）。
+ *
+ * 口径与 `todayUsage` 完全同源（同一个 computeCosts 差值链），只是按账号分组：
+ * 两处各算一遍必然漂移，而护栏若与实际账本不同源，界面上「已用 20/20」与
+ * 实际扣费对不上，用户只会认为护栏坏了。
+ *
+ * **只累加有参照点的行**（req_id 在 delta 里）：首条无游标参照的记录算不出
+ * 增量，把它当 0 会低估消耗；跳过它则是「少算」——护栏对少算的容忍度高于
+ * 多算（多算会误拦健康账号）。
+ *
+ * @returns {Map<string, number>} account_id → 当日积分（保留 4 位）
+ */
+function creditsTodayByAccount(now = Date.now()) {
+  const { rows, delta } = computeCosts();
+  const today = dayKey(now);
+  const out = new Map();
+  for (const r of rows) {
+    if (!r || dayKey(r.ts) !== today) continue;
+    if (r.account_id == null) continue;
+    if (!(r.req_id in delta)) continue;
+    const k = String(r.account_id);
+    out.set(k, (out.get(k) || 0) + delta[r.req_id]);
+  }
+  for (const [k, v] of out) out.set(k, Number(v.toFixed(4)));
+  return out;
+}
+
 module.exports = {
+  creditsTodayByAccount,
   capture, readHistory, indexByReqId, attachCosts,
   computeCosts, dailyUsage, todayUsage, creditRecords, dayKey,
   parseBillCache,
