@@ -48,6 +48,8 @@ data/browser-profile/
 .tmptest*/
 .p2.txt
 .runlogs/
+# CLAUDE.md 重构时的本地备份，不入库（内容以仓库里的 CLAUDE.md 为准）
+CLAUDE.md.bak-*
 # .hy4out/ 是 hy4 批量扫描任务的产出报告（p*_*.md），本地生成物
 .hy4out/
 
