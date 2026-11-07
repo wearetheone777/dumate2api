@@ -2,6 +2,7 @@
 const http = require('http');
 const keysvc = require('../../keys');
 const reqlog = require('../../reqlog');
+const keyQuota = require('../../key-quota');
 const { sendJSON } = require('../router');
 
 // 网关的鉴权开关是**网关进程**的环境变量，管理端读自己的 process.env 永远
@@ -110,6 +111,9 @@ const routes = [
         ...k,
         plain: isAdmin ? (k.plain || null) : null,
         usage: usage[k.id] || { requests: 0, total_tokens: 0, failed: 0, last_at: 0, channels: {} },
+        // 当日配额用量：读**落盘**（网关进程 5s 防抖落盘）——管理端进程的
+        // 内存计数器是空的，读内存会恒显示 0
+        quota_today: keyQuota.readTodayFromDisk(k.id),
       }));
       if (ch) list = list.filter((k) => !k.channel || k.channel === ch);
       const gw = await gatewayRequireKey();
@@ -133,11 +137,16 @@ const routes = [
       }
       if (problems.length) return sendJSON(res, 400, { error: problems.join('；') });
 
-      const created = keysvc.create(body || {});
-      require('../../admin/auth').audit('admin', 'key_create', created.key.name);
-      // 明文已随 key 落盘（plain 字段），之后可在列表随时查看复制；
-      // 这里仍返回一次方便当场保存
-      return sendJSON(res, 200, created);
+      try {
+        const created = keysvc.create(body || {});
+        require('../../admin/auth').audit('admin', 'key_create', created.key.name);
+        // 明文已随 key 落盘（plain 字段），之后可在列表随时查看复制；
+        // 这里仍返回一次方便当场保存
+        return sendJSON(res, 200, created);
+      } catch (e) {
+        // 父 Key 校验失败（不存在 / 超出两级）如实 400，不静默落一把坏 key
+        return sendJSON(res, 400, { error: e.message });
+      }
     },
   },
   {
@@ -146,10 +155,14 @@ const routes = [
     handler: ({ res, body, params }) => {
       const problems = checkLists(body || {});
       if (problems.length) return sendJSON(res, 400, { error: problems.join('；') });
-      const updated = keysvc.update(params[0], body || {});
-      if (!updated) return sendJSON(res, 404, { error: 'key 不存在' });
-      require('../../admin/auth').audit('admin', 'key_update', updated.name);
-      return sendJSON(res, 200, updated);
+      try {
+        const updated = keysvc.update(params[0], body || {});
+        if (!updated) return sendJSON(res, 404, { error: 'key 不存在' });
+        require('../../admin/auth').audit('admin', 'key_update', updated.name);
+        return sendJSON(res, 200, updated);
+      } catch (e) {
+        return sendJSON(res, 400, { error: e.message });
+      }
     },
   },
   {

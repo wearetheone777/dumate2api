@@ -45,7 +45,7 @@ const DEFAULT_ALIASES = {
 // 上游真正认识的 ID。其余名字必须经别名映射后才能用。
 const DEFAULT_UPSTREAM = ['model-text', 'model-artifact-validate', 'glm-5'];
 
-// 云端网关（dumate-svc /gateway/apis/v1，9084 与本地回落共用）接受的模型名。
+// 云端网关（dumate-svc /gateway/apis/v1，fallback-web 本地回落链路在用）接受的模型名。
 // **2026-11-06 真机实测定案**（test/probe-dumate-cloud-models.js，个人版账号）：
 // 这 6 个路由名全部 200，而社区对外别名（deepseek-v4.1 / kimi-k3.1-pro /
 // glm-5.3 / qwen-3.8-flash）与本地后端真名（deepseek-v4.1-flash-low-latency /
@@ -255,7 +255,8 @@ function mapModel(name) {
 }
 
 /**
- * 任意入站模型名 → **云端网关**接受的模型名（9084 直连与本地回落共用）。
+ * 任意入站模型名 → **云端网关**接受的模型名（fallback-web 本地回落在用；
+ * web-gateway 9084 已废弃，但其接线处同函数无需改动）。
  *
  * 与 mapModel 的关键差别：两条链路的模型名空间不同（本地 8980 只认
  * model-text / model-artifact-validate / glm-5，云端只认 cloud_upstream 六个

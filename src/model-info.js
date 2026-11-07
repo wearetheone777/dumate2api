@@ -129,14 +129,45 @@ function dumateRows() {
       maxTokens: real ? real.maxTokens : null,
       maxTokensSource: real ? 'measured' : null,
       maxTokensNote: real ? (real.maxTokensNote || '网关另有输出预算下限 65536（思维链兜底），客户端传小值会被抬到下限') : null,
+      // 多模态：按**映射 target** 的档位语义判（dm-auto-model/mm.* 是上游自己的
+      // 多模态命名空间）。2026-11-07 前这里硬编码 false——mm 档位一旦进暴露
+      // 列表就会被标成纯文本，与它名字的语义相反。
+      multimodal: /\/mm\./.test(target),
+      multimodalSource: 'config',
+      // JSON mode：response_format（JSON mode / json_schema）**只有 qianfan/
+      // 前缀（千帆原生透传）支持**（CLAUDE.md 定案）；应用别名链路传了也不生效。
+      // 按「命名空间」判而不是按模型判——同一个模型换个前缀能力就变了。
+      jsonMode: false,
+      jsonModeSource: 'measured',
+      jsonModeNote: 'response_format 仅 qianfan/ 前缀（千帆原生透传）支持；应用别名链路不支持',
+      // 物理路径（2026-11-07 融合项 P0-3）：应用别名走网关搭子通道（source=web
+      // 默认走网页凭证池，DUMATE_DUMATE_SOURCE=auto 时桌面 8980 优先）；
+      // 千帆原生是独立命名空间（qianfan/ 前缀），应用名在那边 401。路径选择是
+      // 通道级运行态（/health 的 channels.dumate.source），不是模型级——所以
+      // 这里只标「能不能走」，不猜「现在走哪条」。
+      links: { app: true, qianfanRaw: false },
       capability: 'chat_model',
-      multimodal: false,
       // 上游没给模型列表，这里把「别名实际落到哪里」讲清楚——
       // 比笼统的「无接口」更有用：用户能据此判断一个名字是不是真的换了模型
       note: upstream.has(id) ? DUMATE_NOTE : `客户端名，网关按别名转到 ${target}`,
     });
   }
   return rows;
+}
+
+/**
+ * 暴露名 → 映射 target（与 dumateRows 循环内同一算法，抽出来给 /v1/models 用
+ * ——两处各写一份早晚会漂移，别名语义改动时只会改到一处）。
+ */
+function dumateTargetOf(id) {
+  const cfg = modelmap.load();
+  const upstream = new Set(cfg.upstream_models);
+  return cfg.aliases[id] || (upstream.has(id) ? id : cfg.fallback);
+}
+
+/** target → 实测元数据（DUMATE_REAL 查表；查不到返回 null，不编） */
+function dumateRealOf(target) {
+  return DUMATE_REAL[target] || null;
 }
 
 /** 千问的行。倍率本地拿不到（计费在 qwenwork.cn 的积分池里），如实 null */
@@ -389,6 +420,11 @@ async function traeworkRows({ visibleOnly = false, all = false, force = false, r
       isDefault: m.isDefault,
       isNew: m.isNew,
       isBeta: m.isBeta,
+      // 思考档位 / 1M Max 摘要（2026-11-06）：descriptor 显式声明的才非空/为 true。
+      // 当前上游 0 个模型声明 max_mode、思考模型在 remote 端点不可用——前端
+      // 据此显示「协议就绪等放开」的说明而不是空白。
+      reasoningEfforts: m.reasoningEfforts || null,
+      maxMode: m.maxMode === true,
     })),
   };
 }
@@ -434,6 +470,7 @@ async function rowsFor(channel, opts = {}) {
 
 module.exports = {
   SRC, allRows, rowsFor, dumateRows, qwenworkRows, qwenRows, traeworkRows, qoderRows,
+  dumateTargetOf, dumateRealOf,
   setQwenKeys, setQwenModels, qwenworkCachedEntries, setQoderModels,
   DUMATE_NOTE, DUMATE_REAL, QW_CONTEXT, CHANNELS: channels.CHANNELS,
 };

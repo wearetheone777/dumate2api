@@ -100,7 +100,7 @@ function sendFile(res, file) {
   });
 }
 
-function sendJSON(res, status, data) {
+function sendJSON(res, status, data, extraHeaders) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
     'Content-Type': 'application/json',
@@ -109,6 +109,7 @@ function sendJSON(res, status, data) {
     // 管理端接口是实时数据（模型表、账号、埋点）。浏览器/中间层一旦缓存
     // 就会把「上游已更新」看成「界面还是旧的」，且普通刷新也不会重新请求。
     'Cache-Control': 'no-store',
+    ...(extraHeaders || {}),
     'Content-Length': Buffer.byteLength(body),
   });
   res.end(body);
@@ -117,6 +118,7 @@ function sendJSON(res, status, data) {
 router.mount(PREFIX + '/auth', authRoutes.map((r) => ({ ...r, path: r.path.replace(/^\/auth/, '') })));
 router.mount(PREFIX + '/system', systemRoutes);
 router.mount(PREFIX + '/keepalive', keepaliveRoutes);
+router.mount(PREFIX + '/billing', require('./routes/billing').routes);
 router.mount(PREFIX + '/points', pointsRoutes);
 router.mount(PREFIX + '/stats', statsRoutes);
 router.mount(PREFIX + '/usage', usageRoutes);
@@ -129,6 +131,8 @@ router.mount(PREFIX + '/qoder', qoderRoutes);
 router.mount(PREFIX + '/workbuddy', workbuddyRoutes);
 router.mount(PREFIX + '/keys', keysRoutes);
 router.mount(PREFIX + '/cc-switch', ccswitchRoutes);
+router.mount(PREFIX + '/agent-setup', require('./routes/agent-setup').routes);
+router.mount(PREFIX + '/channel-balance', require('./routes/channel-balance').routes);
 router.mount(PREFIX + '/account', accountRoutes);
 router.mount(PREFIX + '/web-accounts', webAccountsRoutes);
 router.mount(PREFIX + '/checkin', checkinRoutes);
@@ -165,7 +169,15 @@ function handleRequest(req, res) {
   const url = req.url.split('?')[0];
 
   if (url === PREFIX + '/healthz') {
-    return sendJSON(res, 200, { status: 'ok', service: 'dumate2api-admin' });
+    // 进程身份（2026-11-07 融合项 P1-6）：与网关 /health 同口径——service 是
+    // 品牌级判据，role 区分入口。管理端没有独立的 X-Service 探测需求，
+    // 头也一并带上，四个进程口径完全一致。
+    const identity = require('../service-identity').identity('admin');
+    return sendJSON(res, 200, {
+      status: 'ok',
+      service: identity.service,
+      role: identity.role,
+    }, { 'X-Service': identity.service });
   }
 
   if (url.startsWith(PREFIX + '/')) {
@@ -187,11 +199,21 @@ function start() {
   autotask.schedule();
   // 任务轮询定时器同样只活在进程内，重启后按保存的配置重新排期
   taskScheduler.schedule();
+  // 低频余额刷新（2026-11-07 融合项 P1-5）：默认关闭，配置落盘后重启自恢复
+  try { require('../balance-refresh').schedule(); } catch (e) { log(`⚠ 余额刷新排程异常（不阻断启动）: ${e.message}`); }
   // 运行时模块接线（池恢复 / livecfg / 计量探活），失败不阻断管理端启动
   try { boot.init({ log }); } catch (e) { log(`⚠ 启动接线异常（不阻断启动）: ${e.message}`); }
   // 优雅停止：保活排程与进行中的一轮、池状态、计量分桶落盘后再退
-  process.once('SIGINT', () => { log('收到 SIGINT，刷盘退出…'); boot.shutdown('SIGINT', true); });
-  process.once('SIGTERM', () => { log('收到 SIGTERM，刷盘退出…'); boot.shutdown('SIGTERM', true); });
+  process.once('SIGINT', () => {
+    log('收到 SIGINT，刷盘退出…');
+    try { require('../balance-refresh').stop(); } catch (e) { /* 停不掉就随进程退 */ }
+    boot.shutdown('SIGINT', true);
+  });
+  process.once('SIGTERM', () => {
+    log('收到 SIGTERM，刷盘退出…');
+    try { require('../balance-refresh').stop(); } catch (e) { /* 同上 */ }
+    boot.shutdown('SIGTERM', true);
+  });
   process.once('exit', () => { try { boot.shutdown('exit'); } catch (e) { /* 退出路径不再抛 */ } });
   log('dumate2api admin starting...');
 

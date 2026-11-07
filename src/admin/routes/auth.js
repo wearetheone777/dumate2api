@@ -206,6 +206,27 @@ const routes = [
       return sendJSON(res, 200, { ok: true });
     },
   },
+  {
+    // 审计日志（2026-11-06 清单项 1）：auth.audit 在 15+ 处埋点（登录/改 key/
+    // 改配置/动账号），此前只有落盘没有读取口——这里补上。admin-only：
+    // 审计是运维视角（viewer 看到了也只是多一个困惑源，而且里面可能有
+    // 账号名/用户名这类敏感字样）。读 data/admin-audit.jsonl，倒序 + 筛选。
+    method: 'GET',
+    path: '/auth/audit',
+    handler: ({ res, req, user }) => {
+      if (user.role !== 'admin') return sendJSON(res, 403, { error: 'admin_only' });
+      const url = new URL(req.url, 'http://localhost');
+      const limit = Math.min(1000, Math.max(1, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
+      const action = (url.searchParams.get('action') || '').trim();
+      const actor = (url.searchParams.get('actor') || '').trim();
+      const all = auth.readAudit();
+      const actions = [...new Set(all.map((r) => r.action))].sort();
+      let rows = all.slice(-limit).reverse();
+      if (action) rows = rows.filter((r) => r.action === action);
+      if (actor) rows = rows.filter((r) => r.actor === actor);
+      return sendJSON(res, 200, { ok: true, rows, actions, total: all.length });
+    },
+  },
 ];
 
 // ---- 多账户的字段校验（纯函数，便于离线测试）----

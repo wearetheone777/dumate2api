@@ -42,6 +42,12 @@
           <template #icon><TeamOutlined /></template>
           <span>账号管理</span>
         </a-menu-item>
+        <!-- 接入配置：写本机 Claude Code / Codex 配置，admin 专属、与通道无关，
+             不走 menuKeys 的通道白名单 -->
+        <a-menu-item v-if="isAdmin" key="setup">
+          <template #icon><ApiOutlined /></template>
+          <span>接入配置</span>
+        </a-menu-item>
         <!-- 账户管理只对 admin 有意义（viewer 是只读角色），且与通道无关，
              不走 menuKeys 的通道白名单 -->
         <a-menu-item v-if="isAdmin" key="users">
@@ -116,7 +122,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined } from '@ant-design/icons-vue'
+import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { auth, isAdmin } from '@/stores/auth'
 import { channelStore, CHANNELS } from '@/stores/channel'

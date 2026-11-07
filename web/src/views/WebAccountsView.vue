@@ -112,6 +112,9 @@
               >
                 <a-button size="small" :disabled="!a.lottery.remaining">抽奖</a-button>
               </a-popconfirm>
+              <a-button size="small" type="link" @click="openProxy(a)">
+                代理{{ a.proxy ? '✓' : '' }}
+              </a-button>
               <a-button size="small" type="link" @click="openDetail(a)">详情</a-button>
               <a-popconfirm title="删除后需重新添加并登录" @confirm="remove(a)">
                 <a-button size="small" type="link" danger>删除</a-button>
@@ -391,6 +394,30 @@
             验证并添加
           </a-button>
         </a-tab-pane>
+
+        <a-tab-pane key="desktop" tab="桌面端直读（最简）">
+          <a-alert type="info" show-icon class="mb-3">
+            <template #message>读本机 DuMate 客户端的登录态，一键导入</template>
+            <template #description>
+              解密 <code>%APPDATA%\qianfan-desktop-app\auth.json</code>（AES-256-GCM，
+              排布实测见 <code>src/auth-import.js</code>）——无需装客户端的机器用不了这个方式，
+              改走「手动粘贴」。同一账号重复导入会被 BDUSS 去重如实挡住。
+            </template>
+          </a-alert>
+
+          <a-form layout="vertical">
+            <a-form-item label="备注名称（可选）">
+              <a-input v-model:value="form.name" placeholder="留空则用账号昵称" />
+            </a-form-item>
+          </a-form>
+
+          <a-button type="primary" :loading="desktopImporting" block @click="importDesktop">
+            一键导入桌面端登录态
+          </a-button>
+          <div v-if="desktopImportResult" class="text-xs mt-2" :class="desktopImportResult.ok ? 'text-emerald-600' : 'text-red-600'">
+            {{ desktopImportResult.text }}
+          </div>
+        </a-tab-pane>
       </a-tabs>
     </a-modal>
 
@@ -491,6 +518,27 @@
         </template>
       </a-spin>
     </a-drawer>
+
+    <!-- 出站代理编辑（per-account）：留空 = 走全局默认（无全局则直连）。
+         后端 normalizeProxyField 归一化，非法 URL 会 400；显示的是脱敏形态
+         （带 user:pass 的代理不出明文），重新输入完整地址即可覆盖。 -->
+    <a-modal v-model:open="proxyOpen" :title="`出站代理：${proxyTarget?.name || ''}`" :confirm-loading="proxySaving" @ok="saveProxy">
+      <a-form layout="vertical">
+        <a-form-item
+          label="代理地址"
+          extra="支持 http/https/socks5，可带 user:pass；留空清除，走全局默认。当前显示为脱敏形态，覆盖请输入完整地址。"
+        >
+          <a-input
+            v-model:value="proxyForm.proxy"
+            placeholder="如 http://user:pass@127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+          />
+        </a-form-item>
+      </a-form>
+      <div class="text-xs text-slate-400">
+        该代理只影响这个账号的出站请求（签到/查余额/模型调用），用于多账号出口 IP 隔离；
+        配置非法会在保存时报错，绝不静默回退直连。
+      </div>
+    </a-modal>
 
     <!-- 会话浏览器：网页端只读查询（会话/项目/connector），与账号管理同源凭证 -->
     <SessionBrowser />
@@ -852,8 +900,62 @@ async function saveManual() {
   }
 }
 
-async function toggle(a: WebAccount, v: boolean) {
-  await client.patch(`/web-accounts/${a.id}`, { enabled: v })
+// ── 出站代理编辑（per-account）──
+// 展示的是脱敏形态（redactProxyUrl），覆盖时输入完整地址；空串 = 清除走全局默认。
+const proxyOpen = ref(false)
+const proxySaving = ref(false)
+const proxyTarget = ref<WebAccount | null>(null)
+const proxyForm = reactive({ proxy: '' })
+
+function openProxy(a: WebAccount) {
+  proxyTarget.value = a
+  proxyForm.proxy = a.proxy || ''
+  proxyOpen.value = true
+}
+
+async function saveProxy() {
+  if (!proxyTarget.value) return
+  proxySaving.value = true
+  try {
+    const { data } = await client.patch(`/web-accounts/${proxyTarget.value.id}`, {
+      proxy: proxyForm.proxy.trim(),
+    })
+    message.success(data?.proxy ? `代理已设置：${data.proxy}` : '代理已清除，走全局默认')
+    proxyOpen.value = false
+    await load()
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '保存失败')
+  } finally {
+    proxySaving.value = false
+  }
+}
+
+// ── 桌面端直读导入（清单项 6 尾巴）──
+// 解密在后端 src/auth-import.js（排布实测）；前端只触发并展示结果。
+const desktopImporting = ref(false)
+const desktopImportResult = ref<{ ok: boolean; text: string } | null>(null)
+
+async function importDesktop() {
+  desktopImporting.value = true
+  desktopImportResult.value = null
+  try {
+    const { data: r } = await client.post('/web-accounts/import-desktop', { name: form.name })
+    desktopImportResult.value = {
+      ok: true,
+      text: `已导入 ${r.cookie_count} 条 cookie（跳过无关域 ${r.skipped_domains} 条）→ 账号「${r.account?.name}」`,
+    }
+    message.success('导入成功')
+    await load()
+  } catch (e: any) {
+    const msg = e?.response?.data?.error || e?.message || '导入失败'
+    desktopImportResult.value = { ok: false, text: msg }
+    message.error(msg)
+  } finally {
+    desktopImporting.value = false
+  }
+}
+
+async function toggle(a: WebAccount, v: boolean) {  await client.patch(`/web-accounts/${a.id}`, { enabled: v })
   await load()
 }
 

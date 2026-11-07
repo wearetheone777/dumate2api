@@ -89,3 +89,29 @@ export function saveKeepaliveConfig(patch: Partial<KeepaliveConfig>): Promise<vo
 export function runKeepaliveOnce(): Promise<{ ok: boolean; started: boolean }> {
   return client.post('/keepalive/run').then((r) => r.data)
 }
+
+// ── 告警推送配置（crit 级告警 → webhook，见 src/notify.js）──
+
+export type NotifyType = 'feishu' | 'wecom' | 'dingtalk' | 'telegram' | 'generic'
+
+export interface NotifyConfig {
+  enabled: boolean
+  type: NotifyType
+  url: string
+  chat_id: string
+}
+
+export function fetchNotifyConfig(): Promise<NotifyConfig & { types: string[] }> {
+  return client
+    .get<{ ok: boolean; types: string[]; config: NotifyConfig }>('/keepalive/notify')
+    .then((r) => ({ ...r.data.config, types: r.data.types }))
+}
+
+export function saveNotifyConfig(cfg: NotifyConfig): Promise<void> {
+  return client.put('/keepalive/notify', cfg).then(() => undefined)
+}
+
+/** 用当前已保存的配置真发一条测试消息——token/签名错误只有发送时暴露 */
+export function testNotify(): Promise<{ ok: boolean; message?: string; error?: string }> {
+  return client.post('/keepalive/notify/test').then((r) => r.data)
+}

@@ -183,7 +183,7 @@ function costOf(accountId, before, after) {
  * 4. **账号名由 provider 上报**（onAccount）：多账号轮询下只有它知道选中的是哪个。
  */
 async function handleDirect(req, res, ctx) {
-  const { provider, payload, channel, model, mapped, stream, startedAt, personalAssistant } = ctx;
+  const { provider, payload, channel, model, mapped, stream, startedAt, personalAssistant, linkOverride } = ctx;
   // 区域（2026-11-03 页面区分）：试调台选的国内/国际，随行记进埋点，
   // 请求日志的区域拆分对试调的行同样生效
   const region = ctx.region || '';
@@ -220,7 +220,7 @@ async function handleDirect(req, res, ctx) {
   // 千问/Qoder 的 send 不认识这个字段，多传无害。
   // **必须在流式/非流式两个分支之外**——流式分支也用它，定义进分支
   // 里就是 ReferenceError: sendOpts is not defined（实测踩过）
-  const sendOpts = { reqId, onAccount, personalAssistant: !!personalAssistant, region };
+  const sendOpts = { reqId, onAccount, personalAssistant: !!personalAssistant, region, linkOverride };
 
   // ---- 非流式 ----
   if (!stream) {
@@ -454,6 +454,11 @@ const routes = [
         const rawRegion = String((body && body.region) || '').toLowerCase();
         const region = (rawRegion === 'intl' || rawRegion === 'global') ? 'intl'
           : rawRegion === 'cn' ? 'cn' : '';
+        // 链路指定（2026-11-06，ChatLab 链路实验）：traework 的三条链路
+        // （utils_chat/remote/solo）显式试调——send 的 linkOverride 压过自动
+        // 分流；其他通道不认识这个字段，多传无害
+        const rawLink = String((body && body.linkOverride) || '').toLowerCase();
+        const linkOverride = ['utils', 'remote', 'solo'].includes(rawLink) ? rawLink : '';
         return handleDirect(req, res, {
           provider: direct, payload, channel, model, mapped: route.model,
           stream, startedAt, before, messages, region,
@@ -462,6 +467,7 @@ const routes = [
           // 漏传的话 traebao/auto 会静默走 solo 链路并正常计费——界面选了
           // 「免费」跑的却是扣积分的，比报错更难察觉。
           personalAssistant: route.personalAssistant,
+          linkOverride,
         });
       }
 

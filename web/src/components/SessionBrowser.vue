@@ -44,6 +44,15 @@
               </span>
               <span v-else class="text-slate-300">—</span>
             </template>
+            <template v-else-if="column.key === 'ops'">
+              <a-button
+                v-if="record.directory"
+                type="link"
+                size="small"
+                @click="openLocalFiles(record)"
+              >文件</a-button>
+              <span v-else class="text-slate-300 text-xs">—</span>
+            </template>
           </template>
           <template #expandedRowRender="{ record }">
             <a-descriptions size="small" :column="2" class="max-w-3xl">
@@ -141,11 +150,70 @@
         </template>
       </a-tab-pane>
     </a-tabs>
+
+    <!-- 本地工作目录浏览：会话产物文件（markdown 章节 / outline 等）。
+         不是对话消息——消息本体没有本地明文，标题如实叫「工作目录」。 -->
+    <a-drawer
+      v-model:open="localOpen"
+      :title="`工作目录：${localSession?.title || ''}`"
+      width="640"
+    >
+      <a-alert type="info" show-icon class="mb-3">
+        <template #message>这里是会话的工作产物</template>
+        <template #description>
+          对话消息本身没有本地明文（上游接口也不提供拉取）；目录与文件内容只读，穿越保护已锚定在会话工作区根下。
+        </template>
+      </a-alert>
+      <div v-if="localDir" class="text-xs text-slate-400 font-mono break-all mb-2">{{ localDir }}</div>
+      <a-spin :spinning="localLoading">
+        <a-alert v-if="localError" type="warning" show-icon class="mb-3" :message="localError" />
+        <a-table
+          v-if="!preview"
+          size="small"
+          :data-source="localEntries"
+          :columns="localColumns"
+          row-key="name"
+          :pagination="false"
+        >
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.key === 'name'">
+              <a-button
+                v-if="record.is_dir"
+                type="link" size="small" class="px-0"
+                @click="enterLocalDir(record.name)"
+              >📁 {{ record.name }}</a-button>
+              <a-button
+                v-else-if="record.readable"
+                type="link" size="small" class="px-0"
+                @click="previewLocalFile(record.name)"
+              >📄 {{ record.name }}</a-button>
+              <span v-else class="text-slate-400">{{ record.name }}</span>
+            </template>
+            <template v-else-if="column.key === 'size'">
+              {{ record.is_dir ? '—' : fmtSize(record.size) }}
+            </template>
+            <template v-else-if="column.key === 'mtime'">
+              {{ fmtTime(record.mtime) }}
+            </template>
+          </template>
+        </a-table>
+        <template v-else>
+          <div class="flex items-center justify-between mb-2">
+            <a-space>
+              <a-button v-if="relStack.length" size="small" @click="backLocalDir">← 上级目录</a-button>
+              <a-button size="small" @click="preview = null">返回文件列表</a-button>
+            </a-space>
+            <span class="font-mono text-xs">{{ preview.name }}</span>
+          </div>
+          <pre class="text-xs bg-slate-50 dark:bg-slate-800 rounded p-3 overflow-auto max-h-[70vh] whitespace-pre-wrap">{{ preview.text }}</pre>
+        </template>
+      </a-spin>
+    </a-drawer>
   </a-card>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   dumateApi,
   type DumateSession,
@@ -154,6 +222,7 @@ import {
   type DumateProjectsResp,
   type DumateConnectorsResp,
   type DumateTemplatesResp,
+  type LocalFileEntry,
 } from '@/api/dumate'
 
 // 后端三处查询互相独立（sessions/projects/connectors 各自 pickCookieAccount），
@@ -172,6 +241,7 @@ const sessionColumns = [
   { title: '更新时间', key: 'updated', width: 150 },
   { title: '来源', dataIndex: 'source', width: 90 },
   { title: '代码改动', key: 'diff', width: 130 },
+  { title: '工作目录', key: 'ops', width: 90 },
 ]
 // 项目行上游字段形状不定（多数账号为空）——一列 JSON 兜底，有结构了再拆列
 const genericColumns = [{ title: '数据', key: 'raw', ellipsis: true }]
@@ -206,6 +276,87 @@ async function loadAll() {
 function errShape<T extends { ok: boolean; error?: string }>(e: any): T {
   const msg = e?.response?.data?.error || e?.message || '请求失败'
   return { ok: false, error: msg } as T
+}
+
+// ── 本地工作目录浏览 ──
+// 锚定在后端做（safeLocalPath，穿越拒绝）；前端只带 dir + 相对路径。
+const localOpen = ref(false)
+const localLoading = ref(false)
+const localSession = ref<DumateSession | null>(null)
+const localDir = ref('')
+const localEntries = ref<LocalFileEntry[]>([])
+const localError = ref('')
+const preview = ref<{ name: string; text: string } | null>(null)
+
+const localColumns = [
+  { title: '文件', key: 'name', ellipsis: true },
+  { title: '大小', key: 'size', width: 90 },
+  { title: '修改时间', key: 'mtime', width: 150 },
+]
+
+const fmtSize = (n: number) =>
+  n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`
+
+async function openLocalFiles(session: DumateSession) {
+  localSession.value = session
+  localOpen.value = true
+  preview.value = null
+  relStack.value = []
+  await loadLocalDir(session.directory || '')
+}
+
+async function loadLocalDir(dir: string, rel = '') {
+  localLoading.value = true
+  localError.value = ''
+  try {
+    const r = await dumateApi.localFiles(rel ? `${dir}/${rel}` : dir)
+    // 子目录进入：后端锚定校验的是**完整路径**，相对路径直接拼进 dir 传
+    if (r.ok) {
+      localDir.value = r.dir || dir
+      localEntries.value = r.entries || []
+    } else {
+      localError.value = r.error || '读取失败'
+      localEntries.value = []
+    }
+  } catch (e: any) {
+    localError.value = e?.response?.data?.error || e?.message || '读取失败'
+  } finally {
+    localLoading.value = false
+  }
+}
+
+function enterLocalDir(name: string) {
+  if (!localSession.value) return
+  // 相对路径拼接由后端 resolve 校验——这里只负责拼字符串
+  const cur = currentRelPath.value
+  const next = cur ? `${cur}/${name}` : name
+  relStack.value.push(next)
+  loadLocalDir(localSession.value.directory || '', next)
+}
+
+function previewLocalFile(name: string) {
+  if (!localSession.value) return
+  const rel = currentRelPath.value ? `${currentRelPath.value}/${name}` : name
+  localLoading.value = true
+  dumateApi.readLocalFile(localSession.value.directory || '', rel).then((r) => {
+    if (r.ok && r.text != null) {
+      preview.value = { name: r.name || name, text: r.text }
+    } else {
+      localError.value = r.error || '读取失败'
+    }
+  }).catch((e: any) => {
+    localError.value = e?.response?.data?.error || e?.message || '读取失败'
+  }).finally(() => { localLoading.value = false })
+}
+
+// 相对路径栈：进入子目录 push，返回列表 pop——比字符串切割可靠
+const relStack = ref<string[]>([])
+const currentRelPath = computed(() => relStack.value[relStack.value.length - 1] || '')
+
+function backLocalDir() {
+  relStack.value.pop()
+  preview.value = null
+  if (localSession.value) loadLocalDir(localSession.value.directory || '', currentRelPath.value)
 }
 
 onMounted(loadAll)

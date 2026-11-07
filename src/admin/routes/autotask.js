@@ -179,6 +179,39 @@ const routes = [
       return sendJSON(res, 200, r);
     },
   },
+  // ── 低频余额刷新（2026-11-07 融合项 P1-5，本体在 src/balance-refresh.js）──
+  // 轻量读接口轮询 + FEFO 快照 + 冷却解冻；与 keepalive（每日全量闭环）分工。
+  // 端点挂在 /auto-checkin 前缀下——保号类运维聚在一处，端点形态与 keepalive 同款。
+  {
+    method: 'GET',
+    path: '/balance-refresh',
+    handler: ({ res }) => sendJSON(res, 200, { ok: true, ...require('../../balance-refresh').snapshot() }),
+  },
+  {
+    method: 'POST',
+    path: '/balance-refresh',
+    handler: ({ res, body }) => {
+      const br = require('../../balance-refresh');
+      try { br.configure(body || {}); } catch (e) {
+        return sendJSON(res, 400, { ok: false, error: e.message });
+      }
+      const s = br.snapshot();
+      require('../../admin/auth').audit('admin', 'balance_refresh_config',
+        s.enabled ? 'on' : 'off', `${s.minutes}min`);
+      return sendJSON(res, 200, { ok: true, ...s });
+    },
+  },
+  {
+    method: 'POST',
+    path: '/balance-refresh/run-now',
+    handler: async ({ res }) => {
+      const br = require('../../balance-refresh');
+      const r = await br.runOnce('manual');
+      require('../../admin/auth').audit('admin', 'balance_refresh_run', '',
+        `${r.ok_count || 0}/${r.accounts || 0}，解冻 ${r.unfrozen_count || 0}`);
+      return sendJSON(res, 200, r);
+    },
+  },
 ];
 
 module.exports = { routes, schedule, state };

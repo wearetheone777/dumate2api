@@ -627,4 +627,10 @@ const routes = [
   },
 ];
 
-module.exports = { routes, derive, pickTiers, buildDeepLink };
+module.exports = {
+  routes, derive, pickTiers, buildDeepLink,
+  // agent-setup（2026-11-07 融合项 P0-2）直写 Claude Code / Codex 配置文件时
+  // 复用同一份 env / TOML 生成器——两处各写一份必然漂移（cc-switch 里的
+  // 片段和直写文件的片段不同步，用户两边配置对不上还以为是网关坏了）。
+  buildClaudeEnv, buildCodexConfig, gatewayBase, TIER_NAMES, qoderRowsMerged,
+};

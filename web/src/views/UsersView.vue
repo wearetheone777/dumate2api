@@ -60,6 +60,117 @@
       </a-table>
     </a-card>
 
+    <!-- 审计日志（admin-only，viewer 会 403）：auth.audit 在 15+ 处埋点，
+         此前只有落盘没有读取口。倒序展示 + 动作/操作人筛选。 -->
+    <a-card v-if="isAdmin" :bordered="false" title="审计日志" class="mt-4">
+      <template #extra>
+        <a-space>
+          <a-select
+            v-model:value="auditAction"
+            size="small"
+            allow-clear
+            placeholder="全部动作"
+            style="width: 180px"
+            :options="auditActions.map((a) => ({ label: a, value: a }))"
+          />
+          <a-input v-model:value="auditActor" size="small" placeholder="操作人" style="width: 120px" allow-clear />
+          <a-button size="small" :loading="auditLoading" @click="loadAudit">刷新</a-button>
+        </a-space>
+      </template>
+      <a-table
+        size="small"
+        :columns="auditColumns"
+        :data-source="auditRows"
+        row-key="__i"
+        :loading="auditLoading"
+        :pagination="{ pageSize: 15, showSizeChanger: false }"
+      >
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'ts'">
+            <span class="num">{{ fmtTime(record.ts) }}</span>
+          </template>
+          <template v-else-if="column.key === 'action'">
+            <a-tag :color="auditTagColor(record.action)">{{ record.action }}</a-tag>
+          </template>
+          <template v-else-if="column.key === 'detail'">
+            <span class="text-xs break-all">{{ record.detail || '—' }}</span>
+          </template>
+        </template>
+      </a-table>
+      <div class="text-xs text-slate-400 mt-2">共 {{ auditTotal }} 条 · 展示最近 {{ auditRows.length }} 条</div>
+    </a-card>
+
+    <!-- 运维动作（admin-only，清单项 11/13/14）：每个写操作都落审计 -->
+    <a-card v-if="isAdmin" :bordered="false" title="运维动作" class="mt-4">
+      <a-alert type="warning" show-icon class="mb-3">
+        <template #message>这些是写操作，按下去立即生效</template>
+        <template #description>
+          池复位会把冷却/熔断/禁用的账号全部拉回健康——只在你确认是「误伤」时用；
+          日常恢复走保活的余额解冻闭环（仪表盘 → 排程设置）。
+        </template>
+      </a-alert>
+      <a-descriptions size="small" :column="1" class="max-w-2xl mb-3">
+        <a-descriptions-item label="桌面客户端版本">
+          <a-tag color="blue">{{ dupeVersion || '读取中…' }}</a-tag>
+          <span class="text-xs text-slate-400 ml-2">客户端自动升级会改变端点行为，升级后请复核模型探测与端口假设</span>
+        </a-descriptions-item>
+      </a-descriptions>
+      <a-space wrap>
+        <a-popconfirm title="把所有冷却/熔断/禁用账号复位为健康？仅确认是误伤时使用。" @confirm="reviveAll">
+          <a-button size="small" :loading="opsBusy.revive" danger>池一键复位</a-button>
+        </a-popconfirm>
+        <a-popconfirm title="8980 活着就不动；没在跑会拉起一个新 backend（需要 auth.json 有已登录账号）？" @confirm="relaunchUpstream">
+          <a-button size="small" :loading="opsBusy.relaunch">拉起上游 8980</a-button>
+        </a-popconfirm>
+        <a-button size="small" :loading="opsBusy.backup" @click="downloadBackup">导出配置备份</a-button>
+      </a-space>
+      <div class="text-xs text-slate-400 mt-2">
+        备份只含配置类文件（model-map / keys / 用户等）+ 账本行数清单；账本本体（requests/credits 等）请直接拷贝 data/ 目录。备份文件含 key 明文与密码哈希，按敏感凭据保管。
+      </div>
+    </a-card>
+
+    <!-- 热配置开关（livecfg，admin-only 编辑）：保存即时生效（网关按 mtime 重读），
+         不需要重启任何进程。viewer 看得到但控件禁用。 -->
+    <a-card :bordered="false" title="运行时开关（热配置）" class="mt-4">
+      <template #extra>
+        <a-button
+          v-if="isAdmin"
+          type="primary"
+          size="small"
+          :loading="liveSaving"
+          @click="saveLive"
+        >保存</a-button>
+      </template>
+      <div class="space-y-3 max-w-xl">
+        <div class="flex items-center justify-between">
+          <div>
+            <div>请求日志记录调用来源</div>
+            <div class="text-xs text-slate-400">关闭后请求日志不再记录 ip / ua（请求日志页的来源列将恒为空）</div>
+          </div>
+          <a-switch v-model:checked="liveForm.recordClientInfo" :disabled="!isAdmin" />
+        </div>
+        <div>
+          <div>隐藏模型（不进 /v1/models，客户端选不到）</div>
+          <a-select
+            v-model:value="liveForm.hiddenModels"
+            mode="tags"
+            :disabled="!isAdmin"
+            placeholder="输入模型 ID 后回车，如 gpt-4o"
+            style="width: 100%"
+            :token-separators="[',', ' ']"
+          />
+          <div class="text-xs text-slate-400 mt-1">只是不对外列出，客户端显式传这些名字仍然可用</div>
+        </div>
+        <div class="flex items-center justify-between">
+          <div>
+            <div>软冷却基数（毫秒）</div>
+            <div class="text-xs text-slate-400">0 = 回退内置默认；改的是 429/限流类退避的基数</div>
+          </div>
+          <a-input-number v-model:value="liveForm.softCooldownMs" :min="0" :disabled="!isAdmin" style="width: 140px" />
+        </div>
+      </div>
+    </a-card>
+
     <!-- 新建账户 -->
     <a-modal v-model:open="createOpen" title="新建账户" :confirm-loading="saving" @ok="submitCreate">
       <a-form layout="vertical">
@@ -87,7 +198,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { App as AntApp } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import client from '@/api/client'
@@ -207,5 +318,132 @@ async function removeUser(u: AdminUser) {
   }
 }
 
-onMounted(load)
+// ── 审计日志（admin-only）──
+const isAdmin = computed(() => auth.user?.role === 'admin')
+const auditRows = ref<Array<{ ts: number; actor: string; action: string; target: string; detail: string; __i: number }>>([])
+const auditActions = ref<string[]>([])
+const auditTotal = ref(0)
+const auditLoading = ref(false)
+const auditAction = ref<string | undefined>(undefined)
+const auditActor = ref('')
+
+const auditColumns = [
+  { title: '时间', key: 'ts', width: 150 },
+  { title: '操作人', dataIndex: 'actor', width: 110 },
+  { title: '动作', key: 'action', width: 150 },
+  { title: '对象', dataIndex: 'target', width: 150 },
+  { title: '详情', key: 'detail', ellipsis: true },
+]
+
+function auditTagColor(action: string) {
+  if (/delete|revoke|disable/i.test(action)) return 'red'
+  if (/create|save|enable|login/i.test(action)) return 'green'
+  return 'blue'
+}
+
+async function loadAudit() {
+  auditLoading.value = true
+  try {
+    const params = new URLSearchParams({ limit: '500' })
+    if (auditAction.value) params.set('action', auditAction.value)
+    if (auditActor.value.trim()) params.set('actor', auditActor.value.trim())
+    const { data } = await client.get(`/auth/audit?${params}`)
+    auditRows.value = (data.rows || []).map((r: any, i: number) => ({ ...r, __i: i }))
+    auditActions.value = data.actions || []
+    auditTotal.value = data.total || 0
+  } catch (e: any) {
+    if (e?.response?.status === 403) {
+      auditRows.value = []
+    } else {
+      message.error(e?.response?.data?.error || '审计加载失败')
+    }
+  } finally {
+    auditLoading.value = false
+  }
+}
+
+// ── 热配置开关（livecfg）──
+const liveSaving = ref(false)
+const liveForm = reactive({ recordClientInfo: true, hiddenModels: [] as string[], softCooldownMs: 0 })
+
+async function loadLive() {
+  try {
+    const { data } = await client.get('/system/config')
+    Object.assign(liveForm, data.config || {})
+  } catch (e) { /* 保持默认 */ }
+}
+
+async function saveLive() {
+  liveSaving.value = true
+  try {
+    await client.put('/system/config', { ...liveForm })
+    message.success('已保存，即时生效（网关按 mtime 重读，无需重启）')
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '保存失败')
+  } finally {
+    liveSaving.value = false
+  }
+}
+
+// ── 运维动作（清单项 11/13/14）──
+const dupeVersion = ref('')
+const opsBusy = reactive({ revive: false, relaunch: false, backup: false })
+
+async function loadVersion() {
+  try {
+    const { data } = await client.get('/system/dumate-version')
+    dupeVersion.value = data.version || '未检出'
+  } catch (e) { dupeVersion.value = '未检出' }
+}
+
+async function reviveAll() {
+  opsBusy.revive = true
+  try {
+    const { data } = await client.post('/system/pool-revive-all')
+    message.success(`已复位 ${data.revived}/${data.sick} 个账号`)
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '复位失败')
+  } finally { opsBusy.revive = false }
+}
+
+async function relaunchUpstream() {
+  opsBusy.relaunch = true
+  try {
+    const { data } = await client.post('/system/upstream-relaunch', {}, { timeout: 30000 })
+    if (data.ok) message.success(data.detail)
+    else message.error(data.detail || '失败')
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || e?.message || '触发失败')
+  } finally { opsBusy.relaunch = false }
+}
+
+async function downloadBackup() {
+  opsBusy.backup = true
+  try {
+    const res = await client.get('/system/backup', { responseType: 'blob' })
+    const url = URL.createObjectURL(res.data)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `dumate2api-backup-${new Date().toISOString().slice(0, 10)}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    message.success('备份已下载（含 key 明文，按敏感凭据保管）')
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '导出失败')
+  } finally { opsBusy.backup = false }
+}
+
+onMounted(() => {
+  load()
+  if (isAdmin.value) {
+    loadAudit()
+    loadLive()
+    loadVersion()
+  }
+})
+
+// 筛选变化自动重查（不用手动点刷新）
+watch([auditAction, auditActor], () => {
+  if (isAdmin.value) loadAudit()
+})
 </script>

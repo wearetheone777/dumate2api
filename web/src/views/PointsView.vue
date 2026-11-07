@@ -1129,6 +1129,9 @@
 
     <!-- 签到详情：按月份/年份查看。千问办公没有签到体系，不渲染。 -->
     <CheckinDetailCard v-if="!isQw && !isWb" />
+
+    <!-- 计费对账（跨通道）：qoder/traework 的逐模型实扣聚合，倍率漂移一页可见 -->
+    <ReconcileCard />
   </div>
 </template>
 
@@ -1138,6 +1141,7 @@ import * as echarts from 'echarts/core'
 import { BarChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
+import ReconcileCard from '@/components/ReconcileCard.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import CheckinDetailCard from '@/components/CheckinDetailCard.vue'
 import client from '@/api/client'

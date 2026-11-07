@@ -82,10 +82,26 @@ const routes = [
   {
     // 技能广场：端点不存在。这里给明确的「不支持」而不是让前端猜 URL。
     method: 'GET',
-    path: '/skills',
-    handler: async ({ res }) => {
+    path: '/skills',    handler: async ({ res }) => {
       const r = await api.skillsSquare();
       return sendJSON(res, 200, { skills: [], unsupported: true, error: r.error });
+    },
+  },
+  {
+    // 本地会话工作目录（2026-11-06 清单项 7）：dir = session 的 directory
+    // 字段（本机路径），file 省略 = 列目录，传 = 读文本。安全锚定在
+    // ~/.qianfan/workspace/sessions/ 下（dumate-web-api.safeLocalPath，
+    // 穿越一律拒绝）——directory 来自上游数据、file 来自用户，两个都
+    // 不可信。只读，单文件 2MB 上限。
+    method: 'GET',
+    path: '/local-files',
+    handler: async ({ res, req }) => {
+      const url = new URL(req.url, 'http://localhost');
+      const dir = url.searchParams.get('dir') || '';
+      const file = url.searchParams.get('file');
+      if (!dir) return sendJSON(res, 400, { ok: false, error: 'dir 参数必填（会话的 directory）' });
+      if (file === null) return sendJSON(res, 200, api.listLocalFiles(dir));
+      return sendJSON(res, 200, api.readLocalFile(dir, file));
     },
   },
   {

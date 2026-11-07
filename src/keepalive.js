@@ -661,6 +661,25 @@ async function runOnce(trigger = 'manual', opts = {}) {
       require('./admin/auth').audit('system', 'keepalive', '',
         `${trigger}: ${units.length} 号，解冻 ${rec.unfrozen.length}${token.aborted ? '（中断）' : ''}`);
     } catch (e) { /* 审计不可用不阻塞结果 */ }
+    // crit 告警推送（2026-11-06 清单项 4）：轮次结束时判一次健康面，crit>0
+    // 才推——warn 是「要留意」，推消息会养成狼来了。fire-and-forget：推送
+    // 挂了不阻塞本轮返回（notify.sendNotify 内部已兜错，这里再兜一层）。
+    // web 账号行惰性 require web-pool（同进程标准快照；无循环依赖——
+    // web-pool 不依赖 keepalive）。
+    setImmediate(() => {
+      try {
+        const notify = require('./notify');
+        if (!notify.loadConfig().enabled) return;
+        const webPool = require('./web-pool');
+        const crits = healthAlerts({ ka: { enabled: state.enabled, last_result: state.last_result }, webAccounts: webPool.snapshot() })
+          .filter((a) => a.level === 'crit');
+        if (!crits.length) return;
+        const lines = crits.map((a) => `[${a.channel}] ${a.account || '—'}: ${a.message}`);
+        notify.sendNotify(`【dumate2api 健康告警】${crits.length} 个危险项\n${lines.join('\n')}`)
+          .then((r) => { if (!r.ok) console.warn('[keepalive] 告警推送失败:', r.error); })
+          .catch(() => { /* 通知挂了不拖挂保活 */ });
+      } catch (e) { /* 通知面任何异常都不影响保活轮 */ }
+    });
     return state.last_result;
   } finally {
     activeRuns.delete(token);

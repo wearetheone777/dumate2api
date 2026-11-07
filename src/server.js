@@ -11,6 +11,11 @@ const media = require('./media');
 const { cachedTokensOf } = require('./usage-norm');
 const { resolveMaxTokens, resolveQwenMaxTokens, resolveTraeworkMaxTokens, resolveQoderMaxTokens } = require('./budget');
 const webFallback = require('./fallback-web');
+// dumate-points 伪模型（2026-11-07 融合项 P0-1）：网页池余额读数走 /v1 面，
+// 让 Codex / Claude Code 这类只看得到网关的 Agent 能自己查「还能跑多少」
+const dumatePoints = require('./dumate-points');
+// 进程身份（2026-11-07 融合项 P1-6）：/health 的 role 字段 + X-Service 响应头
+const serviceIdentity = require('./service-identity');
 
 // 按通道选用预算策略。收敛在这里而不是在四个调用点各写一遍 if——
 // 分开写必然漂移（曾经就漏了千问，导致小预算直接截断正文）。
@@ -224,12 +229,16 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   // provider 解析出**实际发给上游的模型 key** 后回调（目前只有 Qoder 报）。
   // `route.model` 只是去掉前缀的调用方写法，显示名有没有解析成功看不出来。
   const onModel = (name) => { if (name) req._mappedModel = String(name); };
+  // 链路上报（2026-11-06）：traework 的三条链路（utils_chat / remote / solo）
+  // 实际走哪条只有通道知道——req 上存一下，logRequest 落 link 字段。
+  // 没有「链路」概念的通道不上报，字段留空，前端不显示。
+  const onLink = (link) => { if (link) req._link = String(link); };
 
   try {
     // TRAE 宝身份标记（2026-11-03）：resolve() 把 `traebao/` 前缀剥掉后才到
     // provider 手里，send() 靠 payload.model 认不出身份——显式经 opts 传。
     if (route.personalAssistant) req._personalAssistant = true;
-    const providerOpts = { reqId, onAccount, onModel, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
+    const providerOpts = { reqId, onAccount, onModel, onLink, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
       const result = await provider.send(payload, undefined, providerOpts);
@@ -775,6 +784,9 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 记 id 而不是名字：名字可改，改名后按名字聚合的历史会全部对不上号。
     // 名称另存一份，便于日志直接可读。
     key_id: (req._apiKey && req._apiKey.id) || 0,
+    // 子 Key 的父 id（2026-11-08）：reqlog.record 据此把 token 同时计入父
+    // Key 的配额桶（家庭配额）。0 = 独立 Key
+    key_parent_id: (req._apiKey && req._apiKey.parent_id) || 0,
     key: (req._apiKey && req._apiKey.name) || '',
     // 这条请求实际用了哪个上游账号。**权威来源是 provider 上报的**
     // （req._upstreamAccount，多账号轮询下「实际用的那个」只有它知道）；
@@ -784,6 +796,10 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 区域（2026-11-03 国际版）：traework/qoder 的直连请求随账号记录
     // cn/intl，请求日志与用量据此拆分。搭子/千问纯国内，不记（空串）。
     region: req._upstreamRegion || '',
+    // 对话链路（2026-11-06）：traework 的 utils_chat / remote / solo——同一
+    // 通道三条链路的上游端点、计费口径、能力都不同，排障先看这个。
+    // 其他通道不上报，留空。
+    link: req._link || '',
     ...(extra || {}),
   });
 
@@ -874,19 +890,50 @@ async function handleOpenAIModels(req, res) {
   const cfg = modelmap.load();
   const created = Math.floor(Date.now() / 1000);
   const upstream = new Set(cfg.upstream_models);
-  let data = cfg.exposed.map((id) => ({
-    id,
+  // 实测元数据（2026-11-07 融合项 P1-4）：上下文 / 输出上限按映射 target 查
+  // DUMATE_REAL（与模型页同一份数据，单一来源）。**只在有实测依据时透出**——
+  // 查不到就不带字段，而不是给个猜测值：搭子超限是整轮失败而非截断，
+  // 客户端拿着编造的 128K 窗口把超长上下文发过来，比少一个字段害得多。
+  const realOf = (id) => {
+    try {
+      const mi = require('./model-info');
+      return mi.dumateRealOf(mi.dumateTargetOf(id));
+    } catch (e) { return null; }
+  };
+  let data = cfg.exposed.map((id) => {
+    const real = realOf(id);
+    return {
+      id,
+      object: 'model',
+      created,
+      // 分组按「映射后是否落到上游真名」判：暴露列表现在是**真实后端名**
+      // （deepseek-v4.1-flash-low-latency 等，经别名映射到上游槽位），客户端
+      // （cc-switch 按 owned_by 分组）看到的组名仍是 dumate；只有兜底型的
+      // 名字才算 dumate-proxy。
+      owned_by: upstream.has(modelmap.mapModel(id)) ? 'dumate' : 'dumate-proxy',
+      // 可读名来自 modelmap.displayName：真实后端名的条目 name===id；
+      // 带上 name 是为了与其它通道形状一致。
+      name: modelmap.displayName(id),
+      // contextWindow / maxContextWindow 与千问、TRAE 条目同形状
+      // （cc-switch 读这两个字段）；maxOutputTokens 是上游实测输出上限
+      // （网关的输出预算下限是另一回事，不在这声明）。
+      ...(real ? {
+        contextWindow: real.context,
+        maxContextWindow: real.context,
+        maxOutputTokens: real.maxTokens,
+      } : {}),
+    };
+  });
+  // dumate-points 伪模型（2026-11-07 融合项 P0-1）：余额读数入口——列表里
+  // 可发现才有人用。owned_by 用 dumate-proxy：它不是上游真名，也没有 chat
+  // 语义，选中它只会拿到余额文本（零消耗、不打对话上游）。
+  data.push({
+    id: dumatePoints.NAME,
     object: 'model',
     created,
-    // 分组按「映射后是否落到上游真名」判：暴露列表现在是**真实后端名**
-    // （deepseek-v4.1-flash-low-latency 等，经别名映射到上游槽位），客户端
-    // （cc-switch 按 owned_by 分组）看到的组名仍是 dumate；只有兜底型的
-    // 名字才算 dumate-proxy。
-    owned_by: upstream.has(modelmap.mapModel(id)) ? 'dumate' : 'dumate-proxy',
-    // 可读名来自 modelmap.displayName：真实后端名的条目 name===id；
-    // 带上 name 是为了与其它通道形状一致。
-    name: modelmap.displayName(id),
-  }));
+    owned_by: 'dumate-proxy',
+    name: '积分余额查询（伪模型 · 零消耗 · 不打对话上游）',
+  });
 
   // 千问办公的模型带 qwen/ 前缀列出来，否则客户端无从发现这个通道
   // （它们不在 modelmap 里——那套别名是搭子专用的）。
@@ -1279,6 +1326,55 @@ async function handleFileUpload(req, res) {
   }
 }
 
+/**
+ * dumate-points 伪模型（2026-11-07 融合项 P0-1，思路来自 dumate-api）：
+ * 网页池余额读数包装成 chat 响应。不路由到任何上游模型、token 全 0 是真实
+ * 计量（没打模型）；查询本身打的是网页端读接口，零积分消耗。
+ * OpenAI 与 Anthropic 两个入口共用；流式各自出标准事件序列。
+ */
+async function handlePointsModel(req, res, { protocol, stream, startedAt, info }) {
+  req._channel = 'dumate';
+  req._mappedModel = dumatePoints.NAME;
+  let text;
+  try {
+    const s = await dumatePoints.summaryCached();
+    text = dumatePoints.renderText(s);
+  } catch (e) {
+    // 读数整体挂了（如账号文件读不到）也要给调用方一个可读的答复——
+    // 伪模型是信息入口，抛 5xx 只会让 Agent 把它当成通道故障重试
+    text = `积分查询失败：${e.message}（本次请求零消耗）`;
+  }
+  const sseHeaders = {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    ...(res._cors || {}),
+  };
+  if (protocol === 'anthropic') {
+    if (stream) {
+      res.writeHead(200, sseHeaders);
+      for (const ev of dumatePoints.anthropicEvents(text)) {
+        res.write(`event: ${ev.event}\ndata: ${JSON.stringify(ev.data)}\n\n`);
+      }
+      res.end();
+    } else {
+      sendJSON(res, 200, dumatePoints.anthropicBody(text));
+    }
+  } else {
+    if (stream) {
+      res.writeHead(200, sseHeaders);
+      for (const chunk of dumatePoints.openAIChunks(text)) {
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      sendJSON(res, 200, dumatePoints.openAIBody(text));
+    }
+  }
+  logRequest(req, res, startedAt, info, 200, { input: 0, output: 0, total: 0 });
+}
+
 async function handleOpenAIChat(req, res) {
   const startedAt = Date.now();  const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
@@ -1302,6 +1398,12 @@ async function handleOpenAIChat(req, res) {
   const route = router.resolve(reqBody.model);
   if (route.error) {
     return sendJSON(res, 400, { error: { message: route.error, type: 'invalid_request_error' } });
+  }
+  // dumate-points 伪模型（2026-11-07 融合项 P0-1）：拦截在 availability 之前
+  // ——余额读数不依赖搭子通道的就绪状态（桌面没开、网页池整体冷却中，
+  // 都不影响「看余额」这件事本身）。
+  if (route.channel === 'dumate' && route.model === dumatePoints.NAME) {
+    return await handlePointsModel(req, res, { protocol: 'openai', stream: !!reqBody.stream, startedAt, info });
   }
   const avail = router.availability(route.channel);
   if (!avail.ok) {
@@ -1762,6 +1864,11 @@ async function handleAnthropicMessages(req, res) {
   if (route.error) {
     return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: route.error } });
   }
+  // dumate-points 伪模型（2026-11-07 融合项 P0-1）：Claude Code 全程走本入口，
+  // 不拦这里它就查不了余额。同样在 availability 之前（理由见 chat 路径）。
+  if (route.channel === 'dumate' && route.model === dumatePoints.NAME) {
+    return await handlePointsModel(req, res, { protocol: 'anthropic', stream: !!anthropicReq.stream, startedAt, info });
+  }
   const avail = router.availability(route.channel);
   if (!avail.ok) {
     return sendJSON(res, 503, { type: 'error', error: { type: 'api_error', message: `channel ${route.channel} unavailable: ${avail.reason}` } });
@@ -2144,8 +2251,15 @@ const server = http.createServer(async (req, res) => {
   try {
     // Health check
     if (url === '/health' || url === '/ping') {
+      // 进程身份（2026-11-07 融合项 P1-6）：service 是品牌级判据，role 区分
+      // 入口（gateway / gateway-stable）。响应头同步带 X-Service——只看 JSON
+      // 的探测方读字段，看头的负载均衡读头。强校验用带 Key 的 /v1/models，
+      // 弱校验判 service 字段（与 workbuddy2api 面板同口径）。
+      const identity = serviceIdentity.identity('gateway');
       return sendJSON(res, 200, {
         status: 'ok',
+        service: identity.service,
+        role: identity.role,
         upstream_port: upstreamPort,
         upstream_managed: upstreamManaged,
         // 鉴权强制开启（2026-11-01），恒 true。保留字段是为了管理端探测
@@ -2245,8 +2359,9 @@ const server = http.createServer(async (req, res) => {
             }
           })(),
         },
-        service: 'dumate2api',
-      });
+        service: identity.service,
+        role: identity.role,
+      }, { 'X-Service': identity.service });
     }
 
     // ==================== API Key 鉴权（强制，2026-11-01）====================
@@ -2310,6 +2425,19 @@ const server = http.createServer(async (req, res) => {
 
       const verdict = keysvc.validate(key, reqlog.clientIP(req), model, reqChannel);
       if (!verdict.ok) {
+        // 配额超限是 429（客户端自动退避，本地零点重置），不是 403——
+        // 403 会让客户端当硬失败直接放弃。
+        if (verdict.reason === 'quota_exceeded') {
+          req._logPath = url;
+          return sendJSON(res, 429, {
+            error: {
+              message: `Daily quota exceeded: ${verdict.detail}`,
+              type: 'rate_limit_error',
+              code: 'quota_exceeded',
+              reset_at: verdict.reset_at,
+            },
+          });
+        }
         const status = key ? 403 : 401;
         req._logPath = url;
         return sendJSON(res, status, {
@@ -2547,7 +2675,17 @@ async function start() {
       : '✓ 鉴权强制开启：模型端点要求管理端登记的 API key（DUMATE_REQUIRE_KEY 已废除，无需设置）');
     try {
       if (!keysvc.list().length) {
-        log('⚠ 当前没有任何登记 key：所有模型请求都会 401。到管理端「API Key」页创建一把再使用。');
+        // 首启自举（2026-11-08，调研 P2-9）：监听非回环地址时自动签发一把，
+        // 明文只在这里打印一次——否则「端口暴露 + 空 key 集合」等于所有模型
+        // 请求 401，用户手里没有任何可用凭证。
+        const boot = keysvc.ensureFirstRun(PROXY_HOST);
+        if (boot) {
+          log(`⚠ 监听 ${PROXY_HOST}（非回环）且没有任何 Key——已自动生成首启凭证`);
+          log(`  Key: ${boot.token}`);
+          log('  该明文只在这里打印一次；管理端「API Key」页可随时查看复制。');
+        } else {
+          log('⚠ 当前没有任何登记 key：所有模型请求都会 401。到管理端「API Key」页创建一把再使用。');
+        }
       }
     } catch (e) { /* keys.json 读不到不影响启动 */ }
     if (!cors.allowlistSize()) {

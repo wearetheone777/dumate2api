@@ -1299,6 +1299,36 @@
         <div class="text-xs text-slate-400 -mt-2">
           时点 + 随机后延只往后不往前（留在低峰窗口）；错过时点（关机/重启）会在下次启动时自动补跑，签到接口幂等不会重复领取。
         </div>
+
+        <a-divider class="my-3" />
+        <div class="text-sm font-medium mb-2">告警推送（crit 级 → webhook）</div>
+        <div class="text-xs text-slate-400 mb-3">
+          保活轮结束时判定健康面，<b>只推危险项</b>（cookie 失效 / 账号禁用）——警告级只在面板横幅里提示，推消息会养成狼来了。
+        </div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between">
+            <span>启用推送</span>
+            <a-switch v-model:checked="notifyForm.enabled" />
+          </div>
+          <div class="flex items-center justify-between">
+            <span>平台</span>
+            <a-select v-model:value="notifyForm.type" style="width: 140px" :options="notifyTypeOptions" />
+          </div>
+          <div>
+            <div class="text-xs text-slate-500 mb-1">
+              {{ notifyForm.type === 'telegram' ? 'Bot API 地址（https://api.telegram.org/bot&lt;token&gt;）' : 'Webhook 地址' }}
+            </div>
+            <a-input v-model:value="notifyForm.url" size="small" placeholder="https://…" />
+          </div>
+          <div v-if="notifyForm.type === 'telegram'">
+            <div class="text-xs text-slate-500 mb-1">Chat ID</div>
+            <a-input v-model:value="notifyForm.chat_id" size="small" placeholder="如 123456789" />
+          </div>
+          <a-space>
+            <a-button size="small" :loading="notifySaving" @click="saveNotify">保存推送配置</a-button>
+            <a-button size="small" :loading="notifyTesting" @click="onTestNotify">发送测试</a-button>
+          </a-space>
+        </div>
       </div>
     </a-modal>
 
@@ -1539,8 +1569,7 @@
       </a-col>
 
       <a-col :xs="24" :lg="12">
-        <a-card title="本地代理账号" :bordered="false">
-          <a-table
+        <a-card title="本地代理账号" :bordered="false">          <a-table
             size="small"
             :pagination="false"
             :data-source="accounts?.accounts ?? []"
@@ -1564,8 +1593,15 @@
       </a-col>
     </a-row>
 
+    <!-- MCP / CLI 接入（清单项 8）：让 MCP 宿主与终端直接用搭子，产品形态的入口 -->
+    <McpAccessCard class="mt-4" />
+
     <a-alert v-if="error" type="warning" show-icon class="mt-4" :message="`部分数据获取失败：${error}`" />
     </template>
+
+    <!-- 跨通道额度总览（P2-10）：与当前通道无关的全局视野，五个通道分支
+         共用一张卡，放在页面底部不抢各通道自己的首屏信息层级 -->
+    <ChannelBalanceCard ref="balanceCard" class="mt-4" />
   </div>
 </template>
 
@@ -1574,6 +1610,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } 
 import { useRouter } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import TodayUsageCard from '@/components/TodayUsageCard.vue'
+import McpAccessCard from '@/components/McpAccessCard.vue'
+import ChannelBalanceCard from '@/components/ChannelBalanceCard.vue'
 import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
 import { qoderApi, type QoderDashboardAccount, type QoderCreditRow, type QoderGrant } from '@/api/qoder'
 import { qwenworkApi, type QwCredits, type QwDailyRow, type QwAccount, type QwCreditRecord, type QwAccountsSummary } from '@/api/qwenwork'
@@ -1588,7 +1626,11 @@ import type {
   TraeworkCreditsSummary, TraeworkExpiring,
 } from '@/api/traework'
 import client from '@/api/client'
-import { fetchKeepaliveHealth, fetchKeepaliveConfig, saveKeepaliveConfig, runKeepaliveOnce, type KeepaliveHealth, type KeepaliveConfig } from '@/api/health'
+import {
+  fetchKeepaliveHealth, fetchKeepaliveConfig, saveKeepaliveConfig, runKeepaliveOnce,
+  fetchNotifyConfig, saveNotifyConfig, testNotify,
+  type KeepaliveHealth, type KeepaliveConfig, type NotifyConfig, type NotifyType,
+} from '@/api/health'
 import { App } from 'ant-design-vue'
 import type { SystemStatus } from '@/api/system'
 import type { PointsData, AccountsData } from '@/api/points'
@@ -1654,6 +1696,8 @@ const healthOpen = ref(false)
 const loading = ref(false)
 const error = ref('')
 const lastRefresh = ref('')
+/** 跨通道额度卡（页头刷新时一并刷新；它自己也有刷新按钮） */
+const balanceCard = ref<InstanceType<typeof ChannelBalanceCard> | null>(null)
 
 // 通道：千问办公是另一套账（积分/登录态），整块内容与搭子不同。
 // 用 store 的全局状态而不是本地 ref —— 顶栏切换器与这里必须一致。
@@ -2423,6 +2467,14 @@ async function openSchedModal() {
   } catch (e) {
     // 拉不到配置就用当前表单默认值（保存时后端白名单校验兜底）
   }
+  // 推送配置与排程同 modal 不同端点；失败静默（表单默认关，不会误推）
+  try {
+    const n = await fetchNotifyConfig()
+    notifyForm.enabled = n.enabled
+    notifyForm.type = (n.type as NotifyType) || 'feishu'
+    notifyForm.url = n.url || ''
+    notifyForm.chat_id = n.chat_id || ''
+  } catch (e) { /* 保持默认 */ }
 }
 
 async function saveSched() {
@@ -2452,7 +2504,47 @@ async function onRunKeepalive() {
   }
 }
 
+// ── 告警推送配置（crit → webhook，独立保存——与排程配置是两个端点两份数据）──
+const notifyTypeOptions = [
+  { label: '飞书机器人', value: 'feishu' },
+  { label: '企业微信机器人', value: 'wecom' },
+  { label: '钉钉机器人', value: 'dingtalk' },
+  { label: 'Telegram Bot', value: 'telegram' },
+  { label: '通用 JSON', value: 'generic' },
+]
+const notifySaving = ref(false)
+const notifyTesting = ref(false)
+const notifyForm = reactive<NotifyConfig>({ enabled: false, type: 'feishu', url: '', chat_id: '' })
+
+async function saveNotify() {
+  notifySaving.value = true
+  try {
+    await saveNotifyConfig({ ...notifyForm })
+    message.success(notifyForm.enabled ? '推送配置已保存并启用' : '推送配置已保存（当前未启用）')
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || e?.message || '保存失败')
+  } finally {
+    notifySaving.value = false
+  }
+}
+
+async function onTestNotify() {
+  notifyTesting.value = true
+  try {
+    const r = await testNotify()
+    if (r.ok) message.success('测试消息已发送，请到对应平台查收')
+    else message.error(r.error || '发送失败')
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || e?.message || '发送失败')
+  } finally {
+    notifyTesting.value = false
+  }
+}
+
 async function refresh(force = false) {
+  // 跨通道额度卡与当前通道无关（五个分支看同一张卡），页头刷新一并触发；
+  // 不 await——它是独立的慢查询，不该拖住当前通道自己的首屏
+  balanceCard.value?.load(force)
   if (isTw.value) return refreshTw()
   if (isQw.value) return refreshQw()
   if (isQd.value) return refreshQd()

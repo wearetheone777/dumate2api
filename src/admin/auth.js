@@ -280,6 +280,13 @@ function audit(actor, action, target = '', detail = '') {
   });
 }
 
+// 审计读取（GET /auth/audit 用）：倒序返回，坏行静默跳过（appendJSONL 的
+// 轮转/截断可能产生半行，一条坏行不该让整份审计打不开）。
+function readAudit() {
+  const { readJSONL } = require('./store');
+  return readJSONL('admin-audit.jsonl').reverse().filter((r) => r && r.ts);
+}
+
 function parseCookies(req) {
   const out = {};
   const raw = req.headers.cookie || '';
@@ -326,6 +333,7 @@ module.exports = {
   recordFail,
   clearFail,
   audit,
+  readAudit,
   parseCookies,
   currentUser,
 };

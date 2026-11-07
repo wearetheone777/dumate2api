@@ -331,6 +331,113 @@ const routes = [
       });
     },
   },
+  {
+    // ── 运维动作（2026-11-07 清单项 11）──三个写操作都是 admin-only
+    //（router 层对非 GET 统一强制），每个都落审计。
+
+    // 池一键复活：把所有非健康账号（冷却/熔断/禁用/暂停）逐个 revive。
+    // 用途：明确知道是「误伤」（比如限流被放大成熔断的那次教训）后的快速复位，
+    // 不是日常操作——日常恢复走 keepalive 的余额解冻闭环。
+    method: 'POST',
+    path: '/pool-revive-all',
+    handler: ({ res }) => {
+      const { pool } = require('../../pool');
+      const rows = pool.snapshot() || [];
+      const sick = rows.filter((r) => r.state !== 'healthy');
+      const revived = [];
+      for (const r of sick) {
+        try { pool.revive(String(r.id)); revived.push({ id: r.id, uid: r.uid || String(r.id) }); } catch (e) { /* 单个失败不影响其余 */ }
+      }
+      require('../../admin/auth').audit('admin', 'pool_revive_all', '', `${revived.length}/${sick.length} 复位`);
+      return require('../router').sendJSON(res, 200, { ok: true, revived: revived.length, sick: sick.length, detail: revived });
+    },
+  },
+  {
+    // 上游拉起：8980 活着就不动（already_running）；死了 spawn 一个新的并等端口。
+    // launcher 是无条件 spawn + 钉死 -port 8980（见 upstream-launcher.js 注释），
+    // 所以「重拉」的正确语义是先探测再决定，不是无脑 spawn（端口被占时新进程
+    // 绑定失败白死一个）。
+    method: 'POST',
+    path: '/upstream-relaunch',
+    handler: async ({ res }) => {
+      const launcher = require('../../upstream-launcher');
+      const alive = await launcher.waitForPort(8980, '127.0.0.1', 1500).catch(() => false);
+      if (alive) {
+        return require('../router').sendJSON(res, 200, { ok: true, action: 'already_running', detail: '8980 已在监听，未动它' });
+      }
+      try {
+        const { pid } = await launcher.ensureUpstreamProcess(8980);
+        const up = await launcher.waitForPort(8980, '127.0.0.1', 20000).catch(() => false);
+        require('../../admin/auth').audit('admin', 'upstream_relaunch', '8980', up ? 'spawned' : 'spawn 后端口未就绪');
+        return require('../router').sendJSON(res, 200, {
+          ok: up, action: 'spawned', pid,
+          detail: up ? '已拉起并确认 8980 就绪' : '进程已 spawn 但 20 秒内端口未就绪——看登录态是否有效（launcher 需要 auth.json 有已登录账号）',
+        });
+      } catch (e) {
+        require('../../admin/auth').audit('admin', 'upstream_relaunch', '8980', `失败: ${e.message}`);
+        return require('../router').sendJSON(res, 200, { ok: false, action: 'failed', detail: e.message });
+      }
+    },
+  },
+  {
+    // 配置备份导出（2026-11-07 清单项 14）：**配置类**文件合并成单 JSON 下载；
+    // 账本（requests/credits 等，最大的 11MB+）不进包，只给行数清单——
+    // 备份的目的是「换机/重装时把配置带走」，账本要整目录拷贝。
+    method: 'GET',
+    path: '/backup',
+    handler: async ({ res }) => {
+      const fs = require('fs');
+      const path = require('path');
+      const { DATA_DIR } = require('../store');
+      const CONFIG_FILES = ['model-map.json', 'keepalive.json', 'notify.json', 'keys.json', 'hot-config.json', 'admin-users.json'];
+      const config = {};
+      for (const f of CONFIG_FILES) {
+        const p = path.join(DATA_DIR, f);
+        if (fs.existsSync(p)) {
+          try { config[f] = JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { config[f] = { __error: e.message }; }
+        }
+      }
+      const ledgers = {};
+      for (const f of fs.readdirSync(DATA_DIR).filter((x) => x.endsWith('.jsonl'))) {
+        try {
+          ledgers[f] = fs.readFileSync(path.join(DATA_DIR, f), 'utf8').split('\n').filter(Boolean).length;
+        } catch (e) { ledgers[f] = -1; }
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Content-Disposition': `attachment; filename="dumate2api-backup-${new Date().toISOString().slice(0, 10)}.json"`,
+      });
+      return res.end(JSON.stringify({
+        exported_at: new Date().toISOString(),
+        note: 'keys.json 含 API key 明文与 admin-users.json 含密码哈希——备份文件请按敏感凭据保管；账本（jsonl）请直接拷贝 data/ 目录',
+        config,
+        ledgers,
+      }, null, 2));
+    },
+  },
+  {
+    // 桌面客户端版本（2026-11-07 清单项 13）：从注册表 Uninstall 键读
+    // DisplayVersion。客户端自动升级会改变端点行为（社区实测的端口漂移
+    // 就是升级带来的），管理端先要能「看见当前装的是哪个版本」。
+    // reg query 走异步 exec + 5 秒超时——PowerShell 冷启动 5 秒以上的教训
+    // 在 system.js 头注释里写着，绝不能同步 exec 卡事件循环。
+    method: 'GET',
+    path: '/dumate-version',
+    handler: async ({ res }) => {
+      const { exec } = require('child_process');
+      const version = await new Promise((resolve) => {
+        const cmd = 'reg query HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall /s /f "DuMate" /d';
+        const t = setTimeout(() => resolve(null), 5000);
+        exec(cmd, { timeout: 4500 }, (err, stdout) => {
+          clearTimeout(t);
+          if (err) return resolve(null);
+          const m = String(stdout || '').match(/DuMate\s+([\d.]+)/);
+          resolve(m ? m[1] : null);
+        });
+      });
+      return require('../router').sendJSON(res, 200, { ok: true, version, hint: version ? null : '注册表查询失败或未安装（5 秒超时也可能只是机器忙）' });
+    },
+  },
 ];
 
 module.exports = { routes };

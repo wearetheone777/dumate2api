@@ -12,6 +12,7 @@ const WebAccounts = () => import('@/views/WebAccountsView.vue')
 const Usage = () => import('@/views/UsageView.vue')
 const ReqLogs = () => import('@/views/ReqLogsView.vue')
 const ChatLab = () => import('@/views/ChatLabView.vue')
+const AgentSetup = () => import('@/views/AgentSetupView.vue')
 const Users = () => import('@/views/UsersView.vue')
 
 const router = createRouter({
@@ -31,6 +32,8 @@ const router = createRouter({
         { path: 'usage', component: Usage, meta: { title: '用量统计', key: 'usage' } },
         { path: 'reqlogs', component: ReqLogs, meta: { title: '请求日志', key: 'reqlogs' } },
         { path: 'chatlab', component: ChatLab, meta: { title: '聊天测试台', key: 'chatlab' } },
+        // 接入配置写本机客户端文件，只对 admin 有意义（与账户管理同款限制）
+        { path: 'setup', component: AgentSetup, meta: { title: '接入配置', key: 'setup', adminOnly: true } },
         { path: 'users', component: Users, meta: { title: '账户管理', key: 'users', adminOnly: true } },
         // 「任务记录」已并入「积分明细」（见 CLAUDE.md）。这里保留重定向：
         // 旧书签、浏览器历史、后退键都会命中 #/records，没有它会渲染成空白页

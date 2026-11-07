@@ -136,6 +136,22 @@ function normalize(m) {
     // 形状——Trae2api-cn 的 resolve_model_config 产物就是上游返回的整行，
     // 归一化字段子集重构不出来）。只读引用，归一化行不序列化落盘。
     customModel: m || null,
+    // 思考档位摘要（2026-11-06，前端模型卡展示）：descriptor 显式声明
+    // support_thinking 且给出 options 才有——模型名不是能力证据。
+    // 判据与 remote.supportedLevels 一致（内联避免数据层依赖传输层）。
+    reasoningEfforts: (() => {
+      const cfg = m.reasoning_effort_config || m.reasoningEffortConfig;
+      if (!cfg || typeof cfg !== 'object' || cfg.support_thinking !== true) return null;
+      const opts = Array.isArray(cfg.options) ? cfg.options : [];
+      const levels = ['light', 'high', 'extra_high'].filter((l) => opts.map(String).includes(l));
+      return levels.length ? levels : null;
+    })(),
+    // 1M Max 摘要：descriptor 显式 max_mode + detail 的输入/输出上限齐备。
+    // 与 remote.supportsMaxMode 同判据（≥1M 的上下文由 maxModeFields 从
+    // context_window_size(s) 取，这里只做「声明了没」的摘要）。
+    maxMode: m.max_mode === true
+      && Number(detail.prompt_max_tokens) > 0
+      && Number(detail.max_tokens) > 0,
   };
 }
 

@@ -125,6 +125,15 @@
               option-filter-prop="label"
             />
             <a-select v-model:value="streamMode" size="small" style="width: 104px" :options="streamOptions" />
+            <!-- 链路指定（2026-11-06，#15）：traework 三条链路显式试调——
+                 自动分流排障时用「按配置」之外的两档压过它。其他通道不显示 -->
+            <a-select
+              v-if="labChannel === 'traework'"
+              v-model:value="linkOverride"
+              size="small"
+              style="width: 96px"
+              :options="linkOptions"
+            />
           </div>
 
           <div class="bar-right">
@@ -197,6 +206,17 @@ const scrollEl = ref<HTMLElement | null>(null)
 const streamOptions = [
   { label: '流式输出', value: 'stream' },
   { label: '非流式', value: 'plain' },
+]
+
+// 链路指定（2026-11-06，#15）：仅 traework 显示。「按配置」走自动分流
+// （REMOTE/SOLO 开关的优先级）；另两档显式压过自动分流做链路对照试调。
+// solo 强制时带 tools 的请求会如实失败（上游 400 已知）——这正是实验价值。
+const linkOverride = ref('')
+const linkOptions = [
+  { label: '按配置', value: '' },
+  { label: 'utils_chat', value: 'utils' },
+  { label: 'remote', value: 'remote' },
+  { label: 'solo raw', value: 'solo' },
 ]
 
 // 通道选择：测试台原本只能靠手打 `qwen/` 前缀走千问，这里给个下拉。
@@ -477,7 +497,7 @@ async function send() {
     if (streamMode.value === 'plain') {
       const { data } = await client.post('/chatlab/chat', {
         model: model.value, messages: history, stream: false,
-        region: regionParam(),
+        region: regionParam(), linkOverride: linkOverride.value,
       })
       target.content = data.content || '(空回答)'
       target.reasoning = data.reasoning || ''
@@ -496,7 +516,7 @@ async function send() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({ model: model.value, messages: history, stream: true, region: regionParam() }),
+      body: JSON.stringify({ model: model.value, messages: history, stream: true, region: regionParam(), linkOverride: linkOverride.value }),
     })
     if (!resp.ok) {
       const j = await resp.json().catch(() => ({}))

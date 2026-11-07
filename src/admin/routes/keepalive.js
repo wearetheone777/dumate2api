@@ -12,6 +12,7 @@
 // 判据本体是 keepalive.internals.healthAlerts（纯函数，可离线测）。
 const keepalive = require('../../keepalive');
 const webPool = require('../../web-pool');
+const notify = require('../../notify');
 const { sendJSON } = require('../router');
 
 // web-pool.snapshot() 的行很宽（池状态机全量字段）——health 只挑横幅要用的，
@@ -117,6 +118,54 @@ const routes = [
         if (r && r.skipped) console.log('[keepalive] 手动触发被跳过：', r.skipped);
       }).catch(() => { /* 轮内失败已落 last_result */ });
       sendJSON(res, 200, { ok: true, started: true });
+    },
+  },
+  {
+    // 告警推送配置（crit 级告警 → webhook）。GET 明文回显 url：这是本机
+    // 管理端的私有配置页，脱敏回显反而没法核对；审计日志不记 url。
+    method: 'GET',
+    path: '/notify',
+    handler: async ({ res }) => {
+      const cfg = notify.loadConfig();
+      sendJSON(res, 200, {
+        ok: true,
+        types: notify.TYPES,
+        config: {
+          enabled: !!cfg.enabled,
+          type: cfg.type || 'feishu',
+          url: cfg.url || '',
+          chat_id: cfg.chat_id || '',
+        },
+      });
+    },
+  },
+  {
+    method: 'PUT',
+    path: '/notify',
+    handler: async ({ res, body }) => {
+      const problems = notify.validate({ ...(body || {}), type: (body && body.type) || 'feishu' });
+      if (problems.length) return sendJSON(res, 400, { ok: false, error: problems.join('；') });
+      const saved = notify.saveConfig({
+        enabled: !!(body && body.enabled),
+        type: body.type,
+        url: String(body.url || '').trim(),
+        chat_id: String(body.chat_id || '').trim(),
+      });
+      require('../../admin/auth').audit('admin', 'notify_save', '',
+        `${saved.type}${saved.enabled ? ' 启用' : ' 停用'}`);
+      sendJSON(res, 200, { ok: true });
+    },
+  },
+  {
+    // 测试推送：用当前已保存的配置发一条真实消息——「存了但没配对」只有
+    // 真发一条才知道（各平台的 token/签名校验只在发送时暴露）。
+    method: 'POST',
+    path: '/notify/test',
+    handler: async ({ res }) => {
+      const r = await notify.sendNotify('【dumate2api】测试通知：健康告警推送链路正常');
+      sendJSON(res, r.ok ? 200 : 400, r.ok
+        ? { ok: true, message: '已发送，请到对应平台查收' }
+        : { ok: false, error: r.error });
     },
   },
 ];

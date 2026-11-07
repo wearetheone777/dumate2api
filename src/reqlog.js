@@ -51,6 +51,18 @@ function record(entry) {
   if (aggHook) {
     try { aggHook.feed(entry); } catch (e) { /* 计量失败不影响埋点 */ }
   }
+  // 单 Key 每日配额的 token 计数（2026-11-07）：entry.key_id 由各网关的
+  // logRequest 传入。请求数在 keys.validate 里即时计数，token 只能等响应
+  // 结束才知道——所以累加挂在这里（usage 总量在流的最后）。配额面故障
+  // 不影响埋点；DUMATE_KEY_QUOTA=0 时计数器内部直接短路。
+  if (entry && entry.key_id) {
+    try {
+      require('./key-quota').addTokens(entry.key_id, entry.total_tokens, {
+        // 子 Key 的 token 同时计入父 Key 的桶（2026-11-08 家庭配额）
+        familyId: entry.key_parent_id || null,
+      });
+    } catch (e) { /* 不影响埋点 */ }
+  }
   try {
     // 调用来源开关（livecfg.recordClientInfo，F6e）：关掉时不落 ip / ua。
     // 收口在 record 里而不是调用方——server.js 的 logRequest 与三个协议

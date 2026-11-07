@@ -766,6 +766,90 @@
       </a-col>
     </a-row>
 
+    <a-card title="云端网关模型（本地回落链路）" :bordered="false" class="mt-4">
+      <div class="text-xs text-slate-500 mb-3">
+        本地链路（9080/9082）挂掉回落到云端网关时用的模型名空间。2026-11-06 真机实测定案：
+        云端只认下面 6 个路由名（社区对外别名与本地后端真名一律 404）。
+        云端名清单<b>只读</b>——它来自探测结果，手改只会造出必失败的模型；
+        可编辑的是<b>本地名 → 云端名</b>的回落映射（fallback-web 回落时共用，
+        目标必须在上面清单里，保存时后端会校验）。
+      </div>
+      <div class="mb-4">
+        <div class="text-sm font-medium mb-2">云端路由名（只读，实跑身份见括号）</div>
+        <a-tag v-for="m in cloudUpstream" :key="m" color="purple" class="mb-1">{{ dumateLabel(m) }}</a-tag>
+      </div>
+      <div>
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-sm font-medium">回落映射（本地名 → 云端名）</span>
+          <a-button size="small" @click="addCloudAlias">新增映射</a-button>
+        </div>
+        <a-table
+          size="small"
+          :pagination="false"
+          :data-source="cloudAliasRows"
+          :columns="cloudAliasColumns"
+          row-key="__k"
+        >
+          <template #bodyCell="{ column, record, index }">
+            <template v-if="column.key === 'from'">
+              <a-input v-model:value="record.from" size="small" placeholder="本地模型名，如 glm-5" />
+            </template>
+            <template v-else-if="column.key === 'to'">
+              <a-select
+                v-model:value="record.to"
+                size="small"
+                style="width: 100%"
+                :options="cloudTargetOptions"
+              />
+            </template>
+            <template v-else-if="column.key === 'action'">
+              <a-button type="link" size="small" danger @click="removeCloudAliasRow(index)">删除</a-button>
+            </template>
+          </template>
+        </a-table>
+        <div class="text-xs text-slate-400 mt-1">
+          内置映射 glm-5 → glm-53 是同系换代代偿（本地实跑 5.2、云端最接近的是 5.3）；
+          model-artifact-validate 在云端没有对应物，刻意不映射——404 如实失败，不悄悄变成普通聊天。
+        </div>
+      </div>
+    </a-card>
+
+    <!-- 上游 max_tokens 上限自学习观测：上游模型表不带 maxOutputTokens，
+         撞 400 时网关学习 N 并落盘（7 天 TTL），之后自动 clamp。这张卡让
+         「网关帮我兜了什么」第一次可见。 -->
+    <a-card title="上游 max_tokens 上限（自学习）" :bordered="false" class="mt-4">
+      <template #extra>
+        <a-button size="small" :loading="capsLoading" @click="loadCaps">刷新</a-button>
+      </template>
+      <div class="text-xs text-slate-500 mb-2">
+        上游模型表不带输出上限——第一次撞上限（400）时网关记下 N 并自动钳制后续请求，
+        学习条目 7 天过期。expired 的条目会在下次撞限时重新学习。
+      </div>
+      <a-table
+        size="small"
+        :data-source="capsRows"
+        :columns="capsColumns"
+        row-key="model"
+        :pagination="false"
+      >
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'cap'">
+            <span class="num">{{ record.cap == null ? '—' : record.cap.toLocaleString() }}</span>
+          </template>
+          <template v-else-if="column.key === 'source'">
+            <a-tag v-if="record.source === 'learned'" color="purple">已学习</a-tag>
+            <a-tag v-else-if="record.source === 'builtin'" color="green">内置表</a-tag>
+            <a-tag v-else color="default">未知</a-tag>
+          </template>
+          <template v-else-if="column.key === 'learned_at'">
+            <span v-if="record.expired" class="text-slate-400">已过期</span>
+            <span v-else-if="record.learned_at" class="num">{{ fmtTime(record.learned_at) }}</span>
+            <span v-else class="text-slate-300">—</span>
+          </template>
+        </template>
+      </a-table>
+    </a-card>
+
     <a-card title="网关实际返回" :bordered="false">
       <div class="flex items-center justify-between mb-2">
         <span class="text-xs text-slate-500">
@@ -1162,6 +1246,52 @@ const gatewayList = ref<Array<{ id: string; owned_by: string }>>([])
 const gatewayViaKey = ref('')
 const upstreamModels = ref<string[]>([])
 const exposed = ref<string[]>([])
+// 云端名空间（2026-11-06 实测定案）：清单只读展示，回落映射可编辑。
+// cloud_upstream 来自 /models/map 的 cloud_upstream（后端真机探测清单）；
+// 编辑态用行数组（__k 只是 a-table 的 row-key，保存时按 from→to 重建对象）。
+const cloudUpstream = ref<string[]>([])
+const cloudAliasRows = ref<Array<{ __k: number; from: string; to: string }>>([])
+let cloudAliasSeq = 0
+
+const cloudAliasColumns = [
+  { title: '本地模型名', key: 'from', width: '42%' },
+  { title: '映射到云端', key: 'to', width: '42%' },
+  { title: '操作', key: 'action', width: '16%' },
+]
+const cloudTargetOptions = computed(() =>
+  cloudUpstream.value.map((m) => ({ label: `${m}（${dumateLabel(m)}）`, value: m })),
+)
+
+function addCloudAlias() {
+  cloudAliasRows.value.unshift({ __k: ++cloudAliasSeq, from: '', to: cloudUpstream.value[0] || 'model-text' })
+}
+function removeCloudAliasRow(index: number) {
+  cloudAliasRows.value.splice(index, 1)
+}
+
+// ── 上游 max_tokens 上限（自学习观测，GET /models/caps）──
+const capsRows = ref<Array<{ model: string; cap: number | null; source: string | null; learned_at: number | null; expired: boolean }>>([])
+const capsLoading = ref(false)
+const capsColumns = [
+  { title: '模型', dataIndex: 'model' },
+  { title: '生效上限', key: 'cap', width: 130 },
+  { title: '来源', key: 'source', width: 110 },
+  { title: '学习时间', key: 'learned_at', width: 160 },
+]
+
+function fmtTime(ts: number | null) {
+  if (ts == null) return '—'
+  return new Date(ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+async function loadCaps() {
+  capsLoading.value = true
+  try {
+    const { data } = await client.get('/models/caps')
+    capsRows.value = data.rows || []
+  } catch (e) { /* 拉不到就保持空表 */ }
+  finally { capsLoading.value = false }
+}
 
 const columns = [
   { title: '客户端模型名', key: 'name', width: '28%' },
@@ -1191,7 +1321,6 @@ const fmtReset = (iso?: string | null) => {
     ? new Date(t).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
     : '—'
 }
-const fmtTime = (ts: number) => new Date(ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 
 // 千问通道下，每个模型的「近 7 天调用次数与积分消耗」。
 // 数据来自 requests.jsonl（gateway 埋点）与 qwenwork-credits.jsonl（积分归因），
@@ -1325,6 +1454,12 @@ async function load() {
     map.value = data
     upstreamModels.value = data.upstream_models
     exposed.value = data.exposed
+    cloudUpstream.value = data.cloud_upstream || []
+    cloudAliasRows.value = Object.entries(data.cloud_aliases || {}).map(([from, to]) => ({
+      __k: ++cloudAliasSeq,
+      from,
+      to: String(to),
+    }))
     rows.value = data.entries.map((e: any) => ({
       name: e.name,
       target: e.target,
@@ -1366,12 +1501,24 @@ async function save() {
     }
     aliases[name] = r.target
   }
+  // 云端回落映射：本地名去空格；目标已在后端校验（必须命中云端清单），
+  // 这里前端先挡一道，省一次 400 往返。
+  const cloud_aliases: Record<string, string> = {}
+  for (const r of cloudAliasRows.value) {
+    const from = r.from.trim()
+    if (!from) {
+      message.error('存在空的云端映射本地名')
+      return
+    }
+    cloud_aliases[from] = r.to
+  }
   saving.value = true
   try {
     await client.post('/models/map', {
       aliases,
       upstream_models: upstreamModels.value,
       exposed: exposed.value,
+      cloud_aliases,
     })
     message.success('已保存，网关会在下次请求时读取')
     await load()
@@ -1409,14 +1556,20 @@ async function reset() {
 
 onMounted(async () => {
   await load()
-  if (!isQw.value && !isTw.value && !isQd.value) await loadGateway()
+  if (!isQw.value && !isTw.value && !isQd.value) {
+    await loadGateway()
+    await loadCaps()
+  }
 })
 
 // 切通道重拉：四条通道的数据源不同，切换时必须换成对应那份，
 // 否则会停在上一通道的模型表上
 watch(() => channelStore.current, async () => {
   await load()
-  if (!isQw.value && !isTw.value && !isQd.value && !isWb.value) await loadGateway()
+  if (!isQw.value && !isTw.value && !isQd.value && !isWb.value) {
+    await loadGateway()
+    await loadCaps()
+  }
 })
 // 切区域重拉：TRAE/Qoder/WorkBuddy 的模型表按区域走（顶栏统一切换）
 watch(() => regionStore.current, async () => {

@@ -359,6 +359,40 @@ function aggregateExpiring(packages, accountId, days = 30) {
 
 const routes = [
   {
+    // 桌面端登录态直读导入（2026-11-07 清单项 6 尾巴）：解密本机
+    // auth.json（AES-256-GCM，排布实测见 src/auth-import.js 头注释），
+    // 免去 DevTools 复制 Cookie 的手工步骤。BDUSS 去重由 accounts.create
+    // 的重复检查兜底（同账号重复导入 409 如实报「已存在」）。
+    method: 'POST',
+    path: '/import-desktop',
+    handler: ({ res, body }) => {
+      const importer = require('../../auth-import');
+      const r = importer.importDesktopAuth({ dir: body && body.dir });
+      if (!r.ok) return sendJSON(res, 400, r);
+      try {
+        const created = accounts.create({
+          cookie: r.cookie,
+          name: String((body && body.name) || '').trim() || r.name_hint || '',
+        });
+        require('../../admin/auth').audit('admin', 'web_account_create', accounts.displayName(created), `via desktop auth.json（${r.cookie_count} 条 cookie）`);
+        const fresh = accounts.getRaw(created.id) || created;
+        return sendJSON(res, 200, {
+          ok: true,
+          cookie_count: r.cookie_count,
+          skipped_domains: r.skipped_domains,
+          account: accounts.toPublic({
+            ...fresh,
+            uid: fresh.uid || r.bce_user_id || '',
+            nickname: fresh.nickname || r.name_hint || '',
+          }),
+        });
+      } catch (e) {
+        // 已存在同账号等：409 如实报，不吞
+        return sendJSON(res, 409, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
     // 登录器：打开一个受控浏览器窗口，登录后自动抓 cookie。
     // 这是「不依赖用户浏览器状态」的唯一自动路径——搭子没有登录票据接口，
     // 而系统浏览器的 cookie 库在运行时被独占锁定。

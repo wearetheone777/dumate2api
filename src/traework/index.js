@@ -367,13 +367,27 @@ async function send(payload, onChunk, opts = {}) {
     const hasTools = Array.isArray(payload && payload.tools) && payload.tools.length > 0;
     // isAuto 在模型名解析处按剥前缀后的原始意图判定（本函数上方）
     // remote 链路是纯国内的（remoteBaseOf 对 intl 如实拒绝）——国际账号不走
-    const remoteEligible = remoteLevel > 0 && !hasTools && c.regionOf(auth) !== 'intl'
-      && (remoteLevel === 2 || isAuto);
+    // linkOverride（2026-11-06，ChatLab 链路实验）：显式指定链路时压过自动
+    // 分流。'utils' 一律走 utils_chat；'solo' 强制 solo（REMOTE 接管也压过，
+    // tools 请求如实失败——上游 400 已知）；'remote' 要求 REMOTE=2（manual
+    // 策略是它的能力，=1 的 auto 策略接不了显式模型），否则 400 明确报出。
+    const linkOverride = opts.linkOverride === 'utils' || opts.linkOverride === 'solo'
+      || opts.linkOverride === 'remote' ? opts.linkOverride : '';
+    const remoteEligible = linkOverride === 'utils' || linkOverride === 'solo' ? false
+      : linkOverride === 'remote'
+        ? (remoteLevel === 2 && c.regionOf(auth) !== 'intl')
+        : (remoteLevel > 0 && !hasTools && c.regionOf(auth) !== 'intl'
+          && (remoteLevel === 2 || isAuto));
+    if (linkOverride === 'remote' && remoteLevel !== 2) {
+      const e = new Error('remote 链路需要 DUMATE_TRAEWORK_REMOTE=2（manual 策略），当前未开启');
+      e.statusCode = 400;
+      throw e;
+    }
     // level 2 的显式模型：取模型表原始 config（取不到回落 utils_chat）。
     // effortPayload：原始请求体——manual 策略下解析思考档位写入 custom_model。
     // maxMode：单次 trae_max_mode / env 开关（descriptor 硬门在 createSession）
     let remoteOpts = null;
-    if (remoteEligible && remoteLevel === 2) {
+    if (remoteEligible && (remoteLevel === 2 || linkOverride === 'remote')) {
       try {
         const remoteMod = require('./remote');
         const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn' });
@@ -393,8 +407,8 @@ async function send(payload, onChunk, opts = {}) {
     // **纯国内**（与 remote 同边界）：国际 JWT 打国内 raw 端点恒 1001
     // （真机实测：deepseek-v4.1-flash 两区都有、池把请求派给国际账号时 1001）。
     let soloTransport = null;
-    const soloEligible = process.env.DUMATE_TRAEWORK_SOLO === '1' && !persona && !!model
-      && !remoteOpts && !hasTools && !remoteEligible && c.regionOf(auth) !== 'intl';
+    const soloEligible = (linkOverride === 'solo' || (process.env.DUMATE_TRAEWORK_SOLO === '1' && linkOverride !== 'utils' && linkOverride !== 'remote'))
+      && !persona && !!model && !remoteOpts && !remoteEligible && c.regionOf(auth) !== 'intl';
     if (soloEligible) {
       try {
         const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn' });
@@ -408,6 +422,13 @@ async function send(payload, onChunk, opts = {}) {
           };
         }
       } catch (e) { /* 表不可用回落 utils_chat */ }
+    }
+    // 链路上报（埋点 link 字段的数据源）：与 onAccount 同构——实际走哪条链
+    // 只有 send 知道，回调在分流确定后立即触发（无论成败，失败也是链路事实）
+    if (opts.onLink) {
+      const link = remoteEligible && (remoteLevel === 1 || remoteOpts) ? 'remote'
+        : soloTransport ? 'solo' : 'utils_chat';
+      try { opts.onLink(link, persona ? 'traebao' : 'utils_chat'); } catch (e) { /* 上报失败不影响请求 */ }
     }
     const result = remoteEligible && (remoteLevel === 1 || remoteOpts)
       ? await runRemoteConversation(auth, payload, onChunk, opts, model, remoteOpts)

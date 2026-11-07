@@ -178,7 +178,47 @@ function validate(key, ip, model, channel) {
     }
   }
 
+  // 子 Key（2026-11-08，调研 P2-8）：parent_id 指向主 Key。父 Key 被删除 /
+  // 停用 / 过期时，子 Key 一并失效（吊销级联）——否则「吊销父 Key」不生效，
+  // 发出去的子 Key 成了脱缰凭证。只允许两级（父不能再有 parent），杜绝环。
+  let parentKey = null;
+  if (key.parent_id) {
+    parentKey = load().keys.find((x) => x.id === Number(key.parent_id)) || null;
+    if (!parentKey || parentKey.enabled === false
+      || (parentKey.expires_at && Date.now() > parentKey.expires_at)) {
+      return { ok: false, reason: 'parent_revoked' };
+    }
+  }
+
+  // 每日配额（2026-11-07 清单项 9）：daily_limit = { requests?, tokens? }，
+  // 0/缺省 = 不限。token 判定用「已累计」——本请求尚未计入，超限挡在下一发；
+  // 请求数在本函数内即时 +1。429 的重置时刻（本地零点）由 key-quota 给出，
+  // reason=quota_exceeded 的 429 化在网关侧统一处理。
+  //
+  // 子 Key 的家庭配额（2026-11-08）：子 Key 的消耗同时计入父 Key 的计数器，
+  // 所以「父 Key 的每日限额」是全家共享的上限，子 Key 自己的 daily_limit
+  // 是额外收紧——两道上限都要满足。父 Key 自己直接使用时也占用同一个桶，
+  // 语义就是「父 Key 这一份额度，无论被多少子 Key 瓜分」。
+  const childLim = hasLimits(key.daily_limit) ? key.daily_limit : null;
+  const parentLim = parentKey && hasLimits(parentKey.daily_limit) ? parentKey.daily_limit : null;
+  if (childLim || parentLim) {
+    try {
+      const quota = require('./key-quota');
+      const v = quota.check(
+        key.id,
+        childLim || {},
+        parentLim ? { familyId: parentKey.id, familyLimits: parentLim } : {},
+      );
+      if (!v.ok) return { ok: false, reason: 'quota_exceeded', detail: v.detail, reset_at: v.reset_at };
+    } catch (e) { /* 配额面故障不拦请求（fail-open）——限流是软限制，不能比上游还脆 */ }
+  }
+
   return { ok: true };
+}
+
+/** daily_limit 是否真的设了限制（0/缺省都算「不限」） */
+function hasLimits(lim) {
+  return !!lim && (Number(lim.requests) > 0 || Number(lim.tokens) > 0);
 }
 
 // 从请求头里取 token。兼容三种客户端习惯：
@@ -265,12 +305,63 @@ function create(opts = {}) {
       channel: normalizeChannel(opts.channel),
       // 区域绑定：留空 = 不限；'cn'/'intl' 只对 qoder/traework 有区分度
       region: normalizeRegionKey(opts.region),
+      // 每日配额（2026-11-07）：{ requests?, tokens? }，0/缺省 = 不限
+      daily_limit: normalizeDailyLimit(opts.daily_limit),
+      // 父 Key（2026-11-08 子 Key）：指向主 Key 的 id；null = 独立 Key。
+      // 只支持两级——父 Key 本身不能再是子 Key（否则级联判定要递归，且环
+      // 会让吊销语义失效）。
+      parent_id: null,
       note: String(opts.note || ''),
     };
+    const parentId = normalizeParentId(opts.parent_id);
+    if (parentId != null) {
+      const parent = keys.find((x) => x.id === parentId);
+      if (!parent) throw new Error(`父 Key #${parentId} 不存在`);
+      if (parent.parent_id) throw new Error('只支持两级：父 Key 本身不能再是子 Key');
+      key.parent_id = parentId;
+    }
     keys.push(key);
     save({ keys });
     return { key: { ...key, hash: undefined }, token };
   });
+}
+
+/**
+ * 首启凭证自举（2026-11-08，调研 P2-9）：网关监听**非回环地址**且一把 key
+ * 都没有时，自动签发一把并返回明文，由启动日志打印一次。
+ *
+ * 为什么只在非回环触发：本机 127.0.0.1 场景用户随时能在管理端点「新建」，
+ * 自动生成反而多一把要管理的 key、多一行日志噪音。而一旦端口暴露到局域网，
+ * 「空 key 集合」等于所有模型请求 401——用户手里没有任何可用凭证，只能翻
+ * 文档。那个时刻，日志里三行可复制的东西是唯一的入口。
+ *
+ * 判据是监听地址字符串而不是实际可达性：0.0.0.0 与具体网卡都按「已暴露」处理。
+ */
+function ensureFirstRun(host) {
+  const h = String(host || '').trim().toLowerCase();
+  // 空串按回环处理：server.js 的 PROXY_HOST 有默认值，空串只可能来自测试
+  const local = !h || h === '127.0.0.1' || h === 'localhost'
+    || h === '::1' || h === '0:0:0:0:0:0:0:1';
+  if (local) return null;
+  if (load().keys.length > 0) return null;
+  return create({ name: 'first-run', note: '监听非回环地址且无任何 Key 时自动生成' });
+}
+
+// daily_limit 白名单清洗：requests/tokens 只认非负整数，0 与缺省都是「不限」。// 单独收敛成函数——create 与 update 共用同一套口径，形状漂移在入口就挡住。
+function normalizeDailyLimit(v) {
+  if (!v || typeof v !== 'object') return null;
+  const out = {};
+  for (const k of ['requests', 'tokens']) {
+    const n = Number(v[k]);
+    if (Number.isInteger(n) && n > 0) out[k] = n;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** 父 Key id 清洗：正整数或 null（0/空串/非法值一律当「无父」） */
+function normalizeParentId(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 function update(id, patch = {}) {
@@ -286,6 +377,21 @@ function update(id, patch = {}) {
     if (patch.model_allowlist !== undefined) k.model_allowlist = normalizeList(patch.model_allowlist);
     if (patch.channel !== undefined) k.channel = normalizeChannel(patch.channel);
     if (patch.region !== undefined) k.region = normalizeRegionKey(patch.region);
+    if (patch.daily_limit !== undefined) k.daily_limit = normalizeDailyLimit(patch.daily_limit);
+    if (patch.parent_id !== undefined) {
+      const pid = normalizeParentId(patch.parent_id);
+      if (pid != null) {
+        if (pid === k.id) throw new Error('不能把 Key 自己设成父 Key');
+        const parent = data.keys.find((x) => x.id === pid);
+        if (!parent) throw new Error(`父 Key #${pid} 不存在`);
+        if (parent.parent_id) throw new Error('只支持两级：父 Key 本身不能再是子 Key');
+        // 本 Key 已被别人当父时，再把它设成子会造出三级链
+        if (data.keys.some((x) => x.parent_id === k.id)) {
+          throw new Error('该 Key 已被其他 Key 引用为父，不能再设成子 Key');
+        }
+      }
+      k.parent_id = pid;
+    }
     if (patch.note !== undefined) k.note = String(patch.note);
     save(data);
     return { ...k, hash: undefined };
@@ -317,6 +423,7 @@ module.exports = {
   create,
   update,
   remove,
+  ensureFirstRun,
   resolve,
   validate,
   validateCIDR,

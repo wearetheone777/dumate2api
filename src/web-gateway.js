@@ -463,10 +463,15 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (url === '/health' || url === '/ping') {
+      // 进程身份（2026-11-07 融合项 P1-6）：service 统一成 'dumate2api'——
+      // 之前是 'dumate-web-gateway'，四个进程各叫各的，探活判据就没法统一；
+      // 入口区分交给 role 字段。全仓没有消费旧值的代码（grep 过），改判据安全。
+      const identity = require('./service-identity').identity('web-gateway');
       const poolState = pool.snapshot();
       return sendJSON(res, 200, {
         status: 'ok',
-        service: 'dumate-web-gateway',
+        service: identity.service,
+        role: identity.role,
         upstream: 'web-credential',
         accounts_total: poolState.length,
         accounts_enabled: poolState.filter((a) => a.enabled).length,
@@ -475,7 +480,7 @@ const server = http.createServer(async (req, res) => {
           name: a.name, enabled: a.enabled, cooling: a.cooling,
           token_expires_in_s: a.token_expires_in_s,
         })),
-      });
+      }, { 'X-Service': identity.service });
     }
 
     if (REQUIRE_KEY) {
@@ -487,6 +492,17 @@ const server = http.createServer(async (req, res) => {
       }
       const verdict = keysvc.validate(key, reqlog.clientIP(req), null);
       if (!verdict.ok) {
+        // 配额超限 429 化（与 9080 同口径）：客户端对 429 自动退避重试
+        if (verdict.reason === 'quota_exceeded') {
+          return sendJSON(res, 429, {
+            error: {
+              message: `Daily quota exceeded: ${verdict.detail}`,
+              type: 'rate_limit_error',
+              code: 'quota_exceeded',
+              reset_at: verdict.reset_at,
+            },
+          });
+        }
         return sendJSON(res, key ? 403 : 401, {
           error: {
             message: verdict.reason === 'unknown_key' ? 'Invalid or missing API key' : `API key rejected: ${verdict.reason}`,

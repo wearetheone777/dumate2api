@@ -114,7 +114,12 @@ const routes = [
         upstream_models: cfg.upstream_models,
         exposed: cfg.exposed,
         fallback: cfg.fallback,
-        // 界面上要一眼看出哪些名字是上游原生、哪些只是别名
+        // 云端名空间（2026-11-06 实测定案，test/probe-dumate-cloud-models.js）：
+        // 9084 与本地回落共用。cloud_upstream 是实测 200 的六个路由名，界面
+        // **只读展示**——清单来自真机探测，编辑它只会诱导用户改成 404 名；
+        // cloud_aliases（本地名 → 云端名回落映射）可编辑，校验见 POST。
+        cloud_upstream: cfg.cloud_upstream,
+        cloud_aliases: cfg.cloud_aliases,
         entries: Object.keys(cfg.aliases).sort().map((name) => ({
           name,
           target: cfg.aliases[name],
@@ -125,10 +130,46 @@ const routes = [
           aliases: modelmap.DEFAULT_ALIASES,
           upstream_models: modelmap.DEFAULT_UPSTREAM,
           exposed: modelmap.DEFAULT_EXPOSED,
+          cloud_upstream: modelmap.DEFAULT_CLOUD_UPSTREAM,
+          cloud_aliases: modelmap.DEFAULT_CLOUD_ALIASES,
         },
         // 通道视图：上面的 aliases/exposed 只描述搭子（那套别名表是搭子
         // 专用的）。千问办公的模型由上游下发，本地改不了，所以只读展示。
         channels: await channelView(cfg),
+      });
+    },
+  },
+  {
+    // 上游 max_tokens 上限自学习观测（2026-11-06 清单项 4）。
+    // dumate-caps 的机制：上游模型表不带 maxOutputTokens，第一次撞上限
+    // （400 "Range of max_tokens should be [1, N]"）时 learn() 把 N 落盘
+    // data/dumate-caps.json（7 天 TTL），之后 buildBody 出站前自动 clamp。
+    // 管理端进程直接读落盘文件（与网关共享 data/，零跨进程调用）；
+    // capOf 给每个已知模型算「当前生效上限」（内置表 or 已学习 or null）。
+    method: 'GET',
+    path: '/caps',
+    handler: async ({ res }) => {
+      const caps = require('../../dumate-caps');
+      const fs = require('fs');
+      let learned = {};
+      try { learned = JSON.parse(fs.readFileSync(caps.filePath(), 'utf8')) || {}; } catch (e) { /* 尚未触发过学习 */ }
+      const models = [...new Set([...Object.keys(caps.OUTPUT_CAPS), ...Object.keys(learned)])];
+      const now = Date.now();
+      const rows = models.map((m) => {
+        const l = learned[m];
+        const learnedValid = l && Number(l.n) > 0 && Number(l.at) && now - Number(l.at) <= caps.TTL_MS;
+        return {
+          model: m,
+          cap: caps.capOf(m, now),
+          source: learnedValid ? 'learned' : (caps.OUTPUT_CAPS[m] != null ? 'builtin' : null),
+          learned_at: learnedValid ? Number(l.at) : null,
+          expired: l && !learnedValid ? true : false,
+        };
+      });
+      return sendJSON(res, 200, {
+        ok: true,
+        ttl_days: caps.TTL_MS / 86400000,
+        rows: rows.sort((a, b) => a.model.localeCompare(b.model)),
       });
     },
   },
@@ -158,6 +199,22 @@ const routes = [
       if (body.upstream_models !== undefined) {
         if (!Array.isArray(body.upstream_models) || !body.upstream_models.length) {
           problems.push('upstream_models 至少保留一个模型');
+        }
+      }
+      if (body.cloud_aliases !== undefined) {
+        if (typeof body.cloud_aliases !== 'object' || Array.isArray(body.cloud_aliases)) {
+          problems.push('cloud_aliases 必须是对象');
+        } else {
+          // 严格校验目标：toCloudModel 的映射分支要求目标在 cloud_upstream 里
+          // 才生效——指到清单外的名字等于映射静默失效（兜底回 model-text），
+          // 配置错误要在保存时挡住，不能等回落 404 了才发现。
+          const cloudSet = new Set(modelmap.DEFAULT_CLOUD_UPSTREAM);
+          for (const [k, v] of Object.entries(body.cloud_aliases)) {
+            if (!String(k).trim()) problems.push('云端映射的本地名不能为空');
+            if (!cloudSet.has(String(v || ''))) {
+              problems.push(`云端映射 ${k} → ${v || '(空)'} 的目标不在云端模型清单里`);
+            }
+          }
         }
       }
       if (problems.length) return sendJSON(res, 400, { error: problems.join('；') });

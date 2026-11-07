@@ -71,4 +71,21 @@ export const dumateApi = {
   projects: () => client.get<DumateProjectsResp>('/dumate/projects').then((r) => r.data),
   connectors: () => client.get<DumateConnectorsResp>('/dumate/connectors').then((r) => r.data),
   connectorTemplates: () => client.get<DumateTemplatesResp>('/dumate/connectors/templates').then((r) => r.data),
+  // 本地会话工作目录（dir = session 的 directory；file 省略 = 列目录）
+  localFiles: (dir: string) =>
+    client.get(`/dumate/local-files?dir=${encodeURIComponent(dir)}`).then((r) => r.data as {
+      ok: boolean; dir?: string; entries?: LocalFileEntry[]; error?: string
+    }),
+  readLocalFile: (dir: string, file: string) =>
+    client.get(`/dumate/local-files?dir=${encodeURIComponent(dir)}&file=${encodeURIComponent(file)}`).then((r) => r.data as {
+      ok: boolean; name?: string; text?: string; error?: string
+    }),
+}
+
+export interface LocalFileEntry {
+  name: string
+  is_dir: boolean
+  readable: boolean
+  size: number
+  mtime: number
 }

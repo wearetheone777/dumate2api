@@ -57,6 +57,8 @@ export interface ReqLogRow {
   tw_cost?: number
   /** 成本口径（2026-11-06）：session_usage=上游单请求账单（精确）；consumed_delta=差值推断 */
   tw_source?: 'session_usage' | 'consumed_delta'
+  /** 对话链路（traework 三条）：utils_chat / remote / solo。其他通道空串 */
+  link?: 'utils_chat' | 'remote' | 'solo' | ''
   /** false = 与同账号相邻请求并发，差值可能含对方的消耗 */
   tw_exact?: boolean
   /** 请求后的累计已消耗 / 剩余 / 额度上限 */

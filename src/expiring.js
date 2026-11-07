@@ -162,13 +162,21 @@ function accountIds(channel, now = Date.now()) {
 function info(channel, now = Date.now()) {
   const snap = loadSnap();
   const ch = snap && snap.channels && snap.channels[channel];
-  if (!ch) return { at: null, fresh: false, accounts: 0, windowDays: windowDays(channel) };
+  if (!ch) return { at: null, fresh: false, accounts: 0, windowDays: windowDays(channel), nearest: null };
   const accounts = ch.accounts ? Object.keys(ch.accounts).length : 0;
+  // 最早到期时刻（2026-11-08，额度总览卡用）：只报时间不给金额——快照里
+  // 本来就没有金额（写入方只记 nearest），编一个数字不如留空
+  let nearest = null;
+  for (const v of Object.values(ch.accounts || {})) {
+    const t = Number(v);
+    if (Number.isFinite(t) && t > 0 && (nearest === null || t < nearest)) nearest = t;
+  }
   return {
     at: ch.at || null,
     fresh: typeof ch.at === 'number' && now - ch.at <= maxAgeMs(),
     accounts,
     windowDays: windowDays(channel),
+    nearest,
   };
 }
 

@@ -12,6 +12,13 @@ export interface ApiKey {
   model_allowlist: string[]
   /** 通道绑定：'' = 不限；设了就只允许走该通道的模型 */
   channel?: '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder'
+  /** 每日配额（2026-11-07）：0/缺省 = 不限；超限该 key 的请求一律 429，本地零点重置 */
+  daily_limit: { requests?: number; tokens?: number } | null
+  /** 父 Key id（2026-11-08 子 Key）：null = 独立 Key。
+   *  父被停用/删除/过期时子 Key 一并失效；父的每日配额是全家共享上限 */
+  parent_id?: number | null
+  /** 当日配额用量（网关内存计数器经落盘回读，约 5 秒延迟） */
+  quota_today: { requests: number; tokens: number }
   note: string
   usage: {
     requests: number

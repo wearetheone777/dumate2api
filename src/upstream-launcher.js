@@ -16,8 +16,29 @@ const net = require('net');
 
 const DEFAULT_INSTALL = 'D:\\Program Files\\code program\\baidudazi\\DuMate';
 
+// 安装根探测（2026-11-07 修）：DEFAULT_INSTALL 是写死的老路径，客户端装到
+// 别处（如 D:\Programs\dumute\DuMate）时 ensureUpstreamProcess 会报
+// 「exe not found」——运维面板的 relaunch 动作就死在这。按候选顺序找
+// 第一个真的有 backend exe 的根：env > 默认路径 > 常见安装位置。找到的
+// 结果按 root 缓存（exe 路径不会中途变，省得每次探测）。
+const INSTALL_CANDIDATES = [
+  DEFAULT_INSTALL,
+  'D:\\Programs\\dumute\\DuMate',
+  'C:\\Program Files\\DuMate',
+  'C:\\Program Files (x86)\\DuMate',
+];
+let installRootCache = null;
+
 function installRoot() {
-  return process.env.DUMATE_INSTALL_DIR || DEFAULT_INSTALL;
+  if (process.env.DUMATE_INSTALL_DIR) return process.env.DUMATE_INSTALL_DIR;
+  if (installRootCache) return installRootCache;
+  for (const root of INSTALL_CANDIDATES) {
+    if (fs.existsSync(path.join(root, 'resources', 'extra-resource', 'backend', 'bin', 'dumate-main-server.exe'))) {
+      installRootCache = root;
+      return root;
+    }
+  }
+  return DEFAULT_INSTALL;
 }
 
 function exePath() {

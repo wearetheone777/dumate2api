@@ -16,6 +16,8 @@ export interface WebAccount {
   nickname: string
   last_login_ok_at: number | null
   last_error: string
+  /** 出站代理（脱敏形态：带 user:pass 的不出明文；'' = 未配置） */
+  proxy: string
   checkin: {
     last_at: number | null
     last_result: string

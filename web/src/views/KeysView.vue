@@ -74,6 +74,9 @@
                 <span class="ml-1 text-slate-500 cursor-default">仅管理员可见</span>
               </a-tooltip>
             </div>
+            <div v-if="record.parent_id" class="text-xs mt-1">
+              <a-tag color="purple">子 Key · 父 {{ parentName(record.parent_id) }}</a-tag>
+            </div>
           </template>
           <template v-else-if="column.key === 'channel'">
             <a-tag v-if="record.channel === 'qwenwork'" color="cyan">仅千问</a-tag>
@@ -98,6 +101,12 @@
             <div v-if="record.model_allowlist.length" class="text-xs mt-1">
               模型: <span class="font-mono break-words min-w-0">{{ record.model_allowlist.join(', ') }}</span>
             </div>
+          </template>
+          <template v-else-if="column.key === 'quota'">
+            <div class="num" :class="quotaText(record).over ? 'text-rose-600' : ''">
+              {{ quotaText(record).text }}
+            </div>
+            <div v-if="quotaText(record).over" class="text-xs text-rose-500">已超限 · 429 至本地零点</div>
           </template>
           <template v-else-if="column.key === 'usage'">
             <div class="num">{{ record.usage.requests }} 次</div>
@@ -131,7 +140,7 @@
                 :checked="record.enabled"
                 @change="(v: boolean) => toggle(record, v)"
               />
-              <a-popconfirm v-if="isAdmin" title="删除后无法恢复，使用该 key 的客户端会立即失败" @confirm="remove(record)">
+              <a-popconfirm v-if="isAdmin" :title="deleteHint(record)" @confirm="remove(record)">
                 <a-button type="link" size="small" danger>删除</a-button>
               </a-popconfirm>
             </a-space>
@@ -191,6 +200,17 @@
             :options="modelOptions"
           />
         </a-form-item>
+        <a-form-item
+          label="父 Key（子 Key 模式）"
+          extra="选一个主 Key 后本 Key 成为子 Key：父 Key 停用/删除/过期时它一并失效；父 Key 的每日配额是全家共享上限，本 Key 自己的配额是额外收紧。只支持两级。"
+        >
+          <a-select
+            v-model:value="form.parentId"
+            :options="parentOptions"
+            allow-clear
+            placeholder="留空 = 独立 Key"
+          />
+        </a-form-item>
         <a-form-item label="有效期">
           <a-date-picker
             v-model:value="form.expiresAt"
@@ -201,6 +221,14 @@
         </a-form-item>
         <a-form-item label="备注">
           <a-input v-model:value="form.note" placeholder="可选" />
+        </a-form-item>
+        <a-form-item label="每日配额" extra="0 = 不限。超限后该 key 的请求一律 429（客户端自动退避），本地零点重置。适合把 key 发给别人时设上限。">
+          <a-space>
+            <a-input-number v-model:value="form.quotaRequests" :min="0" :step="100" style="width: 130px" />
+            <span class="text-xs text-slate-400">次 / 日</span>
+            <a-input-number v-model:value="form.quotaTokens" :min="0" :step="10000" style="width: 150px" />
+            <span class="text-xs text-slate-400">tokens / 日</span>
+          </a-space>
         </a-form-item>
       </a-form>
     </a-modal>
@@ -298,7 +326,31 @@ const form = reactive({
   region: '' as '' | 'cn' | 'intl',
   expiresAt: null as Dayjs | null,
   note: '',
+  // 每日配额：0 = 不限（提交时 0 值字段不上送，后端 normalize 收敛成 null）
+  quotaRequests: 0,
+  quotaTokens: 0,
+  // 父 Key id（子 Key 模式）：undefined = 独立 Key
+  parentId: undefined as number | undefined,
 })
+
+// 可选父 Key：只列独立 Key（两级限制），编辑时排除自己
+const parentOptions = computed(() =>
+  (data.value?.keys ?? [])
+    .filter((k) => !k.parent_id && k.id !== editing.value?.id)
+    .map((k) => ({ label: `${k.name} (#${k.id})`, value: k.id })),
+)
+function parentName(id: number): string {
+  const p = (data.value?.keys ?? []).find((k) => k.id === id)
+  return p ? p.name : `#${id}（已删除）`
+}
+function childCount(k: ApiKey): number {
+  return (data.value?.keys ?? []).filter((x) => x.parent_id === k.id).length
+}
+function deleteHint(k: ApiKey): string {
+  const n = childCount(k)
+  return '删除后无法恢复，使用该 key 的客户端会立即失败'
+    + (n ? `；它的 ${n} 个子 Key 也会一并失效` : '')
+}
 
 const regionOptions = [
   { label: '不限区域', value: '' },
@@ -307,15 +359,36 @@ const regionOptions = [
 ]
 
 const columns = [
-  { title: '名称', key: 'name', width: '16%' },
-  { title: '通道', key: 'channel', width: '9%' },
-  { title: '区域', key: 'region', width: '8%' },
-  { title: '状态', key: 'state', width: '9%' },
-  { title: '限制', key: 'limits', width: '19%' },
-  { title: '用量', key: 'usage', width: '19%' },
-  { title: '有效期', key: 'expires', width: '11%' },
-  { title: '操作', key: 'action', width: '17%' },
+  { title: '名称', key: 'name', width: '15%' },
+  { title: '通道', key: 'channel', width: '8%' },
+  { title: '区域', key: 'region', width: '7%' },
+  { title: '状态', key: 'state', width: '8%' },
+  { title: '限制', key: 'limits', width: '17%' },
+  { title: '今日/限额', key: 'quota', width: '15%' },
+  { title: '用量', key: 'usage', width: '16%' },
+  { title: '有效期', key: 'expires', width: '10%' },
+  { title: '操作', key: 'action', width: '15%' },
 ]
+
+// 配额列：今日用量 vs 每日限额。超限红色（网关正在对该 key 回 429）。
+function quotaText(k: ApiKey) {
+  const lim = k.daily_limit
+  const used = k.quota_today || { requests: 0, tokens: 0 }
+  if (!lim || (!lim.requests && !lim.tokens)) {
+    return { used, over: false, text: `${used.requests} 次 · 不限` }
+  }
+  const parts: string[] = []
+  let over = false
+  if (lim.requests) {
+    parts.push(`${used.requests}/${lim.requests} 次`)
+    if (used.requests >= lim.requests) over = true
+  }
+  if (lim.tokens) {
+    parts.push(`${compact(used.tokens)}/${compact(lim.tokens)} tok`)
+    if (used.tokens >= lim.tokens) over = true
+  }
+  return { used, over, text: parts.join(' · ') }
+}
 
 const compact = (n: number) =>
   n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n)
@@ -357,6 +430,9 @@ function openCreate() {
   form.channel = isQw.value ? 'qwenwork' : isTw.value ? 'traework' : isQd.value ? 'qoder' : ''
   form.expiresAt = null
   form.note = ''
+  form.quotaRequests = 0
+  form.quotaTokens = 0
+  form.parentId = undefined
   ipError.value = ''
   modalOpen.value = true
 }
@@ -369,6 +445,9 @@ function openEdit(k: ApiKey) {
   form.channel = (k.channel || '') as '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder'
   form.expiresAt = k.expires_at ? dayjs(k.expires_at) : null
   form.note = k.note || ''
+  form.quotaRequests = k.daily_limit?.requests || 0
+  form.quotaTokens = k.daily_limit?.tokens || 0
+  form.parentId = k.parent_id || undefined
   ipError.value = ''
   modalOpen.value = true
 }
@@ -397,6 +476,13 @@ async function save() {
     region: form.region,
     note: form.note,
     expires_at: form.expiresAt ? form.expiresAt.valueOf() : null,
+    // 0 值字段不上送——后端 normalize 把缺省收敛成 null（不限）
+    daily_limit: {
+      ...(form.quotaRequests > 0 ? { requests: form.quotaRequests } : {}),
+      ...(form.quotaTokens > 0 ? { tokens: form.quotaTokens } : {}),
+    },
+    // 父 Key（子 Key 模式）：null = 独立 Key
+    parent_id: form.parentId ?? null,
   }
 
   saving.value = true

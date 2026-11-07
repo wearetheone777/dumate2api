@@ -84,6 +84,15 @@
             <div v-if="record.mapped_model && record.mapped_model !== record.model" class="text-xs text-slate-500">
               → {{ record.mapped_model }}
             </div>
+            <!-- 对话链路（traework 三条，2026-11-06）：同一通道不同上游端点，
+                 排障「这条请求走的哪个端点」先看这个；其他通道不显示 -->
+            <a-tag
+              v-if="record.link"
+              :color="record.link === 'remote' ? 'geekblue' : record.link === 'solo' ? 'purple' : 'default'"
+              class="mt-0.5"
+            >
+              {{ record.link === 'remote' ? 'remote' : record.link === 'solo' ? 'solo raw' : 'utils_chat' }}
+            </a-tag>
           </template>
           <template v-else-if="column.key === 'account'">
             <!-- 账号名可能很长（千问的显示名、TRAE 的昵称），加 tooltip 看全 -->

@@ -69,3 +69,32 @@ test('dumateRows：倍率来自实测缓存（按 target 命中；无缓存/过�
   fs.unlinkSync(tmp);
   delete process.env.DUMATE_DUMATE_RATE_FILE;
 });
+
+// ---- 2026-11-07 融合项 P0-3（双链路标注）与 P1-4（/v1/models 元数据）----
+
+test('dumateTargetOf / dumateRealOf：与 dumateRows 同一映射算法（单一来源）', () => {
+  assert.equal(mi.dumateTargetOf('deepseek-v4.1-flash-low-latency'), 'dm-auto-model/text.L0');
+  assert.equal(mi.dumateTargetOf('glm-5.2'), 'glm-5');
+  assert.equal(mi.dumateRealOf('glm-5').real, 'glm-5.2');
+  assert.equal(mi.dumateRealOf('dm-auto-model/text.L2').context, 983616);
+  assert.equal(mi.dumateRealOf('no-such-target'), null, '查不到如实 null，不编');
+});
+
+test('dumateRows：JSON mode 按命名空间判（应用别名一律 false + 说明）', () => {
+  for (const r of mi.dumateRows()) {
+    assert.equal(r.jsonMode, false, r.id + ' 应用链路不支持 response_format');
+    assert.equal(r.jsonModeSource, 'measured');
+    assert.ok(/qianfan\//.test(r.jsonModeNote), r.id + ' 的说明要指向 qianfan/ 前缀');
+    assert.deepEqual(r.links, { app: true, qianfanRaw: false }, r.id);
+  }
+});
+
+test('dumateRows：multimodal 按 target 档位语义判（mm 档位不再恒 false）', () => {
+  // 当前暴露列表全是 text 档位——false 是正确值
+  for (const r of mi.dumateRows()) {
+    assert.equal(r.multimodal, /\/mm\./.test(r.target), r.id + '（target=' + r.target + '）');
+    assert.equal(r.multimodalSource, 'config');
+  }
+  // 档位语义本身：mm target 必须判 true（一旦 mm 进暴露列表不再标错）
+  assert.equal(mi.dumateRealOf('dm-auto-model/mm.L0').real, 'deepseek-v4.1-flash-low-latency', 'mm 档位在实测表里，语义判断有数据支撑');
+});

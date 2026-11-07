@@ -249,7 +249,92 @@ async function skillsSquare() {
   };
 }
 
+// ── 本地会话工作目录（2026-11-06 清单项 7）──
+//
+// session/detail 返回的 `directory` 是**发起会话那台机器的本机路径**——
+// 网关就在本机跑，所以可以直接读。目录里是会话的**工作产物**（markdown
+// 章节、outline 等），**不是对话消息**——消息本体没有本地明文（见文件头
+// 注释第 2 条），界面上要如实叫「工作目录」，不能许诺「看对话记录」。
+//
+// 安全是这条链路的全部：directory 来自上游数据（不可信输入），file 是
+// 用户可控的相对路径——两个都不可信，必须把最终路径**锚定**在
+// ~/.qianfan/workspace/sessions/ 根下（resolve 后前缀比对），穿越一律
+// 拒绝。只读文本（.md/.txt/.json），单文件 2MB 上限。
+
+const fs = require('fs');
+const path = require('path');
+
+const LOCAL_ROOT = path.join(
+  process.env.USERPROFILE || process.env.HOME || '',
+  '.qianfan', 'workspace', 'sessions',
+);
+
+const LOCAL_TEXT_EXT = new Set(['.md', '.txt', '.json', '.log']);
+const LOCAL_MAX_BYTES = 2 * 1024 * 1024;
+
+/** 路径锚定：resolve 后必须在 LOCAL_ROOT 下。返回绝对路径或 null（拒绝） */
+function safeLocalPath(dirPath, relFile) {
+  if (!dirPath || typeof dirPath !== 'string') return null;
+  const root = path.resolve(LOCAL_ROOT);
+  let base;
+  try { base = path.resolve(dirPath.trim()); } catch (e) { return null; }
+  // 大小写不敏感文件系统（Windows）：统一小写比对
+  if (!base.toLowerCase().startsWith(root.toLowerCase() + path.sep)) return null;
+  if (relFile === undefined || relFile === null || relFile === '') return base;
+  const rel = String(relFile);
+  if (rel.includes('..') || path.isAbsolute(rel)) return null;
+  let full;
+  try { full = path.resolve(base, rel); } catch (e) { return null; }
+  if (!full.toLowerCase().startsWith(root.toLowerCase() + path.sep)) return null;
+  return full;
+}
+
+/** 列出一个会话工作目录（一层）。返回 { ok, dir, entries, error? } */
+function listLocalFiles(dirPath) {
+  const base = safeLocalPath(dirPath);
+  if (!base) return { ok: false, entries: [], error: '目录不在会话工作区根下（拒绝访问）' };
+  let entries;
+  try { entries = fs.readdirSync(base, { withFileTypes: true }); } catch (e) {
+    return { ok: false, entries: [], error: `读取失败：${e.message}` };
+  }
+  const out = [];
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const full = path.join(base, e.name);
+    let size = 0, mtime = 0;
+    try { const st = fs.statSync(full); size = st.size; mtime = st.mtimeMs; } catch (err) { /* 竞态跳过 */ }
+    const ext = path.extname(e.name).toLowerCase();
+    out.push({
+      name: e.name,
+      is_dir: e.isDirectory(),
+      readable: !e.isDirectory() && LOCAL_TEXT_EXT.has(ext) && size <= LOCAL_MAX_BYTES,
+      size,
+      mtime,
+    });
+  }
+  out.sort((a, b) => (a.is_dir === b.is_dir ? b.mtime - a.mtime : (a.is_dir ? -1 : 1)));
+  return { ok: true, dir: base, entries: out };
+}
+
+/** 读一个文本文件。返回 { ok, name, text | error } */
+function readLocalFile(dirPath, relFile) {
+  const full = safeLocalPath(dirPath, relFile);
+  if (!full) return { ok: false, error: '路径不在会话工作区根下（拒绝访问）' };
+  let st;
+  try { st = fs.statSync(full); } catch (e) { return { ok: false, error: '文件不存在' }; }
+  if (st.isDirectory()) return { ok: false, error: '这是一个目录，请先进入' };
+  const ext = path.extname(full).toLowerCase();
+  if (!LOCAL_TEXT_EXT.has(ext)) return { ok: false, error: `只支持文本预览（${[...LOCAL_TEXT_EXT].join(' ')}），二进制文件请用资源管理器` };
+  if (st.size > LOCAL_MAX_BYTES) return { ok: false, error: `文件超过 2MB，请用资源管理器打开` };
+  try {
+    return { ok: true, name: path.basename(full), text: fs.readFileSync(full, 'utf8') };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
 module.exports = {
   listSessions, sessionDetail, listProjects, listConnectors, connectorTemplates, skillsSquare,
   normalizeSession, normalizeConnector, apiError, pickCookieAccount, WEB_HOST,
+  listLocalFiles, readLocalFile, LOCAL_ROOT,
 };
