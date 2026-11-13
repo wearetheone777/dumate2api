@@ -142,12 +142,39 @@ function resolveWorkBuddyMaxTokens(requested) {
   return out;
 }
 
+/**
+ * 客户端 token 字段归一（2026-11-13 真机实测）。
+ *
+ * 上游（dumate-svc /gateway/apis/v1）只认 `max_tokens`，因此：
+ *   - **只发 `max_completion_tokens`** 的客户端（ZCode 等 OpenAI 兼容封装）会让
+ *     预算字段被整个丢掉，请求退回 DEFAULT_BUDGET，用户设的长度形同没设；
+ *   - **两个都发**时上游明文拒绝，整轮失败：
+ *     `setting 'max_tokens' and 'max_completion_tokens' at the same time is not supported`
+ *     （400 invalid_request，客户端侧表现为「本回合执行失败」）。
+ *
+ * 两条都收敛成「只有一个 max_tokens」。两个值不一致时取较大者——同一次请求里
+ * 客户端意图本身不明，取大的不会把用户要的长度砍短，随后仍由 resolveMaxTokens
+ * 按通道 FLOOR/CEIL 钳制。
+ *
+ * @returns {boolean} 是否发生了改写（供调用方决定是否记一笔日志）
+ */
+function normalizeTokenFields(body) {
+  if (!body || typeof body !== 'object') return false;
+  if (body.max_completion_tokens == null) return false;
+  const mct = Number(body.max_completion_tokens);
+  const mt = Number(body.max_tokens);
+  if (Number.isFinite(mct) && (!Number.isFinite(mt) || mct > mt)) body.max_tokens = mct;
+  delete body.max_completion_tokens;
+  return true;
+}
+
 module.exports = {
   resolveMaxTokens,
   resolveQwenMaxTokens,
   resolveTraeworkMaxTokens,
   resolveQoderMaxTokens,
   resolveWorkBuddyMaxTokens,
+  normalizeTokenFields,
   FLOOR,
   QW_FLOOR,
   QW_DEFAULT,
