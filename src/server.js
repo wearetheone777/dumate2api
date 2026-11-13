@@ -9,7 +9,7 @@ const dumateCaps = require('./dumate-caps');
 const promptGuard = require('./prompt-guard');
 const media = require('./media');
 const { cachedTokensOf } = require('./usage-norm');
-const { resolveMaxTokens, resolveQwenMaxTokens, resolveTraeworkMaxTokens, resolveQoderMaxTokens } = require('./budget');
+const { resolveMaxTokens, resolveQwenMaxTokens, resolveTraeworkMaxTokens, resolveQoderMaxTokens, normalizeTokenFields } = require('./budget');
 const webFallback = require('./fallback-web');
 // dumate-points 伪模型（2026-11-07 融合项 P0-1）：网页池余额读数走 /v1 面，
 // 让 Codex / Claude Code 这类只看得到网关的 Agent 能自己查「还能跑多少」
@@ -1411,6 +1411,12 @@ async function handleOpenAIChat(req, res) {
   } catch (e) {
     return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
   }
+
+  // 客户端 token 字段归一（实机原因见 src/budget.js:normalizeTokenFields）：
+  // 上游只认 max_tokens——两个都发会被明文拒绝（400），只发
+  // max_completion_tokens 则预算字段被整个丢弃。必须在 resolveMaxTokens 之前做，
+  // 否则预算取的是默认值而不是客户端要的值。
+  normalizeTokenFields(reqBody);
 
   const info = reqlog.describeRequest(reqBody);
   req._logPath = '/v1/chat/completions';
