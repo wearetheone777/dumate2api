@@ -127,6 +127,37 @@
           </div>
         </div>
         <a-space :size="10">
+          <!-- 主题切换：三态下拉而不是单键翻转。
+               单键只能两态，而 'auto' 是默认值——用户首次进站时是「跟随系统」，
+               单键翻转会把他从 auto 里拽出来，之后就再也不跟随系统了。
+               图标按**生效**主题画（不是按选择），这样 auto 下也能一眼看出现在是什么颜色。 -->
+          <a-dropdown :trigger="['click']" placement="bottomRight">
+            <a-button size="small" class="ghost-btn theme-btn" :title="themeTitle">
+              <template #icon>
+                <svg v-if="isDark" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"
+                  />
+                </svg>
+                <svg v-else viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+                  <circle cx="12" cy="12" r="4.4" fill="currentColor" />
+                  <g stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                    <path d="M12 2.4v2.2M12 19.4v2.2M2.4 12h2.2M19.4 12h2.2" />
+                    <path d="M5.2 5.2l1.6 1.6M17.2 17.2l1.6 1.6M18.8 5.2l-1.6 1.6M6.8 17.2l-1.6 1.6" />
+                  </g>
+                </svg>
+              </template>
+              <span class="theme-btn-text">{{ themeShort }}</span>
+            </a-button>
+            <template #overlay>
+              <a-menu :selected-keys="[themeMode]" @click="onThemeMode">
+                <a-menu-item key="light">浅色</a-menu-item>
+                <a-menu-item key="dark">深色</a-menu-item>
+                <a-menu-item key="auto">跟随系统</a-menu-item>
+              </a-menu>
+            </template>
+          </a-dropdown>
           <a-tag class="user-tag">{{ auth.user?.username }}</a-tag>
           <a-button size="small" class="ghost-btn" @click="onLogout">退出</a-button>
         </a-space>
@@ -147,6 +178,7 @@ import client from '@/api/client'
 import { auth, isAdmin } from '@/stores/auth'
 import { channelStore, CHANNELS } from '@/stores/channel'
 import { regionStore, hasRegion } from '@/stores/region'
+import { isDark, themeMode, setThemeMode, type ThemeMode } from '@/stores/theme'
 
 const collapsed = ref(false)
 const router = useRouter()
@@ -240,6 +272,23 @@ async function onLogout() {
   router.push('/login')
 }
 
+// ---------- 主题切换 ----------
+// 按钮上的短标签按「用户的选择」显示（auto 就写自动），图标按「生效结果」画：
+// 两者会不一致（auto + 系统深色 = 写「自动」画月亮），这是刻意的——
+// 标签回答「我选了什么」，图标回答「现在是什么」。
+const themeShort = computed(() =>
+  themeMode.value === 'auto' ? '自动' : themeMode.value === 'dark' ? '深色' : '浅色'
+)
+const themeTitle = computed(
+  () =>
+    `主题：${isDark.value ? '深色' : '浅色'}` +
+    (themeMode.value === 'auto' ? '（跟随系统）' : '') +
+    ' · 点击切换'
+)
+function onThemeMode({ key }: { key: string }) {
+  setThemeMode(key as ThemeMode)
+}
+
 // URL 参数直达通道/区域视图（?channel=workbuddy&region=cn）：让「某通道某
 // 区域的管理视图」可以被链接分享、被书签直达，也让自动化走查不必依赖点击
 // 顶栏切换器。只认合法值，非法参数静默忽略（不报错——URL 是数据不是指令）。
@@ -269,11 +318,11 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
 
 /* 侧栏：比内容区再深一档灰，靠明度分层而不是靠边框 */
 .lab-sider {
-  background: #edf1f6 !important;
+  background: var(--lab-sider-bg) !important;
   border-right: 1px solid var(--lab-border);
 }
 .lab-sider :deep(.ant-layout-sider-trigger) {
-  background: #e4e9f0;
+  background: var(--lab-sider-trigger);
   border-top: 1px solid var(--lab-border);
   color: var(--lab-text-mute);
 }
@@ -409,7 +458,7 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
 }
 .ch-btn:hover {
   color: var(--lab-text);
-  background: rgba(15, 23, 42, 0.04);
+  background: var(--lab-hover);
 }
 .ch-btn.on {
   background: var(--lab-primary-dim);
@@ -460,7 +509,7 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
   padding: 0 20px;
   height: 58px;
   line-height: 58px;
-  background: rgba(255, 255, 255, 0.82);
+  background: var(--lab-header-bg);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--lab-border);
   position: sticky;
@@ -477,7 +526,7 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
   color: var(--lab-text-mute);
 }
 .crumb-sep {
-  color: #b6c0cd;
+  color: var(--lab-border-strong);
 }
 .crumb-cur {
   color: var(--lab-text);
@@ -523,4 +572,18 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
   }
 }
 
+
+/* 主题切换按钮：太阳/月亮图标 + 极短标签。
+   标签保留是因为纯图标在「自动」态下说不出当前是什么（图标只表达生效结果）。 */
+.theme-btn {
+  display: inline-flex;
+  align-items: center;
+}
+.theme-btn-text {
+  font-size: 12px;
+  letter-spacing: 0.3px;
+}
+.theme-btn svg {
+  display: block;
+}
 </style>

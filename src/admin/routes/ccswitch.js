@@ -65,6 +65,12 @@ function pickTiers(rows, wantIds) {
     for (const m of rows) {
       byId.set(String(m.id), m);
       if (m.prefixed) byId.set(String(m.prefixed), m);
+      // 同后端合并后的别名（alsoKnownAs）：用户显式指定的名字可能不是主行
+      // 的 id（实例：deepseek-v41-flash 被并进 model-text）。只按 id/prefixed
+      // 索引会让这种显式选择解析成空档位，最终写出空模型名（review #6）。
+      for (const alias of (Array.isArray(m.alsoKnownAs) ? m.alsoKnownAs : [])) {
+        if (!byId.has(String(alias))) byId.set(String(alias), m);
+      }
     }
     return wantIds.map((id) => byId.get(String(id))).filter(Boolean);
   }

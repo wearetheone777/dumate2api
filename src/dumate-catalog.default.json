@@ -1,0 +1,445 @@
+{
+  "schema": 1,
+  "models": {
+    "deepseek-v4-flash-0731": {
+      "id": "deepseek-v4-flash-0731",
+      "name": "deepseek-v4-flash-0731",
+      "limit": {
+        "context": 200000,
+        "output": 32000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "deepseek-v4-pro": {
+      "id": "deepseek-v4-pro",
+      "name": "deepseek-v4-pro",
+      "limit": {
+        "context": 1000000,
+        "output": 384000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "deepseek-v41-flash": {
+      "id": "deepseek-v41-flash",
+      "name": "deepseek-v41-flash",
+      "limit": {
+        "context": 1000000,
+        "output": 384000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "dm-auto-model/mm.L0": {
+      "id": "dm-auto-model/mm.L0",
+      "name": "dm-auto-model/mm.L0",
+      "limit": {
+        "context": 1000000,
+        "output": 384000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "dm-auto-model/mm.L1": {
+      "id": "dm-auto-model/mm.L1",
+      "name": "dm-auto-model/mm.L1",
+      "limit": {
+        "context": 1000000,
+        "output": 384000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "dm-auto-model/mm.L2": {
+      "id": "dm-auto-model/mm.L2",
+      "name": "dm-auto-model/mm.L2",
+      "limit": {
+        "context": 1000000,
+        "output": 384000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "dm-auto-model/text.L0": {
+      "id": "dm-auto-model/text.L0",
+      "name": "dm-auto-model/text.L0",
+      "limit": {
+        "context": 1000000,
+        "output": 384000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "dm-auto-model/text.L1": {
+      "id": "dm-auto-model/text.L1",
+      "name": "dm-auto-model/text.L1",
+      "limit": {
+        "context": 1048576,
+        "output": 1048576
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "dm-auto-model/text.L2": {
+      "id": "dm-auto-model/text.L2",
+      "name": "dm-auto-model/text.L2",
+      "limit": {
+        "context": 983000,
+        "output": 128000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "doubao-seed-2-0-pro": {
+      "id": "doubao-seed-2-0-pro",
+      "name": "doubao-seed-2-0-pro",
+      "limit": {
+        "context": 200000,
+        "output": 32000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "ernie-4.5-turbo-vl-32k": {
+      "id": "ernie-4.5-turbo-vl-32k",
+      "name": "ernie-4.5-turbo-vl-32k",
+      "limit": {
+        "context": 200000,
+        "output": 32000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "glm-53": {
+      "id": "glm-53",
+      "name": "glm-53",
+      "limit": {
+        "context": 1000000,
+        "output": 128000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "glm-53-flash": {
+      "id": "glm-53-flash",
+      "name": "glm-53-flash",
+      "limit": {
+        "context": 1000000,
+        "output": 128000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "kimi-k3": {
+      "id": "kimi-k3",
+      "name": "kimi-k3",
+      "limit": {
+        "context": 1048576,
+        "output": 1048576
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "kimi-k31": {
+      "id": "kimi-k31",
+      "name": "kimi-k31",
+      "limit": {
+        "context": 1048576,
+        "output": 1048576
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "model-text": {
+      "id": "model-text",
+      "name": "model-text",
+      "limit": {
+        "context": 1000000,
+        "output": 384000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "qwen2.5-vl-32b-instruct": {
+      "id": "qwen2.5-vl-32b-instruct",
+      "name": "qwen2.5-vl-32b-instruct",
+      "limit": {
+        "context": 200000,
+        "output": 32000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "qwen3.5-27b": {
+      "id": "qwen3.5-27b",
+      "name": "qwen3.5-27b",
+      "limit": {
+        "context": 200000,
+        "output": 32000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "qwen3.5-35b-a3b": {
+      "id": "qwen3.5-35b-a3b",
+      "name": "qwen3.5-35b-a3b",
+      "limit": {
+        "context": 200000,
+        "output": 32000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "qwen3.5-397b-a17b": {
+      "id": "qwen3.5-397b-a17b",
+      "name": "qwen3.5-397b-a17b",
+      "limit": {
+        "context": 200000,
+        "output": 32000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": false,
+      "modalities": {
+        "input": [
+          "text"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "qwen3.8-max": {
+      "id": "qwen3.8-max",
+      "name": "qwen3.8-max",
+      "limit": {
+        "context": 983000,
+        "output": 128000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    },
+    "qwen38-flash": {
+      "id": "qwen38-flash",
+      "name": "qwen38-flash",
+      "limit": {
+        "context": 983000,
+        "output": 128000
+      },
+      "tool_call": true,
+      "reasoning": false,
+      "attachment": true,
+      "modalities": {
+        "input": [
+          "text",
+          "image",
+          "video"
+        ],
+        "output": [
+          "text"
+        ]
+      }
+    }
+  },
+  "excluded": 21,
+  "asOf": "2026-11-13"
+}

@@ -120,7 +120,9 @@ const routes = [
       const billing = require('../../dumate-billing');
       // mapModel 兜底是网关的真实行为——探针沿用并把映射结果透出
       // （传错名测到 fallback 至少看得见，比静默好；带 mapped 字段）。
-      const mapped = modelmap.mapModel(raw || 'model-text');
+      // 探针走网页池（下面的 pool 是 web-pool），即**云端链路**：清单路由名
+      // 必须直传，否则测的是 model-text 却把倍率记在请求名上（review #7）。
+      const mapped = modelmap.mapModel(raw || 'model-text', { catalog: true });
       const startedAt = Date.now();
       const before = await chatlab.snapshotBalances();
       const payload = {

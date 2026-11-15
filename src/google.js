@@ -32,11 +32,11 @@ const GEMINI_TO_DUMATE = {
   'gemini-flash': 'model-text',
 };
 
-function mapModel(name) {
+function mapModel(name, opts) {
   if (!name) return modelmap.load().fallback;
   if (GEMINI_TO_DUMATE[name]) return GEMINI_TO_DUMATE[name];
   // 上游原生 ID 原样透传，其余交给统一映射（查不到则回落 fallback）
-  return modelmap.mapModel(name);
+  return modelmap.mapModel(name, opts);
 }
 
 function partsToText(parts) {

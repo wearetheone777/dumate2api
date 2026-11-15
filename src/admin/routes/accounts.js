@@ -470,7 +470,10 @@ const routes = [
         '全选复制所有 cookie，粘贴到下面的输入框',
       ],
       note: '百度登录态位于 baidu.com 域，网页无法直接读取浏览器 cookie，所以需要手动复制一次',
-      browser_available: !!loginBrowser.findBrowser(),
+      // 两个条件缺一不可：有可执行文件，且服务端有图形界面。
+      // 无头部署（服务器/容器）能找到 chromium 也开不出窗口——前端据此
+      // 直接切到「手动粘贴」，而不是让用户对着点不动的按钮。
+      browser_available: !!(loginBrowser.findBrowser() && loginBrowser.hasDisplay()),
     }),
   },
   {
@@ -756,15 +759,28 @@ const routes = [
       }));
 
       const ok = results.filter((r) => r.ok);
+      // 汇总口径：失败账号不进合计；**查询成功但读数未知（null）的也不进**，
+      // 但要在 partial / unknown_accounts 里如实标出——部分和不能冒充全量
+      // （余额 null ≠ 0，review #10）。
+      const sumOf = (key) => {
+        const vals = ok.map((r) => r[key]).filter((v) => Number.isFinite(v));
+        return { sum: vals.reduce((s, v) => s + v, 0), known: vals.length };
+      };
+      const left = sumOf('left');
+      const total = sumOf('total');
+      const used = sumOf('used');
       return sendJSON(res, 200, {
         accounts: results,
-        // 汇总口径：只累加取到数据的账号，避免失败的账号把总数拉低
         totals: {
           accounts: results.length,
           ok_accounts: ok.length,
-          left: ok.reduce((s, r) => s + (r.left || 0), 0),
-          total: ok.reduce((s, r) => s + (r.total || 0), 0),
-          used: ok.reduce((s, r) => s + (r.used || 0), 0),
+          left: left.sum,
+          total: total.sum,
+          used: used.sum,
+          // 有余额读数的账号数；少于 ok_accounts 时说明合计是部分和
+          known_accounts: left.known,
+          unknown_accounts: ok.length - left.known,
+          partial: left.known !== ok.length,
         },
       });
     },

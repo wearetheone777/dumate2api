@@ -37,6 +37,26 @@ test('summary：全部失败时 totalLeft 是 null 不是 0（0 会被读成「�
   assert.equal(s.okCount, 0);
 });
 
+test('summary：成功但余额读数为 null 的账号不进合计，并标 partial', async () => {
+  // 上游 200 但少 totalPoints/usedPoints（review #10）：这不是失败、也不是 0。
+  const s = await dp.summary({
+    load: () => [
+      { id: 1, enabled: true, cookie: 'a' },
+      { id: 2, enabled: true, cookie: 'b' },
+    ],
+    quota: async (a) => (a.id === 1
+      ? { id: 1, name: 'A', ok: true, left: 10, total: 20, used: 10 }
+      : { id: 2, name: 'B', ok: true, left: null, total: null, used: null }),
+  });
+  assert.equal(s.totalLeft, 10, '只累已知值');
+  assert.equal(s.unknownCount, 1);
+  assert.equal(s.partial, true);
+  const t = dp.renderText(s);
+  assert.ok(/剩余 未知/.test(t), '未知余额如实渲染，不写成 0');
+  assert.ok(/合计剩余（已知部分）：10/.test(t), t);
+  assert.ok(/1 个账号余额未知未计入/.test(t), t);
+});
+
 test('renderText：好行带数字、坏行带原因、合计带成败计数', async () => {
   const s = await dp.summary({ load, quota });
   const t = dp.renderText(s);

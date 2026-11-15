@@ -89,6 +89,8 @@ async function dumateRow() {
   row.ok = s.okCount > 0;
   if (!s.rows.length) row.error = '网页池没有启用账号';
   else if (!s.okCount) row.error = '全部账号查询失败';
+  // 部分和不能冒充全量：查询成功但没有余额读数的账号要如实标出来
+  if (s.partial) row.note += `；${s.unknownCount} 个账号余额未知，合计只含已知部分`;
   return row;
 }
 

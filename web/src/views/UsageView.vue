@@ -836,14 +836,19 @@ watch(days, load)
 // 切通道要重新拉数据（服务端过滤），不能只改前端显示
 watch(() => channelStore.current, load)
 
+// 主题切换（夜间模式）重绘：canvas 读不到 CSS 变量，按新主题常量重建 option
+function onThemePaint() { renderChart() }
+
 onMounted(() => {
   window.addEventListener('resize', onResize)
+  window.addEventListener('lab:theme', onThemePaint)
   load()
   loadBillMonths()
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('lab:theme', onThemePaint)
   chartInst?.dispose()
   chartInst = null
 })

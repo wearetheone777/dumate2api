@@ -1800,7 +1800,11 @@ onMounted(() => {
     loadOpAccounts()
   }
   window.addEventListener('resize', onResize)
+  window.addEventListener('lab:theme', onThemePaint)
 })
+
+// 主题切换（夜间模式）重绘：canvas 读不到 CSS 变量，按新主题常量重建 option
+function onThemePaint() { renderGrantChart() }
 
 // 切通道重拉：各通道的数据源与结构都不同
 watch(() => channelStore.current, () => {
@@ -1817,6 +1821,7 @@ watch(() => channelStore.current, () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('lab:theme', onThemePaint)
   grantChart?.dispose()
   grantChart = null
 })

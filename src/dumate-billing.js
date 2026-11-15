@@ -48,6 +48,7 @@ function verdictOf(cost) {
 
 const fs = require('fs');
 const path = require('path');
+const modelmap = require('./modelmap');
 const RATE_TTL_MS = 7 * 24 * 3600 * 1000;
 
 function rateCachePath() {
@@ -63,11 +64,77 @@ function readRateCache() {
   } catch (e) { return {}; }
 }
 
-/** 写入一条实测记录（原子写，与 dumate-caps 同款）。失败只影响下次展示 */
+/**
+ * 按名字找缓存条目。**键的规范形式是 `modelmap.backendOf(名字)`**（真实
+ * 后端）：同一后端的 model-text / deepseek-v41-flash / text.L0 只存一份价，
+ * 不会出现「同一后端四个数字」。
+ *
+ * 老缓存里有按 target 或请求名写的条目（2026-11-01 的计费自检直接存
+ * `mapped`）。读取时按 backend 归一后再扫一遍——不认老键会让已经测过的
+ * 倍率凭空消失（review #9）。
+ */
+function findRateEntry(cache, model) {
+  const key = String(model || '');
+  if (!key) return null;
+  if (cache[key]) return { key, entry: cache[key] };
+  const backend = modelmap.backendOf(key);
+  if (backend !== key && cache[backend]) return { key: backend, entry: cache[backend] };
+  // 老缓存可能给同一个后端留下了多个键（model-text / dm-auto-model/text.L0 …）。
+  // 取**最新**的那条，避免旧条目随对象键序遮蔽新测量。
+  const atOf = (e) => Math.max(
+    Number(e && e.pointsPerKOutAt) || 0,
+    Number(e && e.billedAt) || 0,
+    Number(e && e.measuredAt) || 0,
+  );
+  let hit = null;
+  for (const [k, e] of Object.entries(cache)) {
+    if (modelmap.backendOf(k) !== backend) continue;
+    if (!hit || atOf(e) > atOf(hit.entry)) hit = { key: k, entry: e };
+  }
+  return hit;
+}
+
+/**
+ * 写入一条实测记录（原子写，与 dumate-caps 同款）。失败只影响下次展示。
+ *
+ * 两点与老实现不同（review #9 / #11）：
+ *   1. **键归一到真实后端**，写入口径统一（探针脚本、计费自检、合并脚本）。
+ *   2. **按口径分别记时间戳**：pointsPerKOut（积分/千out）与 billed（积分/千tok）
+ *      单位不同，后来者不能覆盖前者的时间——否则要么把旧价格盖成新鲜，
+ *      要么把新测量的另一种口径冲掉。`entry.measuredAt` 可显式传入（合并
+ *      历史报告时用它写**真实测量时刻**，不是合并时刻）。
+ */
 function saveRateEntry(model, entry) {
   try {
     const data = readRateCache();
-    data[model] = { ...entry, measuredAt: Date.now() };
+    const key = modelmap.backendOf(model) || String(model || '');
+    if (!key) return false;
+    const prev = data[key] && typeof data[key] === 'object' ? data[key] : {};
+    const next = { ...prev };
+    // 老条目只有一个 measuredAt：按字段迁移成各自的时刻，迁移时不改原值
+    const legacyAt = Number(prev.measuredAt) || 0;
+    if (next.billed != null && next.billedAt == null) next.billedAt = legacyAt;
+    if (next.pointsPerKOut != null && next.pointsPerKOutAt == null) next.pointsPerKOutAt = legacyAt;
+
+    const at = Number(entry && entry.measuredAt) || Date.now();
+    const { measuredAt, ...rest } = entry || {};
+    Object.assign(next, rest);
+    if (Number.isFinite(rest.pointsPerKOut) && rest.pointsPerKOut > 0) {
+      next.pointsPerKOutAt = at;
+      next.pointsPerKOutTokens = rest.tokens || '';
+    }
+    if (Number.isFinite(rest.billed) && rest.billed > 0) {
+      next.billedAt = at;
+      next.billedTokens = rest.tokens || '';
+    }
+    // measuredAt 只作向后兼容的“最新一次测量”摘要，不再作为单一 TTL 依据
+    next.measuredAt = Math.max(
+      Number(next.pointsPerKOutAt) || 0,
+      Number(next.billedAt) || 0,
+      Number(next.measuredAt) || 0,
+    ) || at;
+    data[key] = next;
+
     const tmp = rateCachePath() + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(data, null, 1));
     fs.renameSync(tmp, rateCachePath());
@@ -80,11 +147,64 @@ function saveRateEntry(model, entry) {
  * 「—」更害人（上游改价后旧倍率看着仍然权威）。
  */
 function rateForTarget(model, now) {
-  const e = readRateCache()[String(model || '')];
+  const hit = findRateEntry(readRateCache(), model);
+  if (!hit) return null;
+  const e = hit.entry;
   if (!e || !Number.isFinite(e.billed) || e.billed <= 0) return null;
-  const at = Number(e.measuredAt) || 0;
+  const at = Number(e.billedAt || e.measuredAt) || 0;
   if (!at || (now || Date.now()) - at > RATE_TTL_MS) return null;
   return e;
 }
 
-module.exports = { billedRate, verdictOf, rateCachePath, readRateCache, saveRateEntry, rateForTarget, RATE_TTL_MS };
+/**
+ * 取某模型的**展示用**倍率，两种口径分先后：
+ *
+ *   ① `pointsPerKOut`（双点解斜率，积分/千 **output** token）——2026-11-15 起
+ *       `test/probe-dumate-rates.js` 写的就是这个。它把「每次调用的固定开销」
+ *      抵消掉了，比 ② 准得多（真机复现：model-text 2.0179 vs 社区 2.014）。
+ *   ② `billed`（单次小请求 + 余额前后差，积分/千 **token** 综合）——2026-11-01
+ *      的老口径，模型页「计费自检」按钮写的。没有 ① 时用它兜底。
+ *
+ * 两个口径**单位不同、不可混比**，所以返回里必须带 `unit`，界面按它写单位，
+ * 不许把两种数字并到一列去比大小（本项目反复踩过的坑）。
+ */
+function rateValueForTarget(model, now) {
+  const hit = findRateEntry(readRateCache(), model);
+  if (!hit) return null;
+  const e = hit.entry || {};
+  const t = now || Date.now();
+  const fresh = (at) => {
+    const n = Number(at) || 0;
+    return n > 0 && t - n <= RATE_TTL_MS;
+  };
+  // 两种口径各有自己的测量时刻：双点解刚测过、单点已过期时，应回落到
+  // 单点的 null 而不是把过期数字当新鲜（反之亦然）。
+  if (Number.isFinite(e.pointsPerKOut) && e.pointsPerKOut > 0 && fresh(e.pointsPerKOutAt || e.measuredAt)) {
+    return {
+      value: e.pointsPerKOut,
+      unit: 'pts/1k_out',
+      unitText: '积分/千out',
+      source: 'two-point',
+      measuredAt: Number(e.pointsPerKOutAt || e.measuredAt),
+      tokens: e.pointsPerKOutTokens || e.tokens || '',
+      note: `双点解斜率实测（${e.pointsPerKOutTokens || e.tokens || '—'}），纯 output token 口径`,
+    };
+  }
+  if (Number.isFinite(e.billed) && e.billed > 0 && fresh(e.billedAt || e.measuredAt)) {
+    return {
+      value: e.billed,
+      unit: 'pts/1k_tok',
+      unitText: '积分/千tok',
+      source: 'single',
+      measuredAt: Number(e.billedAt || e.measuredAt),
+      tokens: e.billedTokens || e.tokens || '',
+      note: e.note || '单次小请求 + 余额前后差（综合输入+输出）',
+    };
+  }
+  return null;
+}
+
+module.exports = {
+  billedRate, verdictOf, rateCachePath, readRateCache, saveRateEntry, rateForTarget,
+  rateValueForTarget, RATE_TTL_MS,
+};

@@ -604,11 +604,11 @@ onMounted(async () => {
   width: 6px;
 }
 .chat-scroll::-webkit-scrollbar-thumb {
-  background: #c8d0db;
+  background: var(--lab-scroll-thumb);
   border-radius: 3px;
 }
 .chat-scroll::-webkit-scrollbar-thumb:hover {
-  background: #a8b4c4;
+  background: var(--lab-scroll-thumb-hover);
 }
 
 /* ---------- 空态 ---------- */

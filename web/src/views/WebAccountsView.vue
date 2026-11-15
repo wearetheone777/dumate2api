@@ -1026,16 +1026,20 @@ async function openDetail(a: WebAccount) {
   }
 }
 
+// 非搭子通道（四条直连通道）的数据由各自子组件自己拉，走自己的接口；
+// 这里只负责搭子的网页账号池。**四个都要列**——早先只判了 TRAE/千问，
+// 在 Qoder / WorkBuddy 通道下打开本页会去打搭子的 /web-accounts 与
+// /login-url（无账号时 502/空数据），纯属多余请求。
+const isDirectView = () => isTw.value || isQw.value || isQd.value || isWb.value
+
 onMounted(async () => {
-  // 按当前通道初始化：顶栏已切到千问时不该去拉搭子的网页账号。
-  // 千问与 TRAE 的数据由各自子组件自己拉（它们走自己的接口，与搭子的池子无关）
-  if (isTw.value || isQw.value) return
+  if (isDirectView()) return
   await Promise.all([load(), loadLoginInfo()])
 })
 
 // 切通道重拉
 watch(() => channelStore.current, async () => {
-  if (isTw.value || isQw.value) return
+  if (isDirectView()) return
   await Promise.all([load(), loadLoginInfo()])
 })
 </script>

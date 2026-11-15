@@ -43,6 +43,16 @@ test('云端不认识的名字兜底 fallback（model-text 两边同后端，安
   assert.strictEqual(modelmap.toCloudModel('glm-5.2'), 'model-text');
 });
 
+test('桌面清单路由名在云端链路原样透传（不静默换模型）', () => {
+  // 这 22 个是客户端自己在云端网关上用的名字。不认它们就会兜底成
+  // model-text——客户端选 qwen3.5-27b 却拿到 deepseek 的答案，200 无从察觉。
+  for (const m of ['dm-auto-model/text.L0', 'qwen3.5-27b', 'doubao-seed-2-0-pro', 'kimi-k3']) {
+    assert.strictEqual(modelmap.toCloudModel(m), m, m);
+  }
+  // 清单外的名字仍然兜底（公共兜底行为不变）
+  assert.strictEqual(modelmap.toCloudModel('not-in-any-list'), 'model-text');
+});
+
 test('空值回落 fallback；model-artifact-validate 不映射（云端无对应物）', () => {
   assert.strictEqual(modelmap.toCloudModel(''), 'model-text');
   assert.strictEqual(modelmap.toCloudModel(null), 'model-text');
@@ -81,4 +91,15 @@ test('mapModel 行为不变（本地链路不受云端名空间影响）', () =>
   assert.strictEqual(modelmap.mapModel('glm-5'), 'glm-5');
   assert.strictEqual(modelmap.mapModel('model-text'), 'model-text');
   assert.strictEqual(modelmap.mapModel('kimi-k31'), 'model-text', '云端名不进本地表');
+});
+
+test('翻译层包装转发 opts：四入口的 {catalog} 不再被吞（review #2 回归锚）', () => {
+  // server.js 的四个协议入口 require 的是 anthropic.js 的包装，不是 modelmap。
+  // 包装只接 name 时，{catalog:true} 整个丢失 → 客户端选 kimi-k31 实际跑
+  // model-text，HTTP 200 无从察觉。这条断言就是那个静默故障的回归守卫。
+  const anthropic = require('../../src/anthropic');
+  const google = require('../../src/google');
+  assert.strictEqual(anthropic.mapModel('kimi-k31', { catalog: true }), 'kimi-k31');
+  assert.strictEqual(anthropic.mapModel('kimi-k31'), 'model-text', '不传 opts 保持桌面链路兜底');
+  assert.strictEqual(google.mapModel('kimi-k31', { catalog: true }), 'kimi-k31');
 });

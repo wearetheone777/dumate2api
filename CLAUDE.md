@@ -60,6 +60,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | 国内/国际区域切换（整页切换约定） | `docs/REGION-SWITCH.md` |
 | `stable/` 冻结快照与发布流程 | `docs/STABLE-SNAPSHOT.md` |
 | 凭证、账号显示名、桌面→网页回落 | `docs/CREDENTIALS-ACCOUNTS.md` |
+| 模型清单 / 思考档位 / 积分分池（2026-11-15 融合） | `docs/FUSION-LANDING-2026-11-15.md`（调研：`docs/GITHUB-DUMATE-RESEARCH-2026-11-15.md`） |
 
 ### 改动前必读的五条
 
@@ -70,6 +71,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 3. **直连通道失败必须让翻译器收尾，不能裸 `res.end()`**——否则 `ERR_STREAM_WRITE_AFTER_END` 直接打挂网关进程。
 4. **流式解析必须用 `StringDecoder`**，不能逐块 `toString('utf8')`——跨 chunk 的多字节汉字会变成 U+FFFD。
 5. **余额 `null` ≠ 0**——读成 0 会把「查不到」显示成「用完了」，然后被当故障排查。
+
+**2026-11-15 又加两条**（都是「踩错会静默故障」级）：
+
+6. **桌面端模型清单的名字只能按链路直传**（`modelmap.mapModel(name, {catalog})`）。
+   清单里 22 个是**云端网关路由名**（`kimi-k31`/`glm-53`…），本地 8980 只认三个。
+   云端链路（`DUMATE_SOURCE=web`，默认）直传，桌面链路仍落 fallback——无条件直传会
+   推翻 `test/unit/cloud-model-map.test.js` 的回归守卫，让桌面链路把 8980 不认识的名字
+   发过去吃 404。清单三级降级（客户端配置 → `data/dumate-catalog.json` → 包内默认
+   `src/dumate-catalog.default.json`）见 `src/dumate-catalog.js`（包内默认必须随代码入库，
+   不能放 gitignore 的 `data/`）。
+   **三处判据必须一致**：四个协议入口 require 的是 `anthropic.js` 的 `mapModel` 包装
+   （必须转发第二个 `opts` 实参）、`server.js` 的 `catalogLink()`（auto 模式下网页池
+   可回落也算云端）、`fallback-web` 用的 `toCloudModel`（也要认同一份清单）。任一处漏了，
+   清单名都会在链路中途被静默改写成 `model-text`，响应仍是 200。
+7. **搭子思考档位只对同后端白名单生效**（`src/dumate-reasoning.js`）：只认 `none/low/high/max`，
+   只对 `deepseek-v41-flash` / `model-text` / `dm-auto-model/{text,mm}.L0` 等同一后端生效；
+   `minimal`/`medium`（翻译层五档词表里的）刻意不映射。改之前先读该文件头三个边界。
 
 ## 命令
 
@@ -645,6 +663,8 @@ per-key 限流（低价值场景）。
 | `DUMATE_GATEWAY_HOST` | `dumate-svc.baidu.com` | 网页凭证换模型 token 的目标主机。上游换域名时改这里 |
 | `DUMATE_UPSTREAM_CWD` | DuMate 安装根 | 拉起 `dumate-main-server.exe` 时的工作目录。后端读相对路径配置时用得上 |
 | `DUMATE_ADMIN_SECURE_COOKIE` | 未设（不置 Secure） | 设 `1` 才给会话 cookie 加 Secure（本地 http 下会被浏览器丢弃） |
+| `DUMATE_EXPOSE_CATALOG` | 未设（开启） | 设 `0` 关闭「/v1/models 追加桌面端模型清单条目」（回到只列 exposed 三条）。只在 `DUMATE_SOURCE=web` 云端链路生效 |
+| `DUMATE_OPENCODE_CONFIG` | 自动探测 | 钉死客户端 `opencode.json` 绝对路径（模型清单真相源；探测路径见 `src/dumate-catalog.js`） |
 | `DUMATE_DESENSITIZE` | 未设（关闭） | 设 `1` 开启系统提示词合规词零宽空格脱敏（词表 `data/desensitize-words.txt`，见 prompt-guard.js） |
 | `DUMATE_TOOL_OUTPUT_CAP` | 未设（关闭） | 历史 role:'tool' 输出超过此字符数截断并标注原始长度（0/未设关闭） |
 | `DUMATE_TRAEWORK_CONNECT_TIMEOUT_MS` | `10000` | TRAE 基址候选轮转的连接超时（tnc.js 候选链；黑洞主机不占满 600s） |

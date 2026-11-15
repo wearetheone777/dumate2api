@@ -331,7 +331,7 @@ onMounted(load)
 .metrics-preview {
   max-height: 320px;
   overflow: auto;
-  background: rgba(15, 23, 42, 0.06);
+  background: var(--lab-surface-3);
   border-radius: 6px;
   padding: 10px;
   font-size: 11px;

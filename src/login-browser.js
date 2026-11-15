@@ -26,13 +26,72 @@ const SETTLE_URLS = [
   'https://console.bce.baidu.com/ai/#/app/dumate/overview',
 ];
 
-// 常见安装位置。优先 Edge（Windows 自带），再 Chrome。
+// 常见安装位置。优先 Edge（Windows 自带），再 Chrome；三平台都列，
+// 因为本项目虽然主要在 Windows 跑，但管理端可以部署在 macOS / Linux 上。
 const CANDIDATES = [
+  // Windows
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  // Linux（发行版路径）
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/snap/bin/chromium',
+  // macOS
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
 ];
+
+/**
+ * playwright 自带的 Chromium（`~/.cache/ms-playwright/chromium-<版本>/…`）。
+ *
+ * 为什么需要：本机可能没装系统浏览器，但 `node_modules/playwright-core`
+ * 的浏览器缓存可能已经存在（跑过 `npx playwright install chromium`，
+ * 或管理端的截图/测试用过）。这种环境下「浏览器登录」是可以工作的，
+ * 不该因为找不到系统 Chrome 就判定不可用。
+ *
+ * **版本目录名会变（chromium-1255），不能写死**——按前缀找最新的一个。
+ * 平台子目录也不同：chrome-linux / chrome-linux64 / chrome-linux-arm64 /
+ * chrome-mac / chrome-win，所以逐层探测而不是拼固定路径。
+ */
+function playwrightChromium() {
+  const roots = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    path.join(require('os').homedir(), '.cache', 'ms-playwright'),
+    path.join(require('os').homedir(), 'Library', 'Caches', 'ms-playwright'),
+  ].filter(Boolean);
+  for (const root of roots) {
+    let dirs = [];
+    try {
+      dirs = fs.readdirSync(root).filter((n) => n.startsWith('chromium-')).sort().reverse();
+    } catch (e) { continue; }
+    for (const d of dirs) {
+      const base = path.join(root, d);
+      let sub = [];
+      try { sub = fs.readdirSync(base); } catch (e) { continue; }
+      for (const rel of sub) {
+        const exe = path.join(base, rel, 'chrome');
+        if (fs.existsSync(exe)) return exe;
+        // macOS 的包结构是 Chromium.app/Contents/MacOS/Chromium
+        const macExe = path.join(base, rel, 'Chromium.app', 'Contents', 'MacOS', 'Chromium');
+        if (fs.existsSync(macExe)) return macExe;
+        const winExe = path.join(base, rel, 'chrome.exe');
+        if (fs.existsSync(winExe)) return winExe;
+      }
+    }
+  }
+  return null;
+}
+
+/** 服务端有没有图形界面——无头环境里「打开一个窗口」本质上做不到 */
+function hasDisplay() {
+  if (process.platform === 'win32' || process.platform === 'darwin') return true;
+  return !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+}
 
 function findBrowser() {
   const envPath = process.env.DUMATE_BROWSER_PATH;
@@ -40,7 +99,7 @@ function findBrowser() {
   for (const p of CANDIDATES) {
     if (fs.existsSync(p)) return p;
   }
-  return null;
+  return playwrightChromium();
 }
 
 // 会话状态。同一时刻只允许一个登录流程——多个窗口同时登录会互相覆盖
@@ -146,11 +205,23 @@ async function start(opts = {}) {
     return { ok: false, error: '已有登录流程进行中，请先完成或取消' };
   }
 
+  // 无图形界面时「打开一个窗口让人登录」根本做不到，提前说清楚——
+  // 否则用户会看到 playwright 抛的 X server 错误，或者对着点不动的按钮。
+  if (!hasDisplay()) {
+    return {
+      ok: false,
+      error: '服务端没有图形界面（无 DISPLAY），浏览器登录用不了。请改用「手动粘贴」：'
+        + '在你自己的浏览器里登录 dumate.cn，从开发者工具复制 Cookie 整行',
+      browser_available: false,
+    };
+  }
   const exe = findBrowser();
   if (!exe) {
     return {
       ok: false,
-      error: '未找到 Edge 或 Chrome。可设置 DUMATE_BROWSER_PATH 指定浏览器路径',
+      error: '未找到可用的浏览器（Edge / Chrome / Chromium / playwright 自带 chromium 都没找到）。'
+        + '可设置 DUMATE_BROWSER_PATH 指定可执行文件路径，或改用「手动粘贴」',
+      browser_available: false,
     };
   }
 
@@ -249,4 +320,4 @@ function cancel() {
   return { ok: true };
 }
 
-module.exports = { start, cancel, snapshot, takeCookie, findBrowser, LOGIN_URL, extractAuthCookie };
+module.exports = { start, cancel, snapshot, takeCookie, findBrowser, hasDisplay, LOGIN_URL, extractAuthCookie };

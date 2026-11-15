@@ -19,35 +19,50 @@ fs.writeFileSync(tmp.file('model-map.json'), JSON.stringify({
 
 process.env.DUMATE_ADMIN_DATA = tmp.dir;
 const modelinfo = require('../src/model-info');
-const budget = require('../src/budget');
 
 test('dumateRows：别名落点语义——别名→目标、native→自身、未知名→fallback', () => {
-  const rows = modelinfo.dumateRows();
-  assert.equal(rows.length, 3);
-  const byId = Object.fromEntries(rows.map((r) => [r.id, r]));
-  for (const r of rows) {
-    assert.equal(r.channel, 'dumate');
-    assert.equal(r.rate, null, '搭子无倍率概念');
-    assert.equal(r.maxTokens, budget.resolveMaxTokens(0));
+  // 关掉清单追加行，只测 exposed 的映射语义（清单行为在 rowsFor 那条用例里）
+  process.env.DUMATE_EXPOSE_CATALOG = '0';
+  try {
+    const rows = modelinfo.dumateRows();
+    const byId = Object.fromEntries(rows.map((r) => [r.id, r]));
+    for (const r of rows) {
+      assert.equal(r.channel, 'dumate');
+      assert.equal(r.rate, null, '搭子无倍率概念');
+      assert.ok(r.maxTokens > 0, r.id + ' 输出上限应是实测正数');
+    }
+    // 别名行：native=false，target 指向映射目标，note 讲清楚转发去哪
+    assert.equal(byId['alias-a'].native, false);
+    assert.equal(byId['alias-a'].target, 'model-text');
+    assert.match(byId['alias-a'].note, /model-text/);
+    // 上游原生行
+    assert.equal(byId['glm-5'].native, true);
+    assert.equal(byId['glm-5'].target, 'glm-5');
+    assert.equal(byId['glm-5'].note, modelinfo.DUMATE_NOTE);
+    // 未登记别名也未登记 upstream → 走 fallback（不是映射到自身）。
+    // 它与 alias-a 落到同一个后端（model-text），2026-11-15 起同后端合并成
+    // 一行：主行保留 alias-a，unknown-alias 进 alsoKnownAs（信息不丢）。
+    assert.ok(byId['alias-a'].alsoKnownAs.includes('unknown-alias'));
+    assert.equal(byId['unknown-alias'], undefined, '同后端不重复占行');
+    assert.equal(rows.length, 2, 'alias-a/unknown-alias 合并 + glm-5');
+  } finally {
+    delete process.env.DUMATE_EXPOSE_CATALOG;
   }
-  // 别名行：native=false，target 指向映射目标，note 讲清楚转发去哪
-  assert.equal(byId['alias-a'].native, false);
-  assert.equal(byId['alias-a'].target, 'model-text');
-  assert.match(byId['alias-a'].note, /model-text/);
-  // 上游原生行
-  assert.equal(byId['glm-5'].native, true);
-  assert.equal(byId['glm-5'].target, 'glm-5');
-  assert.equal(byId['glm-5'].note, modelinfo.DUMATE_NOTE);
-  // 未登记别名也未登记 upstream → 走 fallback（不是映射到自身）
-  assert.equal(byId['unknown-alias'].target, 'model-text');
-  assert.equal(byId['unknown-alias'].native, false);
 });
 
-test('dumateRows：上下文是实测区间（不冒充上游给值）', () => {
-  const r = modelinfo.dumateRows()[0];
-  assert.equal(r.contextWindow, modelinfo.DUMATE_CONTEXT.max);
-  assert.equal(r.contextWindowMin, modelinfo.DUMATE_CONTEXT.min);
-  assert.equal(r.contextSource, 'measured');
+test('dumateRows：上下文来自实测表（不冒充上游给值）', () => {
+  process.env.DUMATE_EXPOSE_CATALOG = '0';
+  try {
+    const rows = modelinfo.dumateRows();
+    const r = rows.find((x) => x.id === 'alias-a');   // → model-text
+    const real = modelinfo.DUMATE_REAL['model-text'];
+    assert.equal(r.contextWindow, real.context);
+    assert.equal(r.contextWindowMin, null, '没有「区间」概念就不再给下界字段填数');
+    assert.equal(r.contextSource, 'measured');
+    assert.equal(r.maxTokens, real.maxTokens);
+  } finally {
+    delete process.env.DUMATE_EXPOSE_CATALOG;
+  }
 });
 
 test('qoderRows：归一化快照形状（session.fetchModels）映射', async () => {
@@ -131,13 +146,33 @@ test('qwenworkRows：默认静态表 + 注入快照后切换', () => {
 });
 
 test('rowsFor：四通道分发 + 未知通道报错', async () => {
-  assert.equal((await modelinfo.rowsFor('dumate')).rows.length, 3);
+  // 2026-11-15：搭子行数不再等于 exposed 的 3 条——dumateRows 会追加桌面端
+  // 模型清单里未覆盖的条目（P0-1）。所以断言改成「≥ exposed 数量，且多出来的
+  // 那部分来源标 desktop」，而不是钉死一个数字（清单条数会随客户端版本变）。
+  const dmRows = (await modelinfo.rowsFor('dumate')).rows;
+  const exposedCount = require('../src/modelmap').load().exposed.length;
+  assert.ok(dmRows.length >= exposedCount, `搭子行数 ${dmRows.length} 应 ≥ exposed ${exposedCount}`);
+  const desktopRows = dmRows.filter((r) => r.contextSource === 'desktop');
+  assert.ok(desktopRows.length > 0, '应包含桌面清单条目（默认环境用包内 22 条清单）');
+  assert.ok(desktopRows.every((r) => r.multimodalSource === 'desktop'), '清单行的来源标记应一致');
   assert.equal((await modelinfo.rowsFor('qwenwork')).rows.length >= 1, true);
   const unknown = await modelinfo.rowsFor('nope');
   assert.deepEqual(unknown.rows, []);
   assert.match(unknown.error, /nope/);
 });
 
+test('rowsFor visibleOnly：未实测的清单候选不进自动选档', async () => {
+  // cc-switch / agent-setup 用 visibleOnly 自动挑档位：清单里只有客户端声明、
+  // 本仓没实测过的名字（verified:false）不能写进客户端默认配置——可能是 404
+  // 的名字（review #5）。管理端表格（不带 visibleOnly）仍能看到它们。
+  const all = (await modelinfo.rowsFor('dumate')).rows;
+  const visible = (await modelinfo.rowsFor('dumate', { visibleOnly: true })).rows;
+  assert.ok(all.some((r) => r.verified === false), '默认清单里应有未实测条目（否则本用例失去意义）');
+  assert.ok(visible.length > 0);
+  assert.ok(visible.every((r) => r.verified !== false), '可见行不得含未实测候选');
+  assert.ok(visible.length < all.length, '必须真的过滤掉了一些');
+});
+
 test('SRC 标记集完整', () => {
-  assert.deepEqual(Object.keys(modelinfo.SRC).sort(), ['config', 'measured', 'upstream']);
+  assert.deepEqual(Object.keys(modelinfo.SRC).sort(), ['config', 'desktop', 'measured', 'upstream']);
 });

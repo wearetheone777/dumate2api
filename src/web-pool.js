@@ -25,6 +25,7 @@
 // 在途帽在 callModel/callModelStream 内 acquire/release；超限返回 busy 标记,
 // 故障转移据此换号而不惩罚该账号。
 const https = require('https');
+const http = require('http');
 const crypto = require('crypto');
 const accounts = require('./accounts');
 const { classify } = require('./upstream-errors');
@@ -37,6 +38,48 @@ const expiringSnap = require('./expiring');
 const proxyAgent = require('./proxy-agent');
 
 const WEB_BASE = process.env.DUMATE_WEB_BASE || 'https://www.dumate.cn';
+
+/**
+ * 把 base URL 拆成 token 请求需要的主机信息。**不能只留 hostname**：
+ * DUMATE_WEB_BASE 指向自建/反代环境时（实例 https://staging:8443/console），
+ * 丢掉端口会 ENOTFOUND、丢掉路径前缀会把请求打到站点根拿回登录页 HTML。
+ */
+function hostOf(raw) {
+  const s = String(raw || '').trim();
+  const withScheme = /^[a-z]+:\/\//i.test(s) ? s : `https://${s}`;
+  try {
+    const u = new URL(withScheme);
+    const basePath = u.pathname.replace(/\/+$/, '');
+    return {
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || '',
+      basePath,
+      label: u.host + basePath,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 签 token 的候选域。2026-11-15 真机实测（账号 1 / 我谁敌，同一份 cookie）：
+//   www.dumate.cn/api/dumate/app/token/get        → 200，token 长度 36，expired_at 19:38:34Z
+//   console.bce.baidu.com/api/dumate/app/token/get → 200，**同一个 token、同一个 expired_at**
+//   用 console 域签的 token 打 /gateway/apis/v1/chat/completions → 200
+// 结论：两个域是同一签发服务的两条入口，token 与域无关。所以多域只是**容灾**
+// ——某域挂掉/被墙/换域名时切另一条，不改变凭证语义。
+//
+// **生产域候选只在 base 也属于生产域时才追加**：用户把 DUMATE_WEB_BASE 指到
+// 自建/测试环境后，容灾回落到 console.bce.baidu.com 等于把测试环境的 Cookie
+// 发给生产租户。凭证不能跨环境重放，所以自建 base 只有它自己一个候选。
+const PROD_WEB_HOSTS = new Set(['www.dumate.cn', 'dumate.cn']);
+const WEB_ORIGIN = hostOf(WEB_BASE) || hostOf('https://www.dumate.cn');
+const TOKEN_HOSTS = [
+  WEB_ORIGIN,
+  ...(PROD_WEB_HOSTS.has(WEB_ORIGIN.hostname) ? [hostOf('https://console.bce.baidu.com')] : []),
+].filter((v, i, a) => v && a.findIndex(
+  (x) => x.hostname === v.hostname && x.port === v.port && x.basePath === v.basePath,
+) === i);
 const GATEWAY_HOST = process.env.DUMATE_GATEWAY_HOST || 'dumate-svc.baidu.com';
 const GATEWAY_PREFIX = '/gateway/apis/v1';
 const TOKEN_TIMEOUT = 15000;
@@ -64,14 +107,34 @@ function stateOf(id) {
 // 不设限等于把上游（或中间人）的输出全部吃进内存。超限按连接失败处理。
 const MAX_JSON_RESP_BYTES = 8 * 1024 * 1024;
 
+/**
+ * 这一域是不是「本身不通」（值得换下一个候选）。
+ * 判据刻意窄：网络错误 / 5xx / 2xx 非 JSON。其余（含 401、404、429、3xx）
+ * 都不是域健康问题——换域不解决问题，只有副作用。
+ */
+function isDomainDown(r) {
+  if (!r) return false;
+  if (r.status === 0) return true;                       // 网络错误 / 超时
+  if (r.status >= 500 && r.status < 600) return true;    // 服务端故障
+  if (r.status >= 200 && r.status < 300 && !r.json) return true; // 被墙/登录页 HTML
+  return false;
+}
+
 // agent 参数：出站代理接线（proxy-agent.getAgentFor 的产物）。null/undefined
 // = 直连（Node 用默认全局 agent），传了就走 CONNECT 隧道。
-function httpsJSON(hostname, path, method, headers, body, timeout = 30000, agent = null) {
+//
+// host 可以是字符串（只有 hostname）或 hostOf() 的产物（带 protocol/port）。
+// 端口必须原样带上——自建 base 常在 8443 这类非默认端口上，丢掉就 ENOTFOUND。
+function httpsJSON(host, path, method, headers, body, timeout = 30000, agent = null) {
+  const info = typeof host === 'object' && host !== null
+    ? host : { protocol: 'https:', hostname: String(host || ''), port: '' };
+  const lib = info.protocol === 'http:' ? http : https;
   return new Promise((resolve) => {
     const payload = body === undefined || body === null ? null : JSON.stringify(body);
-    const req = https.request(
+    const req = lib.request(
       {
-        hostname,
+        hostname: info.hostname,
+        ...(info.port ? { port: Number(info.port) } : {}),
         path,
         method,
         timeout,
@@ -134,16 +197,30 @@ async function getToken(account, force = false, agent = null) {
         return { ok: false, error: `出站代理配置错误: ${e.message}`, expired: false };
       }
     }
-    const r = await httpsJSON(WEB_BASE.replace(/^https?:\/\//, ''), '/api/dumate/app/token/get',
-      'GET', { Cookie: account.cookie }, null, TOKEN_TIMEOUT, ag);
+    // 按候选域依次尝试；只有「这一域明显不通」才换下一个（见 TOKEN_HOSTS 注释）
+    let r = null;
+    const tried = [];
+    for (const host of TOKEN_HOSTS) {
+      r = await httpsJSON(host, host.basePath + '/api/dumate/app/token/get',
+        'GET', { Cookie: account.cookie }, null, TOKEN_TIMEOUT, ag);
+      tried.push(`${host.label}=${r.status || 'net-err'}`);
+      const okNow = r.status === 200 && r.json && r.json.result && r.json.result.token;
+      if (okNow) break;
+      // **只有「这一域本身不通」才换域**：网络错误（status 0）、5xx、
+      // 以及 2xx 却不是 JSON（被墙/被跳登录页）。其余状态一律不换——
+      // 401/403 是凭证问题，400/404 是请求/配置问题，429 是限流，3xx 是
+      // 重定向：换域都不会变好，只会把同一份 Cookie 多报给一个域（用户把
+      // base 指到自建环境时还可能是跨环境重放），并把失败路径拉长。
+      if (!isDomainDown(r)) break;
+    }
 
-    if (r.status !== 200 || !r.json || !r.json.result || !r.json.result.token) {
-      const msg = r.json && r.json.message ? r.json.message : (r.raw || `HTTP ${r.status}`);
-      st.last_error = `取 token 失败：${msg}`;
+    if (!r || r.status !== 200 || !r.json || !r.json.result || !r.json.result.token) {
+      const msg = (r && r.json && r.json.message) ? r.json.message : ((r && r.raw) || `HTTP ${r && r.status}`);
+      st.last_error = `取 token 失败：${msg}${tried.length > 1 ? `（尝试过 ${tried.join('、')}）` : ''}`;
       // token/get 回 401 = cookie 已失效，旧票随之必死——当场清缓存。不清的话
       // 后续请求会先拿僵尸票打模型网关吃 401、再触发强刷回到 token/get 再失败
       // 一次，每个请求都两连败；清了之后失败路径缩短为一次 token/get。
-      if (r.status === 401) {
+      if (r && r.status === 401) {
         st.token = null;
         st.token_expire_at = 0;
       }
@@ -570,4 +647,6 @@ module.exports = {
   // 状态机喂入（task-runner 等绕过故障转移层的直连调用方也要喂,漏喂=状态机失明）
   markSuccess, markFailure,
   GATEWAY_HOST, GATEWAY_PREFIX, stateOf,
+  // 供离线验证检查候选域与端口/路径前缀（只读；运行期不要改写）
+  TOKEN_HOSTS,
 };

@@ -56,6 +56,26 @@
   --lab-shadow-hover: 0 2px 4px rgba(16, 24, 40, 0.05), 0 12px 32px rgba(16, 24, 40, 0.10);
   --lab-shadow-card: 0 1px 3px rgba(16, 24, 40, 0.03), 0 2px 8px rgba(16, 24, 40, 0.04);
 
+  /* 布局壳层：侧栏/顶栏比内容区深一档，靠明度分层（样式在各组件里，
+     所以颜色必须走变量，否则夜间模式下要逐组件改） */
+  --lab-sider-bg: #edf1f6;
+  --lab-sider-trigger: #e4e9f0;
+  --lab-header-bg: rgba(255, 255, 255, 0.82);
+  /* 通用 hover 底（切换器按钮等） */
+  --lab-hover: rgba(15, 23, 42, 0.04);
+  /* 背景网格线 / 表格斑马纹 / 登录卡底色 */
+  --lab-grid-line: rgba(15, 23, 42, 0.018);
+  --lab-grid-line-strong: rgba(15, 23, 42, 0.022);
+  --lab-zebra: rgba(15, 23, 42, 0.012);
+  --lab-login-card: rgba(255, 255, 255, 0.94);
+  /* 滚动条 */
+  --lab-scroll-thumb: #c8d0db;
+  --lab-scroll-thumb-hover: #a8b4c4;
+  /* 背景辉光强度：浅色下青色很淡，深色下要更弱，否则整屏发亮 */
+  --lab-glow-a: rgba(8, 145, 178, 0.07);
+  --lab-glow-b: rgba(8, 145, 178, 0.05);
+  --lab-glow-c: rgba(8, 145, 178, 0.02);
+
   /* 仅系统字体，无网络字体 */
   --lab-mono: Consolas, 'Liberation Mono', monospace;
   /* 仅系统字体，无网络字体 */
@@ -89,11 +109,11 @@ body::before {
   z-index: 0;
   pointer-events: none;
   background-image:
-    radial-gradient(1200px 560px at 6% -6%, rgba(8, 145, 178, 0.07), transparent 65%),
-    radial-gradient(1000px 500px at 98% -2%, rgba(8, 145, 178, 0.05), transparent 62%),
-    radial-gradient(800px 400px at 50% 100%, rgba(8, 145, 178, 0.02), transparent 55%),
-    linear-gradient(rgba(15, 23, 42, 0.018) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(15, 23, 42, 0.018) 1px, transparent 1px);
+    radial-gradient(1200px 560px at 6% -6%, var(--lab-glow-a), transparent 65%),
+    radial-gradient(1000px 500px at 98% -2%, var(--lab-glow-b), transparent 62%),
+    radial-gradient(800px 400px at 50% 100%, var(--lab-glow-c), transparent 55%),
+    linear-gradient(var(--lab-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--lab-grid-line) 1px, transparent 1px);
   background-size: auto, auto, auto, 44px 44px, 44px 44px;
 }
 #app {
@@ -214,7 +234,7 @@ body::before {
 }
 .ant-table-tbody > tr:nth-child(even) > td {
   /* 字面量：极淡 slate 底，只此一处用 rgba 字面值，归属 token 体系的 slate 底层（slate-900 按 1.2% 透明度） */
-  background: rgba(15, 23, 42, 0.012);
+  background: var(--lab-zebra);
 }
 .ant-table-tbody > tr:hover > td {
   background: var(--lab-surface-hover) !important;
@@ -347,7 +367,7 @@ body::before {
 /* Firefox：走标准属性（::-webkit-scrollbar 对它无效） */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #c8d0db transparent;
+  scrollbar-color: var(--lab-scroll-thumb) transparent;
 }
 ::-webkit-scrollbar {
   width: 8px;
@@ -357,11 +377,11 @@ body::before {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #c8d0db;
+  background: var(--lab-scroll-thumb);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #a8b4c4;
+  background: var(--lab-scroll-thumb-hover);
 }
 
 /* ---------- 键盘可达性：Tab 聚焦时给统一的信号色描环 ----------
@@ -775,4 +795,137 @@ code {
   gap: 12px;
   flex-wrap: wrap;
   margin-bottom: 14px;
+}
+
+/* ============================================================
+   夜间模式（深色主题）
+   ------------------------------------------------------------
+   启用方式：<html class="dark">，由 stores/theme.ts 统一加/去。
+   所有颜色都走 --lab-* 变量 —— 上面那份浅色值是这个文件的正文，
+   这里只重写同一批变量的值，组件样式一条都不用改。
+
+   注意两处「变量管不到」的例外，必须在这里单独处理：
+   1. Tailwind 工具类（text-slate-400 等 527 处）是编译期生成的
+      固定色值，不读变量。改模板等于改 500 行，所以按「深色下
+      重映射同一批类名」处理：优先级 (0,2,0) 高于工具类 (0,1,0)。
+      新增页面继续照常用 slate-*，不必写 dark: 变体。
+   2. canvas（ECharts）读不到 CSS 变量，走 utils/chartTheme.ts。
+   ============================================================ */
+
+html.dark {
+  color-scheme: dark;
+
+  /* 分层：页面底最深、卡片浮一档、次级面再浮一档。
+     深色下明度差要比浅色更小——差值大了会显得脏 */
+  --lab-bg: #0b111c;
+  --lab-bg-2: #0e1523;
+  --lab-surface: #111a29;
+  --lab-surface-2: #16202f;
+  --lab-surface-3: #1b2739;
+  --lab-surface-hover: #1a2537;
+
+  --lab-border: #223045;
+  --lab-border-strong: #2f4159;
+
+  --lab-text: #e6edf7;
+  --lab-text-sub: #a7b6cb;
+  /* 深底对比 ≈ 5.2:1，仍低于 sub 一档的层级关系保持住 */
+  --lab-text-mute: #8395ab;
+
+  /* 信号色整体提亮：浅底用的 cyan-600 在深底上糊成一团 */
+  --lab-primary: #22d3ee;
+  --lab-primary-dim: rgba(34, 211, 238, 0.13);
+  --lab-primary-line: rgba(34, 211, 238, 0.32);
+  --lab-primary-glow: rgba(34, 211, 238, 0.07);
+
+  --lab-ok: #34d399;
+  --lab-ok-dim: rgba(52, 211, 153, 0.13);
+  --lab-warn: #fbbf24;
+  --lab-warn-dim: rgba(251, 191, 36, 0.13);
+  --lab-danger: #f87171;
+  --lab-danger-dim: rgba(248, 113, 113, 0.13);
+  --lab-info: #38bdf8;
+  --lab-info-dim: rgba(56, 189, 248, 0.11);
+  --lab-info-line: rgba(56, 189, 248, 0.30);
+
+  /* 阴影：深色下要更重才不会「浮不起来」，但层次靠明度已足够，
+     所以只加一点点，避免卡片边缘出现脏边 */
+  --lab-shadow: 0 1px 2px rgba(0, 0, 0, 0.30), 0 4px 14px rgba(0, 0, 0, 0.28);
+  --lab-shadow-hover: 0 2px 6px rgba(0, 0, 0, 0.34), 0 12px 32px rgba(0, 0, 0, 0.42);
+  --lab-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.26), 0 2px 8px rgba(0, 0, 0, 0.24);
+
+  --lab-sider-bg: #0e1624;
+  --lab-sider-trigger: #132033;
+  --lab-header-bg: rgba(13, 21, 34, 0.82);
+  --lab-hover: rgba(148, 163, 184, 0.10);
+
+  --lab-grid-line: rgba(148, 163, 184, 0.055);
+  --lab-grid-line-strong: rgba(148, 163, 184, 0.065);
+  --lab-zebra: rgba(148, 163, 184, 0.035);
+  --lab-login-card: rgba(17, 26, 41, 0.94);
+
+  --lab-scroll-thumb: #2f4159;
+  --lab-scroll-thumb-hover: #3d5372;
+
+  /* 深色下辉光要弱：同一强度在白底是点缀，在深底是眩光 */
+  --lab-glow-a: rgba(34, 211, 238, 0.05);
+  --lab-glow-b: rgba(34, 211, 238, 0.04);
+  --lab-glow-c: rgba(34, 211, 238, 0.015);
+}
+
+/* ---------- Tailwind 工具类的深色重映射 ----------
+   只覆盖实际用到的槽位（grep 统计得来），不追求全覆盖：
+   slate-400/500 是正文与辅助文字，占 527 处里的 527 处绝大多数。
+   数值上「深色下反着来」：越浅的数字越亮，保持层级不倒置。 */
+html.dark .text-slate-200 { color: #dbe4ef; }
+html.dark .text-slate-300 { color: #cbd5e1; }
+html.dark .text-slate-400 { color: #93a6bf; }
+html.dark .text-slate-500 { color: #a8b8cd; }
+html.dark .text-slate-600 { color: #bccadb; }
+html.dark .text-slate-800 { color: #e6edf7; }
+html.dark .bg-slate-50 { background-color: var(--lab-surface-2); }
+html.dark .bg-slate-300 { background-color: #33455f; }
+html.dark .bg-slate-800 { background-color: #1b2739; }
+
+/* ---------- 深色下的 AntD 细节修正 ----------
+   darkAlgorithm 已经处理了大头，剩下三处是它按浅色语义推导、
+   在深色里会读反或对比不足的 */
+
+/* 主按钮：亮青底上的白字对比不足（≈2.3:1），深色下改深字 */
+html.dark .ant-btn-primary {
+  color: #04222b;
+}
+
+/* 页头标题左侧信号条：浅色用深青到青，深色下要整体提亮，否则描边发黑 */
+html.dark .page-head h2::before {
+  background: linear-gradient(180deg, #22d3ee, #0891b2);
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.45);
+}
+
+/* 侧栏选中态左侧信号条：同上 */
+html.dark .lab-sider .ant-menu-item-selected::before {
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.55);
+}
+
+/* 行内代码：深色下用半透明青底，不要实色块（实色块在深底上像选中态） */
+html.dark code {
+  background: rgba(34, 211, 238, 0.10);
+  border-color: rgba(34, 211, 238, 0.22);
+}
+
+/* 空态插图：AntD 的浅灰 SVG 在深底上会变成一坨亮块，压暗一些 */
+html.dark .ant-empty-image {
+  opacity: 0.45;
+  filter: invert(0.82) hue-rotate(180deg);
+}
+
+/* 表格斑马纹：浅色是压暗，深色是提亮 */
+html.dark .ant-table-tbody > tr:nth-child(even) > td {
+  background: var(--lab-zebra);
+}
+
+/* 模态/抽屉遮罩：深色下遮罩要更黑，才压得住下面的亮面 */
+html.dark .ant-modal-mask,
+html.dark .ant-drawer-mask {
+  background: rgba(0, 0, 0, 0.55);
 }

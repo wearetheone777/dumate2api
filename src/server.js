@@ -6,6 +6,10 @@ const { googleToOpenAI, openAIToGoogle, translateStreamToGoogle } = require('./g
 const { responsesToOpenAI, openAIToResponse, translateStreamToResponses } = require('./responses');
 const images = require('./images');
 const dumateCaps = require('./dumate-caps');
+// 搭子思考档位归一化（2026-11-15 融合 P0-2）：把 2026-10-30 起被剥掉的
+// reasoning_effort 接回来，但只对同后端的白名单模型、且只认四档。
+// 未命中的行为与改造前完全一致（见文件头三个边界）。
+const dumateReasoning = require('./dumate-reasoning');
 const promptGuard = require('./prompt-guard');
 const media = require('./media');
 const { cachedTokensOf } = require('./usage-norm');
@@ -30,6 +34,20 @@ function resolveBudget(target, requested, model) {
   if (kind === 'qoder') return resolveQoderMaxTokens(requested);
   return resolveMaxTokens(requested, dumateCaps.capOf(model));
 }
+// 本次请求的搭子链路是否**云端**（网页凭证直打 dumate-svc）。只有云端链路
+// 才认桌面模型清单里的路由名——桌面链路把那些名字发给 8980 只会 404
+// （见 modelmap.mapModel 的注释）。
+//
+// 判据不能只看**配置**的来源（review #12）：`auto` 模式下桌面 8980 挂掉后
+// 请求实际由网页池承接，若这里仍是 false，清单名会被提前改写成 model-text
+// ——回落之后发出去的就是另一个模型，且 200 无从察觉。网页池可用即视为
+// 云端可达：桌面回 4xx 时 forwardWithFallback 会用**原 body** 回落，清单名
+// 在网页链路上再由 toCloudModel 原样放行。
+const catalogLink = () => {
+  if (router.dumateSource() === 'web') return true;
+  try { return webFallback.available(); } catch (e) { return false; }
+};
+
 const reqlog = require('./reqlog');
 // 首字标记归 reqlog 统一实现：三个协议翻译器（Responses / Anthropic / Google）
 // 也在 reqlog 之外调用它，两处各写一份必然漂移。
@@ -921,10 +939,15 @@ async function handleOpenAIModels(req, res) {
   // DUMATE_REAL（与模型页同一份数据，单一来源）。**只在有实测依据时透出**——
   // 查不到就不带字段，而不是给个猜测值：搭子超限是整轮失败而非截断，
   // 客户端拿着编造的 128K 窗口把超长上下文发过来，比少一个字段害得多。
+  // 取元数据的顺序是**实测优先**：DUMATE_REAL（真机错误体/二分夹逼）→ 清单元数据
+  // （客户端配置声明）。反过来会让 model-text 报 384000（声明）而不是 393216（真值）。
   const realOf = (id) => {
     try {
       const mi = require('./model-info');
-      return mi.dumateRealOf(mi.dumateTargetOf(id));
+      // catalog 显式传：暴露列表里可能有清单路由名（glm-53 等）。不认它
+      // 就会解析成 fallback（model-text），把 model-text 的实测窗口/输出
+      // 上限挂到 glm-53 名下（review #8）。
+      return mi.dumateRealOf(mi.dumateTargetOf(id, { catalog: catalogLink() })) || mi.dumateCatalogOf(id);
     } catch (e) { return null; }
   };
   let data = cfg.exposed.map((id) => {
@@ -951,6 +974,42 @@ async function handleOpenAIModels(req, res) {
       } : {}),
     };
   });
+  // 桌面端模型清单（2026-11-15 融合 P0-1）：客户端配置里有 22 个对话入口，
+  // exposed 只覆盖 3 个。这里把差额补进来，让「选得到」与「真能路由」一致
+  // （mapModel 已对清单名直传，不再静默兜底成 model-text）。
+  //
+  // `verified` 是本仓有没有实测依据：true = 本地 8980 或云端网关真机 200 过，
+  // false = 只有客户端声明。**客户端配置里存在不等于账号有权限**，界面照实
+  // 显示，别把 22 条都写成「可用」。`DUMATE_EXPOSE_CATALOG=0` 回到老行为。
+  // 只在云端链路列出来：桌面链路下这些名字会被 mapModel 兜底成 model-text
+  // （8980 不认识云端路由名），列出来等于让用户选一个「选了什么都不知道」的名字。
+  for (const entry of (catalogLink() ? modelmap.catalogExposed() : [])) {
+    const meta = entry.meta || {};
+    const limit = meta.limit || {};
+    data.push({
+      id: entry.id,
+      object: 'model',
+      created,
+      // 清单名是上游路由名，与 exposed 里的真名同一组（cc-switch 按 owned_by 分组）
+      owned_by: 'dumate',
+      name: modelmap.displayName(entry.id),
+      ...(limit.context ? {
+        contextWindow: limit.context,
+        maxContextWindow: limit.context,
+        maxOutputTokens: limit.output,
+      } : {}),
+      // 元数据来源：probe = 本仓实测，desktop = 客户端配置声明
+      metaSource: entry.verified ? 'probe' : 'desktop',
+      ...(meta.attachment ? { multimodal: true } : {}),
+      dumate: {
+        verified: entry.verified,
+        toolCall: meta.tool_call !== false,
+        reasoning: !!meta.reasoning,
+        ...(meta.variants ? { reasoningVariants: Object.keys(meta.variants) } : {}),
+      },
+    });
+  }
+
   // dumate-points 伪模型（2026-11-07 融合项 P0-1）：余额读数入口——列表里
   // 可发现才有人用。owned_by 用 dumate-proxy：它不是上游真名，也没有 chat
   // 语义，选中它只会拿到余额文本（零消耗、不打对话上游）。
@@ -1442,8 +1501,11 @@ async function handleOpenAIChat(req, res) {
   req._mappedModel = route.model;
 
   if (route.target.needsModelMap) {
-    reqBody.model = mapModel(route.model);
+    reqBody.model = mapModel(route.model, { catalog: catalogLink() });
     req._mappedModel = reqBody.model;
+    // 思考档位：本路径是「最小干预透传」，所以白名单外**不剥**（传什么发什么，
+    // 与改造前一致）；白名单内按搭子的四档归一化，含显式 thinking 开关。
+    dumateReasoning.apply(reqBody, { mappedModel: reqBody.model, stripUnsupported: false });
     // 出站提示词卫生（两项都是默认关闭的选通开关，见 src/prompt-guard.js）：
     // 合规词零宽空格脱敏（DUMATE_DESENSITIZE=1）+ 超大工具输出截断（DUMATE_TOOL_OUTPUT_CAP）
     promptGuard.desensitizeBody(reqBody);
@@ -1672,8 +1734,10 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
   req._channel = route.channel;
 
   if (route.target.needsModelMap) {
-    openaiReq.model = mapModel(route.model);
+    openaiReq.model = mapModel(route.model, { catalog: catalogLink() });
     req._mappedModel = openaiReq.model;
+    // 思考档位同 chat 路径：透传语义，白名单外不剥；白名单内归一化
+    dumateReasoning.apply(openaiReq, { mappedModel: openaiReq.model, stripUnsupported: false });
   } else {
     openaiReq.model = route.model;
     req._mappedModel = route.model;
@@ -1796,10 +1860,12 @@ async function handleOpenAIResponses(req, res) {
   req._channel = route.channel;
 
   if (route.target.needsModelMap) {
-    openaiReq.model = mapModel(route.model);
+    openaiReq.model = mapModel(route.model, { catalog: catalogLink() });
     req._mappedModel = openaiReq.model;
-    // 与 Anthropic 路径同口径：reasoning_effort 只给直连通道，搭子透传前剥掉
-    delete openaiReq.reasoning_effort;
+    // 思考档位：翻译层产出的是 reasoning_effort。白名单模型按搭子四档归一化
+    // （含显式 thinking 开关）；其余模型仍剥掉——翻译层加的字段不进云端，
+    // 与 2026-10-30 起的既有行为一致。
+    dumateReasoning.apply(openaiReq, { mappedModel: openaiReq.model });
     // 图像保真透传（2026-10-31 真机实证）：搭子上游认 OpenAI 标准 image_url
     // part（data URI，网页凭证与桌面链路均 200 且能识别颜色），不再压回占位
     // 文本。此前「上游不支持图像」是能力边界误判
@@ -1915,11 +1981,12 @@ async function handleAnthropicMessages(req, res) {
   req._mappedModel = openaiReq.model;
 
   if (route.target.needsModelMap) {
-    openaiReq.model = mapModel(route.model);
+    openaiReq.model = mapModel(route.model, { catalog: catalogLink() });
     req._mappedModel = openaiReq.model;
-    // 思考强度是直连通道（Qoder）才下发的字段；搭子是「最小干预透传」，
-    // 多余字段原样进云端，行为未知——剥掉（翻译层加的，这里剥干净）。
-    delete openaiReq.reasoning_effort;
+    // 思考档位：anthropicToOpenAI 已把 thinking.effort / budget_tokens 区间
+    // 翻成 reasoning_effort（见 effort-passthrough 单测）。白名单模型按搭子
+    // 四档归一化；其余仍剥掉，与既有行为一致。
+    dumateReasoning.apply(openaiReq, { mappedModel: openaiReq.model });
     // 图像保真透传（同 Google 路径：搭子上游认 image_url part，2026-10-31 实测）
   } else {
     openaiReq.model = route.model;

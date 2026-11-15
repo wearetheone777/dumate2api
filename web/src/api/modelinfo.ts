@@ -2,7 +2,9 @@
 import client from '@/api/client'
 
 /** 字段来源：决定这个数字能不能信 */
-export type ModelFieldSource = 'upstream' | 'measured' | 'config'
+// 'desktop' = 来自搭子桌面客户端的模型清单（dumate-catalog）。
+// 与 'measured' 严格区分：清单是客户端**声明**的值，本仓没有实测过。
+export type ModelFieldSource = 'upstream' | 'measured' | 'config' | 'desktop'
 
 export interface ModelInfoRow {
   id: string
@@ -17,6 +19,17 @@ export interface ModelInfoRow {
   /** 消耗倍率。**只有 TRAE 与 Qoder 的上游给**，其余通道为 null（显示 —，不补 0） */
   rate: number | null
   rateSource: ModelFieldSource | null
+  /** 倍率单位：pts/1k_out（双点解斜率，纯 output）或 pts/1k_tok（单次前后差，综合） */
+  rateUnit?: string | null
+  rateUnitText?: string | null
+  /** 同后端的其他模型名（后端已合并成一行，这里列出来别丢信息） */
+  alsoKnownAs?: string[]
+  /** 实际落到的后端（合并与倍率取数的键） */
+  backend?: string
+  /** 该名字是否在本仓实测集合里（桌面清单条目用；其他通道不填） */
+  verified?: boolean
+  /** 搭子思考档位（清单里只有 deepseek-v41-flash 带 variants） */
+  reasoningEfforts?: string[] | null
   /**
    * 原价倍率（Qoder 的 original_price_factor）。
    * 错峰/免费模型的 rate 会是 0，只显示 rate 会被读成「不扣费」。

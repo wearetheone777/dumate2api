@@ -5,6 +5,24 @@
 // 名会被 router 归进搭子、再被通道绑定判定 403。
 const { test } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+// 自带一份 model-map 夹具：本文件测的是 mapModel/路由语义，不能依赖机器上
+// data/model-map.json 是否存在（`data/` 被 gitignore，干净检出上必挂）。
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-route-'));
+fs.writeFileSync(path.join(TMP, 'model-map.json'), JSON.stringify({
+  aliases: { 'claude-3-5-sonnet-20241022': 'model-text' },
+  upstream_models: [
+    'model-text', 'model-artifact-validate', 'glm-5',
+    'dm-auto-model/text.L0', 'dm-auto-model/text.L1', 'dm-auto-model/text.L2',
+  ],
+  exposed: ['model-text', 'model-artifact-validate', 'glm-5'],
+  fallback: 'model-text',
+}));
+process.env.DUMATE_ADMIN_DATA = TMP;
+
 const mm = require('../../src/modelmap');
 
 test('resolveClaudeRoute：四个通道的档位映射（与 cc-switch provider env 一致）', () => {

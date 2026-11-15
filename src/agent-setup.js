@@ -124,7 +124,13 @@ function backupConfig(clientId, configPath, root = backupRoot(), io = {}) {
   const dir = path.join(root, clientId);
   fs.mkdirSync(dir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = path.join(dir, `${stamp}-${path.basename(configPath)}`);
+  // 同一毫秒内的多次备份会撞名并互相覆盖（实测连续 apply 12 次只剩 8 份）。
+  // 撞名时追加序号，保证每次备份都有独立文件、索引与目录始终一致。
+  const base = path.basename(configPath);
+  let file = path.join(dir, `${stamp}-${base}`);
+  for (let i = 2; fs.existsSync(file); i += 1) {
+    file = path.join(dir, `${stamp}-${i}-${base}`);
+  }
   fs.writeFileSync(file, readF(configPath), 'utf8');
   const entry = { file, at: Date.now(), size: fs.statSync(file).size };
   const idx = readIndex(root);
