@@ -16,20 +16,22 @@
 
 | 优先 | 项 | 一句话 | 主要落点 |
 |---|---|---|---|
-| P0-1 | 模型目录缓存五维分桶 + 冷读单飞 | 现在只按 region 分，同区多账号会互相污染能力判定 | `src/traework/models.js` |
-| P0-2a | 登录本机回环自动回调 + state 单次消费 | 现在必须手抄回调地址，且回调**未做 state 校验** | `src/traework/login.js` + 账号页 |
-| P0-2b | 授权码 + PKCE 换票链路（**独立评估**） | 新客户端 1.107.1 走的是另一套换票契约，不是加个参数 | 同上（需真机验证） |
+| **P0-1 ✅** | 模型目录缓存五维分桶 + 冷读单飞 | **已落地 2026-11-16**：同区多账号不再互相污染能力判定 | `src/traework/models-cache.js` + `models.js` |
+| **P0-4 ✅** | 每模型默认思考档 + 未应用如实标记 | **已落地 2026-11-16**：客户端优先 / 无 descriptor 不套 / 只向下钳 | `src/reasoning-apply.js` + `trae-runtime.defaultReasoning` |
+| **P0-3 ✅** | 凭证被拒不重放 + 冷却隔离 + 单号人工恢复 | **已落地 2026-11-16**：403 不再一律进熔断；裸 403 保持原判定（Qoder 实测 403 也表达额度）；跨区容灾默认关 | `upstream-errors.js` + `traework/failover.js` + `/accounts/:id/recover` |
+| **P0-2a ✅** | 登录本机回环自动回调 + state 单次消费 | **已落地 2026-11-16**：接住回调自动入库，state 单次消费、可取消、10 分钟到期 | `src/traework/oauth-callback.js` + 账号页 |
+| P0-2b 授权码 + PKCE | 🟡 **2026-11-17 真机探明契约，卡在 DeviceProof** | 纯计算已落地：`newPkce`（RFC 7636 向量校验）/`buildAuthCodeUrl`（只追加两参）/`parseAuthCodeCallback`（三种编码形态）；真机结论：**CN 授权页支持 PKCE**（回调只给 `authCodeInfo.AuthCode`，10 分钟单次）→ 换票端点 `POST /trae/api/v3/oauth/ExchangeToken`（**不是** `/cloudide/...`）→ `DeviceInfo` 必须是 **P-256 JWK**（传 base64 SPKI 报 `expected map`）→ `DeviceProof` 也必须是 map，内层结构未知 → `20405 Device proof required`。继续需静态分析新版客户端或枚举形状（会消耗单次码）。优先级低：现有 refreshToken 流程真机可用 |
 | P0-3 | 认证拒绝不重放 + 冷却隔离 + 单号人工恢复 | 401/403 不该换号重打；模型级冷却别升级成全号冷却 | `channel-pool` / `upstream-errors` |
 | P0-4 | 每模型「默认思考档」+「未应用档位如实标记」 | 现在只有档位归一化，没有按模型的默认值 | `trae-runtime` / 新 `reasoning-apply` |
-| P1-5 | 请求尝试链（请求回放，只存判据不存报文） | 「为什么这个号被跳过」目前只能人肉推断 | `reqlog` + 请求日志页 |
+| **P1-5 ✅** | 请求尝试链（只存判据不存报文） | **已落地 2026-11-16**：picked/skip/error/ok/failover 时间轴；闸门拒绝也落日志 | `src/attempts.js` + `reqlog` + 请求日志页 |
 | P1-6 | 会话图片压缩（先做零依赖降级版） | 大 base64 图直接打上游，上下文被图片吃满 | `src/images.js` |
-| P1-7 | 自定义路由组（显式声明 + 有痕迹） | 别名只能 1:1，跨通道回落被禁止；可做显式组 | `model-map.json` + 模型页 |
-| P1-8 | 签到补签（睡眠唤醒补跑）+ 计划按时刻分组 | 机器睡眠/关机错过 9:17 就只能等明天 | `task-scheduler` / 签到页 |
+| P1-7 路由组 | ✅ **2026-11-17 两批落地（流式换成员刻意不做）** | 第一批：`route-groups.js` + `resolveWithGroup`（显式命中 + 分发前按可用性择优）+ `X-Route-Group` / 尝试链 / 请求日志 / 管理端只读；第二批：`dispatchDirect` 组内**运行时换成员**（`ctx.captureError` 接缝，判据 `res.headersSent === false`），换人时同步 `payload.model`/`_channel`/`_mappedModel`/`_routeGroup`，attempts 实例改成复用（否则 failover 判据被冲掉）。**流式换成员未做**：加上接缝后整条请求挂死（0 字节 + 事件循环卡顿），原因未查清。真账号验证：成员 1 失败 → 改派成员 2 → 200「收到」；`route-groups.test.js` 13 项；全量 866/866 |
+| **P1-8 ✅** | 签到补签（睡眠唤醒补跑） | **已落地 2026-11-16**：错过时刻会立刻补跑一次并幂等；另有可见的「今日还差谁」 | `src/traework/makeup.js` + `autotask` + `/checkin/makeup` |
 | P1-9 | 账号级风控参数上台（并发/间隔/短故障重试） | 现在只在环境变量里，改一次要重启 | `trae-runtime` + 运行策略页 |
-| P2-10 | 接入配置「写入前 diff 预览」 | 已有备份/回滚，但改文件前看不到将写什么 | `agent-setup` + 接入配置页 |
-| P2-11 | 会话指纹含 system | 同一句「继续」在不同 system 下撞同一个粘性键 | `channel-pool.sessionKeyOf` |
-| P2-12 | 页面自动刷新间隔 + 阅读模式 | 挂看板全靠手点刷新 | `MainLayout` / 列表页 |
-| P2-13 | 用量统计补 TTFB 与命中率的分母口径 | 现在没有 TTFB 聚合；命中率分母未排除 cacheWrite | `usage-agg` + 用量页 |
+| P2-10 接入配置写入前 diff 预览 | ✅ **2026-11-16 已落地** | `agent-setup.js` 抽 `buildNext`（apply/preview **同一份计算**）+ `diffLines`（零依赖行级 LCS，CRLF/末尾换行/1200 行上限）+ `maskSecret`（长值留后四位、短值整段）+ `POST /agent-setup/preview`（不改文件、不建备份）+ 写入弹窗内差异视图（行号 + `+/−` 前缀，不只靠颜色）；`agent-setup-preview.test.js` 9 项；全量 853/853；9127 真机（HOME 指临时目录）预览零写入、写后幂等、401/400 校验。**未做**：cc-switch 写入路径的同款预览 |
+| P2-11 会话指纹含 system + 进日志 | ✅ **2026-11-16 已落地（两小批）** | 键 = `sha1(system 全文 + 首条 user 2048 字)`；`sessionKeyFor` 把「算键」与「回传 `opts.onSessionKey`」绑在一处（5 个 provider 全改）；网关落 `session_key` 到请求日志、前端详情抽屉显示（顺带补 `route_group`）；`session-key-system.test.js` 9 项 + TRAE 接线 2 条断言；全量 862/862；9123 真机（假 Qoder 号）实测「同 system 三次同键 / 不同 system 不同键 / 追加轮次键不变」。**未做**：按会话键筛选与分组的界面 |
+| P2-12 页面自动刷新 + 阅读模式 | ✅ **2026-11-16 已落地** | `web/src/stores/ui.ts`：**共享定时器**（不是每页一个）+ 页面不可见不刷（不污染请求日志与用量分桶）+ 同回调单飞 + 抛错不炸 + 间隔持久化；`useAutoRefresh(fn)` 随卸载自动注销，已接仪表盘/请求日志/用量/告警。阅读模式只改排版（侧栏收起、字号与 `.num` 放大），**不隐藏数据**。验证：类型检查 + 构建通过、产物文案核对；**未做真机界面核对**（本会话无浏览器） |
+| P2-13 用量 TTFB 与命中率分母 | ✅ **2026-11-16 已落地** | `usage-agg` 加 TTFB（样本/和/min/max/>3s/8 段直方图 → avg+p50+p90，无样本 null）+ 缓存写入 `cache_creation_tokens`（`reqlog.pickUsage` 认 Anthropic 第三段）+ 命中率 `读命中/(读命中+非缓存输入−写入)`、`reported=0` 时 null；桶合并收敛成唯一 `mergeInto`（第三份字段清单 `normalizeBucket` 踩过，已加读写盘回归守卫）+ 用量页「首字延迟与缓存命中」卡；`usage-ttfb-hitrate.test.js` 9 项；全量 844/844；9127 真机种子数据全字段可见 | `usage-agg` + 用量页 |
 
 ---
 
@@ -704,17 +706,26 @@ curl -s "https://gcore.jsdelivr.net/gh/<o>/<r>@v1.6.0/docs/OAUTH.md"   # 按 tag
 
 ## 14. 落地状态（待更新）
 
+> **收口文档**：`docs/LANDING-2026-11-16.md`（落地一览 / 复验命令 / 未做项与阻塞 / 快照发布评估）。
+> 本节的逐项状态以那张表为准，这里只保留每项的技术要点。
+
 | 项 | 状态 | 备注 |
 |---|---|---|
-| P0-1 模型目录缓存分桶 | 未开始 | |
-| P0-2a 登录自动回调 | 未开始 | 换票契约不动 |
+| P0-1 模型目录缓存分桶 + 冷读单飞 | ✅ **2026-11-16 已落地** | `src/traework/models-cache.js`（新）+ `models.js` / `traework/index.js` / `admin/routes/{traework,models}.js` / `model-info.js` / 前端模型页；`test/unit/trae-models-scope.test.js` 17 项；全量 716/716；隔离 9123 冒烟通过。见 `CLAUDE.md` 的「2026-11-16 落地」节 |
+| P0-2a 登录自动回调 | ✅ **2026-11-16 已落地** | `src/traework/oauth-callback.js` + 4 个端点 + 前端三步向导（保留粘贴退路）；`test/unit/trae-oauth-callback.test.js` 12 项；真上游冒烟（假 token 得 `401/20101`，状态如实 failed，监听关闭）。换票契约未动 |
 | P0-2b PKCE 换票 | **待验证** | 需真账号跑通 `ExchangeToken(AuthCode)` |
-| P0-3 认证拒绝不重放 / 冷却隔离 / 单号恢复 | 未开始 | |
-| P0-4 默认思考档 | 未开始 | `reasoning_default` 字段名待核对 |
-| P1-5 请求尝试链 | 未开始 | |
-| P1-6 图片压缩 | 未开始 | 先做零依赖 C 方案 |
-| P1-7 路由组 | 未开始 | |
-| P1-8 补签 | 未开始 | |
-| P1-9 风控上台 | 未开始 | |
+| P0-3 认证拒绝不重放 / 冷却隔离 / 单号恢复 | ✅ **2026-11-16 已落地** | `upstream-errors.isAuthReject`（403 要正向证据，裸 403 不动）+ `trae-auth-reject.test.js` 20 项 + `POST /accounts/:id/recover` + 前端「恢复」；跨区容灾默认关（`src/traework/failover.js`）。全量 736/736，Qoder 三个专项回归通过 |
+| P0-4 默认思考档 | ✅ **2026-11-16 已落地** | `src/reasoning-apply.js` + `defaultReasoning` 运行态配置 + `X-Reasoning-Applied` + 前端卡片；`test/unit/reasoning-default.test.js`(10) + `trae-reasoning-wire.test.js`(4)；只读探针 `test/probe-traework-reasoning.js`。**上游无「默认档」字段证据**，默认值只用我们自己的配置 |
+| P1-5 请求尝试链 | ✅ **2026-11-16 已落地** | `src/attempts.js` + `availability.details` + TRAE 五类判据 + `logGateReject`（闸门拒绝也落日志）+ 前端时间轴；`attempts.test.js` 8 + `trae-attempts-wire.test.js` 4；全量 785/785；真网关冒烟四条拒绝都有行与原因 |
+| P1-6 图片压缩 | ✅ **2026-11-16 已落地（两批）** | `src/image-budget.js` + 四入口接线 + 请求日志五个字段 + 前端两张面（日志详情「内联图片」、风控页「内联图片上限」）；`test/unit/image-budget.test.js` 10 项；全量 809/809；9123 真机 413 与「关掉上限回到 503」双向验证。第二批：`src/png.js`（纯 JS PNG 解码/面积平均缩小/重编码，只用内置 zlib）+ 按原图指纹的 LRU 缓存（同图复用结果）+ `maxEdge` 与 `DUMATE_IMAGE_MAX_EDGE` + 缓存统计与清缓存端点；`png.test.js` 8 项、`image-budget.test.js` 追加 6 项；全量 823/823；9123 真机三向对照（1.3MB→27KB 不再 413 / 同图命中缓存 264ms→11ms / 关掉 maxEdge 立刻 413）。**JPEG 不缩**（要 huffman 解码）；另三个入口的 413 与压缩无账号未实测 |
+| P1-7 路由组 | 🟡 **第一批已落地（配置 + 分发前择优），跨成员重试待做** | `src/route-groups.js` + `router.resolveWithGroup`（4 个入口替换 resolve）+ `X-Route-Group` / 尝试链 `group:` 判据 / 请求日志 `route_group` + `/v1/models` 列出组名 + `GET /api/admin/route-groups`（逐成员可用性 + 被丢弃的配置项）+ 模型页只读卡；`route-groups.test.js` 12 项；全量 835/835；9123 真机四向对照（零账号 503 逐条原因 / 普通模型无副作用 / `DUMATE_SOURCE=auto` 下改派到第 3 个成员 / 管理端读数）。**未做**：运行时失败后的跨成员重试、组写入接口与编辑界面、成员权重 |
+| P1-8 补签 | ✅ **2026-11-16 已落地** | `src/traework/makeup.js`（plan + shouldCatchUp）+ `autotask` 睡眠唤醒补跑（`last_run_day` 幂等）+ `POST /traework/checkin/makeup`（默认 dryRun）+ 前端「今日补签」；`test/unit/checkin-makeup.test.js` 11 项；全量 773/773。展示部分（计划按时刻分组/记录表列宽）留到界面批次 |
+| P1-9 风控上台 | ✅ **2026-11-16 已落地** | `src/throttle.js`（新，唯一解析点：面板 > env > 默认）+ `livecfg` 的 `throttle`/`throttleMaxMs` + `channel-pool`/`repair`/`upstream-errors` 三处现读（`THROTTLE_MAX_MS` 由常量改函数）+ `GET /system/throttle`、`POST /system/pool-revive` + 前端「通道风控」页；`test/unit/throttle-config.test.js` 14 项；全量 799/799；隔离 9127 冒烟（PUT 往返 / 稀疏落盘 / 整条重置 / 未知通道 400）。**只搬了真正影响上游行为的三项 + 全局冷却上限**，「全局并发」本项目没有该维度（并发帽是每账号的），不造字段 |
 | P2-10 / 11 / 12 / 13 | 未开始 | |
 | P2-14 账单补查 | 备选 | 需真机对照 |
+
+**存量问题（2026-11-16 发现，与本轮批次无关，已在干净 HEAD 上用 `git worktree` 复现）**：
+`test/verify-qoder-throttle.js` 的「status 明说还要排很久 → 早停（不烧满预算）」一项失败
+（实测 8.3~9.0s，阈值 7s）。口径是：早停（`giveup`）之后外层仍按 `QUEUE_PATIENCE_MS`(6s)
+换号重试，两个账号累加就到了 9s。**要么改判据要么改测试测量的口径，别只调阈值把失败藏起来**
+——改 Qoder 换号节奏需要真账号验证，本轮未动。
