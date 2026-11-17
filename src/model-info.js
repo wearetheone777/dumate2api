@@ -573,15 +573,23 @@ async function qoderRows({ region = '' } = {}) {
  * 「哪个模型花多少」答不上来（这些条目的倍率/上下文全是 null）。
  * 排查「为什么某个名字调不通」时传 { all: true } 看全量。
  */
-async function traeworkRows({ visibleOnly = false, all = false, force = false, region = 'cn' } = {}) {
+async function traeworkRows({ visibleOnly = false, all = false, force = false, region = 'cn', accountId = '' } = {}) {
   const models = require('./traework/models');
-  const r = await models.fetchModels({ force, region: region || 'cn' });
+  // accountId 可空：给了就取该账号那一份能力表（倍率/档位/max_mode 才是这个号的真值），
+  // 不给沿用「该区最新一份」。作用域摘要随结果回传，界面上要能看见。
+  const r = await models.fetchModels({ force, region: region || 'cn', accountId });
   let list = r.models;
   if (!all) list = list.filter(models.isUsableRow);
   else if (visibleOnly) list = list.filter((m) => m.visible);
   return {
     ok: r.ok,
     error: r.error,
+    scope: r.scope || null,
+    cacheScope: r.cacheScope || '',
+    cached: r.cached === true,
+    scopes: models.cacheScopes(region || 'cn'),
+    // 合并过的行要露出痕迹：能力字段是聚合值时必须能解释「为什么说支持」
+    merged: list.some((m) => (m.mergedScopes || 0) > 1),
     rows: list.map((m) => ({
       id: m.id,
       name: m.name,
@@ -619,6 +627,10 @@ async function traeworkRows({ visibleOnly = false, all = false, force = false, r
       maxMode: m.maxMode === true,
       // 套餐门槛：上游 descriptor 显式声明才 true，其余 null（不猜）
       upgradeRequired: m.upgradeRequired === true ? true : null,
+      // 聚合痕迹（2026-11-16 P0-1）：>1 表示这一行由多个账号作用域合并而来，
+      // rateScopeAmbiguous 表示各账号倍率不一致（会员折扣差异，不是坏数据）
+      mergedScopes: m.mergedScopes || 1,
+      rateScopeAmbiguous: m.rateScopeAmbiguous === true,
     })),
   };
 }
@@ -664,7 +676,11 @@ async function rowsFor(channel, opts = {}) {
   if (channel === 'qoder') return { rows: await qoderRows(opts), error: '' };
   if (channel === 'traework') {
     const r = await traeworkRows(opts);
-    return { rows: r.rows, error: r.error };
+    // 作用域摘要一起回：界面要能显示「这张表是哪份/是不是聚合出来的」
+    return {
+      rows: r.rows, error: r.error,
+      scope: r.scope, cacheScope: r.cacheScope, cached: r.cached, scopes: r.scopes, merged: r.merged,
+    };
   }
   return { rows: [], error: `未知通道 ${channel}` };
 }

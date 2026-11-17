@@ -15,7 +15,11 @@ const { soloHeaders } = require('./headers');
 // 「播报即收尾」的常量与判定收敛到共享模块（千问 / Qoder / TRAE 同一判据，
 // 见 src/repair.js 头注释——TRAE 2026-10-05 实测只有「检测 + 重试」可靠）。
 const repair = require('../repair');
-const REPAIR_CAPS = repair.envCaps('TRAEWORK'); // DUMATE_TRAEWORK_HOLD_CAP / _REPAIR_RETRY
+// 修复配置**不再在模块加载时快照**（2026-11-16，调研 P1-9）：面板/环境变量
+// 改了要立即生效。原来在这里 `const REPAIR_CAPS = repair.envCaps('TRAEWORK')`，
+// 于是 DUMATE_TRAEWORK_REPAIR_RETRY 与管理端面板那一栏都得重启网关才算数。
+// 取值本身仍是 `repair.envCaps`（优先级 面板 > env > 默认，见 src/throttle.js），
+// 这里只负责「什么时候读」。
 
 /**
  * 执行纪律——与 src/qwenwork/chat.js 同一份文本、同一个判定口径
@@ -480,18 +484,21 @@ function toOpenAIChunk(evt, model) {
 /** 重试时追加的修复指令（实测 5/5 触发工具调用；文本收敛在 src/repair.js） */
 const REPAIR_NUDGE = repair.REPAIR_NUDGE;
 
+/** 当前生效的修复配置（每次调用现读，热生效） */
+function repairCaps() { return repair.envCaps('TRAEWORK'); }
+
 /** 正文缓冲上限：超过就转直发（真·长回答不该被扣住等判定） */
-const HOLD_CAP = REPAIR_CAPS.HOLD_CAP;
+function holdCap() { return repairCaps().HOLD_CAP; }
 
 /** 重试次数上限（0 关闭整个修复） */
-const REPAIR_MAX = REPAIR_CAPS.REPAIR_MAX;
+function repairMax() { return repairCaps().REPAIR_MAX; }
 
 /**
  * 一轮「无工具调用」的回复，是不是「没干活就收工」。
  * @returns {boolean}
  */
 function looksUnfinished(text) {
-  return repair.looksUnfinished(text, HOLD_CAP);
+  return repair.looksUnfinished(text, holdCap());
 }
 
 /** 在请求体末尾追加修复指令（幂等：已经加过就不再加） */
@@ -522,7 +529,10 @@ function withRepairNudge(bodyJson) {
  * @param {string} model
  * @param {boolean} hold 是否启用缓冲（只有「带工具的请求」才需要）
  */
-function createTextGate(emit, model, hold) {
+function createTextGate(emit, model, hold, capIn) {
+  // 缓冲阈值**创建时取一次**：每次 chunk 去读配置等于每个 SSE 事件一次 stat。
+  // 一次请求内阈值变化没有意义（同一条流得用同一个判据）。
+  const cap = Number(capIn) > 0 ? Number(capIn) : holdCap();
   let pending = '';          // 已收到但还没下发的正文
   let text = '';             // 本轮收到的全部正文（不论有没有下发）
   let live = !hold;          // 是否已转为直发
@@ -555,7 +565,7 @@ function createTextGate(emit, model, hold) {
           if (live) emit(mkChunk({ content: d.response }));
           else {
             pending += d.response;
-            if (pending.length > HOLD_CAP) { live = true; flush(); }
+            if (pending.length > cap) { live = true; flush(); }
           }
         }
         return;
@@ -763,6 +773,6 @@ function aggregate(events, model) {
 }
 
 module.exports = {  buildBody, postStream, readStream, toOpenAIChunk, deltaOf, aggregate, eventError, normalizeToolCall,
-  createTextGate, looksUnfinished, withRepairNudge, REPAIR_NUDGE, REPAIR_MAX, HOLD_CAP,
+  createTextGate, looksUnfinished, withRepairNudge, REPAIR_NUDGE, repairCaps, holdCap, repairMax,
   parseDsmlToolCalls, turnIdOf, oidSessionId,
 };

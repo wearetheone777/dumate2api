@@ -395,7 +395,7 @@ async function send(payload, onChunk, opts = {}) {
   //   401 session_dead → 先刷新 token 重试同账号（hub #441），刷新失败才判死换号
   //   6004 model_cap   → 只冷却 (账号, 模型)（scope:model 喂池），换号继续打同模型
   //   参数错误         → 不喂池不写 lastError，如实 400（hub v1.10.11 #794）
-  const sessionKey = channelPool.sessionKeyOf(payload, opts);
+  const sessionKey = channelPool.sessionKeyFor(payload, opts);
   const usable = accountsForRegion(authStore.findUsable(), opts.region);
   if (!usable.length) throw noRegionAccountError(opts.region);
   const tried = new Set();

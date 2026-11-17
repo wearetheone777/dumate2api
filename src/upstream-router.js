@@ -259,6 +259,47 @@ function resolve(model) {
 }
 
 /**
+ * 带**路由组**的解析（调研 P1-7 第一批）。
+ *
+ * 命中组名时按成员顺序挑第一个「当前可用」的；跳过的成员原样记下原因
+ * （客户端从 `X-Route-Group` 看到命中的是谁，日志里看到跳过了谁、为什么）。
+ *
+ * 第一批只做**分发前的可用性择优**：`availability()` 说这条通道没号 / 被暂停，
+ * 就换下一个成员。判定在分发之前，所以**不存在「响应已开始写还要换成员」**的
+ * 危险路径；上游运行时失败后的跨成员重试要动翻译器收尾语义，留给第二批。
+ *
+ * require 走函数内懒加载，与本文件其它通道模块同一形态（避免顶层成环）。
+ *
+ * @param {string} model 请求里的模型名
+ * @param {{availability?:Function}} [opts] 仅供测试注入（生产用本模块的 availability）
+ * @returns {object} 与 resolve() 同形；额外带 `group{name,index,total,member,skipped}`。
+ *          全部成员不可用时返回 `{error, errorStatus:503}`——**是暂时性故障，不是 400**。
+ */
+function resolveWithGroup(model, opts = {}) {
+  const plan = require('./route-groups').plan(model);
+  if (!plan) return resolve(model);
+  const avail = opts.availability || availability;
+  const skipped = [];
+  for (let i = 0; i < plan.members.length; i++) {
+    const member = plan.members[i];
+    const r = resolve(member);
+    if (r.error) { skipped.push({ member, index: i + 1, reason: r.error }); continue; }
+    let av = null;
+    try { av = avail(r.channel); } catch (e) { av = { ok: false, reason: `availability 抛错: ${e.message}` }; }
+    if (av && av.ok === false) { skipped.push({ member, index: i + 1, reason: av.reason || '不可用' }); continue; }
+    // `members` 整份带上：运行时换成员（P1-7 第二半）要靠它往后走，
+    // 只给 total 的话调用方只能猜顺序。**这是第二批新增的字段**，
+    // 第一批的 group 里没有它（当时只需要「选中的是第几个」）。
+    return { ...r, group: { name: plan.name, index: i + 1, total: plan.members.length, member, members: [...plan.members], skipped } };
+  }
+  return {
+    error: `route_group_unavailable: ${plan.name}（${skipped.map((x) => `${x.index}.${x.member}: ${x.reason}`).join('；')}）`,
+    errorStatus: 503,
+    group: { name: plan.name, index: 0, total: plan.members.length, member: '', members: [...plan.members], skipped },
+  };
+}
+
+/**
  * 搭子的凭证来源：`'web'`（默认）或 `'auto'`。
  *
  * 默认值已从 `auto` 改成 `web`（2026-10-22）。依据是实测而非偏好：
@@ -354,6 +395,7 @@ function exposedFor(channel, models) {
 }
 
 module.exports = {
+  resolveWithGroup,
   QWEN_PREFIX,
   TRAEWORK_PREFIX,
   QODER_PREFIX,

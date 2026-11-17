@@ -49,6 +49,8 @@ const catalogLink = () => {
 };
 
 const reqlog = require('./reqlog');
+const attemptsMod = require('./attempts');
+const imageBudget = require('./image-budget');
 // 首字标记归 reqlog 统一实现：三个协议翻译器（Responses / Anthropic / Google）
 // 也在 reqlog 之外调用它，两处各写一份必然漂移。
 const markFirstToken = reqlog.markFirstToken;
@@ -273,11 +275,56 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
     }
   };
 
+  // 跨区容灾事实（2026-11-16 P0-3）：只有 TRAE provider 在本区无可用账号、
+  // 且运行态开关打开时才会回调。与降级同一条纪律——**绝不静默换区域**，
+  // 头已发出时改用 SSE 注释帧（合法 no-op，四种协议入口都忽略）。
+  // 默认思考档事实（2026-11-16 P0-4）：只有 provider 真的套了/尝试套过才回调。
+  // 与降级、跨区同一纪律——**事实必须可见**：客户端与排查的人都要能回答
+  // 「这一轮的 high 是我要的，还是网关的默认档」。
+  // 尝试链（2026-11-16 P1-5）：只记判据不记报文。provider 往里追加
+  // picked / skip / error / ok / failover，最后由 logRequest 落到请求日志。
+  // **复用已存在的尝试链**：路由组换成员会再次进入本函数，若每次都新建实例，
+  // 上一次写的 `failover` 判据会被后一次覆盖掉——链里只剩最后一段，
+  // 「为什么换了成员」就查不到了（2026-11-17 实测踩到）。
+  const attemptLog = req._attempts || attemptsMod.create({ t0: startedAt, limit: 8 });
+  req._attempts = attemptLog;
+
+  // 会话键（2026-11-16，P2-11 补）：provider 算出来的粘性键回传给网关，
+  // 落进请求日志——**没有它就没法按会话分组看「这条会话为什么换号」**
+  // （账号列只能前后对比，看不出是不是同一个会话）。键只在本地用，不进上游。
+  const onSessionKey = (key) => {
+    try { req._sessionKey = String(key || '').slice(0, 40); } catch (e) { /* 埋点失败不影响请求 */ }
+  };
+
+  const onReasoning = (res) => {
+    if (!res) return;
+    req._reasoning = {
+      source: res.source || '', requested: res.requested || '',
+      effective: res.effective || '', note: res.note || '',
+    };
+    let text = '';
+    try { text = require('./reasoning-apply').summary(res); } catch (e) { text = ''; }
+    if (!text) return;
+    if (!res.headersSent) res.setHeader('X-Reasoning-Applied', text);
+    else if (!res.writableEnded && !res.destroyed) {
+      try { res.write(`: X-Reasoning-Applied: ${text}\n\n`); } catch (e) { /* 连接已断 */ }
+    }
+  };
+
+  const onFailover = (text) => {
+    if (!text) return;
+    req._failover = String(text);
+    if (!res.headersSent) res.setHeader('X-Traework-Failover', req._failover);
+    else if (!res.writableEnded && !res.destroyed) {
+      try { res.write(`: X-Traework-Failover: ${req._failover}\n\n`); } catch (e) { /* 连接已断 */ }
+    }
+  };
+
   try {
     // TRAE 宝身份标记（2026-11-03）：resolve() 把 `traebao/` 前缀剥掉后才到
     // provider 手里，send() 靠 payload.model 认不出身份——显式经 opts 传。
     if (route.personalAssistant) req._personalAssistant = true;
-    const providerOpts = { reqId, onAccount, onModel, onLink, onDegraded, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
+    const providerOpts = { reqId, onAccount, onModel, onLink, onDegraded, onFailover, onReasoning, onSessionKey, attempts: attemptLog, startedAt, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
       const result = await provider.send(payload, undefined, providerOpts);
@@ -285,6 +332,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
       // 降级头：非流式整包还没发头时补进真正的响应头（流式若已发头，
       // onDegraded 已改用 SSE 注释帧给出事实）。
       if (req._degraded && !res.headersSent) res.setHeader('X-Trae-Degraded', req._degraded);
+      if (req._failover && !res.headersSent) res.setHeader('X-Traework-Failover', req._failover);
       if (kind === 'anthropic') {
         const anth = openAIToAnthropic(out, payload.model);
         logRequest(req, res, startedAt, info, 200, anth.usage || null);
@@ -514,18 +562,114 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
       }
     })();
   } catch (e) {
-    const status = e.statusCode || 502;
-    logRequest(req, res, startedAt, info, status, null, { error: e.message });
-    // 429 必须带 Retry-After：上游限流时**自己说了要等多久**
-    // （retryAfterSeconds / waitTime，见 upstream-errors.throttleRetryMs）。
-    // 不带给客户端，它就只能盲退避——退不够会再撞一次限流（加深冷却），
-    // 退过头则白白拉长用户等待。Codex / Claude Code 都认这个头。
-    const ra = Number(e.retryAfterMs);
-    const extra = status === 429 && ra > 0
-      ? { 'Retry-After': String(Math.ceil(ra / 1000)) }
-      : null;
-    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } }, extra);
+    // 捕获接缝（调研 P1-7 第二半）：**走到这个 catch 说明一个字节都还没写出去**
+    // （流式分支自己处理了已发头的情况）。这条路径上的失败都是「分发前」的
+    // ——模型不在该通道的能力表里、该区没有账号、provider 没就绪……
+    // 它们正好是路由组最该换成员的一类：让调用方（`dispatchDirect`）决定
+    // 是换下一个成员还是收尾，所以这里**不写响应**，把错误原样交出去。
+    if (ctx && ctx.captureError) { ctx.capturedError = e; return; }
+    return respondDirectError(req, res, startedAt, info, e);
   }
+}
+
+/**
+ * 直连通道失败的统一收尾（从 `handleDirectChannel` 的 catch 抽出来）。
+ *
+ * 抽出来的理由：路由组换成员失败到底时要重放同一段收尾，两份实现必然漂移
+ * ——尤其 `Retry-After` 这种「客户端据此退避」的头，漏一处就是一次盲退避。
+ */
+function respondDirectError(req, res, startedAt, info, e) {
+  const status = (e && e.statusCode) || 502;
+  const message = (e && e.message) || 'upstream error';
+  logRequest(req, res, startedAt, info, status, null, { error: message });
+  // 429 必须带 Retry-After：上游限流时**自己说了要等多久**
+  // （retryAfterSeconds / waitTime，见 upstream-errors.throttleRetryMs）。
+  // 不带给客户端，它就只能盲退避——退不够会再撞一次限流（加深冷却），
+  // 退过头则白白拉长用户等待。Codex / Claude Code 都认这个头。
+  const ra = Number(e && e.retryAfterMs);
+  const extra = status === 429 && ra > 0
+    ? { 'Retry-After': String(Math.ceil(ra / 1000)) }
+    : null;
+  return sendJSON(res, status, { error: { message, type: 'api_error' } }, extra);
+}
+
+/**
+ * 直连通道 + **路由组的运行时换成员**（调研 P1-7 第二半）。
+ *
+ * 第一批只做了「分发前按可用性择优」；这里补上「分发时失败也能换」。
+ *
+ * **只在能证明安全时才换**——判据是 `res.headersSent === false`：
+ *   - 走到 `handleDirectChannel` 的外层 catch 意味着**一个字节都没写**，
+ *     换成员不会让客户端收到两段拼接内容；
+ *   - 一旦已经发过头（翻译器一进来就 `writeHead(200)`），绝不换成员：
+ *     客户端会收到第二个 `response.created` / `message_start`，比直接失败更难查。
+ *
+ * **流式请求目前不换成员**（2026-11-17 实测结论）：在流式分支的
+ * 「首帧前失败」处也加过同样接缝，结果整条请求挂死（客户端 120s 超时、
+ * 响应 0 字节，伴随 2~5s 的事件循环卡顿）。原因没查清——流式分支在失败前
+ * 已经建过 shim 并 pipe 到 res，换成员要重开一条 shim，谁持有 res 的收尾权
+ * 说不清。**没查清就不上**：留一条明确的 400 比留一个偶发挂死好。
+ * 非流式（`!wantStream`）走同一函数但只经过外层 catch，这条路径已验证可用。
+ *
+ * 换成员会在尝试链里留 `failover` 判据（`group:<name>→<member>`），
+ * 与「选中」「跳过」同一套词汇——不静默换人。
+ *
+ * @returns {Promise<void>} 响应由内部写（成功或最终失败）
+ */
+async function dispatchDirect(req, res, payload, route, ctx) {
+  const g = route && route.group;
+  const members = g && Array.isArray(g.members) ? g.members : null;
+  if (!members || members.length <= 1) return handleDirectChannel(req, res, payload, route, ctx);
+
+  let last = null;
+  // 从「第一批选中的那个」开始往后试；之前的成员在第一批已经按可用性跳过了
+  const from = Math.max(0, (g.index || 1) - 1);
+  for (let i = from; i < members.length; i++) {
+    let r = route;
+    if (i !== from) {
+      r = router.resolve(members[i]);
+      if (r.error) {
+        noteGroupSkip(req, g.name, members[i], r.error);
+        continue;
+      }
+      // **必须把 payload 的模型名也换掉**：入口在分发前已经把 payload.model
+      // 写成第一个成员的模型名，provider 读的是 payload.model——只换 route
+      // 会让第二次尝试仍然带着旧模型名打上游（实测：换成员后错误还是
+      // 「__no_such_model__ 不在模型表中」）。
+      if (payload && typeof payload === 'object') payload.model = r.model;
+      req._mappedModel = r.model;
+      // 跨通道的组：埋点里的通道也要跟着换，否则这条请求会记到上一个通道头上
+      if (r.channel && r.channel !== req._channel) req._channel = r.channel;
+      // 埋点里的组标签跟着走：仍写 1/N 会让人以为走的还是第一个成员
+      req._routeGroup = `${g.name} ${i + 1}/${members.length}`;
+      try { if (!res.headersSent) res.setHeader('X-Route-Group', req._routeGroup); } catch (e2) { /* 头已发 */ }
+    }
+    const c = { ...ctx, captureError: true, capturedError: null };
+    await handleDirectChannel(req, res, payload, r, c);
+    if (!c.capturedError) return;                 // 成功，或已在内部写成响应
+    const e = c.capturedError;
+    if (res.headersSent || res.writableEnded) {
+      // 已经吐过东西：不能换，按普通失败收尾（这时响应通常已经写完，
+      // respondDirectError 里的 sendJSON 会因为 headersSent 抛错——由它内部吞）
+      return respondDirectError(req, res, ctx.startedAt, ctx.info, e);
+    }
+    last = e;
+    if (i + 1 < members.length) {
+      try {
+        if (req._attempts) {
+          req._attempts.add({ outcome: 'failover', reason: `group:${g.name}→${members[i + 1]}（第 ${i + 2}/${members.length} 个；前一个失败：${String(e.message).slice(0, 60)}）` });
+        }
+      } catch (e2) { /* 埋点失败不影响请求 */ }
+    }
+  }
+  return respondDirectError(req, res, ctx.startedAt, ctx.info, last || new Error('route group exhausted'));
+}
+
+/** 组成员在运行时解析失败/不可用时的跳过判据（与第一批的 skip 同一套词汇） */
+function noteGroupSkip(req, name, member, reason) {
+  try {
+    if (req._attempts) req._attempts.add({ outcome: 'skip', reason: `group:${name} 跳过 ${member}: ${String(reason || '').slice(0, 60)}` });
+  } catch (e) { /* 埋点失败不影响请求 */ }
 }
 
 // Forward request to DuMate upstream
@@ -796,6 +940,33 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 不记这个的话，排查「为什么这次走的账号不是桌面那个」时无从判断。
     // 只有真的回落了才有值，桌面链路不带这个字段。
     credential_source: req._credentialSource || '',
+    // 思考档位的来源（2026-11-16 P0-4）：client=客户端给的 / default=网关默认档 /
+    // 空=没档位。不记这个的话，「为什么这个模型今天思考变长了」无从回答。
+    reasoning_source: req._reasoning ? req._reasoning.source : '',
+    reasoning_requested: req._reasoning ? req._reasoning.requested : '',
+    reasoning_effective: req._reasoning ? req._reasoning.effective : '',
+    // 尝试链（2026-11-16 P1-5）：把「为什么是这个号 / 为什么跳过 / 为什么失败」
+    // 变成可读的时间轴。只记判据，不记请求体与响应体。
+    ...(req._attempts ? req._attempts.json() : {}),
+    // 内联图片体量（P1-6）：count=全部图 part / inline=其中的 data URI 张数。
+    // 不记这组数，「要不要压缩、压到多少」只能靠猜；external 是外链图，
+    // 大小在上游手里，我们不假装量得出来（不计入 bytes）。
+    image_count: req._imageStats ? req._imageStats.count : 0,
+    image_inline: req._imageStats ? req._imageStats.dataCount : 0,
+    image_bytes: req._imageStats ? req._imageStats.bytes : 0,
+    image_max_bytes: req._imageStats ? req._imageStats.maxBytes : 0,
+    image_format: req._imageStats ? req._imageStats.topFormat : '',
+    // 压缩（P1-6b）：缩了几张、缩之前多大。没有这两个字段时「图变小了」
+    // 这件事在日志里是不可见的，而它直接改变了客户端看到的请求体。
+    image_compressed: req._imageCompressed ? req._imageCompressed.length : 0,
+    image_cached: req._imageCached || 0,
+    image_bytes_before: req._imageBytesBefore || 0,
+    image_skip: req._imageSkipped ? req._imageSkipped.join(',') : '',
+    // 路由组（P1-7）：命中的组与成员序号。空 = 这条请求没走组。
+    route_group: req._routeGroup || '',
+    // 会话粘性键（P2-11）：同一条会话的所有请求共享这个值，换号时前后行能对上。
+    // 空 = 这条请求不粘（无首条 user / 非直连通道 / 显式未给）。
+    session_key: req._sessionKey || '',
     model: info.model || '',
     // 映射后的模型：客户端发来的名字经 modelmap 转换后实际打给上游的值。
     // 排查「为什么 glm-5 变成了 model-text」这类问题时要看它。
@@ -815,6 +986,9 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 全价请求统计（usage-agg）只认前者，把没回报的算成零命中会虚增全价占比。
     cached_tokens: u.cached || 0,
     cached_reported: !!u.cachedReported,
+    // 缓存写入（P2-13）：Anthropic 系的第三段。命中率分母要由它剔掉写入。
+    cache_creation_tokens: u.creation || 0,
+    cache_creation_reported: !!u.creationReported,
     // 计量口径（2026-11-06）：qwen-acp 的会话帧不带 token 计量（tokens 恒 0），
     // 扣费真实发生（三池差值实证）但逐笔金额网关侧拿不到——差值法每请求要
     // 多 2 次上游调用，不值得。标 wallet-delta 让界面显示「无计量」，
@@ -870,6 +1044,114 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
       && (u.input || u.output || cursorAccount)) {
     pointsCursor.capture(ts, cursorAccount);
   }
+}
+
+/**
+ * 路由闸门拒绝也要落日志（2026-11-16 P1-5）。
+ *
+ * 原来这四个分支直接 `sendJSON(503)` 就返回了：请求日志里**一条都没有**，
+ * 于是「为什么这次 503」在管理端查不到（本轮冒烟就是这样：`requests.jsonl`
+ * 里连行都没有）。现在记一行 + 一条 `gate:` 尝试链，原因与原响应文案同源。
+ *
+ * 注意 `res._logged` 由 logRequest 置位，后续真正的处理路径不会重复记。
+ */
+function logGateReject(req, res, startedAt, info, status, channel, reason) {
+  try {
+    if (!req._attempts) req._attempts = attemptsMod.create({ t0: startedAt || Date.now(), limit: 8 });
+    req._attempts.add({ outcome: 'skip', reason: `gate: ${String(reason || '').slice(0, 90)}` });
+    if (channel && !req._channel) req._channel = channel;
+    logRequest(req, res, startedAt || Date.now(), info || {}, status, null);
+  } catch (e) { /* 埋点失败绝不影响响应 */ }
+}
+
+/**
+ * 路由组事实（调研 P1-7 第一批）：命中哪个组、用的是第几个成员、跳过了谁。
+ *
+ * 三条出口都写，因为它们回答的是不同人的问题：
+ *   - 客户端：`X-Route-Group`（头已发就跳过——与 X-Trae-Failover 同一纪律）
+ *   - 排查的人：尝试链（skip / failover 两条判据，最直观）
+ *   - 统计：请求日志的 `route_group` 字段（能按组聚合）
+ *
+ * 埋点失败一律吞掉：路由组是锦上添花的能力，不能因为它把请求打挂。
+ */
+function noteRouteGroup(req, res, route) {
+  const g = route && route.group;
+  if (!g) return;
+  const label = `${g.name} ${g.index}/${g.total}`;
+  req._routeGroup = label;
+  try {
+    if (!req._attempts) req._attempts = attemptsMod.create({ t0: Date.now(), limit: 8 });
+    for (const sk of g.skipped || []) {
+      req._attempts.add({ outcome: 'skip', reason: `group:${g.name} 跳过 ${sk.member}: ${sk.reason}` });
+    }
+    if (g.index > 0) {
+      req._attempts.add({ outcome: 'failover', reason: `group:${g.name}→${g.member}（第 ${g.index}/${g.total} 个）` });
+    }
+  } catch (e) { /* 埋点失败不影响请求 */ }
+  try {
+    if (!res.headersSent) res.setHeader('X-Route-Group', label);
+  } catch (e) { /* 头发不出去不影响请求 */ }
+}
+
+/**
+ * 内联图片上限（调研 P1-6 第一批：观测 + 守门，不做压缩）。
+ *
+ * 为什么放在「翻译之后、分流之前」：四个协议入口到这一步 payload 都已是
+ * OpenAI 形状（图像统一成 image_url part），扫描只有一份实现。放在各协议
+ * 入口之前就得为 Anthropic 的 source.data / Google 的 inlineData 各写一遍。
+ *
+ * 三条纪律：
+ *   - **默认不限**（上限 0）：没有实测依据的阈值只会挡住能用的场景。
+ *   - 统计**总是**记（`req._imageStats`），超限与否都能在请求日志里看到
+ *     「这次带了几个图、多大」——不谈压缩，先有数。
+ *   - 扫描/判定抛错**不阻断请求**：守门是附加能力，故障不能变成 503。
+ *
+ * @returns {boolean} true = 已回 413，调用方必须 return
+ */
+function enforceImageBudget(req, res, payload, ctx) {
+  let verdict = null;
+  // 压缩（默认关，P1-6 第二批）：超长边的内联 PNG 就地缩小重编码。
+  // 放在判定之前——压完可能就不超限了，那这条请求就该正常走，而不是被拒。
+  // 结果按原图指纹缓存（会话历史每轮都重发同一张图，没有缓存等于每轮重算）。
+  let squeezed = null;
+  try { squeezed = imageBudget.compressPayload(payload); } catch (e) { squeezed = null; }
+  if (squeezed && squeezed.changed) {
+    req._imageCompressed = squeezed.items;
+    // 缓存命中也要单独记：`image_compressed=0 且字节数变小` 只有这一种解释，
+    // 混在一起会让「压缩到底有没有发生」在日志里无法判断
+    req._imageCached = squeezed.cacheHits;
+    req._imageBytesBefore = squeezed.bytesBefore;
+  } else if (squeezed && squeezed.bytesBefore) {
+    // 未压缩但量到了：记下来，「为什么不缩」在日志里也查得到
+    req._imageBytesBefore = squeezed.bytesBefore;
+    if (squeezed.skipped.length) req._imageSkipped = squeezed.skipped.map((x) => x.reason);
+  }
+  try { verdict = imageBudget.apply(payload); } catch (e) { return false; }
+  req._imageStats = verdict.stats;
+  if (verdict.ok) return false;
+  const { startedAt, info } = ctx || {};
+  // 走同一套闸门埋点：客户端看到 413，日志里能看到「gate: 图片超限…」
+  const lim = verdict.limits;
+  const short = verdict.oversize.length
+    ? `图片超限：第 ${verdict.oversize[0].n} 张 ${imageBudget.human(verdict.oversize[0].bytes)} > ${imageBudget.human(lim.maxBytes)}`
+    : `图片超限：合计 ${imageBudget.human(verdict.stats.bytes)} > ${imageBudget.human(lim.maxTotalBytes)}`;
+  logGateReject(req, res, startedAt, info, 413, req._channel || '', short);
+  return sendJSON(res, 413, {
+    error: {
+      message: verdict.message,
+      type: 'invalid_request_error',
+      code: verdict.code,
+      images: {
+        count: verdict.stats.count,
+        inline: verdict.stats.dataCount,
+        external: verdict.stats.externalCount,
+        bytes: verdict.stats.bytes,
+        max_bytes: verdict.stats.maxBytes,
+        limit_bytes: lim.maxBytes || null,
+        limit_total_bytes: lim.maxTotalBytes || null,
+      },
+    },
+  });
 }
 
 // ==================== OpenAI Compatible Endpoints ====================
@@ -1020,6 +1302,23 @@ async function handleOpenAIModels(req, res) {
     owned_by: 'dumate-proxy',
     name: '积分余额查询（伪模型 · 零消耗 · 不打对话上游）',
   });
+
+  // 路由组（P1-7）：组名必须能被发现，否则客户端只能靠口口相传配置。
+  // owned_by 用 `dumate-proxy`：它不是上游真名，也没有固定后端——成员哪条可用
+  // 就用哪条，**`route_group` 字段如实列出成员顺序**，让客户端知道这是「择优」。
+  try {
+    const routeGroups = require('./route-groups');
+    for (const g of routeGroups.Load().groups) {
+      data.push({
+        id: g.name,
+        object: 'model',
+        created,
+        owned_by: 'dumate-proxy',
+        name: `路由组（按可用性择优：${g.members.join(' → ')}）`,
+        route_group: { members: [...g.members] },
+      });
+    }
+  } catch (e) { /* 组配置坏掉不能让列表失败 */ }
 
   // 千问办公的模型带 qwen/ 前缀列出来，否则客户端无从发现这个通道
   // （它们不在 modelmap 里——那套别名是搭子专用的）。
@@ -1481,9 +1780,14 @@ async function handleOpenAIChat(req, res) {
   // 名字带通道前缀，不再是 claude-* 形状）；key 没绑通道时原样放行。
   const _cl = modelmap.normalizeIncomingModel(reqBody.model, req._apiKey && req._apiKey.channel);
   if (_cl) reqBody.model = _cl;
-  const route = router.resolve(reqBody.model);
+  const route = router.resolveWithGroup(reqBody.model);
+  // 组的择优事实**先记**：全不可用时同样要留下「命中哪个组、跳过了谁」，
+  // 否则那条 503 在日志里只剩一句被截断的文本（attempts 上限 90 字符）。
+  noteRouteGroup(req, res, route);
   if (route.error) {
-    return sendJSON(res, 400, { error: { message: route.error, type: 'invalid_request_error' } });
+    // 未知前缀/未知通道也落一行：否则「这个模型名为什么 400」在日志里同样查不到
+    logGateReject(req, res, startedAt, info, route.errorStatus || 400, route.channel || '', route.error);
+    return sendJSON(res, route.errorStatus || 400, { error: { message: route.error, type: 'invalid_request_error', code: route.errorStatus || 400 } });
   }
   // dumate-points 伪模型（2026-11-07 融合项 P0-1）：拦截在 availability 之前
   // ——余额读数不依赖搭子通道的就绪状态（桌面没开、网页池整体冷却中，
@@ -1491,8 +1795,13 @@ async function handleOpenAIChat(req, res) {
   if (route.channel === 'dumate' && route.model === dumatePoints.NAME) {
     return await handlePointsModel(req, res, { protocol: 'openai', stream: !!reqBody.stream, startedAt, info });
   }
+  // 内联图片上限（P1-6）：放在可用性闸门**之前**——图太大是客户端自己能修的问题，
+  // 先回「没有可用账号」会把人带去查错方向；这条判定不需要账号，可离线验证。
+  if (enforceImageBudget(req, res, reqBody, { startedAt, info })) return;
+
   const avail = router.availability(route.channel);
   if (!avail.ok) {
+    logGateReject(req, res, startedAt, info, 503, route.channel, avail.reason);
     return sendJSON(res, 503, {
       error: { message: `channel ${route.channel} unavailable: ${avail.reason}`, type: 'api_error' }
     });
@@ -1529,7 +1838,7 @@ async function handleOpenAIChat(req, res) {
   // 在 mapModel / 预算之后、转发之前分流——它的 body 构造与搭子不同，
   // 且要经官方 wasm 封装。
   if (target.direct) {
-    return await handleDirectChannel(req, res, reqBody, route, { startedAt, info, kind: 'openai', region: req._apiKeyRegion || '' })
+    return await dispatchDirect(req, res, reqBody, route, { startedAt, info, kind: 'openai', region: req._apiKeyRegion || '' })
   }
 
   // 云端网关（dumate-svc.baidu.com）只在被显式要求时才在流尾补一个 usage 帧；
@@ -1723,12 +2032,17 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
   // 按 key 通道重写，同 chat 路径。
   const _cl = modelmap.normalizeIncomingModel(openaiReq.model, req._apiKey && req._apiKey.channel);
   if (_cl) openaiReq.model = _cl;
-  const route = router.resolve(openaiReq.model);
+  const route = router.resolveWithGroup(openaiReq.model);
+  // 组的择优事实**先记**：全不可用时同样要留下「命中哪个组、跳过了谁」，
+  // 否则那条 503 在日志里只剩一句被截断的文本（attempts 上限 90 字符）。
+  noteRouteGroup(req, res, route);
   if (route.error) {
-    return sendJSON(res, 400, { error: { message: route.error, code: 400, status: 'INVALID_ARGUMENT' } });
+    logGateReject(req, res, startedAt, info, route.errorStatus || 400, route.channel || '', route.error);
+    return sendJSON(res, route.errorStatus || 400, { error: { message: route.error, code: route.errorStatus || 400, status: 'INVALID_ARGUMENT' } });
   }
   const avail = router.availability(route.channel);
   if (!avail.ok) {
+    logGateReject(req, res, startedAt, info, 503, route.channel, avail.reason);
     return sendJSON(res, 503, { error: { message: `channel ${route.channel} unavailable: ${avail.reason}`, code: 503, status: 'UNAVAILABLE' } });
   }
   req._channel = route.channel;
@@ -1751,9 +2065,11 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
     promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
+  // 内联图片上限（P1-6）：默认不限；超限时给一句能照做的错，并把它记进闸门日志
+  if (enforceImageBudget(req, res, openaiReq, { startedAt, info })) return;
   if (target.direct) {
     openaiReq.stream = isStream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'google', region: req._apiKeyRegion || '' })
+    return await dispatchDirect(req, res, openaiReq, route, { startedAt, info, kind: 'google', region: req._apiKeyRegion || '' })
   }
   // 同 handleOpenAIChat：云端只在被显式要求时回流 usage 帧。
   if (isStream) openaiReq.stream_options = { include_usage: true };
@@ -1849,12 +2165,17 @@ async function handleOpenAIResponses(req, res) {
   //（Claude Desktop 3p 直连）按 key 通道重写，同 chat 路径。
   const _cl = modelmap.normalizeIncomingModel(openaiReq.model, req._apiKey && req._apiKey.channel);
   if (_cl) openaiReq.model = _cl;
-  const route = router.resolve(openaiReq.model);
+  const route = router.resolveWithGroup(openaiReq.model);
+  // 组的择优事实**先记**：全不可用时同样要留下「命中哪个组、跳过了谁」，
+  // 否则那条 503 在日志里只剩一句被截断的文本（attempts 上限 90 字符）。
+  noteRouteGroup(req, res, route);
   if (route.error) {
-    return sendJSON(res, 400, { error: { message: route.error, type: 'invalid_request_error' } });
+    logGateReject(req, res, startedAt, info, route.errorStatus || 400, route.channel || '', route.error);
+    return sendJSON(res, route.errorStatus || 400, { error: { message: route.error, type: 'invalid_request_error', code: route.errorStatus || 400 } });
   }
   const avail = router.availability(route.channel);
   if (!avail.ok) {
+    logGateReject(req, res, startedAt, info, 503, route.channel, avail.reason);
     return sendJSON(res, 503, { error: { message: `channel ${route.channel} unavailable: ${avail.reason}`, type: 'api_error' } });
   }
   req._channel = route.channel;
@@ -1882,9 +2203,11 @@ async function handleOpenAIResponses(req, res) {
     promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
+  // 内联图片上限（P1-6）：默认不限；超限时给一句能照做的错，并把它记进闸门日志
+  if (enforceImageBudget(req, res, openaiReq, { startedAt, info })) return;
   if (target.direct) {
     openaiReq.stream = isStream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'responses', region: req._apiKeyRegion || '' })
+    return await dispatchDirect(req, res, openaiReq, route, { startedAt, info, kind: 'responses', region: req._apiKeyRegion || '' })
   }
   // 同 handleOpenAIChat：云端只在被显式要求时回流 usage 帧。
   if (isStream) openaiReq.stream_options = { include_usage: true };
@@ -1953,9 +2276,13 @@ async function handleAnthropicMessages(req, res) {
   // 重写——这是 Desktop 直连的主路径，同 chat 路径的幂等重写。
   const _cl = modelmap.normalizeIncomingModel(anthropicReq.model, req._apiKey && req._apiKey.channel);
   if (_cl) anthropicReq.model = _cl;
-  const route = router.resolve(anthropicReq.model);
+  const route = router.resolveWithGroup(anthropicReq.model);
+  // 组的择优事实**先记**：全不可用时同样要留下「命中哪个组、跳过了谁」，
+  // 否则那条 503 在日志里只剩一句被截断的文本（attempts 上限 90 字符）。
+  noteRouteGroup(req, res, route);
   if (route.error) {
-    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: route.error } });
+    logGateReject(req, res, startedAt, info, route.errorStatus || 400, route.channel || '', route.error);
+    return sendJSON(res, route.errorStatus || 400, { type: 'error', error: { type: 'invalid_request_error', message: route.error } });
   }
   // dumate-points 伪模型（2026-11-07 融合项 P0-1）：Claude Code 全程走本入口，
   // 不拦这里它就查不了余额。同样在 availability 之前（理由见 chat 路径）。
@@ -1964,6 +2291,7 @@ async function handleAnthropicMessages(req, res) {
   }
   const avail = router.availability(route.channel);
   if (!avail.ok) {
+    logGateReject(req, res, startedAt, info, 503, route.channel, avail.reason);
     return sendJSON(res, 503, { type: 'error', error: { type: 'api_error', message: `channel ${route.channel} unavailable: ${avail.reason}` } });
   }
   req._channel = route.channel;
@@ -2001,9 +2329,11 @@ async function handleAnthropicMessages(req, res) {
     promptGuard.capToolOutputs(openaiReq, process.env.DUMATE_TOOL_OUTPUT_CAP);
   }
   const target = route.target;
+  // 内联图片上限（P1-6）：默认不限；超限时给一句能照做的错，并把它记进闸门日志
+  if (enforceImageBudget(req, res, openaiReq, { startedAt, info })) return;
   if (target.direct) {
     openaiReq.stream = !!anthropicReq.stream;
-    return await handleDirectChannel(req, res, openaiReq, route, { startedAt, info, kind: 'anthropic', region: req._apiKeyRegion || '' })
+    return await dispatchDirect(req, res, openaiReq, route, { startedAt, info, kind: 'anthropic', region: req._apiKeyRegion || '' })
   }
   // Ask the upstream for a usage-bearing final chunk so we can report real
   // token counts instead of zeroes. Harmless if the upstream ignores it.

@@ -62,6 +62,12 @@ test('全部账号关闭模型请求：status 明确报出且仍是已登录，�
   fs.writeFileSync(file, JSON.stringify({
     accounts: [{ id: 1, enabled: true, modelEnabled: false, accessToken: 'a', refreshToken: 'r' }],
   }), 'utf8');
+  // **必须把 mtime 推远**：auth.js 按 mtime 失效重读，而上一条用例刚写过同一个文件。
+  // 两次写在同一个毫秒内完成时 mtimeMs 相同 → 缓存不失效 → 这里读到上一条的
+  // 3 个账号（其中 has modelEnabled 的号）→ ready 变成 true，断言随机失败。
+  // 实测本机 3 次里能中 1 次（2026-11-16）。推 mtime 比 sleep 更确定。
+  const later = new Date(Date.now() + 2000);
+  fs.utimesSync(file, later, later);
   const st = tw.status();
   assert.strictEqual(st.ready, false);
   assert.strictEqual(st.loggedIn, true);

@@ -11,7 +11,7 @@
 //
 // API Key 的区域绑定优先于 fallbackRegion：key 已经限死 cn/intl 时，
 // 降级只换模型、不越区域（否则等于用开关绕过鉴权约束）。
-const { classify, traeCodeOf, traeCodeKind, unescapeDeep } = require('../upstream-errors');
+const { classify, traeCodeOf, traeCodeKind, unescapeDeep, isAuthReject } = require('../upstream-errors');
 
 const QUOTA_TEXT = /(额度|积分|余额|credits?|quota)[^\n]{0,20}(不足|耗尽|用完|insufficient|exhausted)|(?:3003|3004|4008)\b/i;
 const UPGRADE_TEXT = /subscription[- ]only|订阅专享|需(?:要)?升级|upgrade[_ -]?required|\b1005\b|套餐(?:不支持|未包含)/i;
@@ -23,6 +23,10 @@ function reasonOf(err) {
   const status = Number(err.statusCode || err.status) || 0;
   const code = traeCodeOf(raw);
   const codeKind = code != null ? traeCodeKind(code) : null;
+  // 凭证/授权被拒不是额度问题（2026-11-16）：换模型、换区域都是同一份凭证，
+  // 白试一次只会把「请重新登录」拖成两倍耗时。显式排除，别让 QUOTA_TEXT
+  // 里的「不足/耗尽」误命中（有些 403 文案会带「额度」字样）。
+  if (isAuthReject(status || code || 0, raw)) return null;
   const cls = classify({ status: status || code || 0, message: raw });
 
   // 额度：402、HARD_TEXT、TRAE 额度码 3003/3004/4008，或 classify 判 hard

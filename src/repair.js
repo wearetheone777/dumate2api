@@ -39,6 +39,10 @@ const DEFAULT_HOLD_CAP = 600;
 /** 各通道的重试次数默认值（0 = 关闭整个修复） */
 const DEFAULT_REPAIR_MAX = 1;
 
+// 风控旋钮的解析（P1-9）：面板 > env > 默认。只取「短故障重试」一项，
+// 见 envCaps 的注释。依赖方向 repair → throttle → livecfg，无环。
+const throttle = require('./throttle');
+
 /**
  * 读某通道的修复配置。prefix 是环境变量段名：
  *   TRAEWORK  → DUMATE_TRAEWORK_HOLD_CAP / DUMATE_TRAEWORK_REPAIR_RETRY
@@ -47,14 +51,22 @@ const DEFAULT_REPAIR_MAX = 1;
  *   WORKBUDDY → DUMATE_WORKBUDDY_HOLD_CAP / DUMATE_WORKBUDDY_REPAIR_RETRY
  *
  * 空串的重试值按 0 处理（Number('')===0，与 TRAE 旧口径一致）。
+ *
+ * 2026-11-16（调研 P1-9）：`REPAIR_MAX` 多一层**面板热改**（优先级
+ * 面板 > env > 默认）。解析在 `src/throttle.js` 里实现一份，这里只取值——
+ * 面板没填时返回值与旧版逐字节一致（含 `''` → 0 的口径）。
+ * `HOLD_CAP` 不进面板：它是「多长算真回答」的判据阈值，不是风控节奏参数，
+ * 改了会让同一段回答时而被扣时而直发，面板上放它只会被误调。
  */
 function envCaps(prefix) {
   const cap = process.env[`DUMATE_${prefix}_HOLD_CAP`];
   const retry = process.env[`DUMATE_${prefix}_REPAIR_RETRY`];
   const h = Number(cap == null || cap === '' ? DEFAULT_HOLD_CAP : cap);
+  const hotRetry = throttle.knob(String(prefix || '').toLowerCase(), 'retryMax');
+  const legacyRetry = retry == null ? DEFAULT_REPAIR_MAX : Math.max(0, Math.floor(Number(retry) || 0));
   return {
     HOLD_CAP: h > 0 ? h : DEFAULT_HOLD_CAP,
-    REPAIR_MAX: retry == null ? DEFAULT_REPAIR_MAX : Math.max(0, Math.floor(Number(retry) || 0)),
+    REPAIR_MAX: hotRetry == null ? legacyRetry : hotRetry,
   };
 }
 

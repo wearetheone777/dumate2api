@@ -18,7 +18,7 @@ const path = require('path');
 const filelock = require('./filelock');
 
 const FILE = 'traework-runtime.json';
-const FIELDS = ['degrade', 'maxMode', 'pickStrategy', 'accountGuard', 'gatewayPaused'];
+const FIELDS = ['degrade', 'maxMode', 'pickStrategy', 'accountGuard', 'gatewayPaused', 'crossRegionFailover', 'defaultReasoning'];
 
 function dataDir() {
   return process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', 'data');
@@ -35,6 +35,14 @@ function defaults() {
     pickStrategy: 'round-robin',
     accountGuard: { enabled: false, reserveCredits: null, reserveBelow: null, dailyTokens: null, dailyCredits: null, modelTokens: null },
     gatewayPaused: false,
+    // 跨区容灾（P0-3 子项，默认关）：**只有本区确实一个可用账号都没有**时
+    // 才把请求改派到对方区，且只在 API Key 未绑定区域时生效。'to' 留空 =
+    // 自动挑「对方那一区」。刻意不做「一遇 429 就跨区」——那会掩盖限流。
+    crossRegionFailover: { enabled: false, to: '' },
+    // 默认思考档（P0-4，默认空 = 不干预）：`{模型模式: 档位}`，模式支持
+    // `精确名` / `前缀*` / `*` 兜底。**只对客户端没给档位的请求生效**，
+    // 且只在该模型 descriptor 明确声明了支持档位时才套（见 src/reasoning-apply.js）。
+    defaultReasoning: {},
   };
 }
 
@@ -118,6 +126,41 @@ function sanitize(patch, { strict = false } = {}) {
       }
       continue;
     }
+    if (key === 'crossRegionFailover') {
+      out.crossRegionFailover = {};
+      if (obj.enabled !== undefined) out.crossRegionFailover.enabled = obj.enabled === true;
+      if (obj.to !== undefined) {
+        const r = String(obj.to || '').trim().toLowerCase();
+        if (r && r !== 'cn' && r !== 'intl') {
+          fail('crossRegionFailover.to 只能是 cn / intl 或留空');
+          continue;
+        }
+        out.crossRegionFailover.to = r;
+      }
+      continue;
+    }
+    if (key === 'defaultReasoning') {
+      // 形状校验在这里，**档位词表不在这里再写一份**（单一来源是
+      // `src/traework/remote.js` 的 EFFORT_LEVELS/normalizeLevel）。所以
+      // 懒加载它做值校验：词表变化时这里自动跟上，不会漂移。
+      let normalize = null;
+      try { normalize = require('./traework/remote').normalizeLevel; } catch (e) { normalize = null; }
+      const table = {};
+      for (const [rawK, rawV] of Object.entries(obj)) {
+        const k = String(rawK || '').trim().slice(0, 120);
+        const v = String(rawV == null ? '' : rawV).trim().slice(0, 32);
+        if (!k || !v) continue;
+        const lv = normalize ? normalize(v) : '';
+        if (normalize && !lv) {
+          fail(`defaultReasoning["${k}"] 的档位「${v}」不合法（light / high / extra_high 及其别名）`);
+          continue;
+        }
+        // 落**归一化**后的原生档：配置里不该出现两套词表（`ultra` 是 extra_high 的别名）
+        table[k] = lv || v;
+      }
+      out.defaultReasoning = table;
+      continue;
+    }
     if (key === 'maxMode') {
       out.maxMode = {};
       if (obj.enabled !== undefined) out.maxMode.enabled = obj.enabled === true;
@@ -153,6 +196,12 @@ function merge(base, patch) {
   for (const key of FIELDS) {
     const p = patch[key];
     if (p === undefined) continue;
+    // defaultReasoning 是**配置表**（键就是规则），必须整体替换：
+    // 深合并会让「删掉一行」永远删不掉（提交 {} 等于什么都没改）。
+    if (key === 'defaultReasoning') {
+      out[key] = (p && typeof p === 'object' && !Array.isArray(p)) ? { ...p } : {};
+      continue;
+    }
     if (p && typeof p === 'object' && !Array.isArray(p)) out[key] = { ...(base[key] || {}), ...p };
     else out[key] = p;
   }
@@ -174,13 +223,20 @@ function Load() {
     cache = { mtime: m, snap: merge(defaults(), sanitize(raw)) };
   }
   const s = cache.snap;
-  // 返回私有拷贝：调用方对数组/对象的改动不污染下一个读者
+  // 返回私有拷贝：调用方对数组/对象的改动不污染下一个读者。
+  //
+  // **这里是一份独立的字段白名单**——新增 FIELDS 项必须同时加进来，否则
+  // `defaults()` 有、`Store()` 写盘也有，只有 `Load()` 读出来是 undefined。
+  // 2026-11-16 踩过一次（crossRegionFailover 写盘成功、接口恒 null，
+  // 单测锁在 test/unit/trae-auth-reject.test.js 的「Load 覆盖全部 FIELDS」）。
   return {
     degrade: { ...s.degrade },
     maxMode: { ...s.maxMode, models: [...s.maxMode.models] },
     pickStrategy: s.pickStrategy,
     accountGuard: { ...s.accountGuard },
     gatewayPaused: s.gatewayPaused,
+    crossRegionFailover: { ...(s.crossRegionFailover || {}) },
+    defaultReasoning: { ...(s.defaultReasoning || {}) },
   };
 }
 

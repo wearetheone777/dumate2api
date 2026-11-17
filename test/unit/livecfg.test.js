@@ -26,7 +26,16 @@ test.after(() => {
 test('无配置文件时返回默认值（recordClientInfo 默认开，向后兼容既有日志）', () => {
   reset();
   const cfg = livecfg.Load();
-  assert.deepStrictEqual(cfg, { recordClientInfo: true, hiddenModels: [], softCooldownMs: 0 });
+  // throttle/throttleMaxMs 是 P1-9 新增（全部 null = 跟随 env/默认），
+  // 断言只钉「旧字段的默认值没变」+「新字段确实是未设」，不整体 deepEqual：
+  // 每次加白名单字段都改一次这里的字面量，等于把这条回归锚变成维护负担。
+  assert.strictEqual(cfg.recordClientInfo, true);
+  assert.deepStrictEqual(cfg.hiddenModels, []);
+  assert.strictEqual(cfg.softCooldownMs, 0);
+  assert.strictEqual(cfg.throttleMaxMs, 0);
+  for (const ch of livecfg.THROTTLE_CHANNELS) {
+    assert.deepStrictEqual(cfg.throttle[ch], { inflightMax: null, minIntervalMs: null, retryMax: null });
+  }
 });
 
 test('sanitize 非严格（磁盘读）：未知键丢弃，不炸', () => {

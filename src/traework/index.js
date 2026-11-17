@@ -6,6 +6,9 @@ const c = require('./constants');
 const chat = require('./chat');
 const authStore = require('./auth');
 const models = require('./models');
+const failover = require('./failover');
+const reasoningApply = require('../reasoning-apply');
+const upstreamErrors = require('../upstream-errors');
 const { normalizeError } = require('../errtext');
 const images = require('../images');
 // 选号接缝（集成阶段）：冷却/熔断/粘性/在途帽统一走池状态机。
@@ -87,12 +90,40 @@ function listModelEntries() {
   return models.cachedModelEntries();
 }
 
-/** 预热模型表（进程启动时调一次，让 /v1/models 拿到完整列表）。两区各自有账号就各预热一份 */
-function warmupModels() {
-  return Promise.all([
-    models.fetchModels({ region: 'cn' }).catch(() => null),
-    models.fetchModels({ region: 'intl' }).catch(() => null),
-  ]);
+/**
+ * 预热模型表（进程启动时调一次，让 /v1/models 拿到完整列表）。
+ *
+ * 2026-11-16（P0-1）起**按账号各预热一份**：模型表里倍率/档位/max_mode/multimodal
+ * 都是账号相关的，只预热「该区第一个号」等于让其它账号看着别人的能力表做判断。
+ * 每区上限 `WARM_MAX_PER_REGION` 个账号——预热是启动期的批量请求，不能因为
+ * 账号多就变成一次上游风暴；没预热的账号在它第一次接请求时按需拉（带单飞）。
+ */
+const WARM_MAX_PER_REGION = parseInt(process.env.DUMATE_TRAEWORK_MODELS_WARM_MAX || '3', 10);
+
+async function warmupModels() {
+  const jobs = [];
+  for (const region of ['cn', 'intl']) {
+    const accounts = models.accountsForRegion(region).slice(0, Math.max(1, WARM_MAX_PER_REGION));
+    for (const a of accounts) {
+      jobs.push(models.fetchModels({ region, accountId: a.id }).catch(() => null));
+    }
+    // 该区一个账号都没有时也拉一次：让「没有可用账号」这条错误如实出现在缓存/日志里
+    if (!accounts.length) jobs.push(models.fetchModels({ region }).catch(() => null));
+  }
+  const results = (await Promise.all(jobs)).filter(Boolean);
+  const oks = results.filter((r) => r && r.ok && Array.isArray(r.models) && r.models.length);
+  // 返回值保持**单个结果**的形状：server.js 的启动日志读 m.ok / m.models.length。
+  // 多作用域的事实放进 scopes/warmed，不让日志那句「N 个模型」变成 undefined。
+  const largest = oks.slice().sort((a, b) => b.models.length - a.models.length)[0] || null;
+  return {
+    ok: !!largest,
+    models: largest ? largest.models : [],
+    error: largest ? '' : ((results.find((r) => r && r.error) || {}).error || 'unknown'),
+    // 预热成功的作用域（账号级），日志/管理端都能核对；失败数单独计
+    scopes: oks.map((r) => r.scope).filter(Boolean),
+    warmed: oks.length,
+    failed: results.length - oks.length,
+  };
 }
 
 /**
@@ -337,7 +368,7 @@ async function runSendOnce(payload, onChunk, opts = {}) {
   // 选号经池状态机：冷却/熔断/禁用/暂停/在途满跳过 + 会话粘性。
   // traework 单账号时代不做故障转移；多账号后由池提供「跳过坏号」能力，
   // 换号重试仍交给上层（一次会话内修不动模型行为问题）。
-  const sessionKey = channelPool.sessionKeyOf(payload, opts);
+  const sessionKey = channelPool.sessionKeyFor(payload, opts);
   // 区域约束（API Key 的 region，2026-11-01）：'intl' → 只用国际账号。
   // 国际版已接入（2026-11-03）：没有国际账号时明确报出，而不是静默派给国内。
   let poolRegion = opts.region === 'intl' ? 'intl' : (opts.region === 'cn' ? 'cn' : '');
@@ -403,6 +434,48 @@ async function runSendOnce(payload, onChunk, opts = {}) {
         blocked: guarded.blocked,
       }));
     e.statusCode = 503;
+    // 尝试链（P1-5）：池子空是**结论**，原因是「为什么空」——原样写进链
+    if (opts.attempts) {
+      try { opts.attempts.add({ outcome: 'skip', reason: `no_usable_account: ${String(e.message).slice(0, 90)}` }); }
+      catch (err) { /* 埋点失败不影响请求 */ }
+    }
+
+    // 跨区容灾（调研 P0-3 子项，**默认关**）：本区**确实**一个可用账号都没有
+    // 时才考虑对方区。三条边界，缺一不可：
+    //   1. API Key 没绑区域（poolRegion 为空）——钉了区域的 Key 跨区等于绕过鉴权；
+    //   2. 对方区**真有账号**，且该模型在对方区的模型表里已知（否则白打一次 400）；
+    //   3. 只试一次（opts.failoverTried），绝不来回弹。
+    // 刻意不做「一遇 429 就跨区」：那会把限流掩盖成「换个区的账号就好了」。
+    const curRegion = c.normalizeRegion(allUsable.length ? c.regionOf(allUsable[0]) : (opts.region || 'cn'));
+    const foPlan = failover.plan({
+      cfg: runtime.crossRegionFailover,
+      poolRegion,
+      curRegion,
+      model,
+      tried: opts.failoverTried === true,
+      hasAccount: (reg) => models.accountsForRegion(reg).length > 0,
+      // 必须**正向确认**：`isKnownModel` 在「该区表没预热」时是放行语义（true），
+      // 拿它单独判定等于在没有证据时就把请求发到对方区。要求该区缓存已就绪。
+      known: (m, reg) => models.hasCache(reg) && models.isKnownModel(m, reg),
+    });
+    if (foPlan) {
+      try {
+        const out = await runSendOnce(payload, onChunk, { ...opts, region: foPlan.to, failoverTried: true });
+        if (opts.attempts) {
+          try { opts.attempts.add({ outcome: 'failover', reason: `${foPlan.from}->${foPlan.to}` }); }
+          catch (err) { /* 同上 */ }
+        }
+        // 容灾事实必须可见（与降级同一个纪律：绝不静默换区域）
+        if (opts.onFailover) {
+          try { opts.onFailover(`${foPlan.from}->${foPlan.to}`); } catch (err) { /* 上报失败不影响结果 */ }
+        }
+        return out;
+      } catch (e2) {
+        // 两次都没账号：把「对方区也不行」附在原始错误后面，别让第二次的
+        // 503 盖住「本区为什么不可用」这个根因
+        e.message = `${e.message}；跨区 ${foPlan.from}->${foPlan.to} 仍失败：${e2.message}`;
+      }
+    }
     throw e;
   }
   const sel = channelPool.pickCandidate(CHANNEL, usable, {
@@ -413,6 +486,10 @@ async function runSendOnce(payload, onChunk, opts = {}) {
   if (!sel) {
     const err = new Error('traework 没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
     err.statusCode = 503;
+    if (opts.attempts) {
+      try { opts.attempts.add({ outcome: 'skip', reason: 'pool_pick_failed（冷却/禁用/在途满）' }); }
+      catch (e2) { /* 埋点失败不影响请求 */ }
+    }
     throw err;
   }
   const { uid } = sel;
@@ -430,11 +507,49 @@ async function runSendOnce(payload, onChunk, opts = {}) {
   }
 
   const accountName = auth.nickname || auth.uid || `账号 ${auth.id}`;
+  // 尝试链（P1-5）：谁被选中、选它时的选号策略（策略本身也是「为什么是它」的一部分）
+  if (opts.attempts) {
+    try {
+      opts.attempts.add({
+        accountId: auth.id, account: accountName, outcome: 'picked',
+        // 这里**不能**引用 remoteEligible / remoteOpts：它们在下面的 try 块里才声明，
+        // 引用会抛 ReferenceError 并被外层 catch 吞掉——第一次实现就是这么把
+        // picked 条目静默丢掉的（链里只剩 error，看起来像"没选号就失败了"）。
+        // 链路归属由 onLink 单独上报，这里只写选号策略。
+        reason: `strategy=${runtime.pickStrategy || 'round-robin'}`,
+      });
+    } catch (e2) { /* 埋点失败不影响请求 */ }
+  }
   if (opts.onAccount) {
     // 第二个参数是账号 id：计费自检探针要按 id 回读该账号的 consumed 增量
     // （名字可能重名）。既有调用方只取第一个参数，不受影响。
     try { opts.onAccount(accountName, auth.id); } catch (e) { /* 上报失败不影响请求 */ }
   }
+
+  // 默认思考档（P0-4，2026-11-16）：客户端没给档位时按运行态配置套一个默认值。
+  // 三条边界都压在这一层，因为这里才同时具备「本次账号」与「本次模型」：
+  //   · 只认**这个账号**的 descriptor（档位能力随账号/套餐不同）；
+  //   · descriptor 没声明支持 → 不套（表没预热时同样不套）；
+  //   · 客户端显式给了任何形态的档位 → 一律不动。
+  // 套用/未套用都经 onReasoning 上报，网关写 X-Reasoning-Applied 与埋点。
+  let effortRes = null;
+  try {
+    const table = runtime.defaultReasoning;
+    if (model && table && typeof table === 'object' && Object.keys(table).length) {
+      const meta = models.cachedMetaById(model, c.regionOf(auth) === 'intl' ? 'intl' : 'cn', { accountId: auth.id });
+      effortRes = reasoningApply.applyDefault(payload, {
+        table, model, supported: meta ? meta.reasoningEfforts : null,
+      });
+      if (effortRes.applied) payload = effortRes.payload;
+      if (opts.onReasoning) { try { opts.onReasoning(effortRes); } catch (e) { /* 上报失败不影响请求 */ } }
+      // 只在「真的套了」或「配了但没生效」时打日志——配置为空时不该刷屏
+      if (effortRes.applied) {
+        console.log(`[traework] 默认思考档 ${effortRes.effective}（model=${model}${effortRes.note ? `，${effortRes.note}` : ''}）`);
+      } else if (effortRes.requested) {
+        console.log(`[traework] 默认思考档未生效：${effortRes.note}（model=${model}）`);
+      }
+    }
+  } catch (e) { /* 默认档是增强项：出任何问题都不影响请求本身 */ }
 
   try {
     // Remote 链路（2026-11-01，P2-16）：DUMATE_TRAEWORK_REMOTE=1 时，**纯文本的
@@ -477,7 +592,7 @@ async function runSendOnce(payload, onChunk, opts = {}) {
     if (remoteEligible && (remoteLevel === 2 || linkOverride === 'remote')) {
       try {
         const remoteMod = require('./remote');
-        const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn' });
+        const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn', accountId: auth.id });
         const hit = (rows.models || []).find((m) => m.id === model);
         if (hit && hit.customModel) {
           remoteOpts = {
@@ -498,7 +613,7 @@ async function runSendOnce(payload, onChunk, opts = {}) {
       && !persona && !!model && !remoteOpts && !remoteEligible && c.regionOf(auth) !== 'intl';
     if (soloEligible) {
       try {
-        const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn' });
+        const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn', accountId: auth.id });
         const hit = (rows.models || []).find((m) => m.id === model);
         if (hit && hit.customModel) {
           const solo = require('./solo');
@@ -520,6 +635,14 @@ async function runSendOnce(payload, onChunk, opts = {}) {
     const result = remoteEligible && (remoteLevel === 1 || remoteOpts)
       ? await runRemoteConversation(auth, payload, onChunk, opts, model, remoteOpts)
       : await runConversation(auth, payload, onChunk, opts, model, soloTransport);
+    if (opts.attempts) {
+      try {
+        opts.attempts.add({
+          accountId: auth.id, account: accountName, outcome: 'ok',
+          ms: Date.now() - startedAtOf(opts),
+        });
+      } catch (e2) { /* 埋点失败不影响请求 */ }
+    }
     // 成功喂池：清熔断/软退避/防误杀计数（修复重试属于模型行为，不算失败）
     channelPool.noteSuccess(CHANNEL, auth.id);
     // lastError 是「最近一次结果」，不是「历史故障」（qwenwork 2026-10-02 同款
@@ -533,6 +656,16 @@ async function runSendOnce(payload, onChunk, opts = {}) {
     }
     return result;
   } catch (e) {
+    if (opts.attempts) {
+      try {
+        const cls = upstreamErrors.classify({ status: Number(e.statusCode) || 0, message: e.message, model });
+        opts.attempts.add({
+          accountId: auth.id, account: accountName, outcome: 'error',
+          reason: `${cls.kind || 'unknown'}:${Number(e.statusCode) || 0}`,
+          ms: Date.now() - startedAtOf(opts),
+        });
+      } catch (e2) { /* 埋点失败不影响请求 */ }
+    }
     // 探针模式（opts.probe）不喂池、不写 lastError：错误照常上抛如实展示
     if (!opts.probe) {
       channelPool.noteError(CHANNEL, auth.id, { status: Number(e.statusCode) || 0, message: e.message, model });
@@ -737,7 +870,7 @@ async function runConversation(auth, payload, onChunk, opts, model, transport = 
       agg = chat.aggregate(r.events, ledgerModel);
       const msg = (agg.choices && agg.choices[0] && agg.choices[0].message) || {};
       const hasCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
-      if (hasCalls || !needsRepair(meta, msg.content) || attempt >= chat.REPAIR_MAX) break;
+      if (hasCalls || !needsRepair(meta, msg.content) || attempt >= chat.repairMax()) break;
       attempt++;
       const nudged = chat.withRepairNudge(curBody);
       if (!nudged) break;
@@ -775,7 +908,7 @@ async function runConversation(auth, payload, onChunk, opts, model, transport = 
     // 已经转为直发（正文超长 / 出现过工具调用）→ 这是正常一轮，收尾
     if (g.live || g.toolCalls > 0) break;
     if (!chat.looksUnfinished(g.text)) break;
-    if (attempt >= chat.REPAIR_MAX) break;
+    if (attempt >= chat.repairMax()) break;
     attempt++;
     const nudged = chat.withRepairNudge(curBody);
     if (!nudged) break;
@@ -806,13 +939,20 @@ async function runConversation(auth, payload, onChunk, opts, model, transport = 
 
 /** 这一轮该不该重试：请求确实带了工具，且回复没调工具又说还有下一步 */
 function needsRepair(meta, text) {
-  if (chat.REPAIR_MAX <= 0) return false;
+  if (chat.repairMax() <= 0) return false;
   if (!meta || !meta.toolCount) return false;
   return chat.looksUnfinished(text);
 }
 
 /** 修复触发时留一行日志——这是「模型行为」而不是「网关行为」，不记下来就无从归因。
  *  带上被丢弃的正文片段，用来区分「真·播报即收尾」与「判据误伤」（两者处置完全不同）。 */
+
+/** 尝试链的计时起点：优先用调用方给的 startedAt（与埋点同源），否则不填 ms */
+function startedAtOf(opts) {
+  const t = Number(opts && opts.startedAt);
+  return Number.isFinite(t) && t > 0 ? t : NaN;
+}
+
 function logRepair(reqId, attempt, text) {
   try {
     const snip = String(text || '').replace(/\s+/g, ' ').slice(0, 120);

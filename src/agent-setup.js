@@ -272,12 +272,97 @@ async function deriveTiers(channel, wantIds) {
  * @param {string} [p.baseUrl] 覆盖网关地址（默认 gatewayBase()）
  * @param {object} [p.io] 测试注入 {read,write,exists,homedir}
  */
-async function apply(p) {
+// ==================== 写入前的差异预览（调研 P2-10）====================
+//
+// 为什么要有：这套东西**直接改用户本机的配置文件**（~/.claude/settings.json、
+// ~/.codex/config.toml）。有备份与还原，但「点写入之前看不到会变成什么样」——
+// 合并规则（深合并 / 受管块替换）对用户是不透明的，改错了只能靠还原兜。
+//
+// 三条纪律：
+//   1. **预览与写入必须同一份计算**（`buildNext`）。两份实现必然漂移，而漂移的
+//      表现是「预览说没问题、写进去不是那样」——比没有预览更坏。
+//   2. 预览**不碰磁盘**：不写配置、不建备份、不更新索引（备份是写入的副作用）。
+//   3. 预览里**密钥打码**：diff 会原样包含 token 行，回显明文等于把密钥送进
+//      浏览器历史与日志。打码只影响展示，真写入用的仍是调用方给的 token。
+
+/** 行级 diff 的行数上限：超过就只报「变了」而不列明细（配置文件的 100 倍有余） */
+const DIFF_MAX_LINES = 1200;
+
+function splitLines(text) {
+  const s = String(text == null ? '' : text).replace(/\r\n/g, '\n');
+  if (!s) return [];
+  const lines = s.split('\n');
+  // 末尾换行制造的空串不算一行（否则每份文件都会多一条「假的删除」）
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+
+/**
+ * 行级 diff（LCS）。返回 `{changed, truncated, added, removed, ops}`，
+ * `ops` 里每项是 `{t:' '|'-'|'+', a, b, text}`（a/b 是两侧行号，缺侧为 null）。
+ *
+ * 没有引第三方 diff 库：配置文件的量级（几 KB）用不着 Myers，LCS 的 DP 足够，
+ * 且**不引依赖**本身有价（这个仓库的离线测试全靠零依赖）。
+ */
+function diffLines(before, after, opts = {}) {
+  const cap = Math.max(1, Number(opts.maxLines) || DIFF_MAX_LINES);
+  const A = splitLines(before);
+  const B = splitLines(after);
+  const out = { changed: A.join('\n') !== B.join('\n'), truncated: false, added: 0, removed: 0, ops: [] };
+  if (!out.changed) return out;
+  if (A.length > cap || B.length > cap) {
+    out.truncated = true;
+    out.added = B.length;
+    out.removed = A.length;
+    return out;
+  }
+  // LCS 长度表（arr[i][j] = A[i..] 与 B[j..] 的最长公共子序列长度）
+  const n = A.length;
+  const m = B.length;
+  const w = m + 1;
+  const dp = new Int32Array((n + 1) * w);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * w + j] = A[i] === B[j]
+        ? dp[(i + 1) * w + (j + 1)] + 1
+        : Math.max(dp[(i + 1) * w + j], dp[i * w + (j + 1)]);
+    }
+  }
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (A[i] === B[j]) {
+      out.ops.push({ t: ' ', a: i + 1, b: j + 1, text: A[i] });
+      i++; j++;
+    } else if (dp[(i + 1) * w + j] >= dp[i * w + (j + 1)]) {
+      out.ops.push({ t: '-', a: i + 1, b: null, text: A[i] });
+      out.removed++; i++;
+    } else {
+      out.ops.push({ t: '+', a: null, b: j + 1, text: B[j] });
+      out.added++; j++;
+    }
+  }
+  for (; i < n; i++) { out.ops.push({ t: '-', a: i + 1, b: null, text: A[i] }); out.removed++; }
+  for (; j < m; j++) { out.ops.push({ t: '+', a: null, b: j + 1, text: B[j] }); out.added++; }
+  return out;
+}
+
+/** 把密钥打码成 `••••后四位`；短值整段打码（后四位等于泄露一半） */
+function maskSecret(text, secret) {
+  const s = String(secret || '').trim();
+  if (!s) return String(text || '');
+  const shown = s.length >= 12 ? `••••${s.slice(-4)}` : '••••';
+  return String(text || '').split(s).join(shown);
+}
+
+/**
+ * 算出「要写什么」，**不落盘**。`apply` 与 `preview` 共用这一份——
+ * 两份实现必然漂移，而漂移的表现是「预览说没问题、写进去不是那样」。
+ */
+async function buildNext(p = {}) {
   const io = p.io || {};
   const readF = io.read || ((f) => fs.readFileSync(f, 'utf8'));
-  const writeF = io.write || ((f, c) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, c, 'utf8'); });
   const existsF = io.exists || ((f) => fs.existsSync(f));
-  const root = p.root || backupRoot();
 
   const client = p.client;
   if (client !== 'claude-code' && client !== 'codex') {
@@ -289,10 +374,8 @@ async function apply(p) {
   const { tiers, derived, accountNote } = await deriveTiers(channel, Array.isArray(p.models) ? p.models.map(String) : []);
 
   const configPath = client === 'claude-code' ? claudeSettingsPath() : codexConfigPath();
-  const existing = existsF(configPath) ? readF(configPath) : '';
-
-  // 先备份当前态（文件不存在就不备份——「未配置」没有可回退对象）
-  const backup = backupConfig(client, configPath, root, io);
+  const exists = existsF(configPath);
+  const existing = exists ? readF(configPath) : '';
 
   let next;
   if (client === 'claude-code') {
@@ -301,6 +384,54 @@ async function apply(p) {
   } else {
     next = mergeCodexToml(existing, codexSnippet(channel, tiers, derived, token, base));
   }
+  return { client, channel, token, base, tiers, derived, accountNote, configPath, exists, existing, next };
+}
+
+/** 预览的说明文案与 apply 同源（一句话说清「这次会改成什么」） */
+function explain(client) {
+  return client === 'codex'
+    ? '将写入 ~/.codex/config.toml 的受管块（含内联 bearer token）；Codex 重启后生效'
+    : '将把 env 深合并进 ~/.claude/settings.json（其它键原样保留）；Claude Code 重启后生效';
+}
+
+/**
+ * 写入前预览：返回**将写入的差异**，不改任何文件。
+ * @returns {object} 与 apply 同形的元数据 + {exists, changed, stats, ops, truncated}
+ */
+async function preview(p = {}) {
+  const b = await buildNext(p);
+  const d = diffLines(b.existing, b.next);
+  const mask = (t) => maskSecret(t, b.token);
+  return {
+    ok: true,
+    client: b.client,
+    configPath: b.configPath,
+    exists: b.exists,
+    changed: d.changed,
+    truncated: d.truncated,
+    stats: { added: d.added, removed: d.removed, lines: splitLines(b.next).length },
+    // 密钥打码后再出门：diff 会包含 token 行，明文回显等于把 key 送进浏览器历史
+    ops: d.ops.map((op) => ({ ...op, text: mask(op.text) })),
+    channel: b.channel,
+    gateway: b.base,
+    model: b.tiers[0] ? b.tiers[0].prefixed : '',
+    derived: b.derived,
+    ...(b.accountNote ? { accountNote: b.accountNote } : {}),
+    note: d.changed ? explain(b.client) : '当前文件已经就是这个内容（幂等，写入不会改动任何字节）',
+  };
+}
+
+async function apply(p) {
+  const io = p.io || {};
+  const writeF = io.write || ((f, c) => { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, c, 'utf8'); });
+  const root = p.root || backupRoot();
+
+  // 要写什么只算一次（`buildNext` 同时被 preview 用），然后才备份+落盘
+  const b = await buildNext(p);
+  const { client, channel, configPath, next, tiers, derived, accountNote, base } = b;
+
+  // 先备份当前态（文件不存在就不备份——「未配置」没有可回退对象）
+  const backup = backupConfig(client, configPath, root, io);
   writeF(configPath, next);
 
   const idx = readIndex(root);
@@ -352,6 +483,7 @@ function restore(p = {}) {
 
 module.exports = {
   listClients, detect, apply, restore,
+  preview, buildNext, diffLines, maskSecret, explain,
   mergeClaudeSettings, mergeCodexToml, codexSnippet, deriveTiers,
   backupConfig, latestBackup, backupRoot, gatewayBase,
   claudeSettingsPath, codexConfigPath,
