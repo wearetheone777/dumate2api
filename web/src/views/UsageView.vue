@@ -122,6 +122,76 @@
       </a-col>
     </a-row>
 
+    <!-- 首字延迟与缓存命中（P2-13）：数据源是分桶账本，明细滚走后趋势仍在。
+         两个口径都刻意与「老日志现扫」不同：
+           - TTFB 的分母只数**报了首字的请求**（老日志没这个字段），无样本显示「—」
+           - 命中率的分母剔掉**缓存写入**（写入这轮没被读过，算进分母等于把预热轮
+             当成没命中）；分母为 0 时显示「—」而不是 0% -->
+    <a-card title="首字延迟与缓存命中" :bordered="false" class="mt-4">
+      <template #extra>
+        <span class="text-xs text-slate-400">分桶账本 · 含已折叠的历史</span>
+      </template>
+      <a-spin v-if="loading && !agg" size="small" />
+      <template v-else-if="agg?.totals">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div>
+            <div class="block-label">首字 p50</div>
+            <div class="num text-lg">{{ ttfbText(agg.totals.ttfb_p50) }}</div>
+            <div class="text-xs text-slate-400">{{ ttfbRange(agg.totals.ttfb_p50) }}</div>
+          </div>
+          <div>
+            <div class="block-label">首字 p90</div>
+            <div class="num text-lg">{{ ttfbText(agg.totals.ttfb_p90) }}</div>
+            <div class="text-xs text-slate-400">{{ ttfbRange(agg.totals.ttfb_p90) }}</div>
+          </div>
+          <div>
+            <div class="block-label">首字均值 / 最慢</div>
+            <div class="num text-lg">{{ ttfbText(agg.totals.ttfb_avg_ms) }}</div>
+            <div class="text-xs text-slate-400">
+              {{ agg.totals.ttfb_samples ? `最慢 ${fmtMs(agg.totals.ttfb_max_ms)}` : '没有首字样本' }}
+            </div>
+          </div>
+          <div>
+            <div class="block-label">首字 &gt; 3s 占比</div>
+            <div class="num text-lg">{{ slowShare(agg.totals) }}</div>
+            <div class="text-xs text-slate-400">
+              样本 {{ fmt(agg.totals.ttfb_samples || 0) }} / 请求 {{ fmt(agg.totals.requests || 0) }}
+            </div>
+          </div>
+        </div>
+        <div class="mt-3 grid grid-cols-2 md:grid-cols-3 gap-3">
+          <div>
+            <div class="block-label">缓存命中率</div>
+            <div class="num text-lg">{{ rateText(agg.totals.cache_hit) }}</div>
+            <div class="text-xs text-slate-400">
+              {{ agg.totals.cache_hit && agg.totals.cache_hit.reported === 0
+                ? '窗口内没有通道上报缓存字段（不可知，不是 0%）'
+                : '分母已排除缓存写入' }}
+            </div>
+          </div>
+          <div>
+            <div class="block-label">命中 / 分母</div>
+            <div class="num text-sm">
+              {{ compact(agg.totals.cache_hit?.numerator ?? 0) }} /
+              {{ compact(agg.totals.cache_hit?.denominator ?? 0) }}
+            </div>
+          </div>
+          <div>
+            <div class="block-label">缓存写入</div>
+            <div class="num text-sm">
+              {{ compact(agg.totals.cache_creation_tokens ?? 0) }}
+              <span class="text-xs text-slate-400">（{{ fmt(agg.totals.cache_creation_reported || 0) }} 条上报）</span>
+            </div>
+          </div>
+        </div>
+        <div class="text-xs text-slate-400 mt-2">
+          首字延迟用 8 段直方图（250/500/1s/2s/5s/10s/30s），p50/p90 是**段上界的近似值**，
+          括号里给出真实区间；无样本时显示「—」，不按 0ms 报。
+        </div>
+      </template>
+      <a-empty v-else description="窗口内还没有分桶数据" />
+    </a-card>
+
     <!-- 今日概览：只有请求数与 token 说不清「今天跑得怎么样」，
          补上成功率、快慢与今日在用的模型 -->
     <a-card title="今日概览" :bordered="false" class="mt-4">
@@ -544,6 +614,7 @@ import { BarChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import { SERIES, INK, TOOLTIP_BASE, axisStyle, compactNum, exactNum, barSeries } from '@/utils/chartTheme'
+import { useAutoRefresh } from '@/stores/ui'
 
 echarts.use([BarChart, GridComponent, TooltipComponent, CanvasRenderer])
 
@@ -594,11 +665,62 @@ interface FullPrice {
   prompt_tokens: number
   prompt_share: number
 }
+/** TTFB 分位数：值是**段上界的近似**（直方图 8 段），lo/hi 是真实区间 */
+interface TtfbPoint { ms: number; lo: number; hi: number | null }
+interface AggTotals {
+  requests?: number
+  input_noncached_tokens?: number
+  cached_tokens?: number
+  /** 缓存写入（Anthropic 系才报）：命中率分母已剔掉它 */
+  cache_creation_tokens?: number
+  cache_creation_reported?: number
+  // TTFB（P2-13）：无样本时是 null，**不是 0**
+  ttfb_avg_ms?: number | null
+  ttfb_samples?: number
+  ttfb_min_ms?: number | null
+  ttfb_max_ms?: number | null
+  ttfb_slow?: number
+  ttfb_p50?: TtfbPoint | null
+  ttfb_p90?: TtfbPoint | null
+  /** 命中率：分子分母都摊出来，页面直显、复核也直显 */
+  cache_hit?: {
+    numerator: number
+    denominator: number
+    fresh_tokens: number
+    cache_write_tokens: number
+    /** 这一行里有多少条请求的上游真的报了缓存字段：0 = 命中率不可知 */
+    reported: number
+    rate: number | null
+  }
+}
 interface AggSnapshot {
   full_price?: FullPrice
-  totals?: { input_noncached_tokens?: number; cached_tokens?: number }
+  totals?: AggTotals
 }
 const agg = ref<AggSnapshot | null>(null)
+
+/** 首字分位数的显示：无样本是「—」（不是 0ms） */
+function ttfbText(p?: TtfbPoint | number | null) {
+  if (p == null) return '—'
+  const ms = typeof p === 'number' ? p : p.ms
+  return `≈ ${fmtMs(ms)}`
+}
+/** 分位数落在哪一段（直方图粒度），让「≈」有据可查 */
+function ttfbRange(p?: TtfbPoint | null) {
+  if (!p) return ''
+  return p.hi == null ? `${fmtMs(p.lo)} 以上` : `${fmtMs(p.lo)}–${fmtMs(p.hi)}`
+}
+/** 首字 > 3s 的占比：分母是**有首字样本**的请求，不是全部请求 */
+function slowShare(t?: AggTotals | null) {
+  const n = Number(t?.ttfb_samples || 0)
+  if (!n) return '—'
+  return `${(((Number(t?.ttfb_slow) || 0) / n) * 100).toFixed(1)}%`
+}
+/** 命中率：分母 0 时是 null → 显示「—」，不显示 0% */
+function rateText(h?: AggTotals['cache_hit']) {
+  if (!h || h.rate == null) return '—'
+  return `${(h.rate * 100).toFixed(1)}%`
+}
 
 // 当前通道。**服务端按通道过滤**而不是前端筛已聚合的数字——
 // 卡片、折线、按模型表都建立在同一批行上，前端筛只能筛掉表里的行，
@@ -839,6 +961,9 @@ watch(() => channelStore.current, load)
 // 主题切换（夜间模式）重绘：canvas 读不到 CSS 变量，按新主题常量重建 option
 function onThemePaint() { renderChart() }
 
+
+// 自动刷新（P2-12）：注册后由顶栏的间隔开关驱动，卸载时自动注销
+useAutoRefresh(load)
 onMounted(() => {
   window.addEventListener('resize', onResize)
   window.addEventListener('lab:theme', onThemePaint)

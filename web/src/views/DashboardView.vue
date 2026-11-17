@@ -1637,6 +1637,7 @@ import type { PointsData, AccountsData } from '@/api/points'
 import type { StatsSummary, DailyRow } from '@/api/stats'
 import type { UsageOverview } from '@/api/usage'
 import { SERIES, INK, TOOLTIP_BASE, axisStyle, compactNum, exactNum, lineSeries } from '@/utils/chartTheme'
+import { useAutoRefresh } from '@/stores/ui'
 
 interface DashAccount {
   id: number
@@ -2815,6 +2816,9 @@ function onThemePaint() {
   renderQwTokenChart()
 }
 
+
+// 自动刷新（P2-12）：注册后由顶栏的间隔开关驱动，卸载时自动注销
+useAutoRefresh(refresh)
 onMounted(() => {
   window.addEventListener('resize', onResize)
   window.addEventListener('lab:theme', onThemePaint)

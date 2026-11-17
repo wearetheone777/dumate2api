@@ -1,6 +1,12 @@
 <template>
-  <a-layout class="min-h-screen lab-shell">
-    <a-layout-sider v-model:collapsed="collapsed" collapsible :width="216" breakpoint="md" class="lab-sider">
+  <a-layout class="min-h-screen lab-shell" :class="{ 'reading-mode': readingMode }">
+    <a-layout-sider
+      v-model:collapsed="siderCollapsed"
+      :collapsible="!readingMode"
+      :width="216"
+      breakpoint="md"
+      class="lab-sider"
+    >
       <div class="lab-logo">
         <span class="logo-mark"><AppLogo :size="19" /></span>
         <span v-if="!collapsed" class="logo-text">DuMate<span class="logo-accent">控制台</span></span>
@@ -48,6 +54,11 @@
         <a-menu-item v-if="isAdmin" key="trae-runtime">
           <template #icon><ControlOutlined /></template>
           <span>运行策略</span>
+        </a-menu-item>
+        <!-- 通道风控（P1-9）：并发/间隔/重试/限流上限 + 通道级复位，admin 专属 -->
+        <a-menu-item v-if="isAdmin" key="channel-policy">
+          <template #icon><SafetyCertificateOutlined /></template>
+          <span>通道风控</span>
         </a-menu-item>
         <!-- 运行日志：进程 console，admin 专属 -->
         <a-menu-item v-if="isAdmin" key="logs">
@@ -158,6 +169,26 @@
               </a-menu>
             </template>
           </a-dropdown>
+          <!-- 自动刷新（P2-12）：共享一个定时器，页面不可见时不刷。
+               挂看板时不用一直手点；间隔选项与「不自动刷新」同一份常量。 -->
+          <a-select
+            v-model:value="autoRefreshMs"
+            size="small"
+            class="refresh-select"
+            :options="REFRESH_OPTIONS"
+            :title="`自动刷新：${refreshingCount ? '正在更新' : '按间隔重新拉取当前页数据'}`"
+          />
+          <a-tag v-if="refreshingCount" color="processing" class="refresh-tag">更新中</a-tag>
+          <!-- 阅读模式：只改排版（侧栏收起 + 字号/数字放大），**不隐藏任何数据** -->
+          <a-button
+            size="small"
+            class="ghost-btn"
+            :type="readingMode ? 'primary' : 'default'"
+            :title="readingMode ? '退出阅读模式' : '阅读模式：放大数字、收起侧栏（不隐藏数据）'"
+            @click="readingMode = !readingMode"
+          >
+            {{ readingMode ? '退出阅读' : '阅读模式' }}
+          </a-button>
           <a-tag class="user-tag">{{ auth.user?.username }}</a-tag>
           <a-button size="small" class="ghost-btn" @click="onLogout">退出</a-button>
         </a-space>
@@ -172,15 +203,22 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined } from '@ant-design/icons-vue'
+import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import client from '@/api/client'
 import { auth, isAdmin } from '@/stores/auth'
 import { channelStore, CHANNELS } from '@/stores/channel'
 import { regionStore, hasRegion } from '@/stores/region'
 import { isDark, themeMode, setThemeMode, type ThemeMode } from '@/stores/theme'
+import { autoRefreshMs, readingMode, refreshingCount, REFRESH_OPTIONS } from '@/stores/ui'
 
 const collapsed = ref(false)
+// 自动刷新与阅读模式（P2-12）：状态在 stores/ui.ts，跨页持久化
+const siderCollapsed = computed({
+  get: () => readingMode.value || collapsed.value,
+  // 阅读模式下禁用折叠按钮，这个 setter 只在普通模式生效
+  set: (v: boolean) => { collapsed.value = v },
+})
 const router = useRouter()
 const route = useRoute()
 
@@ -553,6 +591,36 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
   .lab-content {
     margin: 24px 28px 28px;
   }
+}
+
+/* 自动刷新选择器：窄一点，别把顶栏挤成两行 */
+.refresh-select {
+  width: 116px;
+}
+.refresh-tag {
+  margin-inline-end: 0;
+}
+
+/* 阅读模式（P2-12）：**只改排版，不隐藏任何数据**。
+   目标是「挂墙/投影时一眼看清数字」：收起侧栏、放大字号与关键数字、
+   收紧表头与行的间隙。任何「为了清爽」而藏字段的做法都不在这里做——
+   看板上少的那一列，就是下一次排障时的盲点。 */
+.reading-mode :deep(.lab-content) {
+  font-size: 15px;
+}
+.reading-mode :deep(.num) {
+  font-size: 1.12em;
+  letter-spacing: 0.2px;
+}
+.reading-mode :deep(.ant-table) {
+  font-size: 13.5px;
+}
+.reading-mode :deep(.ant-table-tbody > tr > td) {
+  padding-block: 10px;
+}
+.reading-mode :deep(.stat-value),
+.reading-mode :deep(.block-label) {
+  font-size: 13px;
 }
 
 /* 窄屏适配：面包屑只留当前页名，避免顶栏溢出 */

@@ -311,16 +311,27 @@ export const traeworkApi = {
       rows: TraeworkCreditRecord[]
       window: { cost: number; requests: number; exact: number }
     }>(`/traework/credits/records?limit=${limit}${region ? `&region=${region}` : ''}`),
-  models: (opts: { visibleOnly?: boolean; refresh?: boolean; region?: 'cn' | 'intl' } = {}) => {
+  /**
+   * 模型表。2026-11-16（P0-1）：缓存按作用域分（账号 + function + 客户端版本），
+   * 响应里带 `scope/cacheScope/cached/scopes` —— 界面必须能回答「这张表是谁取的」。
+   */
+  models: (opts: { visibleOnly?: boolean; refresh?: boolean; region?: 'cn' | 'intl'; accountId?: string } = {}) => {
     const q: string[] = []
     if (opts.visibleOnly) q.push('visible=1')
     if (opts.refresh) q.push('refresh=1')
     if (opts.region) q.push(`region=${opts.region}`)
+    if (opts.accountId) q.push(`accountId=${encodeURIComponent(opts.accountId)}`)
     const qs = q.length ? '?' + q.join('&') : ''
     return client.get<{
       models: TraeworkModel[]
       total: number
       region?: 'cn' | 'intl'
+      /** 本次数据的作用域（账号级视角才有 accountId） */
+      scope?: { key: string; id: string; region: string; accountId: string; fn: string; version: string } | null
+      cacheScope?: string
+      cached?: boolean
+      /** 该区当前缓存里的全部作用域 */
+      scopes?: Array<{ id: string; accountId: string; fn: string; version: string; at: number; ageMs: number; stale: boolean; models: number }>
       error: string
       fetchedAt: number
       rateNote: string
@@ -350,6 +361,43 @@ export const traeworkApi = {
       '/traework/login/url',
       { region },
     ),
+  /**
+   * 发起**回环登录**（2026-11-16 P0-2a）：在 127.0.0.1 起临时监听，官方授权页
+   * 自己跳回来就完成入库。端口占用会返回 503 + `fallback`，前端应退回手动粘贴。
+   */
+  loginStart: (payload: { region: 'cn' | 'intl'; accountId?: number } = { region: 'cn' }) =>
+    client.post<{
+      ok: boolean
+      region: 'cn' | 'intl'
+      sessionId: string
+      url: string
+      redirect: string
+      expiresAt: number
+      intervalMs: number
+      deviceId: string
+      machineId: string
+      reuseDevice: boolean
+      accountId: number | null
+      hint: string
+      error?: string
+      fallback?: string
+    }>('/traework/login/start', payload),
+  /** 轮询回环登录状态（只读，不含凭证） */
+  loginStatus: (sessionId: string) =>
+    client.get<{
+      status: 'pending' | 'exchanging' | 'success' | 'failed' | 'expired' | 'cancelled' | 'not_found'
+      account?: TraeworkAccount | null
+      error?: string
+      /** 上游是否回显了 state（国内版可能不回显——这是证据，不是错误） */
+      trace_verified?: boolean
+      expiresAt?: number
+      redirect?: string
+    }>(`/traework/login/status?sessionId=${encodeURIComponent(sessionId)}`),
+  loginCancel: (sessionId: string) =>
+    client.post<{ ok: boolean; status?: string; error?: string }>('/traework/login/cancel', { sessionId }),
+  /** 手动粘贴回调（浏览器与网关不同机 / 回环起不来时的退路） */
+  loginComplete: (sessionId: string, callback: string) =>
+    client.post<{ ok: boolean; account?: TraeworkAccount; error?: string }>('/traework/login/complete', { sessionId, callback }),
   loginCallback: (payload: { callback: string; deviceId: string; machineId: string; region: 'cn' | 'intl' }) =>
     client.post<{ ok: boolean; account?: TraeworkAccount; error?: string }>('/traework/login/callback', payload),
   removeAccount: (id: number) => client.delete(`/traework/accounts/${id}`),
@@ -366,6 +414,45 @@ export const traeworkApi = {
       results: Array<{ id: number; ok: boolean; error?: string; [k: string]: any }>
       error?: string
     }>('/traework/accounts/batch', { ids, action, options }),
+  /**
+   * 单账号人工恢复（2026-11-16 P0-3）：清冷却/熔断/401 计数/禁用标记 + 清 lastError。
+   * 与批量 resume 的区别：这条**总是**清（人工逐个点 = 我确认它现在可用）。
+   */
+  recoverAccount: (id: number) =>
+    client.post<{ ok: boolean; id: number; revived: boolean; clearedLastError: boolean; before?: unknown }>(
+      `/traework/accounts/${id}/recover`,
+    ),
+  /**
+   * 今日补签（2026-11-16 P1-8）：先用账本 + `lastCheckin` 算出「今天还差谁」，
+   * 再只对缺口账号跑幂等签到。**默认 dryRun=true 只预览**——这是会在上游产生动作的接口。
+   */
+  checkinMakeup: (payload: { ids?: number[]; dryRun?: boolean } = {}) =>
+    client.post<{
+      ok: boolean
+      dryRun: boolean
+      day: string
+      window: { open: boolean; reason: string }
+      due: Array<{ id: number; name: string }>
+      skipped: Array<{ id: number; name: string; reason: string; detail: string }>
+      counts: { total: number; due: number; signed: number; disabled: number; outside: number }
+      ran: Array<{ id: number; name: string; ok: boolean; already?: boolean; gained?: number | null; error?: string }>
+      summary?: { due: number; ok: number; already: number; failed: number }
+      error?: string
+    }>('/traework/checkin/makeup', payload),
+  /** 模型表缓存的作用域清单与命中统计（只读，排查「为什么又打了一次上游」） */
+  modelCache: (region?: 'cn' | 'intl') =>
+    client.get<{
+      region: string
+      scopes: Array<{ id: string; accountId: string; fn: string; version: string; at: number; ageMs: number; stale: boolean; models: number }>
+      stats: Record<string, number>
+      cacheMs: number
+      scopeCap: number
+    }>(`/traework/models/cache${region ? `?region=${region}` : ''}`),
+  /** 清模型表缓存（下次取数必打上游）。换了会员等级 / 加了账号后强刷用 */
+  clearModelCache: (region?: 'cn' | 'intl') =>
+    client.post<{ ok: boolean; region: string; scopes: unknown[]; stats: Record<string, number> }>(
+      '/traework/models/cache/clear', { region },
+    ),
   /** 回填手机号（从昵称抽；TRAE 无官方手机号接口，多数情况抽不到） */
   refreshPhone: () =>
     client.post<{

@@ -152,6 +152,8 @@ router.mount(PREFIX + '/usage', usageRoutes);
 router.mount(PREFIX + '/reqlogs', reqlogRoutes);
 router.mount(PREFIX + '/chatlab', chatlabRoutes);
 router.mount(PREFIX + '/models', modelsRoutes);
+// 路由组（P1-7）：只读观测面（当前会走谁 / 跳过了谁 / 配置里被丢弃的条目）
+router.mount(PREFIX + '/route-groups', require('./routes/route-groups').routes);
 router.mount(PREFIX + '/qwenwork', qwenworkRoutes);
 router.mount(PREFIX + '/traework', traeworkRoutes);
 // 调研融合批次（2026-11-08）：TRAE 运行期开关 / 运维告警 / 日志 / 指标 / 月度账单

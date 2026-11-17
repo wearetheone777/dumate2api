@@ -58,6 +58,36 @@ export interface SetupRestoreResult {
   error?: string
 }
 
+/** 预览里的一行差异：`t` 是 ' '/'-'/'+'，a/b 是两侧行号（缺侧为 null） */
+export interface SetupDiffOp {
+  t: ' ' | '-' | '+'
+  a: number | null
+  b: number | null
+  /** 行内容。**密钥已由后端打码**（••••后四位），预览不回显明文 token */
+  text: string
+}
+
+export interface SetupPreviewResult {
+  ok: boolean
+  client: string
+  configPath: string
+  /** 配置文件当前是否存在 */
+  exists: boolean
+  /** false = 当前内容与将写入的完全一致（幂等，写入不会改动任何字节） */
+  changed: boolean
+  /** 行数超过上限时只报统计、不列明细 */
+  truncated: boolean
+  stats: { added: number; removed: number; lines: number }
+  ops: SetupDiffOp[]
+  channel: string
+  gateway: string
+  model: string
+  derived: SetupDerived
+  accountNote?: string
+  note: string
+  error?: string
+}
+
 export const agentSetupApi = {
   clients() {
     return client.get<SetupClientsData>('/agent-setup/clients')
@@ -66,6 +96,11 @@ export const agentSetupApi = {
   /** 写入配置。token 留空时后端写 'nokey' 占位（鉴权已强制，实际请求会被 401） */
   apply(params: { client: string; channel: string; token?: string }) {
     return client.post<SetupApplyResult>('/agent-setup/apply', params)
+  },
+
+  /** 写入前预览：返回将写入的差异，**不改任何文件**（与 apply 同一份计算） */
+  preview(params: { client: string; channel: string; token?: string }) {
+    return client.post<SetupPreviewResult>('/agent-setup/preview', params)
   },
 
   restore(clientId: string) {

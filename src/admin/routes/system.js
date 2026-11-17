@@ -353,6 +353,105 @@ const routes = [
     },
   },
   {
+    // 通道级风控参数（P1-9）。返回**当前生效值 + 来源**，而不只是面板里填的
+    // 数字：同一个旋钮有 env、面板、内置默认三个来源，界面上看不到「到底谁
+    // 在生效」时，改面板没效果就无从归因（本项目一贯的判据：每个事实必须可
+    // 观测）。解析单一实现是 src/throttle.js。
+    method: 'GET',
+    path: '/throttle',
+    handler: ({ res }) => {
+      const throttle = require('../../throttle');
+      const channelsMod = require('../../channels');
+      const repair = require('../../repair');
+      const { DEFAULTS } = require('../../pool');
+      // 未设时的兜底值（来源分三种，界面上要能说清「3 是面板填的还是环境变量的」）
+      const FALLBACK = {
+        inflightMax: Number(DEFAULTS && DEFAULTS.inFlightMax) || 4,
+        minIntervalMs: 0,
+        retryMax: Number(repair.DEFAULT_REPAIR_MAX) || 0,
+      };
+      // 内联图片上限（P1-6）也放这个响应里：同一份 livecfg、同一个页面，
+      // 多开一个端点只是多一次往返，而「风控」在界面上是一件事。
+      const imageBudget = require('../../image-budget');
+      return require('../router').sendJSON(res, 200, {
+        ok: true,
+        file: livecfg.FILE,
+        throttleMaxMs: throttle.throttleMaxMs(),
+        throttleMaxMsEnv: 'DUMATE_THROTTLE_MAX_MS',
+        fallback: FALLBACK,
+        imageBudget: {
+          ...imageBudget.limits(),
+          panel: livecfg.Load().imageBudget || { maxBytes: 0, maxTotalBytes: 0, maxEdge: 0 },
+          env: {
+            maxBytes: imageBudget.ENV_MAX_MB,
+            maxTotalBytes: imageBudget.ENV_TOTAL_MB,
+            maxEdge: imageBudget.ENV_MAX_EDGE,
+          },
+          // 压缩缓存的可观测面：命中率低说明「同图重复发送」的假设不成立，
+          // 那缓存就是在白占内存；命中率高说明每一轮都在省一次缩放。
+          cache: imageBudget.cacheStats(),
+        },
+        channels: throttle.all().map((row) => {
+          const knobs = {};
+          for (const [k, v] of Object.entries(row.knobs)) {
+            knobs[k] = { ...v, fallback: FALLBACK[k], effective: v.value == null ? FALLBACK[k] : v.value };
+          }
+          return { channel: row.channel, label: channelsMod.label(row.channel), knobs };
+        }),
+      });
+    },
+  },
+  {
+    // 图片压缩缓存（P1-6b）：只读统计在 GET /throttle 里，这里只负责清。
+    // 什么时候需要清：改了 maxEdge 之后旧结果仍按原图指纹命中（键不含参数），
+    // 于是「改了没效果」——这是缓存的键设计带来的，必须给一个显式出口。
+    method: 'POST',
+    path: '/image-cache/clear',
+    handler: ({ res }) => {
+      const imageBudget = require('../../image-budget');
+      const before = imageBudget.cacheStats();
+      imageBudget.cacheClear();
+      require('../../admin/auth').audit('admin', 'image_cache_clear', '', `${before.entries} 条`);
+      return require('../router').sendJSON(res, 200, { ok: true, cleared: before.entries, before });
+    },
+  },
+  {
+    // 通道级人工恢复（P1-9 的「提供人工恢复入口」）：只 revive 该通道前缀的
+    // 账号，不动其它通道的状态。省略 channel = 全池（等价 /pool-revive-all）。
+    //
+    // 为什么按通道分：四通道共用一台池，但故障原因是各自上游给的——Qoder
+    // 排队被放大成熔断时，没有理由顺手把 TRAE 的凭证失效状态一起复位。
+    method: 'POST',
+    path: '/pool-revive',
+    handler: ({ res, body }) => {
+      const throttle = require('../../throttle');
+      const channelsMod = require('../../channels');
+      const raw = String((body && body.channel) || '').trim().toLowerCase();
+      if (raw && !throttle.CHANNELS.includes(raw)) {
+        return require('../router').sendJSON(res, 400, {
+          ok: false,
+          error: `未知通道: ${raw}（可用: ${throttle.CHANNELS.join(', ')}）`,
+        });
+      }
+      const { pool } = require('../../pool');
+      const rows = pool.snapshot() || [];
+      // uid 键位见 src/channel-pool.js：直连通道是 `${channel}:${id}`，
+      // 网页池是裸数字。按前缀过滤就是按通道过滤。
+      const mine = raw ? rows.filter((r) => String(r.id || '').startsWith(`${raw}:`)) : rows;
+      const sick = mine.filter((r) => r.state !== 'healthy');
+      const revived = [];
+      for (const r of sick) {
+        try { pool.revive(String(r.id)); revived.push({ id: r.id, uid: r.uid || String(r.id) }); } catch (e) { /* 单个失败不影响其余 */ }
+      }
+      const scope = raw || 'all';
+      require('../../admin/auth').audit('admin', 'pool_revive', scope, `${revived.length}/${sick.length} 复位`);
+      return require('../router').sendJSON(res, 200, {
+        ok: true, channel: raw || '', label: raw ? channelsMod.label(raw) : '全部通道',
+        revived: revived.length, sick: sick.length, total: mine.length, detail: revived,
+      });
+    },
+  },
+  {
     // 上游拉起：8980 活着就不动（already_running）；死了 spawn 一个新的并等端口。
     // launcher 是无条件 spawn + 钉死 -port 8980（见 upstream-launcher.js 注释），
     // 所以「重拉」的正确语义是先探测再决定，不是无脑 spawn（端口被占时新进程

@@ -190,6 +190,7 @@ import client from '@/api/client'
 import { alertsApi, ALERT_RULES, ALERT_TUNING, metricsPaths } from '@/api/alerts'
 import type { ActiveAlert, AlertConfig } from '@/api/alerts'
 import { isAdmin } from '@/stores/auth'
+import { useAutoRefresh } from '@/stores/ui'
 
 const { message } = App.useApp()
 const router = useRouter()
@@ -298,6 +299,9 @@ function goDashboard() {
   router.push('/')
 }
 
+
+// 自动刷新（P2-12）：注册后由顶栏的间隔开关驱动，卸载时自动注销
+useAutoRefresh(load)
 onMounted(load)
 </script>
 

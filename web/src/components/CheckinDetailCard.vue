@@ -27,7 +27,51 @@
     </template>
 
     <a-alert v-if="error" type="error" show-icon :message="error" class="mb-2" />
-    <a-spin v-else :spinning="loading">
+
+    <template v-else>
+    <!-- 今日补签（2026-11-16 P1-8）：只对 TRAE 显示。回答的是「今天还差谁」，
+         而不是「现在给所有人签一次」——后者正是它要修掉的毛病。 -->
+    <div v-if="channel === 'traework'" class="mb-4 rounded-md border border-slate-700/60 p-3">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="text-xs text-slate-400">
+          今日补签
+          <span v-if="mk" class="ml-1">
+            · {{ mk.day }} · 待补 <b class="num text-slate-200">{{ mk.counts.due }}</b>
+            · 已签 {{ mk.counts.signed }}
+            <span v-if="mk.counts.disabled">· 停用 {{ mk.counts.disabled }}</span>
+            <span v-if="!mk.window.open" class="text-amber-500">· {{ mk.window.reason }}</span>
+          </span>
+        </div>
+        <a-space>
+          <a-button size="small" :loading="mkLoading" @click="previewMakeup">检查缺口</a-button>
+          <a-button
+            size="small"
+            type="primary"
+            :disabled="!mk || !mk.due.length"
+            :loading="mkRunning"
+            @click="runMakeup"
+          >
+            执行补签{{ mk && mk.due.length ? `（${mk.due.length}）` : '' }}
+          </a-button>
+        </a-space>
+      </div>
+      <div v-if="mkError" class="mt-2 text-xs text-red-400">{{ mkError }}</div>
+      <div v-if="mk && mk.due.length" class="mt-2 text-xs text-slate-400">
+        待补：<span v-for="(d, i) in mk.due" :key="d.id">{{ i ? '、' : '' }}{{ d.name }}</span>
+      </div>
+      <div v-if="mk && mk.skipped.length" class="mt-1 text-xs text-slate-500">
+        跳过：<span v-for="(s, i) in mk.skipped" :key="s.id">{{ i ? '、' : '' }}{{ s.name }}（{{ s.detail || s.reason }}）</span>
+      </div>
+      <div v-if="mkRan.length" class="mt-1 text-xs">
+        <span
+          v-for="(r, i) in mkRan"
+          :key="r.id"
+          :class="r.ok ? 'text-emerald-500' : 'text-red-400'"
+        >{{ i ? ' · ' : '' }}{{ r.name }}：{{ r.ok ? (r.already ? '上游已签' : `+${r.gained == null ? '已签' : r.gained}`) : (r.error || '失败') }}</span>
+      </div>
+    </div>
+
+    <a-spin :spinning="loading">
       <div class="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
         <span>{{ data?.year ?? year }} 年 {{ data?.month ?? month }} 月</span>
         <span>本月签到 <b class="num text-slate-200">{{ monthAccountDays }}</b> 账号·天</span>
@@ -78,6 +122,7 @@
 
       <div v-if="data?.note" class="mt-3 text-xs text-slate-500">{{ data.note }}</div>
     </a-spin>
+    </template>
   </a-card>
 </template>
 
@@ -86,6 +131,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import client from '@/api/client'
 import { channelStore, isQwenwork } from '@/stores/channel'
 import type { CheckinAccount, CheckinDetailData } from '@/api/checkin'
+import { traeworkApi } from '@/api/traework'
 
 const now = new Date()
 const year = ref(now.getFullYear())
@@ -93,6 +139,49 @@ const month = ref(now.getMonth() + 1)
 const data = ref<CheckinDetailData | null>(null)
 const loading = ref(false)
 const error = ref('')
+
+// 今日补签（P1-8）：mk = 上一次「检查缺口」的结果；mkRan = 执行后的逐账号结果
+const mk = ref<Awaited<ReturnType<typeof traeworkApi.checkinMakeup>>['data'] | null>(null)
+const mkRan = ref<Array<{ id: number; name: string; ok: boolean; already?: boolean; gained?: number | null; error?: string }>>([])
+const mkLoading = ref(false)
+const mkRunning = ref(false)
+const mkError = ref('')
+
+/** 只问「今天还差谁」，不动手（默认 dryRun） */
+async function previewMakeup() {
+  mkLoading.value = true
+  mkError.value = ''
+  mkRan.value = []
+  try {
+    const { data } = await traeworkApi.checkinMakeup({ dryRun: true })
+    mk.value = data
+    if (!data.ok && data.error) mkError.value = data.error
+  } catch (e: any) {
+    mkError.value = e?.response?.data?.error || '检查失败'
+  } finally {
+    mkLoading.value = false
+  }
+}
+
+/** 真的去补（只补缺口账号；账号之间由后端留间隔） */
+async function runMakeup() {
+  mkRunning.value = true
+  mkError.value = ''
+  try {
+    const { data } = await traeworkApi.checkinMakeup({ dryRun: false })
+    mk.value = data
+    mkRan.value = data.ran || []
+    if (data.summary && data.summary.failed) {
+      mkError.value = `${data.summary.failed} 个账号补签失败（原因见下方逐条）`
+    }
+    // 补完刷新日历，让「今日已签」立刻反映出来
+    await load()
+  } catch (e: any) {
+    mkError.value = e?.response?.data?.error || '补签失败'
+  } finally {
+    mkRunning.value = false
+  }
+}
 
 // 千问办公没有签到体系；组件本来就被 v-if 挡掉，这里再兜一层，
 // 避免将来有人复用时打出无意义的请求。

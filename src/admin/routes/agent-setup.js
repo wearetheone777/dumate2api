@@ -27,6 +27,35 @@ const routes = [
     },
   },
   {
+    // 写入前预览（调研 P2-10）：返回**将写入的差异**，不改任何文件。
+    // body 与 /apply 完全一致——用户先在这里看清楚，再点写入。
+    // 预览与写入共用 buildNext（同一份计算），所以不可能出现
+    // 「预览说没问题、写进去不是那样」。
+    method: 'POST',
+    path: '/preview',
+    handler: async ({ res, body }) => {
+      const b = body || {};
+      const client = String(b.client || '').trim();
+      if (!new RegExp(`^(${CLIENT_IDS})$`).test(client)) {
+        return sendJSON(res, 400, { ok: false, error: `client 必须是 ${CLIENT_IDS}` });
+      }
+      try {
+        const r = await setup.preview({
+          client,
+          channel: b.channel,
+          token: b.token,
+          models: b.models,
+          baseUrl: b.baseUrl,
+        });
+        // 审计只记「谁预览了谁」，不记内容（diff 里本来也已把 token 打码）
+        try { require('../auth').audit('admin', 'agent_setup_preview', `${client}/${r.channel}`, `${r.stats.added}+/${r.stats.removed}-`); } catch (e) { /* 忽略 */ }
+        return sendJSON(res, 200, r);
+      } catch (e) {
+        return sendJSON(res, 500, { ok: false, error: `预览失败：${e.message}` });
+      }
+    },
+  },
+  {
     // 直写配置。body: {client, channel?, token?, models?, baseUrl?}
     method: 'POST',
     path: '/apply',

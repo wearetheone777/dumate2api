@@ -6,6 +6,7 @@ const accounts = require('../../accounts');
 const { doCheckin } = require('./accounts');
 const { sendJSON } = require('../router');
 const { readJSON, writeJSON } = require('../store');
+const makeup = require('../../traework/makeup');
 
 const CONFIG_FILE = 'auto-checkin.json';
 const DEFAULT_HOUR = parseInt(process.env.DUMATE_AUTO_CHECKIN_HOUR || '9', 10);
@@ -18,6 +19,9 @@ function loadConfig() {
     enabled: !!saved.enabled,
     hour: Number.isInteger(saved.hour) ? saved.hour : DEFAULT_HOUR,
     minute: Number.isInteger(saved.minute) ? saved.minute : DEFAULT_MINUTE,
+    // 上次真正跑过的本地日期（YYYY-MM-DD）。补跑判定的第二条证据：
+    // 「今天该跑但没跑过」——没有它，进程重启就会重复补跑（虽然幂等，但会白打上游）。
+    lastRunDay: typeof saved.last_run_day === 'string' ? saved.last_run_day : '',
   };
 }
 
@@ -26,6 +30,7 @@ function saveConfig() {
     enabled: state.enabled,
     hour: state.hour,
     minute: state.minute,
+    last_run_day: state.lastRunDay || '',
     updated_at: Date.now(),
   });
 }
@@ -53,6 +58,21 @@ function schedule() {
   if (timer) { clearTimeout(timer); timer = null; }
   if (!state.enabled) { state.next_run_at = null; return; }
 
+  // 补跑（2026-11-16 调研 P1-8）：原来 `nextRunAt()` 把「今天已过的时刻」顺延到
+  // 明天，于是**进程在 9:17 之后启动 / 机器那时在睡眠**就整天空转。这里补的
+  // 正是这一种：时间点已过 + 今天还没跑过 → 立刻跑一次，跑完再排下一次。
+  const cu = makeup.shouldCatchUp({
+    enabled: state.enabled, hour: state.hour, minute: state.minute, lastRunDay: state.lastRunDay,
+  });
+  if (cu.run) {
+    state.next_run_at = null;
+    state.catchup_reason = cu.reason;
+    runOnce('catchup')
+      .catch(() => null)          // 补跑失败不能打死排程
+      .finally(() => { schedule(); });
+    return;
+  }
+
   state.next_run_at = nextRunAt();
   const delay = state.next_run_at - Date.now();
   timer = setTimeout(async () => {
@@ -71,6 +91,10 @@ async function runOnce(trigger) {
     const results = await Promise.all(targets.map((a) => doCheckin(a)));
     const ok = results.filter((r) => r.ok).length;
     state.last_run_at = Date.now();
+    // 记录「今天跑过了」：补跑判定靠它幂等，重启不会重复补
+    state.lastRunDay = makeup && require('../../checkin-ledger').dayOf(Date.now());
+    state.catchup_reason = '';
+    try { saveConfig(); } catch (e) { /* 落盘失败不影响本次结果 */ }
     state.last_result = {
       trigger,
       total: results.length,
@@ -85,20 +109,32 @@ async function runOnce(trigger) {
   }
 }
 
+/** GET / POST 共用的快照形状：字段缺一半会让前端读到 undefined（P1-8 踩过） */
+function snapshot() {
+  return {
+    enabled: state.enabled,
+    hour: state.hour,
+    minute: state.minute,
+    last_run_at: state.last_run_at,
+    last_result: state.last_result,
+    next_run_at: state.next_run_at,
+    running: state.running,
+    // 补跑（P1-8）：上次跑的是哪一天、这次是不是补跑、为什么补
+    last_run_day: state.lastRunDay || '',
+    catchup_reason: state.catchup_reason || '',
+    note: '自动签到每日执行一次（幂等，重复执行无副作用）。抽奖消耗次数且不可逆，仅支持手动触发。',
+    // 机器睡眠/进程晚启动时，时间点已过也会**立即补跑一次**（P1-8），
+    // 判据见 src/traework/makeup.js 的 shouldCatchUp
+    catchup_note: '今天的时间点已过但没跑过时，启动或保存配置会立刻补跑一次；跑过即不再补。',
+  };
+}
+
 const routes = [
   {
     method: 'GET',
     path: '',
     handler: ({ res }) => sendJSON(res, 200, {
-      enabled: state.enabled,
-      hour: state.hour,
-      minute: state.minute,
-      last_run_at: state.last_run_at,
-      last_result: state.last_result,
-      next_run_at: state.next_run_at,
-      running: state.running,
-      // 说明安全边界，避免误以为抽奖也会自动跑
-      note: '自动签到每日执行一次（幂等，重复执行无副作用）。抽奖消耗次数且不可逆，仅支持手动触发。',
+      ...snapshot(),
     }),
   },
   {
@@ -124,12 +160,7 @@ const routes = [
       saveConfig();
       require('../../admin/auth').audit('admin', 'auto_checkin_config',
         state.enabled ? 'on' : 'off', `${state.hour}:${String(state.minute).padStart(2, '0')}`);
-      return sendJSON(res, 200, {
-        enabled: state.enabled,
-        hour: state.hour,
-        minute: state.minute,
-        next_run_at: state.next_run_at,
-      });
+      return sendJSON(res, 200, { ...snapshot(), ok: true });
     },
   },
   {

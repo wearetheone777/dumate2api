@@ -17,6 +17,40 @@ const expiringSnap = require('../../expiring');
 // 调研融合批次（2026-11-08）：运行态配置、批量运维编排、额度预警
 const runtime = require('../../trae-runtime');
 const batch = require('../../traework/batch');
+const oauthCallback = require('../../traework/oauth-callback');
+const makeup = require('../../traework/makeup');
+const checkinLedger = require('../../checkin-ledger');
+
+// 回环登录的会话表（进程内，10 分钟到期；没有持久化价值）
+const loginBroker = oauthCallback.createBroker();
+
+/**
+ * 回环/粘贴两条路共用的换票回调：解析回调 → exchangeAndSave。
+ * 与 `/login/callback` 同一套逻辑（那边手写了一遍，这里抽出来给会话用）。
+ */
+async function exchangeFromBroker(url, session) {
+  const ctx = (session && session.context) || {};
+  const parsed = login.parseCallback(url);
+  if (!parsed.refreshToken) {
+    return { ok: false, error: '回调里没有 refreshToken，检查是否被浏览器/客户端截断' };
+  }
+  const r = await login.exchangeAndSave({
+    refreshToken: parsed.refreshToken,
+    deviceId: ctx.deviceId,
+    machineId: ctx.machineId,
+    uid: parsed.uid,
+    nickname: parsed.nickname,
+    // 回调自带的账号域主机（国际版实测 api-sg-central.trae.ai）——不能猜
+    host: parsed.host,
+    region: ctx.region === 'intl' ? 'intl' : 'cn',
+  });
+  if (r.ok) {
+    try {
+      require('../auth').audit('admin', 'traework_login', (r.account && r.account.id) || '', '凭据落盘（回环回调）');
+    } catch (e) { /* 审计失败不影响结果 */ }
+  }
+  return r;
+}
 const degrade = require('../../traework/degrade');
 
 // 区域过滤（2026-11-03 页面按区域整体切换）：'cn' / 'intl'。账号列表按
@@ -114,9 +148,13 @@ const routes = [
       // 区域（2026-11-03 国际版）：cn（缺省）/ intl——两区模型表不同，分开看
       const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
       const region = regionRaw === 'intl' ? 'intl' : 'cn';
+      // 账号级取数（2026-11-16 P0-1）：模型表里倍率/档位/max_mode/multimodal 都按
+      // 账号下发。不传 accountId 时沿用「该区最新一份」，并在响应里把作用域写出来
+      // ——「这张表是谁取的」必须可回答，否则能力判断错了又查不出来。
+      const accountId = decodeURIComponent(((req.url.match(/[?&]accountId=([^&]*)/) || [])[1] || ''));
       let out = { ok: false, error: '', models: [], fetchedAt: 0 };
       try {
-        out = await models.fetchModels({ force, region });
+        out = await models.fetchModels({ force, region, accountId });
       } catch (e) {
         out = { ok: false, error: e.message, models: [], fetchedAt: 0 };
       }
@@ -126,12 +164,46 @@ const routes = [
         models: list,
         total: (out.models || []).length,
         region,
+        // 本次数据的作用域（账号/function/客户端版本 + 短指纹）；命中缓存时 cached=true
+        scope: out.scope || null,
+        cacheScope: out.cacheScope || '',
+        cached: out.cached === true,
+        // 该区当前缓存里的全部作用域：账号多了以后「谁的表现在被用」一眼可见
+        scopes: models.cacheScopes(region),
         // 取不到时如实报错，前端显示错误而不是一张空表
         error: out.error || '',
         fetchedAt: out.fetchedAt || 0,
         // 倍率的单位与来源写清楚：接口给的是相对倍率，不是积分绝对值
         rateNote: '倍率是相对值（接口字段 consumption_rate.rate），实际扣费 = 倍率 × 用量；折扣未命中时按原价扣。',
       });
+    },
+  },
+  {
+    // 模型表缓存的作用域清单与命中统计（只读）。用途：排查「为什么又打了一次上游」
+    // 与「这个账号的能力表到底取到没有」。默认关的调试面，不含凭证。
+    method: 'GET',
+    path: '/models/cache',
+    handler: async ({ res, req }) => {
+      const regionRaw = ((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '').toLowerCase();
+      const region = regionRaw === 'intl' ? 'intl' : (regionRaw === 'cn' ? 'cn' : '');
+      return sendJSON(res, 200, {
+        region: region || 'all',
+        scopes: models.cacheScopes(region),
+        stats: models.cacheStats(),
+        cacheMs: models.CACHE_MS,
+        scopeCap: models.SCOPE_CAP,
+      });
+    },
+  },
+  {
+    // 清缓存（写操作，admin）。下次 fetch 必打上游——「换了会员等级 / 加了账号」后
+    // 强制重取用；不清的话最长等一个 CACHE_MS 周期。
+    method: 'POST',
+    path: '/models/cache/clear',
+    handler: async ({ res, body }) => {
+      const region = String((body && body.region) || '').toLowerCase();
+      const out = models.clearModelCache(region === 'intl' || region === 'cn' ? region : '');
+      return sendJSON(res, 200, { ...out, stats: models.cacheStats() });
     },
   },
   {
@@ -639,6 +711,146 @@ const routes = [
     },
   },
   {
+    /**
+     * 发起「回环登录」会话（2026-11-16 调研 P0-2a）。
+     *
+     * 与 `/login/url` 的区别：这条会在 127.0.0.1 起一个临时监听，官方授权页
+     * 自己跳回来，回调直接接住并换票入库——用户不用再抄那条长 URL。
+     * 浏览器与网关不在同一台机器 / 网关在容器里时用 `/login/complete` 粘贴。
+     * `/login/url` + `/login/callback` 的老路径**原样保留**（同一条换票逻辑）。
+     */
+    method: 'POST',
+    path: '/login/start',
+    handler: async ({ res, body }) => {
+      const region = (body && body.region === 'intl') ? 'intl' : 'cn';
+      const wantId = body && body.accountId;
+      const existing = wantId ? authStore.get(wantId) : null;
+      let ids;
+      let reused = false;
+      if (existing && existing.deviceId && existing.machineId) {
+        ids = { deviceId: existing.deviceId, machineId: existing.machineId };
+        reused = true;
+      } else {
+        ids = login.newDeviceIds();
+      }
+      let sess;
+      try {
+        sess = await loginBroker.start({
+          context: { region, deviceId: ids.deviceId, machineId: ids.machineId, accountId: existing ? existing.id : null },
+          onCallback: exchangeFromBroker,
+        });
+      } catch (e) {
+        // 端口占用等：如实报错并给出可执行的办法，**不静默退回**手动粘贴——
+        // 前端会把这个 message 显示出来（用户可自己选择继续用手动路径）
+        return sendJSON(res, 503, { ok: false, error: e.message, fallback: '/login/url' });
+      }
+      return sendJSON(res, 200, {
+        ok: true,
+        region,
+        sessionId: sess.sessionId,
+        // 授权页 + 本次 state（= 上游 login_trace_id）+ 回环地址，三者必须成套
+        url: login.buildAuthUrl(ids, region, { trace: sess.state, redirect: sess.redirect }),
+        redirect: sess.redirect,
+        expiresAt: sess.expiresAt,
+        intervalMs: 1500,
+        deviceId: ids.deviceId,
+        machineId: ids.machineId,
+        reuseDevice: reused,
+        accountId: existing ? existing.id : null,
+        hint: '在浏览器里完成登录，回调会被本机接住；若浏览器与网关不在同一台机器，请改用「粘贴回调」。',
+      });
+    },
+  },
+  {
+    // 回环登录的状态（只读，给前端轮询）。**不返回任何凭证**。
+    method: 'GET',
+    path: '/login/status',
+    handler: async ({ res, req }) => {
+      const sid = decodeURIComponent(((req.url.match(/[?&]sessionId=([^&]*)/) || [])[1] || ''));
+      if (!sid) return sendJSON(res, 400, { error: '缺少 sessionId' });
+      return sendJSON(res, 200, loginBroker.status(sid));
+    },
+  },
+  {
+    // 取消回环登录（关掉监听，会话作废）
+    method: 'POST',
+    path: '/login/cancel',
+    handler: async ({ res, body }) => {
+      const sid = body && body.sessionId;
+      const out = loginBroker.cancel(sid);
+      return sendJSON(res, out.ok ? 200 : 404, out);
+    },
+  },
+  {
+    /**
+     * 手动粘贴回调（浏览器与网关不同机 / 容器部署 / 回环端口起不来时的退路）。
+     * 与 `/login/callback` 的区别：会话里已经带着 deviceId/machineId/region，
+     * 前端不必再自己记住它们；且走同一条单次消费 + state 校验。
+     */
+    method: 'POST',
+    path: '/login/complete',
+    handler: async ({ res, body }) => {
+      const sid = body && body.sessionId;
+      const cb = body && body.callback;
+      if (!sid) return sendJSON(res, 400, { error: '缺少 sessionId（需先调 /login/start）' });
+      const out = await loginBroker.complete(sid, cb, exchangeFromBroker);
+      if (!out.ok) {
+        // 403/409/410 是**状态码**语义（state 不匹配 / 已用过 / 已过期），透传
+        return sendJSON(res, out.status && out.status >= 400 ? out.status : 200, { ok: false, error: out.error });
+      }
+      return sendJSON(res, 200, { ok: true, account: out.account });
+    },
+  },
+  {
+    /**
+     * 今日补签（2026-11-16 调研 P1-8）。
+     *
+     * 为什么不复用 `/checkin`：那条是「现在就给这些账号签一次」，**不回答
+     * 『今天还差谁』**。这里先用账本 + `lastCheckin` 算出真实的缺口，再只对
+     * 缺口账号跑既有幂等签到——既省上游请求，也让界面能显示「为什么它被跳过」。
+     *
+     * `dryRun: true` 只预览不动手（默认预览，因为这是会在上游产生动作的接口）。
+     */
+    method: 'POST',
+    path: '/checkin/makeup',
+    handler: async ({ res, body }) => {
+      const dryRun = !(body && body.dryRun === false);   // 缺省预览
+      const ids = Array.isArray(body && body.ids) ? body.ids.map(Number).filter(Number.isFinite) : [];
+      let rows = [];
+      try { rows = checkinLedger.rowsInRange({ channel: 'traework' }); } catch (e) { rows = []; }
+      const p = makeup.plan({ accounts: authStore.list(), rows, ids });
+      if (dryRun || !p.due.length) {
+        return sendJSON(res, 200, { ok: true, dryRun, ...p, ran: [] });
+      }
+      const ran = [];
+      for (let i = 0; i < p.due.length; i += 1) {
+        const d = p.due[i];
+        const a = authStore.get(d.id);
+        if (!a) { ran.push({ id: d.id, name: d.name, ok: false, error: '账号不存在' }); continue; }
+        try {
+          const r = await checkin.checkinAndSave(a, authStore, { respectBackoff: true });
+          ran.push({
+            id: d.id, name: d.name, ok: !!r.ok, already: !!r.already,
+            gained: r.gained == null ? null : r.gained, error: r.error || '',
+          });
+        } catch (e) {
+          ran.push({ id: d.id, name: d.name, ok: false, error: e.message });
+        }
+        // 与 task-scheduler 同口径的账号间隔：并发打同一个上游更容易被识别
+        if (i < p.due.length - 1) await new Promise((r2) => setTimeout(r2, 2000));
+      }
+      return sendJSON(res, 200, {
+        ok: true, dryRun: false, ...p, ran,
+        summary: {
+          due: p.due.length,
+          ok: ran.filter((x) => x.ok).length,
+          already: ran.filter((x) => x.already).length,
+          failed: ran.filter((x) => !x.ok).length,
+        },
+      });
+    },
+  },
+  {
     // 回填手机号。
     //
     // TRAE 的 GetUserInfo 已 401，拿不到官方身份字段，昵称是唯一线索。
@@ -702,6 +914,33 @@ const routes = [
       try { require('../auth').audit(user && user.username, 'traework_accounts_batch', payload.action || '', `${out.succeeded || 0}/${out.total || 0}`); }
       catch (e) { /* 审计失败不影响批量结果 */ }
       return sendJSON(res, out.ok ? 200 : 400, out);
+    },
+  },
+  {
+    // 单账号人工恢复（2026-11-16 P0-3）。清冷却 / 熔断 / 401 防误杀计数 / 禁用标记，
+    // 并清掉账号上挂的 lastError。
+    //
+    // 与批量 `resume` 的区别（刻意不同语义，别合并）：
+    //   · 批量恢复**默认保留**上游冷却（force 才清）——防手滑把刚被上游拒掉的号
+    //     整批放出来，那是「一次点击制造一次冲击」；
+    //   · 这条**总是**清——人工逐个点下去的语义就是「我确认这个号现在可用」。
+    method: 'POST',
+    path: '/accounts/:id/recover',
+    handler: async ({ res, params }) => {
+      const id = Number(params[0]);
+      const a = Number.isFinite(id) ? authStore.get(id) : null;
+      if (!a) return sendJSON(res, 404, { error: '账号不存在' });
+      const channelPool = require('../../channel-pool');
+      const uid = channelPool.uidOf('traework', id);
+      // 恢复前的可用性快照：让「恢复到底解掉了什么」可核对（冷却剩余/熔断/禁用）
+      let before = null;
+      try { before = channelPool.availability('traework', [a], {}); } catch (e) { before = null; }
+      const revived = require('../../pool').pool.revive(uid);
+      let clearedLastError = false;
+      try {
+        if (a.lastError) { authStore.patch(id, { lastError: '' }); clearedLastError = true; }
+      } catch (e) { /* 清标记失败不影响恢复结果 */ }
+      return sendJSON(res, 200, { ok: true, id, revived: !!revived, clearedLastError, before });
     },
   },
   {

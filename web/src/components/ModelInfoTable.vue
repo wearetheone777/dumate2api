@@ -12,6 +12,16 @@
       <div class="text-xs text-slate-500">
         <template v-if="channel === 'traework'">
           倍率与上下文来自上游下发（{{ rows.length }} 个模型）
+          <span v-if="scope" class="block mt-1 text-[11px] text-slate-400">
+            缓存作用域：账号 {{ scope.accountId || '（该区任意）' }} · function {{ scope.fn }} · v{{ scope.version }}
+            · 指纹 {{ scope.id }}{{ cached ? ' · 命中缓存' : ' · 刚重取' }}
+            <span v-if="merged" class="text-amber-600">· 多账号合并（能力取宽、上限取窄）</span>
+            <span v-if="scopes && scopes.length > 1" class="ml-1">
+              · 本区共 {{ scopes.length }} 份（{{
+                scopes.map((x) => (x.accountId || '?') + '@' + ageText(x.ageMs) + (x.stale ? ' 已过期' : '')).join('、')
+              }}）
+            </span>
+          </span>
         </template>
         <template v-else-if="channel === 'qoder'">
           倍率（price_factor）与上下文来自上游下发（{{ rows.length }} 个模型）·
@@ -32,6 +42,10 @@
           checked-children="仅可见"
           un-checked-children="全部"
         />
+        <!-- 清缓存重取：换了会员等级 / 新加账号后不必等 TTL 到期 -->
+        <a-button v-if="channel === 'traework'" size="small" @click="emit('clear-cache')">
+          清缓存重取
+        </a-button>
         <!-- 排序：只要有倍率数据就给下拉。早先写死「TRAE / Qoder 才有」，
              结果搭子拿到 22 个实测倍率后反而没法排序（2026-11-15 用户反馈） -->
         <a-select v-if="hasRate" v-model:value="sort" size="small" style="width: 130px" :options="sortOptions" />
@@ -237,7 +251,28 @@ const props = defineProps<{
   channel: 'dumate' | 'qwenwork' | 'traework' | 'qoder'
   /** 外部传入的数据（模型页已按通道拉过时可复用，避免重复请求） */
   preloaded?: ModelInfoRow[] | null
+  /**
+   * 模型表缓存的**作用域**（2026-11-16 P0-1，只有 TRAE 有）。
+   * 展示它是因为「能力判断错了」时必须能回答「这张表是谁取的」。
+   */
+  scope?: { id: string; accountId: string; fn: string; version: string } | null
+  /** 该区缓存里的全部作用域（账号多了以后谁的表现在在被用） */
+  scopes?: Array<{ id: string; accountId: string; fn: string; version: string; ageMs: number; stale: boolean; models: number }>
+  /** 本次数据是命中缓存还是重取的 */
+  cached?: boolean
+  /** 行是由多个账号作用域合并出来的（能力取宽、上限取窄） */
+  merged?: boolean
 }>()
+
+const emit = defineEmits<{ (e: 'clear-cache'): void }>()
+
+/** 缓存年龄说人话：「12 分钟前」比时间戳有用 */
+function ageText(ms: number) {
+  const m = Math.max(0, Math.round((ms || 0) / 60000))
+  if (m < 1) return '刚刚'
+  if (m < 60) return `${m} 分钟前`
+  return `${Math.round(m / 60)} 小时前`
+}
 
 const rows = ref<ModelInfoRow[]>([])
 const error = ref('')

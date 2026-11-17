@@ -126,6 +126,40 @@
           </div>
         </a-form-item>
       </a-form>
+      <!-- 写入前预览（P2-10）：这套东西直接改本机配置文件，合并规则（深合并 /
+           受管块替换）对用户不透明——先看清楚会变成什么，再点写入。
+           预览与写入走同一个 buildNext，所以不可能出现「预览说没问题、写进去不是那样」。 -->
+      <div class="mt-1 flex items-center gap-2">
+        <a-button size="small" class="ghost-btn" :loading="previewing" @click="doPreview">
+          {{ preview ? '重新预览' : '预览将写入的差异' }}
+        </a-button>
+        <span v-if="preview" class="text-xs" :class="preview.changed ? 'text-orange-600' : 'text-slate-400'">
+          {{ preview.changed
+            ? `将改动 +${preview.stats.added} / −${preview.stats.removed} 行（当前 ${preview.exists ? '已存在' : '不存在'}）`
+            : '内容已一致：写入不会改动任何字节（幂等）' }}
+        </span>
+      </div>
+      <div v-if="previewError" class="text-xs text-red-500 mt-1">{{ previewError }}</div>
+      <a-alert v-if="preview?.note" type="info" show-icon class="mt-2" :message="preview.note" />
+      <div v-if="preview && preview.ops.length" class="diff-box mt-2">
+        <div
+          v-for="(op, i) in preview.ops"
+          :key="i"
+          class="diff-line"
+          :class="op.t === '+' ? 'diff-add' : (op.t === '-' ? 'diff-del' : 'diff-ctx')"
+        >
+          <span class="diff-ln">{{ op.t === '+' ? op.b : op.a }}</span>
+          <span class="diff-sign">{{ op.t }}</span>
+          <span class="diff-txt">{{ op.text }}</span>
+        </div>
+      </div>
+      <div v-if="preview?.truncated" class="text-xs text-amber-600 mt-1">
+        文件行数过多，只给统计不列明细（{{ preview.stats.lines }} 行）
+      </div>
+      <div v-if="preview" class="text-xs text-slate-400 mt-1">
+        预览里的密钥已打码（••••后四位）；写入用的是你填的那个值。
+      </div>
+
       <a-alert v-if="applyError" type="error" show-icon class="mt-2" :message="applyError" />
     </a-modal>
   </div>
@@ -136,7 +170,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { App as AntApp } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import client from '@/api/client'
-import { agentSetupApi, type SetupApplyResult, type SetupClient } from '@/api/agentsetup'
+import { agentSetupApi, type SetupApplyResult, type SetupClient, type SetupPreviewResult } from '@/api/agentsetup'
 import { isAdmin } from '@/stores/auth'
 
 const { message } = AntApp.useApp()
@@ -149,6 +183,10 @@ const dlgOpen = ref(false)
 const dlgClient = ref<SetupClient | null>(null)
 const saving = ref(false)
 const applyError = ref('')
+// 写入前预览（P2-10）
+const preview = ref<SetupPreviewResult | null>(null)
+const previewing = ref(false)
+const previewError = ref('')
 const lastResult = ref<SetupApplyResult | null>(null)
 
 const form = reactive({
@@ -204,6 +242,9 @@ async function loadKeys() {
 function openApply(c: SetupClient) {
   dlgClient.value = c
   applyError.value = ''
+  // 换了客户端，旧预览作废（别让上一份 diff 被当成这一份的真相）
+  preview.value = null
+  previewError.value = ''
   // 默认用已有明文 Key 的第一把：鉴权强制后 nokey 必 401，默认值就该是能用的
   const first = keyOptions.value[0]
   form.keyId = first ? first.value : undefined
@@ -211,9 +252,32 @@ function openApply(c: SetupClient) {
   dlgOpen.value = true
 }
 
+/** 只算差异、不写文件；与 apply 同一份后端计算 */
+async function doPreview() {
+  if (!dlgClient.value) return
+  previewing.value = true
+  previewError.value = ''
+  try {
+    const { data } = await agentSetupApi.preview({
+      client: dlgClient.value.id,
+      channel: form.channel,
+      token: form.token.trim(),
+    })
+    preview.value = data
+    if (!data.ok) previewError.value = data.error || '预览失败'
+  } catch (e: any) {
+    preview.value = null
+    previewError.value = e?.response?.data?.error || '预览失败'
+  } finally {
+    previewing.value = false
+  }
+}
+
 async function doApply() {
   if (!dlgClient.value) return
   applyError.value = ''
+  // 参数变了，之前的预览就不再是「将写入的内容」
+  preview.value = null
   saving.value = true
   try {
     const { data } = await agentSetupApi.apply({
@@ -248,6 +312,25 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+/* 差异视图：等宽、可滚动、行号在左。加 +/− 前缀而不是只靠颜色——
+   颜色在深色主题/色觉差异下都可能失效，符号不会。 */
+.diff-box {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  background: rgba(148, 163, 184, 0.06);
+}
+.diff-line { display: flex; gap: 6px; padding: 0 8px; white-space: pre; }
+.diff-add { background: rgba(22, 163, 74, 0.14); }
+.diff-del { background: rgba(220, 38, 38, 0.14); }
+.diff-ctx { color: #8b949e; }
+.diff-ln { width: 34px; text-align: right; color: #8b949e; flex: none; }
+.diff-sign { width: 10px; flex: none; }
+.diff-txt { overflow: hidden; text-overflow: ellipsis; }
 .setup-row {
   display: flex;
   align-items: center;
