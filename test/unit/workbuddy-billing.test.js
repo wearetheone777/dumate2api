@@ -213,7 +213,8 @@ test('maybeRefreshTier：刷新落档案；失败保留旧值；TTL 内读缓存
   const os = require('os');
   const path = require('path');
   const fs = require('fs');
-  process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-wb-tier-'));
+const { tmpDir } = require('../helpers/tmpdir');
+  process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-wb-tier');
   const billingFresh = (() => { delete require.cache[require.resolve('../../src/workbuddy/billing')]; return require('../../src/workbuddy/billing'); })();
   const patched = [];
   billingFresh._setFetchTier(async (region, acc) => {

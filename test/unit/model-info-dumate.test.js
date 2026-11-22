@@ -38,36 +38,48 @@ test('dumateRows：暴露的四个名字全部有实测元数据（不拿同类�
 });
 
 test('dumateRows：倍率来自实测缓存（按 target 命中；无缓存/过期如实 null）', () => {
-  // 缓存文件指到临时文件，断言才不依赖真机探针的落盘状态
+  // 缓存文件指到临时文件，断言才不依赖真机探针的落盘状态。
+  //
+  // **必须用 mkdtemp 而不是 `tmpdir()/dumate-rate-test-<pid>.json`**：
+  // 原写法在断言失败时会跳过结尾的 unlink，文件留在临时目录里；下次运行若
+  // 复用同一个 pid（Windows 上很常见），用例一开始就**读到自己上一轮的
+  // fixture**，「无缓存应 null」直接假失败——用例毒化了自己。实测临时目录里
+  // 攒了 5 个这样的残留文件（2026-11-06 起）。
   const os = require('node:os');
   const path = require('node:path');
   const fs = require('node:fs');
-  const tmp = path.join(os.tmpdir(), `dumate-rate-test-${process.pid}.json`);
+const { tmpDir } = require('../helpers/tmpdir');
+  const dir = tmpDir('dumate-rate-test');
+  const tmp = path.join(dir, 'rate.json');
   process.env.DUMATE_DUMATE_RATE_FILE = tmp;
-  // 无缓存：全部 null（未实测，不是 0）
-  const empty = mi.dumateRows();
-  for (const r of empty) {
-    assert.equal(r.rate, null, r.id + ' 无缓存应 null');
-    assert.equal(r.rateSource, null, r.id);
+  try {
+    // 无缓存：全部 null（未实测，不是 0）
+    const empty = mi.dumateRows();
+    for (const r of empty) {
+      assert.equal(r.rate, null, r.id + ' 无缓存应 null');
+      assert.equal(r.rateSource, null, r.id);
+    }
+    // 有缓存：倍率按映射 target 命中（探针把实测记在上游槽位名下）
+    fs.writeFileSync(tmp, JSON.stringify({
+      'dm-auto-model/text.L0': { billed: 3.5135, cost: 1.04, tokens: 296, account: 't', measuredAt: Date.now() },
+    }));
+    const rows = mi.dumateRows();
+    const mt = rows.find((r) => r.id === 'deepseek-v4.1-flash-low-latency');
+    assert.equal(mt.rate, 3.5135, '真实名行的倍率 = target 槽位的实测值');
+    assert.equal(mt.rateSource, 'measured');
+    assert.ok(/实测于/.test(mt.rateNote), mt.rateNote);
+    // 过期（8 天前）：如实回落 null——过期数字比「—」更害人
+    fs.writeFileSync(tmp, JSON.stringify({
+      'model-text': { billed: 3.5135, cost: 1.04, tokens: 296, account: 't', measuredAt: Date.now() - 8 * 24 * 3600 * 1000 },
+    }));
+    // 重新取行：rows 是改写缓存前算好的，不能复用
+    const expired = mi.dumateRows();
+    assert.equal(expired.find((r) => r.id === 'deepseek-v4.1-flash-low-latency').rate, null);
+  } finally {
+    // 无论断言成败都清干净：这个文件是**本用例自己**造的
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* 清不掉不影响结论 */ }
+    delete process.env.DUMATE_DUMATE_RATE_FILE;
   }
-  // 有缓存：倍率按映射 target 命中（探针把实测记在上游槽位名下）
-  fs.writeFileSync(tmp, JSON.stringify({
-    'dm-auto-model/text.L0': { billed: 3.5135, cost: 1.04, tokens: 296, account: 't', measuredAt: Date.now() },
-  }));
-  const rows = mi.dumateRows();
-  const mt = rows.find((r) => r.id === 'deepseek-v4.1-flash-low-latency');
-  assert.equal(mt.rate, 3.5135, '真实名行的倍率 = target 槽位的实测值');
-  assert.equal(mt.rateSource, 'measured');
-  assert.ok(/实测于/.test(mt.rateNote), mt.rateNote);
-  // 过期（8 天前）：如实回落 null——过期数字比「—」更害人
-  fs.writeFileSync(tmp, JSON.stringify({
-    'model-text': { billed: 3.5135, cost: 1.04, tokens: 296, account: 't', measuredAt: Date.now() - 8 * 24 * 3600 * 1000 },
-  }));
-  // 重新取行：rows 是改写缓存前算好的，不能复用
-  const expired = mi.dumateRows();
-  assert.equal(expired.find((r) => r.id === 'deepseek-v4.1-flash-low-latency').rate, null);
-  fs.unlinkSync(tmp);
-  delete process.env.DUMATE_DUMATE_RATE_FILE;
 });
 
 // ---- 2026-11-07 融合项 P0-3（双链路标注）与 P1-4（/v1/models 元数据）----

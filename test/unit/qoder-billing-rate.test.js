@@ -10,7 +10,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'qoder-rate-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('qoder-rate');
 process.env.DUMATE_ADMIN_DATA = TMP; // 在 require credits 之前
 const credits = require('../../src/qoder/credits');
 

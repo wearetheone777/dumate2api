@@ -102,6 +102,10 @@ function buildChatBody(payload, region, account) {
   // 必带身份句与提示词指纹，出站前中性化。放在会话 id 派生之前——清洗不改写
   // user 内容，convId（取首条 user）不受影响，前缀缓存键稳定
   body.messages = sanitize.sanitizeMessages(body.messages);
+  // 顶层 tools[] 也要清（2026-11-08）：原来只清 messages，工具定义里的品牌指纹
+  // 与提示词痕迹一样会被渠道校验看到。**只清 description，不动 name/schema 结构**
+  // （改名会让 tool_call 回传对不上，改 schema 会让参数生成失效）。
+  if (Array.isArray(body.tools)) body.tools = sanitize.sanitizeTools(body.tools);
 
   // 会话 id：跨轮稳定（前缀缓存不被打散），三头与 body 同源
   const convId = stableConversationId(body.messages);
@@ -114,6 +118,70 @@ function buildChatBody(payload, region, account) {
 }
 
 /**
+ * 剥掉 reasoning 相关字段（降级一次用）。
+ *
+ * 出处（2026-11-08 融合批，GitHub 生态调研）：上游 11150
+ * `reasoning effort is not supported` —— 模型存在、账号健康，只是**这个模型
+ * 不吃 effort 参数**。原实现把这个 body 原样透传，撞上 11150 后被判成请求级
+ * 失败，用户拿到 400；而**把字段剥掉重发一次就能过**。
+ *
+ * 三种写法都要剥（不同客户端/翻译层给的不同）：
+ *   reasoning_effort（OpenAI 风格顶层）
+ *   reasoning: { effort } （嵌套形态）
+ *   thinking / enable_thinking （部分 SDK）
+ * 剥完若 body 空到只剩 messages，那是常态（这些字段本来就是可选的）。
+ *
+ * @returns {{body:string, removed:string[]}|null} null = 本来就没有，无需降级
+ */
+function withoutReasoningFields(payload) {
+  let obj = payload;
+  if (typeof payload === 'string') {
+    try { obj = JSON.parse(payload); } catch (e) { return null; }
+  }
+  if (!obj || typeof obj !== 'object') return null;
+  const body = JSON.parse(JSON.stringify(obj));
+  const removed = [];
+  for (const k of ['reasoning_effort', 'reasoning', 'thinking', 'enable_thinking']) {
+    if (Object.prototype.hasOwnProperty.call(body, k)) {
+      delete body[k];
+      removed.push(k);
+    }
+  }
+  if (!removed.length) return null;
+  return { body: JSON.stringify(body), removed };
+}
+
+/**
+ * 按账号**稳定派生**的设备/会话标识（2026-11-08 融合批）。
+ *
+ * 出处：GitHub 生态调研（ardeyoxipianyi/workbuddy2api-hub 的
+ * `X-Machine-ID` / `X-Session-ID` 派生；多份实现交叉实证）。
+ *
+ * **为什么必须按账号派生，不能用进程级常量**：
+ * 这两个头是上游的设备关联键。若整个网关共用一个值，**整个账号池会被上游
+ * 关联成同一台设备**——一个账号触发 11140，其余账号跟着连坐。这与「出口 IP
+ * 连坐」是同一个机制，而它比 IP 更难换（IP 有代理槽，设备指纹没有）。
+ *
+ * 派生口径（与参照实现一致）：
+ *   md5("<salt>:<uid>") 取前 32 hex，再改造成 UUIDv4 形状（第 13 位 4、
+ *   第 17 位 8/9/a/b）。为什么改形状而不直接用 md5：上游按 UUID 校验格式，
+ *   32 位裸 hex 会被当成非法值；用 md5 而非 randomUUID 是为了**跨重启稳定**
+ *   （同一账号每天都是同一台设备，这才像真人）。
+ *
+ * @param {'machine'|'session'} salt
+ * @param {string|number} uid 账号 uid（缺失时退回账号 id，仍保证跨账号不同）
+ * @returns {string} UUIDv4 形状的稳定标识；uid 为空时返回空串（不编）
+ */
+function deriveDeviceId(salt, uid) {
+  const key = String(uid == null ? '' : uid).trim();
+  if (!key) return '';
+  const s = crypto.createHash('md5').update(`${salt}:${key}`, 'utf8').digest('hex');
+  // 8-4-4-4-12，钉版本位（4）与变体位（8|9|a|b）
+  const variant = (0x8 | (parseInt(s[16], 16) & 0x3)).toString(16);
+  return `${s.slice(0, 8)}-${s.slice(8, 12)}-4${s.slice(13, 16)}-${variant}${s.slice(17, 20)}-${s.slice(20, 32)}`;
+}
+
+/**
  * chat 请求头。缺失的身份字段用官方 CLI 的 X-No-* 约定表达；
  * X-Conversation 三头是**国际版硬校验**（缺任一 11128），国内版同样带——
  * 官方客户端每个 chat 请求都带，两版一致才像客户端。
@@ -123,6 +191,10 @@ function chatHeaders(region, account, bodyLen, convId) {
   const acceptLanguage = region === 'global' ? 'en-US' : 'zh-CN';
   const clientVersion = (process.env.DUMATE_WORKBUDDY_APP_VERSION || '').trim()
     || spec.fallbackAppVersion;
+  // 每请求独立的 id：message id 与 request id **同值**（官方客户端把 message id
+  // 镜像到 X-Request-ID，两份不同会让「一次用户发送」被记成两次请求）
+  const msgId = crypto.randomBytes(16).toString('hex');
+  const traceId = crypto.randomBytes(16).toString('hex');
   const h = {
     Accept: 'application/json, text/event-stream',
     'Accept-Language': acceptLanguage,
@@ -140,12 +212,27 @@ function chatHeaders(region, account, bodyLen, convId) {
     'X-IDE-Type': 'CLI',
     'X-IDE-Name': 'CLI',
     'X-IDE-Version': clientVersion,
-    'X-Request-ID': crypto.randomBytes(16).toString('hex'),
-    // 会话三件套（dsh-xdpool#58：缺任一 400 11128）
+    'X-Request-ID': msgId,
+    // 会话四件套（dsh-xdpool#58：缺任一 400 11128）。
+    // X-Conversation-Request-ID 是上游「一次用户发送」的聚合主键，每请求新值；
+    // X-Conversation-Message-ID 是被回答的那条消息，与 X-Request-ID 同值。
     'X-Conversation-ID': convId,
     'X-Conversation-Request-ID': crypto.randomBytes(16).toString('hex'),
-    'X-Conversation-Message-ID': crypto.randomBytes(16).toString('hex'),
+    'X-Conversation-Message-ID': msgId,
+    // 链路追踪族（桌面形态实测都带）：缺了不报错，但带上才像原客户端。
+    // 桌面端无父 span，故 Root-Request-ID 与本请求同级。
+    'X-Root-Request-ID': msgId,
+    'X-Trace-ID': traceId,
+    'X-B3-TraceId': traceId,
+    'X-B3-SpanId': crypto.randomBytes(8).toString('hex'),
+    'X-B3-Sampled': '1',
   };
+  // 设备/会话标识按账号派生（见 deriveDeviceId 注释）：**绝不共用进程级常量**
+  const uidKey = account && (account.uid || account.id);
+  const machineId = deriveDeviceId('machine', uidKey);
+  const sessionId = deriveDeviceId('session', uidKey);
+  if (machineId) h['X-Machine-ID'] = machineId;
+  if (sessionId) h['X-Session-ID'] = sessionId;
   if (account && account.uid) h['X-User-Id'] = account.uid;
   else h['X-No-User-Id'] = '1';
   if (account && account.enterpriseId) h['X-Enterprise-Id'] = account.enterpriseId;
@@ -164,8 +251,12 @@ function chatUserAgent(region) {
 }
 
 /**
- * 发流式请求。返回 { stream, status, raw, convId }。
+ * 发流式请求。返回 { stream, status, headers, convId, reqHeaders }。
  * 走账号的出站代理（proxy-agent），与其它直连通道同规则。
+ *
+ * `reqHeaders` 是**我们实际发出去**的请求头（不是上游回的）：11-128 取证
+ * （dump.js）要对照出站身份头，重建一份会有偏差（X-Request-ID 之类每次随机），
+ * 所以在这里原样回传。
  */
 function postStream(region, account, payload) {
   return new Promise((resolve) => {
@@ -188,7 +279,7 @@ function postStream(region, account, payload) {
       // 长流不能设总超时，否则 SSE 会被掐断（与其它直连通道同口径）
       timeout: 600000,
       ...(agent ? { agent } : {}),
-    }, (res) => resolve({ stream: res, status: res.statusCode, headers: res.headers, convId }));
+    }, (res) => resolve({ stream: res, status: res.statusCode, headers: res.headers, convId, reqHeaders: headers, bodyText: body }));
     req.on('error', (e) => resolve({ stream: null, status: 0, error: e.message, convId }));
     req.on('timeout', () => { req.destroy(); resolve({ stream: null, status: 0, error: 'timeout', convId }); });
     req.write(body);
@@ -315,5 +406,6 @@ function aggregate(chunks, model, opts = {}) {
 
 module.exports = {
   stableConversationId, promptCacheKey, hasFunctionTools, buildChatBody, chatHeaders, chatUserAgent,
+  withoutReasoningFields, deriveDeviceId,
   postStream, readStream, aggregate,
 };

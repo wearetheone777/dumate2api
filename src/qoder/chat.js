@@ -16,6 +16,11 @@ const crypto = require('crypto');
 const { StringDecoder } = require('string_decoder');
 const c = require('./constants');
 const cosy = require('./cosy');
+// 运行期配置（P0-3）：三个计时器与请求体上限改为**每次现读**。
+// 此前它们是模块加载时读一次 env 就定死——调阈值必须重启网关，而这类
+// 「定时器写死」已经造成过一次 6s 误杀大上下文 preflight 的事故。
+// runtime.pick 失败时回落到下面的字面默认值（配置读不到不该让请求 500）。
+const runtime = require('./runtime');
 const { normalizeUsageCache } = require('../usage-norm');
 const { contentText } = require('../images');
 const { payloadError, envelopeStatus, throttleRetryMs } = require('../upstream-errors');
@@ -29,14 +34,22 @@ const TIMEOUT_MS = 600000;
  * → 每次重放几十 MB → 整池进熔断（qoder2api-hub 实测的失败链）。而换号对
  * 体积问题毫无作用——每一份请求一样大。
  */
-const MAX_BODY_MB = Math.max(1, Number(process.env.DUMATE_QODER_MAX_BODY_MB) || 29);
+const MAX_BODY_MB_DEFAULT = 29;
+
+/** 当前生效的请求体上限（MB）。**每次现读**：面板改完不必重启（见 runtime.js） */
+function maxBodyMb() {
+  const v = runtime.pick('timeouts.maxBodyMb', MAX_BODY_MB_DEFAULT);
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 1 ? n : MAX_BODY_MB_DEFAULT;
+}
 
 function assertBodySize(encBody) {
   const bytes = Buffer.byteLength(String(encBody || ''));
-  const limit = MAX_BODY_MB * 1024 * 1024;
+  const mb = maxBodyMb();
+  const limit = mb * 1024 * 1024;
   if (bytes <= limit) return bytes;
   const err = new Error(
-    `Qoder 请求体 ${(bytes / 1048576).toFixed(1)}MB 超过上游单请求上限 ${MAX_BODY_MB}MB：`
+    `Qoder 请求体 ${(bytes / 1048576).toFixed(1)}MB 超过上游单请求上限 ${mb}MB：`
     + '请缩短上下文（减少历史/附件）。换账号无用——这是请求本身体积的问题。',
   );
   err.statusCode = 413;
@@ -458,14 +471,22 @@ function unwrap(raw) {
 // 到点主动断，交给上层换号或如实报错。
 // 正常请求的首字实测在 0.5~2.5s，60s 留了两个数量级的余量；
 // 大上下文确实慢时用 DUMATE_QODER_FIRST_BYTE_MS 放宽（上限参考上游自己的 180s）。
-const FIRST_BYTE_MS = parseInt(process.env.DUMATE_QODER_FIRST_BYTE_MS || '60000', 10);
+const FIRST_BYTE_MS_DEFAULT = 60000;
+
+/** 当前生效的首字节超时（ms，0 = 关闭）。每次现读，见 runtime.js */
+function firstByteMs() {
+  const v = runtime.pick('timeouts.firstByteMs', FIRST_BYTE_MS_DEFAULT);
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : FIRST_BYTE_MS_DEFAULT;
+}
 
 /** 给请求挂一个「首字节」计时器；返回 clear()，收到第一块数据后调用 */
 function armFirstByte(req) {
-  if (!(FIRST_BYTE_MS > 0)) return () => {};
+  const ms = firstByteMs();
+  if (!(ms > 0)) return () => {};
   const timer = setTimeout(() => {
-    req.destroy(new Error(`qoder upstream first-byte timeout (${FIRST_BYTE_MS}ms)`));
-  }, FIRST_BYTE_MS);
+    req.destroy(new Error(`qoder upstream first-byte timeout (${ms}ms)`));
+  }, ms);
   if (typeof timer.unref === 'function') timer.unref();
   return () => clearTimeout(timer);
 }
@@ -477,7 +498,14 @@ function armFirstByte(req) {
 // 上游限流排队（RESOURCE_LIMIT + isQueued）最多沉默 READ_IDLE_MS 就被主动断开，
 // 交给上层换号或如实报错，客户端不用陪跑到被掐。
 // DUMATE_QODER_READ_IDLE_MS 可调，0 关闭。必须大于首字节超时，否则两计时器抢跑。
-const READ_IDLE_MS = parseInt(process.env.DUMATE_QODER_READ_IDLE_MS || '120000', 10);
+const READ_IDLE_MS_DEFAULT = 120000;
+
+/** 当前生效的读空闲超时（ms，0 = 关闭）。每次现读，见 runtime.js */
+function readIdleMs() {
+  const v = runtime.pick('timeouts.readIdleMs', READ_IDLE_MS_DEFAULT);
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : READ_IDLE_MS_DEFAULT;
+}
 
 // 「排队 ack」超时（2026-10-27 加，这才是排队时真正起作用的那个计时器）。
 //
@@ -513,27 +541,36 @@ const READ_IDLE_MS = parseInt(process.env.DUMATE_QODER_READ_IDLE_MS || '120000',
 // 宁可按 prefill 处置。
 //
 // DUMATE_QODER_CONTENT_MS 可调，0 关闭。
-const CONTENT_MS = parseInt(process.env.DUMATE_QODER_CONTENT_MS || '90000', 10);
+const CONTENT_MS_DEFAULT = 90000;
+
+/** 当前生效的「无内容」超时（ms，0 = 关闭）。每次现读，见 runtime.js */
+function contentMs() {
+  const v = runtime.pick('timeouts.contentMs', CONTENT_MS_DEFAULT);
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : CONTENT_MS_DEFAULT;
+}
 
 /** 排队的「无内容」计时器；返回 clear()，转发第一帧真实内容后调用 */
 function armContentDeadline(req) {
-  if (!(CONTENT_MS > 0)) return () => {};
+  const ms = contentMs();
+  if (!(ms > 0)) return () => {};
   const timer = setTimeout(() => {
-    req.destroy(new Error(`qoder upstream queued (no content in ${CONTENT_MS}ms)`));
-  }, CONTENT_MS);
+    req.destroy(new Error(`qoder upstream queued (no content in ${ms}ms)`));
+  }, ms);
   if (typeof timer.unref === 'function') timer.unref();
   return () => clearTimeout(timer);
 }
 
 /** 给请求挂一个「读空闲」计时器；note() 在每块数据到达时重置，clear() 收尾调用 */
 function armReadIdle(req) {
-  if (!(READ_IDLE_MS > 0)) return { note: () => {}, clear: () => {} };
+  const ms = readIdleMs();
+  if (!(ms > 0)) return { note: () => {}, clear: () => {} };
   let timer = null;
   const arm = () => {
     clearTimeout(timer);
     timer = setTimeout(() => {
-      req.destroy(new Error(`qoder upstream read idle (${READ_IDLE_MS}ms)`));
-    }, READ_IDLE_MS);
+      req.destroy(new Error(`qoder upstream read idle (${ms}ms)`));
+    }, ms);
     if (timer.unref) timer.unref();
   };
   arm();
@@ -940,4 +977,7 @@ module.exports = {
   post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
   getQueueStatus, parseQueueStatus, normalizeUsageCache,
   assertBodySize, rememberReasoning, backfillToolCallIds,
+  // 运行期参数读取器（P0-3）：离线验证与 /config 端点用它报当前生效值，
+  // 免得界面显示的是 env 默认值而实际生效的是面板值。
+  firstByteMs, readIdleMs, contentMs, maxBodyMb,
 };

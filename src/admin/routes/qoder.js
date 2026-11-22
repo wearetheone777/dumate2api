@@ -91,14 +91,23 @@ const routes = [
       try {
         const raw = await session.fetchModels(fr.account, { force });
         if (!raw.ok) return sendJSON(res, 200, { models: [], total: 0, region: constants.normalizeRegion(pref.region), error: raw.error || '', fetchedAt: 0 });
+        const reg = constants.normalizeRegion(pref.region);
+        // 叠加**主动探测**结论（P2-20）：模型表声称的输出上限普遍虚高，
+        // 实测过的才有数字。没测过的 probe=null，界面不标注（没测 ≠ 没钳制）。
+        let models = raw.models;
+        try { models = require('../../qoder/output-probe').decorate(raw.models, { region: reg }); }
+        catch (e) { models = raw.models; }
         return sendJSON(res, 200, {
-          models: raw.models,
-          total: raw.models.length,
-          region: constants.normalizeRegion(pref.region),
+          models,
+          total: models.length,
+          region: reg,
           error: '',
           fetchedAt: Date.now(),
           // 倍率语义写清楚：相对值，不是积分绝对值
           rateNote: '倍率是相对值（上游字段 price_factor），实际扣费 = 倍率 × 用量。0.1 档最省，适合调试。',
+          probeNote: 'probe 字段是**实测**输出上限（主动探测落盘）：clamped=被静默钳制（标「32K ⚠ 钳制 4×」）、'
+            + 'at_least=追平过该档（标「64K ✓」）、inconclusive=测不出（标「?」）。'
+            + '**没测过的不标注**——没测 ≠ 没钳制。30 天视为陈旧。',
         });
       } catch (e) {
         return sendJSON(res, 200, { models: [], total: 0, region: region || constants.normalizeRegion(pref.region), error: e.message, fetchedAt: 0 });
@@ -157,6 +166,11 @@ const routes = [
         }
         const acc = fr.account;
         const q = await session.fetchQuota(acc.accessToken, a.region, { agent });
+        // 订阅周期观察（P1-10）：fetchQuota 打的是 `/api/v2/quota/usage`，
+        // 它的响应体里若带周期边界（nextResetAt/expiresAt 一族）就顺手落盘。
+        // 失败不改状态——宁可这次不更新，也不因为一次网络抖动把周期清零。
+        try { require('../../qoder/period').observe(a.id, q.raw || q.data || null); }
+        catch (e) { /* 观察失败不影响额度结果 */ }
         // 签到状态走**只读**的 /campaigns（不领取任何东西），与 TRAE 的
         // checkedIn 同一口径。查失败给 null，不猜成「已签」或「未签」。
         const ck = await session.checkinStatus(acc.accessToken, a.region, { agent });
@@ -224,6 +238,20 @@ const routes = [
       const shownExpiring = region ? expiring.filter((g) => shownIds.has(g.accountId)) : expiring;
       const estSumOf = shownExpiring.reduce((s, r) => s + estOf(r), 0);
       const grantedSumShown = shownExpiring.reduce((s, r) => s + (r.amount || 0), 0);
+      // 本周期扣费（P1-10）：按各账号的周期状态切分账本。多账号各是各的周期，
+      // 「本周期扣费合计」= 各账号本周期之和；任一账号没有周期信息时，
+      // 该账号按全量计并整体标 unbounded（把全量算成本周期是假数据）。
+      const periodMod = require('../../qoder/period');
+      const creditsMod = require('../../qoder/credits');
+      const ledger = creditsMod.readHistory();
+      const perAccountPeriod = rows.map((r) => {
+        const st = periodMod.stateOf(r.id);
+        const sum = periodMod.summarize(ledger, { periodStart: st ? st.periodStart : null, accountId: r.id });
+        return { id: r.id, name: r.nickname, bounded: sum.bounded, ...sum };
+      });
+      const anyUnbounded = perAccountPeriod.some((x) => !x.bounded);
+      const periodCost = perAccountPeriod.reduce((s, x) => s + x.cost, 0);
+      const periodBilled = perAccountPeriod.reduce((s, x) => s + x.billedRequests, 0);
       return sendJSON(res, 200, {
         count: rows.length,
         region: region || undefined,
@@ -249,9 +277,27 @@ const routes = [
           expiringAmount: Number((estOk ? estSumOf : grantedSumShown).toFixed(4)),
           expiringEstimated: estOk,
           expiringGrantedAmount: Number(grantedSumShown.toFixed(4)),
+          // 本周期扣费（P1-10）。**unbounded=true 表示有账号没有周期信息**——
+          // 那部分账号按全量累计计入了，界面必须标注，否则「本周期扣费」
+          // 会被读成真的只花了这么多。
+          period: {
+            bounded: !anyUnbounded,
+            cost: Number(periodCost.toFixed(4)),
+            billedRequests: periodBilled,
+            // 均价用 billed 口径（失败/免费帧不进分母，见 period.js 第 4 条）
+            avgPerBilledRequest: periodBilled > 0
+              ? Number((perAccountPeriod.reduce((s, x) => s + x.billedCost, 0) / periodBilled).toFixed(4))
+              : null,
+            perAccount: perAccountPeriod.map((x) => ({
+              id: x.id, name: x.name, bounded: x.bounded, cost: x.cost,
+              billedRequests: x.billedRequests, avg: x.avgPerBilledRequest,
+            })),
+          },
         },
         // 免费用户实际能用的就是 addOnQuota（签到/赠送）。写清楚避免误读。
-        note: 'addOnQuota 是签到/赠送得到的积分（免费用户实际可用）；userQuota 是订阅套餐内的额度（Free 套餐恒为 0）。两者不可相加。',
+        note: 'addOnQuota 是签到/赠送得到的积分（免费用户实际可用）；userQuota 是订阅套餐内的额度（Free 套餐恒为 0）。两者不可相加。'
+          + 'period 是**本订阅周期**的扣费口径（按各账号的周期边界切分账本，均值只数计费帧）；'
+          + 'bounded=false 说明有账号还没观察到周期边界——那部分按全量累计计入，别把它当成「本周期只花了这些」。',
       });
     },
   },
@@ -360,6 +406,160 @@ const routes = [
     },
   },
   {
+    // 用量分析（P2-17）：reqlog（channel=qoder）⨝ credits 账本（按 req_id）。
+    //
+    // 调研原文「数据源现成，纯前端聚合 + 一个聚合端点」。通用维度（按天/按
+    // 模型/按 Key）已在 /usage/overview；这里补的是 **Qoder 特有的三块**：
+    //   1. **按账号归因**——多账号下「哪个号烧了多少」是 FEFO/护栏调参的依据
+    //   2. **积分 / 1M Token 折算**——上游直给单请求 credits，与 reqlog 的
+    //      tokens 相除即可得每百万 token 的真实成本（比倍率标称值可信）
+    //   3. **本周期消耗**（P1-10 口径）——累计/本周期/计费请求数/均价
+    //
+    // 口径：
+    //   · 只统计 status 200~399 的「成功请求」进 token/延迟/速率指标——失败
+    //     请求单独给 failed 计数，混进均值会把「失败了三次」读成「跑得慢」
+    //   · credits 缺失（上游没给 usage.credits）的行**不补 0**：0 会被读成
+    //     「没花钱」，而真相是没测到；折算比率只将有值的行为分母
+    //   · 吐字速率 = output_tokens ÷ (ms/1000)，只对非零 output 与非零 ms 计算
+    method: 'GET',
+    path: '/usage',
+    handler: async ({ req, res }) => {
+      const days = Math.min(90, Math.max(1,
+        parseInt((req.url.match(/[?&]days=(\d+)/) || [])[1] || '30', 10) || 30));
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' ? 'global' : (regionRaw === 'cn' || regionRaw === 'global' ? regionRaw : '');
+      const since = Date.now() - days * 86400000;
+      const reqlog = require('../../reqlog');
+      const credits = require('../../qoder/credits');
+      const periodMod = require('../../qoder/period');
+      const authStore = require('../../qoder/auth');
+
+      // 账号 id → 名字（账号已删的旧行如实保留 id）
+      const nameOf = new Map(authStore.list().map((a) => [a.id, a.nickname || a.uid || `账号 ${a.id}`]));
+      // credits 账本按 req_id 索引（与请求日志同一关联键）
+      const costByReqId = credits.indexByReqId();
+
+      const rows = reqlog.read({
+        limit: 0,
+        filter: (r) => r && r.channel === 'qoder'
+          && r.ts >= since
+          && (!region || String(r.region || '') === region),
+      }).rows;
+
+      const okRows = rows.filter((r) => r.status >= 200 && r.status < 400);
+      const failed = rows.length - okRows.length;
+      const msRows = okRows.filter((r) => Number(r.ms) > 0);
+      const ftRows = okRows.filter((r) => typeof r.first_token_ms === 'number' && r.first_token_ms > 0);
+      // 吐字速率：output 非零且 ms 非零的流式请求才有意义
+      const rateRows = okRows.filter((r) => (r.output_tokens || 0) > 0 && Number(r.ms) > 0);
+
+      const bucket = (keyOf) => {
+        const m = new Map();
+        for (const r of okRows) {
+          const k = keyOf(r) || '(未知)';
+          let c = m.get(k);
+          if (!c) {
+            c = { key: k, requests: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, credits: 0, credited: 0, msTotal: 0, outputTotal: 0 };
+            m.set(k, c);
+          }
+          c.requests++;
+          c.inputTokens += r.input_tokens || 0;
+          c.outputTokens += r.output_tokens || 0;
+          c.totalTokens += r.total_tokens || 0;
+          c.msTotal += Number(r.ms) || 0;
+          c.outputTotal += r.output_tokens || 0;
+          const cost = costByReqId.get(r.req_id);
+          if (cost && Number.isFinite(Number(cost.credits))) {
+            c.credits += Number(cost.credits);
+            c.credited++;
+          }
+        }
+        return [...m.values()].map((c) => ({
+          ...c,
+          credits: Math.round(c.credits * 10000) / 10000,
+          // 积分 / 1M Token：真实成本密度（倍率标称值的实测对照）
+          creditsPer1M: c.totalTokens > 0 && c.credited > 0
+            ? Math.round((c.credits / c.totalTokens) * 1000000 * 10000) / 10000
+            : null,
+          avgTokPerSec: c.msTotal > 0 && c.outputTotal > 0
+            ? Math.round((c.outputTotal / (c.msTotal / 1000)) * 10) / 10
+            : null,
+        }));
+      };
+
+      const byAccount = bucket((r) => (r.account_id != null ? String(r.account_id) : '(未标注)'))
+        .map((c) => ({ ...c, name: /^\d+$/.test(c.key) ? (nameOf.get(Number(c.key)) || `账号 ${c.key}`) : c.key }))
+        .sort((a, b) => b.credits - a.credits || b.totalTokens - a.totalTokens);
+      const byModel = bucket((r) => r.model).sort((a, b) => b.totalTokens - a.totalTokens);
+
+      // 按天（credits 与 tokens 同轴，前端画双系列）
+      const byDayMap = new Map();
+      for (const r of rows) {
+        const k = credits.dayKey(r.ts);
+        let d = byDayMap.get(k);
+        if (!d) { d = { day: k, requests: 0, tokens: 0, credits: 0, credited: 0 }; byDayMap.set(k, d); }
+        d.requests++;
+        d.tokens += r.total_tokens || 0;
+        const cost = costByReqId.get(r.req_id);
+        if (cost && Number.isFinite(Number(cost.credits))) { d.credits += Number(cost.credits); d.credited++; }
+      }
+      const daily = [];
+      for (let i = days - 1; i >= 0; i--) {
+        const k = credits.dayKey(Date.now() - i * 86400000);
+        const d = byDayMap.get(k) || { day: k, requests: 0, tokens: 0, credits: 0, credited: 0 };
+        daily.push({ ...d, credits: Math.round(d.credits * 10000) / 10000 });
+      }
+
+      // 本周期消耗（P1-10 口径）：按各账号周期状态切分账本
+      const ledger = credits.readHistory();
+      const accounts = authStore.list().filter((a) => !region || constants.normalizeRegion(a.region) === region);
+      const perAccount = accounts.map((a) => {
+        const st = periodMod.stateOf(a.id);
+        const s = periodMod.summarize(ledger, { periodStart: st ? st.periodStart : null, accountId: a.id });
+        return {
+          id: a.id, name: a.nickname || a.uid || `账号 ${a.id}`,
+          bounded: s.bounded, periodStart: s.periodStart,
+          cost: s.cost, billedRequests: s.billedRequests, avg: s.avgPerBilledRequest,
+        };
+      });
+      const anyUnbounded = perAccount.some((x) => !x.bounded);
+
+      return sendJSON(res, 200, {
+        days,
+        region: region || undefined,
+        totals: {
+          requests: rows.length,
+          ok: okRows.length,
+          failed,
+          inputTokens: rows.reduce((s, r) => s + (r.input_tokens || 0), 0),
+          outputTokens: rows.reduce((s, r) => s + (r.output_tokens || 0), 0),
+          totalTokens: rows.reduce((s, r) => s + (r.total_tokens || 0), 0),
+          credits: Math.round(okRows.reduce((s, r) => {
+            const c = costByReqId.get(r.req_id);
+            return s + (c && Number.isFinite(Number(c.credits)) ? Number(c.credits) : 0);
+          }, 0) * 10000) / 10000,
+          avgMs: msRows.length ? Math.round(msRows.reduce((s, r) => s + r.ms, 0) / msRows.length) : null,
+          avgFirstTokenMs: ftRows.length ? Math.round(ftRows.reduce((s, r) => s + r.first_token_ms, 0) / ftRows.length) : null,
+          avgTokPerSec: rateRows.length
+            ? Math.round(rateRows.reduce((s, r) => s + (r.output_tokens / (r.ms / 1000)), 0) / rateRows.length * 10) / 10
+            : null,
+        },
+        byAccount,
+        byModel,
+        daily,
+        period: {
+          bounded: !anyUnbounded,
+          perAccount,
+          cost: Number(perAccount.reduce((s, x) => s + x.cost, 0).toFixed(4)),
+          billedRequests: perAccount.reduce((s, x) => s + x.billedRequests, 0),
+        },
+        note: 'credits 是上游直给的单请求扣费（只有经网关的请求有账）；折算比率只将有值的行为分母，'
+          + '缺失不补 0。period 是本订阅周期口径（P1-10）——bounded=false 表示有账号没观察到周期边界，'
+          + '那部分按全量累计计入。吐字速率 = output_tokens ÷ 耗时，只统计有值请求。',
+      });
+    },
+  },
+  {
     // 计费自检探针：按模型发一个小请求，把「上游实际计费倍率」与模型表
     // 标称值并排返回——上游静默改路由的可见性（融合 qoder2api-hub #113 的
     // /diag/model-billing，数据源是 billed_rate 账本）。**不做自动判定**：
@@ -455,6 +655,101 @@ const routes = [
       const okCount = results.filter((r) => r.ok).length;
       try { require('../auth').audit('admin', 'qoder_checkin', id || 'all', `${okCount}/${results.length}`); } catch (e) { /* 审计失败不影响结果 */ }
       return sendJSON(res, 200, { ok: true, results });
+    },
+  },
+  {
+    // 主动探测模型真实输出上限（P2-20）。**触发式**，不是同步等。
+    //
+    // **为什么必须触发式（2026-11-08 真机实测）**：单档 `max_tokens=4096` 要
+    // 214 秒（completion 24706 / reasoning 23513）。四档串行十几分钟，同步
+    // HTTP 必然超时、浏览器先断。所以与 `/autocheckin/run` 同款：立刻返回
+    // `started`，结果靠 `GET /output-probes` 与 `GET /output-probe/status` 轮询。
+    //
+    // **同一时刻只允许一个**：探测是重额度动作，并发跑等于把「最省的 0.1 档」
+    // 变成四倍消耗。
+    method: 'POST',
+    path: '/output-probe',
+    handler: async ({ res, body }) => {
+      const probe = require('../../qoder/output-probe');
+      const model = String((body && body.model) || '').trim().replace(/^qoder\//, '');
+      if (!model) return sendJSON(res, 400, { ok: false, error: '缺少 model' });
+      const region = constants.normalizeRegion((body && body.region) || 'cn');
+      // 声称上限（裁阶梯用）。取不到就按 65536 探——**声称值只作参考下界**
+      let claimed = null;
+      try {
+        const pref = authStore.preferred();
+        if (pref) {
+          const raw = await session.fetchModels(pref, {});
+          const meta = (raw.ok ? raw.models : []).find((m) => m.key === model || m.name === model);
+          if (meta && meta.maxOutputTokens) claimed = Number(meta.maxOutputTokens);
+        }
+      } catch (e) { /* 表不可用照探 */ }
+      const r = probe.start(model, { region, modelMaxTokens: claimed });
+      if (!r.started) {
+        return sendJSON(res, 409, {
+          ok: false, started: false, error: `已有探测在跑（${probe.status().model}），等它结束`,
+          status: probe.status(),
+        });
+      }
+      try {
+        require('../auth').audit('admin', 'qoder_output_probe', `${region}/${model}`, 'started');
+      } catch (e) { /* 审计失败不影响探测 */ }
+      return sendJSON(res, 200, {
+        ok: true, started: true, model, region,
+        status: probe.status(),
+        note: '已开始探测（异步）。**单档真机约 3~4 分钟**，四档串行可能十几分钟——'
+          + '轮询 GET /output-probe/status 看进度，结论落 data/qoder-output-probes.json。',
+      });
+    },
+  },
+  {
+    // 探测任务状态（不阻塞：只读进程内状态）
+    method: 'GET',
+    path: '/output-probe/status',
+    handler: async ({ res }) => {
+      const probe = require('../../qoder/output-probe');
+      return sendJSON(res, 200, { ok: true, ...probe.status() });
+    },
+  },
+  {
+    // 已探测结论一览（本地落盘，不打上游）
+    method: 'GET',
+    path: '/output-probes',
+    handler: async ({ res, req }) => {
+      const probe = require('../../qoder/output-probe');
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw ? constants.normalizeRegion(regionRaw === 'intl' ? 'global' : regionRaw) : '';
+      const doc = probe.loadProbes();
+      const rows = Object.entries(doc)
+        .map(([k, v]) => ({ key: k, ...v }))
+        .filter((r) => !region || r.region === region)
+        .map((r) => ({
+          model: r.model,
+          region: r.region,
+          verdict: r.verdict,
+          claimed: r.modelMaxTokens || null,
+          actual: r.verdict === 'clamped' ? r.clamped
+            : (r.verdict === 'at_least' ? r.atLeast
+              : (r.verdict === 'unbounded' ? ((r.unbounded && r.unbounded.completion) || null) : null)),
+          unbounded: r.unbounded || null,
+          label: r.verdict === 'unbounded'
+            ? `${probe.fmtK(r.unbounded && r.unbounded.completion)} ۞ 不受 max_tokens（传 ${probe.fmtK(r.unbounded && r.unbounded.requested)}）`
+            : (r.verdict === 'clamped' && r.clamped
+              ? `${probe.fmtK(r.clamped)} ⚠ 钳制${r.modelMaxTokens && r.modelMaxTokens / r.clamped > 1 ? ` ${Math.round((r.modelMaxTokens / r.clamped) * 10) / 10}×` : ''}`
+              : (r.verdict === 'at_least' && r.atLeast ? `${probe.fmtK(r.atLeast)} ✓` : '?')),
+          ts: r.ts,
+          stale: probe.isStale(r),
+        }))
+        .sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      return sendJSON(res, 200, {
+        region: region || undefined,
+        count: rows.length,
+        rows,
+        note: '探测结果落 data/qoder-output-probes.json，30 天视为陈旧。'
+          + '**没测过的模型不在此表**——没测 ≠ 没钳制，别把「表里没有」读成「没问题」。'
+          + '۞ 表示上游不理 max_tokens（真机实测：传 4096 回来 24706）——'
+          + '这不是「上限很大」，而是「没有可测的上限」，别再指望靠它钳制输出量。',
+      });
     },
   },
   {
@@ -609,6 +904,20 @@ const routes = [
         const bs = all.filter((g) => g.accountId === id && g.expiresAt && g.expiresAt > now);
         estByAccount.set(id, grants.estimateRemaining(bs, rem));
       }
+      // 到期分布（P2-18）：按到期日聚合「哪天会一口气作废多少 + 到期前日均需耗量」。
+      // 数据源与逐批明细同源（推算剩余），只是换了个视角——明细看不出
+      // 「明天同时作废 300」这种真风险。
+      const distribution = (() => {
+        const withEst = all
+          .filter((g) => g.expiresAt && g.expiresAt > now)
+          .filter((g) => !region || regionOf(g) === region)
+          .map((g) => {
+            const m = estByAccount.get(g.accountId);
+            const est = m ? m.get(g.grantId) : null;
+            return { ...g, estimatedRemaining: est != null ? est : null };
+          });
+        return grants.expiryDistribution(withEst, now);
+      })();
       // 每批补上派生字段（剩余天数 / 是否已过期 / 推算剩余），前端直接渲染
       const decorate = (g) => {
         const m = estByAccount.get(g.accountId);
@@ -629,6 +938,13 @@ const routes = [
           modelScope: g.modelScope,
           daysLeft: g.expiresAt ? Math.max(0, Math.ceil((g.expiresAt - now) / 86400000)) : null,
           expired: !!(g.expiresAt && g.expiresAt <= now),
+          // 归属核验三态（P0-2）：界面据此把「领取额」读成「真进账」还是
+          // 「额度进了同一个人的另一个号」。老行没有这两个字段 —— 按
+          // unverified 显示，**不默认成 claimed**（那是假数据）。
+          verification: g.verification || 'unverified',
+          verified: g.verified === true ? true : (g.verified === false ? false : null),
+          samePerson: g.samePerson === true,
+          verifyNote: g.verifyNote || '',
         };
       };
       const totalGranted = rows.reduce((s, r) => s + (r.amount || 0), 0);
@@ -662,6 +978,9 @@ const routes = [
         expiringAmount: Number(totalEst.toFixed(4)),
         expiringGrantedAmount: Number(totalGranted.toFixed(4)),
         estimated,
+        // 到期分布（P2-18）：按到期日聚合。remaining 是**推算剩余**，
+        // dailyNeed = 推算剩余 ÷ 剩余天数（「每天要用掉这么多才不亏」）
+        distribution,
         note: '「快过期积分」= 7 天窗口内批次按**先领先扣**模拟分到的余额（总余额来自上游额度接口）。'
           + '上游不按批次扣费，逐批剩余是推算值不是上游数据；amount（领取额）是该批次领到的数量，仅作对照。'
           + (estimated ? '' : '（本次有账号总余额查询失败，界面显示的是领取额口径。）')
@@ -704,6 +1023,60 @@ const routes = [
           errored: accounts.filter((a) => a.lastError).length,
         },
         note: '账号状态为本地落盘快照；额度需查「额度」页（会打上游接口）。',
+      });
+    },
+  },
+  {
+    // 模型锁池视图（P2-19）。本地快照，**不打上游**。
+    //
+    // 回答的是「Qoder 用不了是通道挂了，还是某个模型在排队」——限流早就做成
+    // (账号, 模型) 粒度（`pool.applyModelSoftCooldown`），但这个状态此前**没有任何
+    // 可视化面**：用户只知道「配了 dfmodel 用不了」，不知道「换 qfmodel 立刻可用」。
+    //
+    // 数据源是池快照的 `model_cooldowns`（只含未到期项）。**无锁定是正常态**，
+    // 如实返回空数组（cleared=true），前端据此显示「所有模型均可选」。
+    // 账号总数按区域视图过滤后给，这样「可选 1/2」与账号页的数字同源。
+    method: 'GET',
+    path: '/model-locks',
+    handler: async ({ res, req }) => {
+      const locks = require('../../qoder/model-locks');
+      const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
+      const region = regionRaw === 'intl' ? 'global' : (regionRaw === 'cn' || regionRaw === 'global' ? regionRaw : '');
+      let list = authStore.list();
+      if (region) list = list.filter((a) => constants.normalizeRegion(a.region) === region);
+      let snap = [];
+      try { snap = require('../../pool').pool.snapshot(); } catch (e) { snap = []; }
+      const out = locks.aggregateLocks(snap, {
+        prefix: 'qoder:',
+        total: list.length,
+        now: Date.now(),
+      });
+      // 区域视图下把只属于另一区的锁定账号剔掉：账号 id 不在本区列表里就算别区。
+      // 不剔的话 cn 视图会显示「1 个号被锁」而那个号根本不在 cn 池里。
+      let models = out.models;
+      let lockedAccounts = out.lockedAccounts;
+      if (region) {
+        const ids = new Set(list.map((a) => String(a.id)));
+        const kept = [];
+        for (const m of models) {
+          const accs = m.accounts.filter((x) => ids.has(String(x)));
+          if (!accs.length) continue;
+          kept.push({ ...m, accounts: accs, accountCount: accs.length });
+        }
+        models = kept;
+        lockedAccounts = new Set(kept.flatMap((m) => m.accounts)).size;
+      }
+      return sendJSON(res, 200, {
+        region: region || undefined,
+        models,
+        cleared: models.length === 0,
+        totalAccounts: out.totalAccounts,
+        lockedAccounts,
+        available: Math.max(0, out.totalAccounts - lockedAccounts),
+        note: '模型级冷却是**按 (账号, 模型) 粒度**的：上游同一分钟一个号的 dfmodel 在排队、'
+          + '另一个号的 qfmodel 可能直接可用。所以「某个模型用不了」不等于通道挂了——'
+          + '换模型往往立刻可用。earliestInMs 是「最早有一个号解锁」，'
+          + 'allClearInMs 才是「全池解锁」，两者别混。锁只用于调度，不代表账号健康。',
       });
     },
   },

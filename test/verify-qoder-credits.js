@@ -27,7 +27,8 @@ function ok(name, fn) {
 }
 
 // 用临时目录隔离，避免污染真实数据
-const tmp = fs.mkdtempSync(path.join(require('os').tmpdir(), 'qoder-credits-'));
+const { tmpDir } = require('./helpers/tmpdir');
+const tmp = tmpDir('qoder-credits');
 process.env.DUMATE_ADMIN_DATA = tmp;
 
 (async () => {

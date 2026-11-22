@@ -11,7 +11,8 @@ const path = require('path');
 const fs = require('fs');
 
 // 账号池写临时目录（auth store 落盘）
-process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-wb-login-'));
+const { tmpDir } = require('../helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-wb-login');
 
 const login = require('../../src/workbuddy/login');
 const authStore = require('../../src/workbuddy/auth');

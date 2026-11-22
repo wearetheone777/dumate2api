@@ -15,7 +15,8 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-jsonl-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-jsonl');
 const jsonl = require('../../src/jsonl');
 
 // worker 落成真实文件——`-e` 内嵌脚本要转义路径反斜杠与换行，两种转义叠在

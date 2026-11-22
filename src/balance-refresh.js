@@ -59,6 +59,9 @@ const state = {
   last_run_at: null,
   last_result: null,
   running: false,
+  // Qoder 轮转探活游标（P1-8）。进程内即弃：重启后从 0 号开始重扫一遍，
+  // 一轮之后自然恢复覆盖（N 个账号 N 轮全覆盖，不依赖持久化）
+  qoderCursor: 0,
 };
 
 let timer = null;
@@ -142,10 +145,155 @@ async function collect(opts = {}) {
 }
 
 /**
- * 跑一轮：收余额 → FEFO 快照 → 冷却解冻。
+ * 直连通道的余额扫描（2026-11-08 补）：
+ * WorkBuddy 的 FEFO 快照（`expiring.js`）与额度护栏快照
+ * （`workbuddy/credits-snapshot.js`）都只有 **6 小时 TTL**，而写方原来只有
+ * 管理端 `/credits`。运维不点开页面时快照一过 TTL 就静默失效——真机上
+ * 实测 workbuddy 段的 `at` 已经停了 100+ 小时，护栏快照文件压根没被创建过。
+ *
+ * 接进本模块而不是再起一个定时器：这里本来就是「低频、轻量、串行限速」
+ * 的余额巡检；多一个 10 分钟级的定时器只会让上游看到更密的节奏。
+ *
+ * 口径全部复用 `keepalive` 的 workbuddy adapter（`balance` 取数 +
+ * `persistSnapshots` 落盘），**不在这里重写**——两处各写一份必然漂移
+ * （本仓库已经因为这类复制吃过「文档说做了、代码里没有」的亏）。
+ *
+ * @returns {object|null} null = 通道未启用 / 无可用账号
+ */
+async function collectWorkbuddy(opts = {}) {
+  let ad;
+  try {
+    ad = opts.adapter || keepalive.internals
+      .builtinAdapters().find((a) => a.channel === 'workbuddy');
+  } catch (e) { ad = null; }
+  if (!ad || typeof ad.persistSnapshots !== 'function') return null;
+
+  let list;
+  try { list = ad.list() || []; } catch (e) { return null; }
+  if (!list.length) return null;
+
+  const delay = opts.delay !== undefined ? opts.delay : PER_ACCOUNT_DELAY_MS;
+  const rows = [];
+  for (const a of list) {
+    if (rows.length) await sleep(delay);
+    let b;
+    try {
+      b = opts.balanceOf ? await opts.balanceOf(a) : await ad.balance(a);
+    } catch (e) { b = { ok: false, error: e.message }; }
+    rows.push({
+      channel: 'workbuddy',
+      accountId: a.id != null ? a.id : null,
+      uid: ad.uid(a),
+      name: ad.name(a),
+      ok: !!(b && b.ok),
+      remain: b && Number.isFinite(b.remain) ? b.remain : null,
+      precise: b && Number.isFinite(b.precise) ? b.precise : null,
+      expireNearest: b && Number.isFinite(b.expireNearest) ? b.expireNearest : null,
+      error: (b && b.error) || '',
+    });
+  }
+  const okCount = rows.filter((r) => r.ok).length;
+  // 全失败的轮次照样调 persistSnapshots：它内部会把失败账号走 keepIds，
+  // **at 不推进** —— 这是「部分数据是旧的，不能让快照看起来新鲜」的语义，
+  // 在这里跳过调用反而是另一种错（旧条目该保留的还是要保留）。
+  const out = ad.persistSnapshots(rows);
+  return {
+    accounts: rows.length,
+    ok_count: okCount,
+    fail_count: rows.length - okCount,
+    ...out,
+    rows,
+  };
+}
+
+/**
+ * Qoder 的余额轮转探活（P1-8，docs/QODER-GATEWAY-FEATURE-MERGE.md）。
+ *
+ * 出处：EchoPing07「轮转探活」——后台每轮探测**一个**账号的额度，N 个账号
+ * 最多 N 轮全部刷新，上游调用恒约 1 次/轮；workbuddy panel 的
+ * 「冷却账号余额恢复自动解冻」同一思路。
+ *
+ * **要补的真缺口**：`channelPool.noteCredits` 早就存在（`pool.creditFloor`
+ * 的接线点），但 Qoder 从来没往里写——于是 `DUMATE_POOL_CREDIT_FLOOR`
+ * 保底护栏对 Qoder **完全无效**（`floor_blocked` 恒 false），账号明明耗到
+ * 只剩个位数积分却仍在接流量，每次请求都是注定 402/挂起的浪费。
+ *
+ * **为什么是轮转而不是全量**：Qoder 的额度接口是 `/api/v2/quota/usage`，
+ * 每号一次上游往返；账号多了全量扫会形成明显的机器节奏（hub 风控文档里
+ * 「轮转探活」正是为这个）。所以每轮只探一个，按 id 升序循环。
+ *
+ * **回归口径**：`credits == null` 一律不写（查不到 ≠ 0，写 0 会让保底线
+ * 永久拦住该账号）。这条纪律在 noteCredits 里也有，这里是第二道。
+ *
+ * @param {object} opts 测试注入：list / quota / delay / cursor
+ * @returns {object|null} null = 通道未启用或无可用账号
+ */
+async function collectQoder(opts = {}) {
+  let authStore;
+  let session;
+  try {
+    authStore = require('./qoder/auth');
+    session = require('./qoder/session');
+  } catch (e) { return null; }
+  let list;
+  try { list = opts.list ? opts.list() : authStore.findUsable(); } catch (e) { return null; }
+  list = (list || []).filter((a) => a && a.enabled !== false);
+  if (!list.length) return null;
+
+  // 轮转游标（进程内）：按 id 排序后取下一个，保证「N 个账号 N 轮全覆盖」
+  const sorted = [...list].sort((a, b) => Number(a.id) - Number(b.id));
+  const idx = Number.isInteger(opts.cursor) ? (opts.cursor % sorted.length + sorted.length) % sorted.length
+    : (state.qoderCursor % sorted.length);
+  const a = sorted[idx];
+  state.qoderCursor = (idx + 1) % sorted.length;
+
+  let agent = null;
+  try { agent = require('./proxy-agent').getAgentFor(a); } catch (e) {
+    return { probed: 0, cursor: state.qoderCursor, account: null, error: `出站代理配置错误: ${e.message}` };
+  }
+  let q;
+  try {
+    q = opts.quota
+      ? await opts.quota(a)
+      : await session.fetchQuota(a.accessToken, a.region, { agent });
+  } catch (e) { q = { ok: false, error: e.message }; }
+
+  const name = a.nickname || a.uid || `账号 ${a.id}`;
+  // 有效余额 = 签到积分 + 套餐内（团队号的共享池单列，**不与前面相加**——
+  // 口径见 session.fetchQuota：orgResourcePackage 是「团队池」，个人号没有）
+  const addOn = q && q.ok && q.addOnQuota ? Number(q.addOnQuota.remaining) : null;
+  const user = q && q.ok && q.userQuota ? Number(q.userQuota.remaining) : null;
+  const total = (addOn != null && user != null) ? addOn + user
+    : (addOn != null ? addOn : user);
+  let wrote = false;
+  if (q && q.ok && total != null && Number.isFinite(total)) {
+    // 写进池：这是 `DUMATE_POOL_CREDIT_FLOOR` 对 Qoder 生效的唯一途径
+    try { wrote = require('./channel-pool').noteCredits('qoder', a.id, total); } catch (e) { wrote = false; }
+  }
+  return {
+    probed: q && q.ok ? 1 : 0,
+    cursor: state.qoderCursor,
+    accounts: sorted.length,
+    account: {
+      id: a.id,
+      name,
+      region: a.region,
+      ok: !!(q && q.ok),
+      addOn,
+      user,
+      total: Number.isFinite(total) ? total : null,
+      wrote,
+      error: q && q.ok ? '' : String((q && q.error) || '额度查询失败'),
+    },
+  };
+}
+
+/**
+ * 跑一轮：收余额 → FEFO 快照 → 冷却解冻；再顺带扫一遍直连通道（WorkBuddy + Qoder）。
  * 解冻复用 keepalive 的 reconcile + pool 对接层（同一套「只解硬冷却、
  * 余额查不到不动」的语义，两处各写一份必然漂移）。
- * opts：{ list, quota, pool, delay, trigger }（前四个测试注入）。
+ * opts：{ list, quota, pool, delay, trigger, workbuddy }（前四个测试注入；
+ * workbuddy 是直连通道段的注入点，null = 跳过，便于老用例逐字节不变）
  */
 async function runOnce(trigger = 'manual', opts = {}) {
   if (state.running) return { skipped: 'already_running' };
@@ -160,6 +308,23 @@ async function runOnce(trigger = 'manual', opts = {}) {
     const wrote = expiringSnap.update('dumate',
       okRows.filter((r) => r.expireNearest).map((r) => ({ accountId: r.id, nearest: r.expireNearest })),
       { keepIds: failRows.map((r) => r.id) });
+
+    // 直连通道（WorkBuddy）：失败不拖累主通道结果，单独一段回执
+    let wb = null;
+    if (opts.workbuddy !== null) {
+      try { wb = await collectWorkbuddy({ ...opts.workbuddy, delay: opts.delay }); } catch (e) {
+        wb = { error: e.message };
+      }
+    }
+
+    // 直连通道（Qoder）轮转探活（P1-8）：每轮只探一个账号，写池余额让
+    // `DUMATE_POOL_CREDIT_FLOOR` 保底护栏真正生效。失败不拖累主通道结果。
+    let qd = null;
+    if (opts.qoder !== null) {
+      try { qd = await collectQoder({ ...opts.qoder, delay: opts.delay }); } catch (e) {
+        qd = { error: e.message };
+      }
+    }
 
     // 冷却解冻（keepalive.internals.reconcile：余额 > 阈值 ∩ 冷却中 → 只解硬冷却）
     let rec = { cooling_count: 0, unfrozen: [], below_threshold: [], revive_failed: [] };
@@ -186,11 +351,20 @@ async function runOnce(trigger = 'manual', opts = {}) {
       unfrozen: rec.unfrozen,
       cooling_count: rec.cooling_count,
       revive_failed: rec.revive_failed,
+      workbuddy: wb,
+      qoder: qd,
       rows,
     };
+    const wbNote = wb
+      ? `；WorkBuddy ${wb.ok_count ?? '?'}/${wb.accounts ?? '?'}，FEFO${wb.fefoWrote ? '已更新' : '未写'}`
+      : '';
+    // Qoder 只探一个号，回执写成「探了谁、余额多少、有没有写进池」
+    const qdNote = qd && qd.account
+      ? `；Qoder 探 ${qd.account.name}（${qd.account.ok ? `余额 ${qd.account.total ?? '—'}${qd.account.wrote ? ' 已写池' : ''}` : qd.account.error}）`
+      : '';
     try {
       require('./admin/auth').audit('system', 'balance_refresh', '',
-        `${trigger}: ${okRows.length}/${rows.length}，FEFO${wrote ? '已更新' : '未写'}，解冻 ${rec.unfrozen.length}`);
+        `${trigger}: ${okRows.length}/${rows.length}，FEFO${wrote ? '已更新' : '未写'}，解冻 ${rec.unfrozen.length}${wbNote}${qdNote}`);
     } catch (e) { /* 审计不可用不阻塞 */ }
     return state.last_result;
   } finally {
@@ -207,8 +381,13 @@ function snapshot() {
     running: state.running,
     interval_active: !!timer,
     note: state.enabled
-      ? `每 ${state.minutes} 分钟轻量刷新网页池余额（纯读接口），FEFO 快照随行更新，余额恢复的硬冷却账号自动解冻`
-      : '低频余额刷新未启用——FEFO 快照只在管理端打开相关页面时更新，解冻等每日 keepalive',
+      ? `每 ${state.minutes} 分钟轻量刷新余额（纯读接口）：搭子网页池 + WorkBuddy + Qoder（轮转，每轮一个号）。`
+        + 'FEFO 快照与额度护栏快照随行更新（两者 TTL 都是 6 小时，不刷新就会静默失效），'
+        + '余额恢复的硬冷却账号自动解冻'
+      : '低频余额刷新未启用——FEFO 与护栏快照只在管理端打开相关页面时更新'
+        + '（TTL 6 小时，超时后 FEFO 退回普通轮询、护栏自动失效），解冻等每日 keepalive。'
+        + 'WorkBuddy 每日 keepalive 会顺手写一次，但仍只覆盖 6 小时；'
+        + 'Qoder 的余额快照此时只有管理端点「额度」页会写（保底护栏对 Qoder 期间不生效）',
   };
 }
 
@@ -228,5 +407,7 @@ function configure(patch = {}) {
 
 module.exports = {
   schedule, stop, runOnce, snapshot, configure, state,
-  internals: { collect, loadConfig, PER_ACCOUNT_DELAY_MS, FIRST_RUN_DELAY_MS },
+  // collectWorkbuddy / collectQoder 一并导出：直连通道段的行为（串行、一次落盘、
+  // 轮转游标、失败计数）必须有单测能直接打，否则只能靠「跑一天看看快照新不新」验证
+  internals: { collect, collectWorkbuddy, collectQoder, loadConfig, PER_ACCOUNT_DELAY_MS, FIRST_RUN_DELAY_MS },
 };

@@ -64,6 +64,52 @@ function log(...args) {
   console.log(`[${new Date().toISOString()}]`, ...args);
 }
 
+// 安全响应头（P2-21，docs/QODER-GATEWAY-FEATURE-MERGE.md）。
+//
+// 清单里其余各项此前已逐项落地：登录失败指数退避+IP 限流（audit P1-5）、
+// 恒定时间比较（verifyPwd / session 校验都用 timingSafeEqual）、Cookie
+// HttpOnly+SameSite=Lax（Secure 由 DUMATE_ADMIN_SECURE_COOKIE 控）、请求体
+// 上限先回 413（body-limit.js）、静态路径穿越防护（serveStatic 的 inside
+// 判定）、CORS fail-closed（cors.js）、前端无 v-html（Vue 默认
+// textContent 渲染）。这里补最后一块：**安全响应头**。
+//
+// CSP 的取舍（实测调出来的，别「收紧」）：
+//   script-src 'self'             Vite 的 chunk 全是同源文件，没有内联 script
+//   style-src 'self' 'unsafe-inline'  Vue 的 :style 绑定与 ECharts 的内联
+//                                 样式都是 style 属性（style-src-attr 继承
+//                                 style-src），不放开页面会裸奔
+//   img-src 'self' data:          antd 图标走内嵌 svg data:
+//   connect-src 'self'            管理端只打自己的 /api
+//   frame-ancestors 'none'        等价 X-Frame-Options: DENY，防点击劫持
+//   object-src 'none'; base-uri 'none'  收窄插件与 <base> 注入面
+// 管理端只绑 127.0.0.1，CSP 是纵深防御而不是唯一防线——但「公网化之前
+// 必须做」的就是这一块，现在补齐后公网化只剩改监听地址一件事。
+const CSP_HTML = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "connect-src 'self'",
+  "font-src 'self' data:",
+  "frame-ancestors 'none'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+].join('; ');
+
+/** 给响应补安全头。kind: 'html'（完整 CSP）/ 'json'（API 最小集）。
+ *  返回头对象，由调用方并入 writeHead（sendFile/sendJSON 都走 writeHead）。 */
+function applySecurityHeaders(kind) {
+  const headers = {
+    // nosniff：防「Content-Type 写错被浏览器猜成 html/script」的 MIME 混淆
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+  };
+  if (kind === 'html') headers['Content-Security-Policy'] = CSP_HTML;
+  return headers;
+}
+
 function serveStatic(req, res, urlPath) {
   // 去掉查询串，规范化成 dist 内的相对路径；若越界则回退 index.html。
   // decodeURIComponent 对非法百分号转义会抛 URIError，而本函数由
@@ -108,6 +154,9 @@ function sendFile(req, res, file) {
     const headers = {
       'Content-Type': MIME[ext] || 'application/octet-stream',
       'Content-Length': buf.length,
+      // 安全头（P2-21）：HTML 是唯一可执行上下文，给它完整 CSP；
+      // 其余静态资源（js/css/图片）至少带 nosniff/DENY/no-referrer
+      ...applySecurityHeaders(isEntry ? 'html' : 'static'),
     };
     if (isEntry) {
       const etag = `"${require('crypto').createHash('sha1').update(buf).digest('hex').slice(0, 16)}"`;
@@ -136,6 +185,8 @@ function sendJSON(res, status, data, extraHeaders) {
     // 管理端接口是实时数据（模型表、账号、埋点）。浏览器/中间层一旦缓存
     // 就会把「上游已更新」看成「界面还是旧的」，且普通刷新也不会重新请求。
     'Cache-Control': 'no-store',
+    // 安全头（P2-21）：API 的最小集（HTML 那套 CSP 对 JSON 无意义）
+    ...applySecurityHeaders('json'),
     ...(extraHeaders || {}),
     'Content-Length': Buffer.byteLength(body),
   });
@@ -161,6 +212,8 @@ router.mount(PREFIX + '/logs', require('./routes/logs').routes);
 router.mount(PREFIX + '/metrics', require('./routes/metrics').routes);
 router.mount(PREFIX + '/monthly-billing', require('./routes/monthly-billing').routes);
 router.mount(PREFIX + '/qoder', qoderRoutes);
+// Qoder 运行期配置 + 自动签到排程（P0-3 / P0-1，docs/QODER-GATEWAY-FEATURE-MERGE.md）
+router.mount(PREFIX + '/qoder-runtime', require('./routes/qoder-runtime').routes);
 router.mount(PREFIX + '/workbuddy', workbuddyRoutes);
 router.mount(PREFIX + '/keys', keysRoutes);
 router.mount(PREFIX + '/cc-switch', ccswitchRoutes);
@@ -239,6 +292,13 @@ function start() {
   autotask.schedule();
   // 任务轮询定时器同样只活在进程内，重启后按保存的配置重新排期
   taskScheduler.schedule();
+  // WorkBuddy 自动签到排程（P0-1）：开关默认关，配置落盘后重启自恢复。
+  // 与上面两个排程同进程（管理端）——两个进程各排一份会把上游请求翻倍。
+  try { require('../workbuddy/autocheckin').schedule(); } catch (e) { log(`⚠ WorkBuddy 自动签到排程异常（不阻断启动）: ${e.message}`); }
+  // Qoder 自动签到排程（P0-1）：开关默认关，配置落盘后重启自恢复。
+  // Qoder 零额度时聊天是**挂起**而不是报错——漏签等于通道不可用，所以这条与
+  // WorkBuddy 那条同优先级。同样只在管理端进程排一份（两进程各排会翻倍上游请求）。
+  try { require('../qoder/autocheckin').schedule(); } catch (e) { log(`⚠ Qoder 自动签到排程异常（不阻断启动）: ${e.message}`); }
   // 低频余额刷新（2026-11-07 融合项 P1-5）：默认关闭，配置落盘后重启自恢复
   try { require('../balance-refresh').schedule(); } catch (e) { log(`⚠ 余额刷新排程异常（不阻断启动）: ${e.message}`); }
   // 运维告警规则评估（2026-11-08 调研 P1-6）：默认关闭，环境变量显式开启

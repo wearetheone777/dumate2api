@@ -4,9 +4,8 @@
 // 时间线倒序/过滤/早停、jsonl 轮转跨代查询、重启基线恢复、曲线降采样、
 // 消耗速率、多进程追加。
 // 全部走 tmp 目录与注入时钟，不碰真实 data/。
-process.env.DUMATE_ADMIN_DATA = require('fs').mkdtempSync(
-  require('path').join(require('os').tmpdir(), 'dumate-balancehist-shared-'),
-);
+const { tmpDir } = require('./helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-balancehist-shared');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -15,7 +14,7 @@ const path = require('path');
 const balanceHist = require('../src/balance-hist');
 
 function tmpdir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-balancehist-'));
+  return tmpDir('dumate-balancehist');
 }
 
 const T = new Date(2026, 9, 25, 14, 0).getTime();

@@ -21,6 +21,25 @@ function regionOf(url) {
   return '';
 }
 
+/**
+ * 解析 ?uids=1,2,3（P0-3「只点名缺积分的号」，hub Unreleased）。
+ *
+ * 返回 null = 没点名（全量刷新，旧行为逐字节不变）；Set = 只刷这些账号。
+ * **空串/全是垃圾值也返回 null**——`?uids=` 传空应当被当成「没点名」而不是
+ * 「点名了一个都不刷」，否则前端拼错参数会让页面安然显示空表。
+ */
+function uidsOf(url) {
+  const m = url.match(/[?&]uids=([^&]*)/);
+  if (!m) return null;
+  const raw = decodeURIComponent(m[1] || '');
+  const ids = new Set();
+  for (const part of raw.split(',')) {
+    const n = Number(String(part).trim());
+    if (Number.isInteger(n) && n > 0) ids.add(n);
+  }
+  return ids.size ? ids : null;
+}
+
 const routes = [
   {
     // 通道状态 + 账号列表（脱敏）。?region= 区域视图
@@ -60,6 +79,58 @@ const routes = [
     path: '/restriction',
     handler: async ({ res }) => {
       return sendJSON(res, 200, wb.restrictionState());
+    },
+  },
+  {
+    // 连坐参数（P2-11，hub Unreleased「自定义时长面板化」）。
+    //
+    // 这四个值 2026-11-08 前只是 env、改一次要重启网关。现在读运行期配置
+    // （`src/workbuddy/runtime.js`），env 仍是默认值来源：只设 env 不碰面板的
+    // 部署行为不变。
+    //   GET  → 当前生效值 + env 默认值（界面能看出「哪些是文件覆盖的」）
+    //   PUT  → 保存并**立即按新阈值重算倒计时**（改短 = 现有暂停当场收窄）
+    method: 'GET',
+    path: '/restriction/config',
+    handler: async ({ res }) => {
+      const runtime = require('../../workbuddy/runtime');
+      let config;
+      try { config = runtime.Load(); } catch (e) { config = runtime.defaults(); }
+      return sendJSON(res, 200, {
+        ok: true,
+        config: config.restriction,
+        envDefaults: runtime.defaults().restriction,
+        file: runtime.FILE,
+        note: 'holdSeconds=0 彻底关闭连坐暂停（仍记「哪些号被限制」供观测）；改短时长会立即截断现有倒计时。',
+      });
+    },
+  },
+  {
+    method: 'PUT',
+    path: '/restriction/config',
+    handler: async ({ res, body }) => {
+      const runtime = require('../../workbuddy/runtime');
+      let out;
+      try {
+        out = runtime.Store({ restriction: body || {} });
+      } catch (e) {
+        return sendJSON(res, 400, { ok: false, error: e.message });
+      }
+      // 截断立即生效的落地动作：
+      // 1) 本进程（管理端）内存里若也有暂停，重算快照——restrictionState 已按
+      //    现读配置夹 until，不用额外做事
+      // 2) 网关进程下次判定时自然读到新配置（mtime 失效重读），无需信号文件
+      // 3) 把新的观测快照刷一次，界面不必等下一个请求
+      try { wb.repersistRestriction(); } catch (e) { /* 观测快照刷失败不影响配置落盘 */ }
+      try {
+        require('../auth').audit('admin', 'workbuddy_restriction_config', '',
+          JSON.stringify(out.changed));
+      } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, {
+        ok: true,
+        config: out.config.restriction,
+        changed: out.changed.restriction || {},
+        state: wb.restrictionState(),
+      });
     },
   },
   {
@@ -134,6 +205,138 @@ const routes = [
     },
   },
   {
+    // 模型实时繁忙度（2026-11-08 融合批）
+    //
+    // 用途：**选号/发请求之前**就知道目标模型是否在排队，而不是撞满 429 才退避。
+    // 上游 `/v2/chat/busy` 是唯一「免费、不扣额度、不动账号状态」的接口。
+    //
+    // 三条口径（违反任一条都会把探针变成故障源）：
+    //   1. **国际版 404** → 回 `unsupported: true` 而不是 error，界面显示
+    //      「国际版没有该接口」而不是红字报错；
+    //   2. **≤50 一批**，`busy.js` 内部自动分批；
+    //   3. **只读不拦**：本端点只报告繁忙度，不参与选号。要拦必须显式开
+    //      `DUMATE_WORKBUDDY_BUSY_GUARD=1`（默认关，见 busy.guardEnabled）。
+    method: 'GET',
+    path: '/busy',
+    handler: async ({ res, req }) => {
+      const url = new URL(req.url || '', 'http://x');
+      const region = regionOf(req.url || '') || 'cn';
+      const want = String(url.searchParams.get('models') || '').trim();
+      const busy = require('../../workbuddy/busy');
+      const authStore = require('../../workbuddy/auth');
+
+      // 没点名就取模型表里的全部 id（目录为空时如实返回空，不编）
+      let ids = want ? want.split(',').map((x) => x.trim()).filter(Boolean) : [];
+      if (!ids.length) {
+        try {
+          const m = await require('../../workbuddy/models').fetchModels({ region });
+          ids = (m.models || []).map((x) => x.id).filter(Boolean);
+        } catch (e) { ids = []; }
+      }
+      if (!ids.length) {
+        return sendJSON(res, 200, {
+          ok: true, region, models: [], levels: {}, crowded: [],
+          unsupported: false,
+          guardEnabled: busy.guardEnabled(),
+          note: '没有模型 id 可查（模型目录为空，或 ?models= 未点名）',
+          at: Date.now(),
+        });
+      }
+
+      const usable = authStore.findUsable().filter(
+        (a) => require('../../workbuddy/constants').normalizeRegion(a.region) === region,
+      );
+      if (!usable.length) {
+        return sendJSON(res, 200, {
+          ok: false, region, models: ids, levels: {}, crowded: [],
+          error: `没有可用的${region === 'global' ? '国际' : '国内'}账号，无法探测繁忙度`,
+          // 三个「恒在」字段每个分支都要给：界面靠它们渲染，缺一个就是 undefined，
+          // 而 undefined 在模板里既不是 true 也不是 false（会静默显示成「关」）
+          unsupported: false,
+          guardEnabled: busy.guardEnabled(),
+          note: '没有可用账号，繁忙度不可用——这不代表模型不可用',
+          at: Date.now(),
+        });
+      }
+      // 探针只用第一个账号：繁忙度是**模型级**的上游事实，与哪个账号问无关，
+      // 轮询全部账号只会把上游请求放大 N 倍
+      const acc = await authStore.ensureFresh(usable[0]).catch(() => usable[0]);
+      let r;
+      try {
+        r = await busy.fetchBusy(region, acc, ids);
+      } catch (e) {
+        r = { ok: false, levels: {}, crowded: [], error: e.message };
+      }
+      return sendJSON(res, 200, {
+        ok: !!r.ok,
+        region,
+        models: ids,
+        levels: r.levels || {},
+        crowded: r.crowded || [],
+        unsupported: !!r.unsupported,
+        error: r.error || '',
+        note: r.unsupported
+          ? '国际版没有 /v2/chat/busy 接口（上游 404），繁忙度信息不可用——这是如实的「查不到」，不是通道故障'
+          : '繁忙度是上游的瞬时估算：只作参考，不参与选号（要拦请显式开 DUMATE_WORKBUDDY_BUSY_GUARD=1）',
+        guardEnabled: busy.guardEnabled(),
+        at: Date.now(),
+      });
+    },
+  },
+  {
+    // 成长中心（2026-11-08 融合批，**只读**）
+    //
+    // 调研把「成长任务引擎」列为本项目最大缺失项。这里只做只读聚合：
+    // 连登档位 / 热力墙 / 任务进度 / 成长能量 / 盲盒额度。
+    //
+    // **一个写接口都不调**（不接取任务、不领奖、不开盲盒）：
+    //   1. 调研实证「伪造 /v2/report 成长事件会被上游识别为异常，2026-10-15
+    //      起国际版收紧」——写操作收益（积分）与风险（封号）不对称；
+    //   2. 领奖/接取的 body 形状在调研里被标为「未在 unlocked 态验证」。
+    //
+    // 每次请求打 5 个只读端点，所以**只由界面按需触发**，不进任何自动排程。
+    method: 'GET',
+    path: '/growth',
+    handler: async ({ res, req }) => {
+      const region = regionOf(req.url || '') || 'cn';
+      const url = new URL(req.url || '', 'http://x');
+      const wantId = Number(url.searchParams.get('id') || 0);
+      const growth = require('../../workbuddy/growth');
+      const authStore = require('../../workbuddy/auth');
+      const constants = require('../../workbuddy/constants');
+
+      const usable = authStore.findUsable().filter(
+        (a) => constants.normalizeRegion(a.region) === region,
+      );
+      if (!usable.length) {
+        return sendJSON(res, 200, {
+          ok: false, region, streak: null, heatmap: null, tasks: null,
+          energy: null, buddyQuota: null, errors: {},
+          error: `没有可用的${region === 'global' ? '国际' : '国内'}账号`,
+          note: '只读：不接取任务、不领奖、不开盲盒',
+          at: Date.now(),
+        });
+      }
+      const acc = wantId ? (usable.find((a) => Number(a.id) === wantId) || usable[0]) : usable[0];
+      // 只读查询前先确保 token 新鲜（与 /credits 同口径；失败也用旧 token 试一次）
+      const fresh = await authStore.ensureFresh(acc).catch(() => acc);
+      let out;
+      try {
+        out = await growth.fetchGrowth(region, fresh);
+      } catch (e) {
+        out = {
+          ok: false, region, streak: null, heatmap: null, tasks: null, energy: null,
+          buddyQuota: null, errors: { all: e.message }, note: '', at: Date.now(),
+        };
+      }
+      return sendJSON(res, 200, {
+        ...out,
+        accountId: acc.id,
+        accountName: acc.nickname || acc.uid || `账号 ${acc.id}`,
+      });
+    },
+  },
+  {
     // 模型表（只读，上游下发，双区域目录）
     method: 'GET',
     path: '/models',
@@ -156,20 +359,28 @@ const routes = [
     },
   },
   {
-    // 全部账号的签到状态与额度。?region= 区域视图
+    // 全部账号的签到状态与额度。?region= 区域视图 / ?uids=1,2 只点名刷新
     //
     // **快照按全量账号更新**（traework 同口径）：区域视图只过滤返回行，不缩窄
     // 查询/写入范围——否则国内视图会把国际临期条目忘干净，反过来也一样。
     // 国际版的 checkinStatus / fetchCredits 都是 immediate unsupported（不打
     // 上游），全量查询的额外成本只有国内号本身。
+    //
+    // **?uids=（P0-3，hub Unreleased「只点名缺积分的号」）**：每号一次刷新要打
+    // 三个上游端点（签到状态 + 额度 + 按 TTL 的档位），账号一多既慢又更容易被
+    // 风控注意到。前端积分页只对「额度为 null / 报错」的行点名补刷，其余账号
+    // 一次不发。区域视图与快照口径不变：只刷新点名的号、其余账号的临期条目
+    // 原样保留（`keepIds`），响应带 `scope: 'partial'` 让界面如实标注。
     method: 'GET',
     path: '/credits',
     handler: async ({ res, req }) => {
       const region = regionOf(req.url || '');
+      const uids = uidsOf(req.url || '');
       const proxyAgent = require('../../proxy-agent');
       const rows = [];
       const all = authStore.findUsable();
-      for (const raw of all) {
+      const wanted = uids ? all.filter((a) => uids.has(Number(a.id))) : all;
+      for (const raw of wanted) {
         const a = await authStore.ensureFresh(raw);
         let agent = null;
         try { agent = proxyAgent.getAgentFor(a); } catch (e) {
@@ -206,11 +417,24 @@ const routes = [
       // FEFO 快照：到期取各套餐 CycleEndTime 的最早值，窗口内才进门（与读方
       // 同窗）；查询失败的账号进 keepIds 保留旧条目——「查不到」不是「没有
       // 临期」，写空会让 FEFO 在一次网络抖动后把临期账号忘干净。
+      //
+      // 点名刷新（?uids=）时同理：**没被点名的账号一律进 keepIds**，它们这次
+      // 根本没查，保留旧条目是唯一正确的处置（否则一次补刷会清掉其余账号的
+      // 临期信息，FEFO 立刻退回普通轮询）。
+      //
+      // **代价如实说**：带 keepIds 时 expiring.js **不推进快照心跳 at**（它的
+      // 语义是「部分数据是旧的，不能让快照看起来同样新鲜」），所以只做点名
+      // 补刷不会延长 FEFO 的 TTL。前端进页面本来就走一次全量刷新，正常使用
+      // 不受影响；若长期只补刷，6 小时后 FEFO 会自动退回普通轮询（安全方向）。
       const expiringSnap = require('../../expiring');
       const winMs = expiringSnap.windowDays('workbuddy') * 86400000;
       const nowMs = Date.now();
       const fefoEntries = [];
       const fefoKeep = [];
+      const refreshed = new Set(rows.map((r) => Number(r.id)));
+      for (const raw of all) {
+        if (!refreshed.has(Number(raw.id))) fefoKeep.push(raw.id);
+      }
       for (const r of rows) {
         const expires = (r.packages || [])
           .map((p) => p.expireAt)
@@ -220,12 +444,26 @@ const routes = [
       }
       expiringSnap.update('workbuddy', fefoEntries, { keepIds: fefoKeep });
 
+      // 额度快照（P1-6 护栏的数据源）：与 FEFO 同源同一次查询，落全部账号的
+      // 剩余额。查不到的账号不写（不进快照 = 护栏不知道，不是「剩 0」）；
+      // 点名刷新时未点名的账号原样保留（scope:'partial'）。
+      try {
+        require('../../workbuddy/credits-snapshot').update(
+          rows.map((r) => ({ id: r.id, remain: r.total, precise: r.totalPrecise })),
+          { scope: uids ? 'partial' : 'all' },
+        );
+      } catch (e) { /* 快照写失败不影响 /credits 返回 */ }
+
       // 区域视图：返回的行 / 汇总都按该区域收窄（快照已按全量更新）
       const shown = region ? rows.filter((r) => constants.normalizeRegion(r.region) === region) : rows;
       const known = shown.filter((r) => r.total != null);
       return sendJSON(res, 200, {
         count: shown.length,
         region: region || undefined,
+        // 本次刷新范围：'all' = 全量；'partial' = 只刷了点名的号（其余沿用旧值，
+        // 界面据此提示「未刷新的行显示的是上次结果」）
+        scope: uids ? 'partial' : 'all',
+        requested: uids ? [...uids] : undefined,
         rows: shown,
         summary: {
           total: shown.length,
@@ -265,6 +503,141 @@ const routes = [
       const okCount = out.filter((r) => r.ok).length;
       try { require('../auth').audit('admin', 'workbuddy_checkin', id || (group ? `group:${group}` : 'all'), `${okCount}/${out.length}`); } catch (e) { /* 审计失败不影响结果 */ }
       return sendJSON(res, 200, { ok: true, results: out });
+    },
+  },
+  {
+    // ── 11-128 取证（P1-5，默认关）──
+    //
+    // hub 的 `WB_DUMP_11_128`：上游收紧非官方客户端识别后，11-128 是 Claude Code
+    // 类请求最常见的拒绝码。开关走 env（`DUMATE_WORKBUDDY_DUMP_11_128`，
+    // `1`=摘要 / `full`=含原文），这里只读地告诉操作人「它开没开、落了哪些文件」。
+    //
+    // 为什么不在界面上直接改开关：它是**进程环境变量**，管理端改自己的
+    // process.env 对网关无效（两个进程），做成界面开关会出现「界面显示开了、
+    // 网关其实没开」的假象——那条坑本项目已经踩过（keys.js 的 require_key）。
+    // 所以只读展示 + 操作指引，档位要靠启动参数。
+    method: 'GET',
+    path: '/dumps',
+    handler: async ({ res, req }) => {
+      const dump = require('../../workbuddy/dump');
+      const limit = Math.min(200, Math.max(1, Number((req.url.match(/[?&]limit=(\d+)/) || [])[1]) || 50));
+      return sendJSON(res, 200, {
+        ok: true,
+        ...dump.status(),
+        files: dump.list(limit),
+        howTo: {
+          summary: 'DUMATE_WORKBUDDY_DUMP_11_128=1（只写脱敏摘要：头名清单、body 结构、指纹命中位置，不含提示词）',
+          full: 'DUMATE_WORKBUDDY_DUMP_11_128=full（额外写出站 body 原文，token 已脱敏；排查完请删除文件）',
+          extraCodes: 'DUMATE_WORKBUDDY_DUMP_CODES=11128,6004（默认只认 11-128 / 11128）',
+        },
+        discipline: '11-128 是请求形态判定、不是账号问题：先对照摘要里的身份头与消息形状，不要先轮换账号（换号只会让更多号暴露在同一形态下）。',
+      });
+    },
+  },
+  {
+    // ── 额度护栏（P1-6，调研「积分低于阈值提前拦截」）──
+    //
+    // 现状是**事后**：积分耗尽 → 上游报错 → hard_credit → 402，每次都白打一个
+    // 上游请求。护栏把这件事提前到选号：剩余低于阈值的账号不进候选（护栏是
+    // **选号过滤**而非请求拦截，全被剔除时退回全量，不会把通道弄停）。
+    //
+    // 数据源是 `credits-snapshot`（/credits 顺手写的落盘快照）：快照陈旧/缺失
+    // 时护栏自动失效——不拿旧余额把请求拦死。
+    method: 'GET',
+    path: '/guard',
+    handler: async ({ res }) => {
+      const runtime = require('../../workbuddy/runtime');
+      let cfg;
+      try { cfg = runtime.Load().guard; } catch (e) { cfg = runtime.defaults().guard; }
+      const snap = require('../../workbuddy/credits-snapshot').info();
+      // pool 层的保底线是启动时读 env（`const o` 定死，没有运行期入口），
+      // 所以这里要如实报「当前生效值」与「文件里的值」——两者不一致时
+      // 运维必须看得见，否则改了没反应会被当成 bug。
+      let poolFloor = null;
+      try { poolFloor = require('../../pool').DEFAULTS.creditFloor; } catch (e) { poolFloor = null; }
+      return sendJSON(res, 200, {
+        ok: true,
+        config: cfg,
+        snapshot: snap,
+        // 保底线的真实生效值来自 env（重启才变），与上面的 cfg.creditFloor 可能不同
+        poolFloor,
+        note: '护栏是选号过滤：剩余低于阈值的账号不进候选；快照陈旧/缺失时自动失效（不拿旧余额拦请求）。'
+          + `保留积分下限（creditFloor）由环境变量 DUMATE_POOL_CREDIT_FLOOR 控制，**重启网关才生效**；`
+          + `当前 pool 实际生效值 = ${poolFloor == null ? '未知' : poolFloor}。`,
+      });
+    },
+  },
+  {
+    method: 'PUT',
+    path: '/guard',
+    handler: async ({ res, body }) => {
+      const runtime = require('../../workbuddy/runtime');
+      let out;
+      try {
+        out = runtime.Store({ guard: body || {} });
+      } catch (e) {
+        return sendJSON(res, 400, { ok: false, error: e.message });
+      }
+      try {
+        require('../auth').audit('admin', 'workbuddy_guard_config', '',
+          JSON.stringify(out.changed.guard || {}));
+      } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, {
+        ok: true,
+        config: out.config.guard,
+        snapshot: require('../../workbuddy/credits-snapshot').info(),
+      });
+    },
+  },
+  {
+    // ── 自动签到排程（P0-1，调研文件 docs/WORKBUDDY-FUSION.md）──
+    //
+    // 排程器本体在**管理端进程**（src/workbuddy/autocheckin.js），与 autotask /
+    // task-scheduler / keepalive / balance-refresh 同一处——两个进程各排一份会
+    // 把上游请求翻倍（boot.js 头注释的同一条纪律）。
+    //
+    // **国内版=签到、国际版=网页打卡**（2026-11-08 接通）：上游国际版没有签到
+    // 接口，只有网页 agent 会话打卡（`webagent.dailyActivity`，ACP 建会话跑一轮）。
+    // 那条代码早就写好却全库无调用方——CLAUDE.md 写着「keepalive 的 global 分支
+    // 改为网页打卡」，实际没接。现在由本排程覆盖，`webDaily` 与 `claimed` 分开计数。
+    //
+    // GET  → 开关/时点/抖动/上次结果/下次触发（前端开关与状态展示的数据源）
+    // PUT  → 改配置；**打开时立即跑一轮**，关闭时取消等待中的计划并中断进行中一轮
+    method: 'GET',
+    path: '/autocheckin',
+    handler: async ({ res }) => {
+      const autock = require('../../workbuddy/autocheckin');
+      return sendJSON(res, 200, { ok: true, ...autock.snapshot() });
+    },
+  },
+  {
+    method: 'PUT',
+    path: '/autocheckin',
+    handler: async ({ res, body }) => {
+      const autock = require('../../workbuddy/autocheckin');
+      try {
+        const s = autock.configure(body || {});
+        try {
+          require('../auth').audit('admin', 'workbuddy_autocheckin_config',
+            s.enabled ? 'on' : 'off',
+            `${s.hour}:${String(s.minute).padStart(2, '0')} jitter=${s.jitter_minutes}m`);
+        } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, ...s });
+      } catch (e) {
+        return sendJSON(res, 400, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
+    // 立即跑一轮（不依赖开关状态）。**触发式**：一轮可能跑几秒到几十秒，
+    // 同步 await 会把 HTTP 挂在超时上；结果靠 GET /autocheckin 的 running /
+    // last_result 轮询——与 keepalive/run 同款交付形态。
+    method: 'POST',
+    path: '/autocheckin/run',
+    handler: async ({ res }) => {
+      const autock = require('../../workbuddy/autocheckin');
+      autock.runOnce('manual').catch(() => { /* 轮内失败已落 last_result */ });
+      return sendJSON(res, 200, { ok: true, started: true });
     },
   },
   {

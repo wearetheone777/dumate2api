@@ -205,6 +205,80 @@ DUMATE2API_PORT=9082 node src/server.js
   **自带临时池文件**（`DUMATE_POOL_STATE`）：它会造 429/5xx 惩罚态，写真实池会让
   后续用例选不到账号。
 
+**Qoder 2026-11-08 融合批（P0-1/P0-2/P0-3/P1-6/P1-7/P1-8/P1-11/P2-18）**——七套单测，
+全离线：
+
+- `node --test test/unit/qoder-runtime.test.js`（18 项）——运行期配置热生效、白名单、
+  越界拒绝、并发闸门读面板值、`Store` 在全新数据目录下不 ENOENT。
+- `node --test test/unit/qoder-autocheckin.test.js`（17 项）——时点/只后延抖动/补跑、
+  三态判定（已签/可签/无可领 skipped/**未知不签**）、当日 30 分钟退避与跨日重置、
+  换票失败如实报 refresh、签成写账本。
+- `node --test test/unit/qoder-claim-verify.test.js`（16 项）——归属核验三态
+  （claimed / same_person / **unverified 不猜**）、核验端点是 GET 且**只调 /reward
+  不调 /claim**、grantId 不一致不认账、核验失败不改变签到结论。
+- `node --test test/unit/qoder-balance-probe.test.js`（8 项）——轮转探活（每轮一个号、
+  N 轮全覆盖）、有效余额 = addOn + user、`credits==null` 一律不写池。
+- `node --test test/unit/qoder-pick-strategy.test.js`（6 项）——least-inflight 排序、
+  队首冷却时让位、**粘性优先于策略**、env 按通道隔离。
+- `node --test test/unit/qoder-telemetry.test.js`（11 项）——queued/throttled/rejected
+  三类计数、环形桶清理、`waitOnly` 保守判据、**接线回归**（防「模块写好、无调用方」）。
+- `node --test test/unit/qoder-expiry-distribution.test.js`（8 项）——按自然日聚合、
+  日均需耗量、危险度分级、`null` 不参与合计。
+- `node --test test/unit/qoder-model-locks.test.js`（11 项）——模型锁池视图（P2-19）：
+  按 uid 前缀过滤（池是所有通道共用的）、`earliestInMs` 与 `allClearInMs` 分开给、
+  无锁定是正常态（空数组不造假行）、`available = 总数 − 被锁账号数`。
+- `node --test test/unit/qoder-output-probe.test.js`（15 项）——输出上限主动探测（P2-20）。
+  **真机实测推翻了 workbuddy 那套判据**：Qoder **根本不看 `max_tokens`**（传 4096
+  回来 24706/23363），所以判据改为「`completion > requested × 1.05` → `unbounded`
+  （没有可测的上限）」，且**第一档即停**；同步 HTTP 必然超时（单档 214~256 秒），
+  编排改**触发式**（与 `/autocheckin/run` 同款）。
+
+**Qoder 的 P2 两项**（都离线，另有一个 HTTP 层脚本）：
+`node test/verify-qoder-model-locks-api.js`（7 项，用**真实池单例**造锁，验 HTTP 层）；
+`node test/verify-qoder-runtime-api.js`（10 项，运行期配置与签到排程的端点）。
+
+**协议杂项批**（P2-24 择项落地，2026-11-08）：
+`node --test test/unit/duplicated-v1-hint.test.js`（4 项，重复 `/v1` 的带提示 404，
+**从源码抠正则**锁语义防漂移）、`node --test test/unit/qoder-vl-guard.test.js`
+（10 项，VL 前置校验——**真机实测 Qoder 12/12 模型 `is_vl=true`，当前不触发拦截**，
+保留是为了上游收紧时自动生效）。
+**未做的三项各有实测依据**：`code 115` 按既有定案是「无语义渲染码 → 400 + 不换号」
+（与调研建议的换号处置相反，已由 `verify-qoder-error-surface.js` 锁定）；
+Anthropic 桥 system 改 user 与本项目的前缀缓存实现方向不同（改角色会触及上游对
+system 位置的硬约束）；`/v1/usage` 早已存在（`handleKeyUsage`）。逐条理由见
+`docs/CHANNEL-QODER.md` 的「协议杂项批」节。
+
+**订阅周期统计（P1-10）**：`node --test test/unit/qoder-period.test.js`（10 项）——
+`src/qoder/period.js` 四条边界治理规则（哨兵值 9999 过滤 / 首次保留累计 /
+未推进与后退 ignore、<7 天同周期、≥7 天续期 / 均值只数 billable 帧）。
+**真机实测：Free 账号不存在订阅周期**（`quota/usage` 无周期字段、`/plan` 的
+`end_date=0`），所以 Free 号 `bounded=false` 是正确结论——积分明细页会如实标
+「部分账号未观察到周期边界，此为全量累计口径」。等真出现付费账号再验边界字段；
+**在 Free 号上反复找周期字段是无效劳动**。
+
+**用量分析页（P2-17）**：`GET /api/admin/qoder/usage`——reqlog ⨝ credits 账本
+（按 `req_id`），补 `/usage/overview` 没有的三块：**按账号归因**（埋点前的老行
+如实归「(未标注)」，不猜）、**积分/1M Token 折算**（实测成本密度，错峰折扣与
+缓存命中都体现在实测值里）、**本周期消耗卡**（P1-10 口径）。口径：成功请求才进
+均值、credits 缺失不补 0（折算只将有值的行为分母）、吐字速率只算有值的流式请求。
+真机首批：1183 请求 / 39.4M tokens / 密度 176.62 积分每百万 token / 33.4 tok/s。
+前端在积分明细页 Qoder 区（「用量分析」卡）。
+
+**管理端安全加固（P2-21 收尾）**：`node --test test/unit/admin-security-headers.test.js`
+（9 项）——安全响应头本批补齐（HTML 完整 CSP + 全响应 nosniff/DENY/no-referrer），
+清单其余各项（登录退避/timingSafeEqual/Cookie 属性/body-limit/路径穿越/CORS
+fail-closed/无 v-html）经核对早已落地，本批加**接线自证**防回退。CSP 的
+`style-src 'unsafe-inline'` 是实测必要（Vue :style 与 ECharts 内联样式都是
+style 属性），别盲目收紧——真机回归已过（15 菜单/2 画布/0 破图）。
+**P2-15/16/22/23 经核对已被现有功能覆盖**（聊天测试台、请求日志筛选+
+recordClientInfo、cors.js fail-closed、登录弹窗+文件 mtime 热加载），无需新做。
+至此 Qoder 调研清单**全部处理完毕**：管理端公网化前置清单就绪，公网化只剩改
+监听地址。
+
+`verify-qoder-read-idle.js` 是「运行期配置」改动的**行为回归锚**：它靠「改 env +
+删 require.cache」驱动三种计时器，10 条不变量全绿才说明「模块加载时读一次」确实
+改成现读且语义没变。细节见 `docs/CHANNEL-QODER.md` 的「运行期配置与自动签到」节。
+
 **`node test/qoder-cli.js` 是不开管理端也能验证 Qoder 通道的入口**（与 `traework-login.js` 同定位）：
 `login [cn|global]` 生成授权链接 → `status` → `models`（带倍率排序）→ `quota` →
 `checkin`（领积分）→ `chat "你好" [model]`（**默认用最省的 gfmodel**）→ `remove <id>`。
@@ -619,6 +693,10 @@ per-key 限流（低价值场景）。
 | `DUMATE_WORKBUDDY_MODELS_CACHE_MS` | `600000` | WorkBuddy 模型表缓存时长（10 分钟，按区域分缓存） |
 | `DUMATE_WORKBUDDY_APP_VERSION` | 未设（按区域兜底 5.5.6 / 5.5.2） | 覆盖客户端版本号（进 `X-IDE-Version` 与 chat UA） |
 | `DUMATE_WORKBUDDY_CLI_UA` | `CLI/2.63.2 CodeBuddy/2.63.2` | 模型目录/刷新请求的 UA（上游按它识别 CLI 客户端形态） |
+| WorkBuddy 融合批（2026-11-08）九项 | 见文档 | 连坐四参数（`DUMATE_WORKBUDDY_RESTRICTION_*` / `_RESTRICTED_ROTATE_MAX`，**运行期配置**`data/workbuddy-runtime.json`）、取证（`DUMATE_WORKBUDDY_DUMP_11_128` = `1` 摘要 / `full` 原文、`_DUMP_CODES`）、护栏快照（`_CREDITS_TTL_MS` / `_CREDITS_SNAPSHOT_FILE`）、签到排程（`_CHECKIN_HOUR` / `_MINUTE`）——**逐项口径见 `docs/CHANNEL-WORKBUDDY.md` 第 11 条** |
+| `DUMATE_BODY_DRAIN_MS` | `5000` | 请求体超限后「先回 413」的排空时限（ms），到期 destroy。`0` = 立即断开。原实现读完才回，大包上传中的 RST 会把 413 吞成「连接被重置」 |
+| `DUMATE_POOL_CREDIT_FLOOR` | 未设（`0` 关闭） | pool 层**保留积分下限**：写进池的余额低于它时该账号不进候选（`floorBlockedFor`）。数据源是 `channel-pool.noteCredits`（WorkBuddy 由 `keepalive.persistSnapshots` 顺带写入）。**`createPool` 时定死，改它要重启网关**——`/api/admin/workbuddy/guard` 会回 `poolFloor` 报当前实际生效值，界面在两边不一致时标红提示。与 `guard.threshold` 不是一回事（那个是快照级选号过滤、有 6h TTL） |
+| `DUMATE_PORT_PROBE` | 未设（开启） | 启动前端口占用检查（能连上即算占用，`/health` 不回话也算）。`0` 关闭——容器/编排里端口由外部占用时用 |
 | `DUMATE_QODER_FIRST_BYTE_MS` | `60000` | Qoder 上游**首字节**超时（ms），挡「连响应头都不给」的挂起。`0` 关闭 |
 | `DUMATE_QODER_CONTENT_MS` | `90000` | Qoder 上游**无内容**超时（ms）：排队时上游先回一个空 ack 帧再沉默，首字节计时器会被它清掉，只有这个计时器兜底。只在**还没转发过真实内容**时计时，有内容即撤销。**90s 的依据是成功请求首字实测 > 6s 占 14.4%、> 30s 占 7.6%、max 63.9s**——旧的 12s/6s 会把大上下文 prefill 当成排队误杀（详见 `docs/CHANNEL-QODER.md`）。真排队由 10605 信封在 200~680ms 内识别，不走这个计时器。`0` 关闭 |
 | `DUMATE_QODER_QUEUE_PATIENCE_MS` | `6000` | 排队重试的**总预算**（ms）。实测推翻了「按上游时长耐心等」的旧结论：排队是请求级随机，等 30 秒也不保证放行，所以改为快速轮询几轮（信封本身 150~1000ms 就到）仍失败就如实回 429。`0` = 拿到限流立刻回 429 |
@@ -635,6 +713,10 @@ per-key 限流（低价值场景）。
 | `DUMATE_QODER_QUEUE_POLL` | 未设（开启） | 设 `0` 关闭官方排队轮询协议（信封型限流按 `retryAfterSeconds` 睡眠后重发 + queue/status 放行信号），回到纯快速轮询（429 交还客户端） |
 | `DUMATE_QODER_QUEUE_POLL_BUDGET_MS` | `60000` | 排队等待的**整次请求**预算（ms，所有账号共享）。耗尽后 throttle 错误按旧路交回（429） |
 | `DUMATE_QODER_QUEUE_POLL_INTERVAL_MS` | 按 `retryAfterSeconds`（夹 [5s, 20s]） | 每轮排队等待的睡眠时长。仅供测试注入短间隔，生产别调小——上游明说的等待要尊重 |
+| `DUMATE_QODER_INFLIGHT_MAX` | `0`（= 池默认 4） | **单号并发闸门**（`channel-pool` 的通道级在途帽）。Qoder 的 10605 排队是请求级随机，并发越高越容易撞；设 `1` = 单号串行、超出在**本地排队**。调大无意义（超过上游并发窗口就是撞限流）。面板 `concurrency.inflightMax` 优先于本变量 |
+| `DUMATE_QODER_MIN_INTERVAL_MS` | `0`（关） | 单号最小请求间隔（ms）：上次选号后不足间隔的账号本轮跳过（busy，不惩罚）。约束**发射节奏**不是请求时长。面板 `concurrency.minIntervalMs` 优先 |
+| `DUMATE_QODER_PICK_STRATEGY` | 未设（池默认加权抽签） | 设 `least-inflight` = **最少在途优先**（同分按最久未被选）。加权抽签会把流量压到余额高的号，那恰是最容易排队的时候。**粘性优先于本策略**（前缀缓存命中率比排队概率更值钱）。面板 `concurrency.pickStrategy` 优先 |
+| `DUMATE_QODER_CHECKIN_HOUR` / `_MINUTE` | `10` / `15` | 自动签到排程的每日时点。**取 10:15 而不是 00:00**：上游活动 `Daily reset: 10:00 (UTC+8)`，00:00 去签会撞在「昨天已领、今天没开」的格子里。开关默认关，面板 `#/qoder-runtime` 打开 |
 | `DUMATE_DUMATE_SOURCE` | 未设（`web`） | 搭子凭证来源。未设 = **只用网页凭证**（桌面链路不参与，跳过启动那次约 3 秒的探测；池子不可用时路由层直接拒绝并说明原因，不静默退回桌面链路）。设 `auto`（别名 `desktop`）= 桌面优先、不可用时回落网页池。**无法识别的值按 `web` 处理并在启动日志告警** |
 | `DUMATE_WEB_FALLBACK` | 未设（开启） | 设 `0` 关闭「桌面凭证不可用时回落到网页池」（见 `docs/CREDENTIALS-ACCOUNTS.md`）。关闭后桌面凭证失效即请求全失败 |
 | `DUMATE_POINTS_METER` | 未设（开启） | 设 `0` 关闭搭子的余额游标采集（`points-cursor.js`）。关闭后请求日志不再有逐条消耗 |

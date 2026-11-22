@@ -12,7 +12,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-probe-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-probe');
 process.env.DUMATE_ADMIN_DATA = TMP; // 在 require 之前（grants/credits 落盘隔离）
 const TMP_STATE = path.join(TMP, 'pool-state.json');
 process.env.DUMATE_POOL_STATE = TMP_STATE;

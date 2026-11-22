@@ -49,6 +49,12 @@
           <template #icon><ControlOutlined /></template>
           <span>运行策略</span>
         </a-menu-item>
+        <!-- Qoder 运行策略：超时/排队/冷却热生效 + 自动签到（P0-1/P0-3）。
+             只在 Qoder 通道下出现——它是通道级配置，套到别的通道上是误导 -->
+        <a-menu-item v-if="isAdmin && channelStore.current === 'qoder'" key="qoder-runtime">
+          <template #icon><ControlOutlined /></template>
+          <span>Qoder 运行策略</span>
+        </a-menu-item>
         <!-- 运行日志：进程 console，admin 专属 -->
         <a-menu-item v-if="isAdmin" key="logs">
           <template #icon><CodeOutlined /></template>

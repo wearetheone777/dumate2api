@@ -455,3 +455,435 @@ ratio），panel 会话鉴权后；ratio≠1 的判读口径写在响应 note �
 倍率元数据过期都是合法偏差）。**模型页有「计费自检」按钮**（ModelsView.vue
 的 Qoder 卡 extra，对模型表里倍率最低的模型跑探针，结果按 ratio 偏离 ±5%
 着色成 success/warning）。
+
+---
+
+## 运行期配置与自动签到（2026-11-08 融合批，P0-1/P0-2/P0-3）
+
+出处：[QODER-GATEWAY-FEATURE-MERGE.md](QODER-GATEWAY-FEATURE-MERGE.md) 的第一批（P0）。
+四项一起落地，因为它们互为前提：排程要热配置才敢开、核验要给排程用、面板要能改闸门。
+
+### 1. 运行期配置（P0-3）——修「模块加载时读一次 env 就定死」
+
+`src/qoder/runtime.js`（`data/qoder-runtime.json`，mtime 热读 + 原子写 + filelock）。
+此前 `chat.js` 的三个计时器与请求体上限是**模块加载时**读一次 `process.env`，
+调阈值必须重启网关——这类「定时器写死」已造成过一次事故（`CONTENT_MS` 取 6s
+误杀大上下文 prefill，见本文件前文 90s 修正）。现在 `firstByteMs / contentMs /
+readIdleMs / maxBodyMb` 都是**每次现读**（`chat.js` 的同名函数），面板改完下一次
+请求就生效。
+
+**纪律四条**（与 `workbuddy/runtime.js`、`trae-runtime.js`、`livecfg.js` 同构）：
+
+1. 原子写（tmp + `renameAtomic`）+ 跨进程 filelock；**先 mkdir 再取锁**——
+   全新数据目录下锁文件 `openSync` 会 ENOENT（不是 EEXIST），异常会穿成面板 500。
+2. mtime 失效重读，网关与管理端**共用同一份**。
+3. 白名单：磁盘宽容（未知键丢弃）/ 接口提交严格（未知键 400）。填错键名静默
+   无效是最难查的失败。
+4. **env 仍是默认值来源**——只设 env 不碰面板的部署行为逐字节不变；面板写入后
+   以面板为准，`DELETE /api/admin/qoder-runtime` 删掉面板文件即回落到 env。
+
+**本文件独有的一条**：文件不存在（mtime 0）时**不缓存**默认快照。默认值来自 env，
+而 `test/verify-qoder-read-idle.js` 的手法正是「改 env → 删 require.cache → 重
+require」；缓存了默认快照，该脚本的 10 条不变量会当场失真。
+
+字段：`timeouts.*` / `queue.*`（pollEnabled、pollBudgetMs、patienceMs、stepMs、
+pollIntervalMs、cooldownMs）/ `limits.*`（throttleMaxMs、fefoDays）/ `repair.*`
+（retry、holdCap）/ `concurrency.*`（inflightMax、minIntervalMs、pickStrategy）。
+
+`upstream-errors.js` 的 `THROTTLE_MAX_MS` / `QUEUE_THROTTLE_COOLDOWN_MS` 改成
+**getter**（`Object.defineProperty`），所以既有值引用写法（含
+`verify-qoder-throttle.js`）不用改，而每次读都拿到当前生效值。
+
+### 2. 自动签到排程（P0-1）
+
+`src/qoder/autocheckin.js`（排程在**管理端进程**，与 workbuddy/autocheckin 同处；
+两个进程各排一份会把上游请求翻倍）。
+
+**为什么比 WorkBuddy 的更急**：Qoder 零额度时聊天是**挂起**而不是报错，漏签一天
+等于通道不可用。**时点默认 10:15 不是 00:00**：上游活动 `Daily reset: 10:00 (UTC+8)`，
+00:00 去签会撞在「昨天已领、今天没开」的格子里。
+
+五条口径（放宽任一条都会变成白打上游或白掉一天积分）：
+
+1. 开关默认关，落盘持久化；打开时**立即跑一轮**（点了就想看到结果）。
+2. 时点 + **只后延**的随机抖动（0~10 分钟），整池齐发是机器特征。
+3. 签到前**先查状态**（只读 `/campaigns`）：已签跳过、**状态未知不签**（不拿盲签
+   去赌——盲签失败污染 `lastError`，也在风控画像上白记一笔）、无可领活动 = `skipped`
+   （**有意不重试**，那不是失败）。
+4. 失败**当日退避 30 分钟**再试一次，跨日重置（`withinBackoff` 纯函数）。
+5. 签成写统一签到账本（`channel='qoder'`），失败如实进 `last_result` 不伪造。
+
+统计口径：`failed` 只数**真失败**（领取失败/换票失败），`unknown` 单列——把
+「上游查不到状态」算进 failed 会让它看起来像「签到被打挂了」，而两者该做的事完全不同。
+
+端点：`GET/PUT /api/admin/qoder-runtime/autocheckin`、`POST .../autocheckin/run`
+（触发式，结果靠 GET 轮询）。面板：`#/qoder-runtime`（侧栏「Qoder 运行策略」，
+只在 Qoder 通道下出现）。
+
+### 3. 签到归属只读核验（P0-2）
+
+`session.verifyClaim` + `grants.classifyVerification`。
+
+**核心情报**（workbuddy2api 面板 2026-11-04 真机实测更正版）：每日 100 Credits
+**按账号各发一份**，只有服务端判定「同一个人」时才只发一份（后领的被拒
+`SAME_PERSON_ALREADY_CLAIMED`）。设备指纹（伪造全套/完全不带 Cosy-* 头）与
+`agentAccountScope` **均不参与判定**。
+
+**为什么必须核验**：账本以 `grantId` 为幂等键，但「领过了」与「真领到了」是两回事
+——被判同人的号没有积分进账，账本照记领取额就是假数据，FEFO 推算剩余跟着错
+（把两个号都当成有积分，选号派给一个其实没额度的号）。
+
+三态严格区分，**问不出结论就 `unverified`，不猜不假报**：
+
+| 核验返回 | 结论 | 含义 |
+|---|---|---|
+| `CLAIMED` + grantId 与本号一致 | `claimed` | 真进账 |
+| `BLOCKED` + `SAME_PERSON` | `same_person` | 额度进了同一个人的另一个号 |
+| grantId 不一致 / 未返回 / 请求失败 / 端点 404 | `unverified` | 未核实（附原因） |
+
+**只读的硬约束**：端点是 `GET /sash/api/v1/me/campaigns/{cid}/reward`，绝不触发领取；
+`cid` **只取本账号自己列表里的那个**（拿别人的活动 id 去探账属越界，也会被风控画像
+记一笔）。离线断言直接锁这两条（`test/unit/qoder-claim-verify.test.js`）。
+
+核验失败**不改变签到结论**——签到成功仍是成功，只是标未核实；领取环节被拒时
+`samePerson` 也透出（与普通 403 区分开）。账本行补 `verification`/`verified`/
+`samePerson`/`verifyNote`，老行缺失按 `unverified` 读（**不能默认成 claimed**，
+那是假数据）。
+
+### 4. 余额轮转探活（P1-8）
+
+`balance-refresh.js` 的 `collectQoder`：每轮只探**一个**账号（N 个账号 N 轮全覆盖），
+写 `channelPool.noteCredits('qoder', ...)`。
+
+**要补的真缺口**：`pool.creditFloor` + `floorBlockedFor()` 早就有，但 Qoder 从来没
+往里写过——于是 `DUMATE_POOL_CREDIT_FLOOR` 保底护栏对 Qoder **完全无效**
+（`floor_blocked` 恒 false），账号耗到只剩个位数积分仍在接流量，每次请求都是注定
+402/挂起的浪费。
+
+有效余额 = `addOnQuota.remaining + userQuota.remaining`（团队共享池 `orgResourcePackage`
+**不相加**——它是团队池，口径同 `fetchQuota`）。`credits == null` 一律不写池
+（查不到 ≠ 0，写 0 会让保底护栏永久拦住该号）。
+
+### 5. 并发闸门与选号策略（P1-6/P1-7）
+
+`channel-pool` 的 `inflightMaxOf` / `minIntervalMsOf` / `pickStrategyOf` 对 **qoder**
+优先读运行期配置，env 只作兜底（别的通道仍是纯 env——不要让这里变成「所有通道都
+悄悄改了来源」，那会让既有部署的 env 失效且无从察觉）。
+
+`pickStrategy = 'least-inflight'` 时按「在途少 → 最久未被选」排序，池用
+`pickMode:'first'` 取第一个可用项（绕开池判据是不行的：队首可能正被冷却/在途满/
+保底拦住）。**粘性优先于 least-inflight**：前缀缓存命中率直接影响实付 token，而在途
+均衡只影响排队概率；两者冲突时选前者。
+
+**默认全关（0）**。调研建议 Qoder 默认并发 1，但那是「先埋点观察 10605 率再定阈值」
+的结论（`channel-pool` 原注释就写着这句）；升级时静默把吞吐砍四分之三不是该做的事，
+要不要收紧是显式决定。
+
+### 6. `/health` 风控遥测（P1-11）
+
+`src/qoder/telemetry.js`：滚动 10 分钟、12 个环形桶，分 `queued`（信封型排队，等多久
+都不保证放行）/ `throttled`（调用配额限流，等久了会恢复）/ `rejected`（审核拒绝/模型
+不可用，换号无用）三类计数，`/health` 的 `channels.qoder.telemetry` 直接读。
+
+**要回答的问题**：「Qoder 用不了」是通道坏了还是上游让我们等？两者在客户端看起来
+完全一样（都要等），处置完全不同（等 vs 换号/重登）。判据**复用 upstream-errors 的
+分类**，不另写一套正则（两套必然漂移，「遥测说在排队、实际进了 breaker」比没有遥测
+更糟）。计数只用于观测，**绝不参与选号**。
+
+`waitOnly()` 是给探活降级用的保守判据：窗口内全「等」类、无成功、样本 ≥5 才成立；
+有 1 条成功就返回 false（通道是通的），`rejected` 存在也不算「只是在等」。
+
+### 验证
+
+全部离线，不需要账号与网络：
+
+```bash
+node --test test/unit/qoder-runtime.test.js            # 18 项：热生效/白名单/越界/闸门
+node --test test/unit/qoder-autocheckin.test.js        # 17 项：时点/抖动/三态/退避
+node --test test/unit/qoder-claim-verify.test.js       # 16 项：三态/只读/GrantId 比对
+node --test test/unit/qoder-balance-probe.test.js      # 8 项：轮转/写池/null≠0
+node --test test/unit/qoder-pick-strategy.test.js      # 6 项：在途排序/粘性优先
+node --test test/unit/qoder-telemetry.test.js          # 11 项：三类计数/环形桶/保守判据
+node --test test/unit/qoder-expiry-distribution.test.js # 8 项：按日聚合/日均需耗量
+```
+
+`verify-qoder-read-idle.js` 是这批改动的**行为回归锚**：它靠「改 env + 删 require.cache」
+驱动三种计时器，10 条不变量全绿才说明「模块加载时读一次」确实改成现读了，且语义没变。
+
+---
+
+## 模型锁池视图与输出上限探测（2026-11-08 融合批，P2-19 / P2-20）
+
+### P2-19 模型锁池视图（`src/qoder/model-locks.js`）
+
+**要回答的问题**：「Qoder 用不了」是整条通道挂了，还是**某个模型**在排队？
+
+限流早就是 (账号, 模型) 粒度（`pool.applyModelSoftCooldown`——实测同一分钟一个
+账号的 `dfmodel` 排 4697 位、另一个账号的 `qfmodel` 直接 200），但**这个状态此前
+没有任何可视化面**：用户只知道「配了 dfmodel 用不了」，不知道「换 qfmodel 立刻
+可用」。这正是「Qoder 用不了、网页版正常」那类误诊的根源。
+
+端点 `GET /api/admin/qoder/model-locks`（本地快照，不打上游）。五条口径：
+
+1. **按 uid 前缀过滤**（`qoder:`）——池是所有通道共用的，不过滤会混进别的通道的锁
+2. `earliestInMs` 与 `allClearInMs` **分开给**：前者是「有一个号能用了」，后者才是
+   「这个模型彻底恢复」。只给前者会让人以为马上就通了
+3. **无锁定是正常态**：空数组 + `cleared=true`，不造一行「全部正常」的假数据
+4. `available` = 已登记总数 − 被锁账号数（同一账号锁多个模型只算一次）
+5. `kind` 只做粗分（queue / quota / model / other），**不给处置建议**——
+   判错的代价是让人白等或白换模型，两个都不轻
+
+### P2-20 输出上限主动探测（`src/qoder/output-probe.js`）
+
+与 `max-output.js` 的分工（互补，别合并）：
+
+| | 触发时机 | 代价 |
+|---|---|---|
+| `max-output.js`（被动） | 撞到 400 `Range of max_tokens should be [1, N]` 才学 | **第一次必然先撞一次，用户那一轮是失败的** |
+| `output-probe.js`（主动） | 显式运维动作，提前测 | 烧额度（单档 3~4 分钟） |
+
+**真机实测推翻了两条原本的设计（2026-11-08，`qfmodel` / `max_tokens=4096`）**：
+
+1. **上游根本不看 `max_tokens`**：传 4096，回来 `completion_tokens=24706`
+   （第二次复测 23363），其中 reasoning 23513、`finish_reason=stop`。所以
+   workbuddy 那套「`finish=length` 且明显不足 → clamped」在 Qoder 上**永远测不出
+   东西**——判据改为按 Qoder 的真实形态：`completion > requested × 1.05` 即判
+   **`unbounded`（没有可测的上限）**，这本身就是结论。
+2. **同步 HTTP 必然超时**：单档 214~256 秒，四档串行十几分钟。所以编排改成
+   **触发式**（与 `/autocheckin/run` 同款）：`POST /output-probe` 立刻返回
+   `started`，进度靠 `GET /output-probe/status` 轮询。**同一时刻只允许一个**
+   （重额度动作，并发跑等于把「最省的 0.1 档」变成四倍消耗）。
+
+判据（`judgeStep`，纯函数）：
+
+| 形态 | 判定 |
+|---|---|
+| `completion > requested × 1.05` | `exceeded` → verdict `unbounded`（**第一档即停**，再探只白烧几分钟） |
+| `finish=length` 且 ≥90% 请求值 | `at_least`（真实上限 ≥ 该档，升阶继续） |
+| `finish=length` 且明显不足 | `clamped`（撞了别的顶；此形态真机还没出现，保留以防上游行为变化） |
+| `finish=stop` 且 ≤ 请求值 | `below`（模型自己收尾，没撞顶） |
+| 无 usage / 未知 finish | `inconclusive`（如实记，不猜） |
+
+**上游 400 的显式范围声明是最权威真值**：命中 `Range of max_tokens should be
+[1, N]` 即判 `clamped`、记 `steps[].verdict='declared'`，并顺手
+`max-output.learn(region, model, N)`——之后出站自动 clamp，不再踩第二次。
+
+结果落 `data/qoder-output-probes.json`（30 天视为陈旧）。标注口径：
+
+| verdict | 标注 |
+|---|---|
+| `unbounded` | `23K ۞ 不受 max_tokens（传 4K）`——**要给证据**，否则读者会当成测错了 |
+| `clamped` | `32K ⚠ 钳制 4×`（声称 ÷ 实测） |
+| `at_least` | `64K ✓` |
+| `inconclusive` | `?` |
+| **无记录** | **不标注**——没测过 ≠ 没钳制 |
+
+`fmtK` 按 **1024** 换算（32768 → 32K），与上下游文档的读法一致；按 1000 会写成
+33K/66K，反而增加认知成本。
+
+**这条结论对上游使用的实际影响**：Qoder 的输出长度**无法靠 `max_tokens` 钳制**，
+要控长度只能用提示词。网关层不再为「Qoder 输出太长」做任何 clamp 尝试。
+
+### 验证
+
+```bash
+node --test test/unit/qoder-model-locks.test.js     # 11 项：前缀过滤/双时刻/空态/排序
+node --test test/unit/qoder-output-probe.test.js    # 15 项：判据/第一档即停/触发式编排/标注
+node test/verify-qoder-model-locks-api.js           # 7 项：HTTP 层（真实池单例）
+```
+
+真机留痕：`qfmodel|cn` → `verdict=unbounded, requested=4096, completion=23363,
+elapsed=256s, steps=1`。
+
+---
+
+## 协议杂项批（2026-11-08，P2-24 择项落地）
+
+调研清单的 P2-24 是一包「小而独立」的杂项。逐项核对后**只做了两项、写清三项
+不做的依据**——因为其中几项与本项目已有的实测定案冲突，照抄会破坏现状。
+
+### 做了：重复 `/v1` 前缀的带提示 404
+
+这是接入第一高频错误：base URL 已含 `/v1`，客户端又拼一次 → 打到
+`/v1/v1/chat/completions`。用户看到「网关 404」会去怀疑网关坏了/模型不存在，
+真因却是 base URL 重了一段。
+
+判据 `^/v1(/v1)+(/.*)?$`，命中回 404 + `code: 'duplicated_v1_prefix'` +
+`hint: {received, expected}`，并打一条 WARN（这类错误靠用户自报很难定位）。
+**不静默重写**——重写等于替用户猜意图，而他明明配错了。
+
+真机对照：`/v1/v1/chat/completions` → 404 + 两种改法；`/v1/chat/completions`
+→ 200 且模型链路完好（`GLM-5.3-Flash` 正常回话）。`/v1beta/...`、`/v2/v1/...`
+不误伤。离线断言 `test/unit/duplicated-v1-hint.test.js`（4 项，**从源码抠正则**
+锁语义，防「提示还在、判据被改窄」）。
+
+### 做了：VL 前置校验（`src/qoder/vl-guard.js`）
+
+判据：模型表 `is_vl=false` 且有 `image_url` part → 本地 400，省掉一次注定失败的
+上游调用与几十 MB 图片传输。
+
+**但 2026-11-08 真机实测：本通道目前不会触发拦截**。Qoder 模型表里**全部 12 个
+模型的 `is_vl` 都是 true**（auto / fast / qmodel_38max / qfmodel / dmodel /
+dfmodel / gmodel / gfmodel / kmodel_latest / kmodel / jmodel / mmodel），且实测给
+`gfmodel` 传 1x1 PNG 上游**正常接受**——它只在 reasoning 里用 `<image>` 元描述
+替代真实图像内容（上游自己的降级行为，不是拒绝）。
+
+保留这份校验的三个理由：`is_vl` 是上游下发字段、随时可能收紧（那时自动生效）；
+判据放行优先（表不可用/模型不在表里一律放行），现在留着不误伤；「实测无拦截」
+这件事必须写下来，否则后人会以为忘了接线。
+
+不惩罚账号：`visionBlocked` 在 `poolInfoOf` 里走 400 + 不惩罚——拒绝的是「模型
+不支持」，与账号健康无关（否则一次误配能把整池打冷）。离线断言
+`test/unit/qoder-vl-guard.test.js`（10 项，含一条**真机现状自证**：全 true 时
+不拦、翻一个 false 就拦）。
+
+### 不做：`code 115` 入额度码表（与既有实测冲突）
+
+调研（出处 D3-vin）建议把 115 补进 `quotaKindOfText` 并按 112 处置（换号）。
+**本项目已有相反定案**：115 属「无语义渲染码」，处置是**400 + 不换号**
+（`OPAQUE_SUB400`，见 `index.js` 的码表注释），理由是官方对渲染类错误码是
+「弹错误不重试」，而 hub 的 i18n 里没有 115 的含义。D3-vin 的依据强度低于本项目
+的实测，照抄会把「确定性渲染错误」变成「换号白试三次」。已由
+`verify-qoder-error-surface.js` 锁定（115 必须 reject、不换号、statusCode 压回 400）。
+
+### 不做：Anthropic 桥 system 原位改 user
+
+调研建议 `messages` 里的 system 原位改 user 以保住前缀缓存命中率。**本项目已从
+另一个方向解决了同一问题**：Qoder 的前缀缓存靠 `channel-pool.sessionKeyOf` 的
+会话亲和 + `chat.buildBody` 的 business 派生（缓存亲和单测在
+`test/unit/qoder-cache-affinity.test.js`），不需要改动消息角色。改角色会触及
+上游对 system 位置的硬约束（`repair.js` 头注释记载「system 留在 messages 里是
+上游的硬约束」），风险大于收益。
+
+### 不做：`/v1/usage` 客户端自查端点（已存在）
+
+`handleKeyUsage`（`GET /v1/usage`）早在 M3 就落地了，按请求日志聚合 key 自身的
+用量（today / 7d / 30d，`quota` 如实 null）。与通道无关，Qoder 的请求自动在内。
+无需改动。
+
+### 验证
+
+```bash
+node --test test/unit/duplicated-v1-hint.test.js   # 4 项：判据/不误伤/不静默重写
+node --test test/unit/qoder-vl-guard.test.js       # 10 项：放行优先/文案/不惩罚/现状自证
+```
+
+真机对照（9082，Qoder key）：
+- `/v1/v1/chat/completions` → **404** + `duplicated_v1_prefix` + 两种改法
+- `/v1/chat/completions` → **200**，`model: GLM-5.3-Flash`，credits 0.301
+- `qoder/gfmodel` + 1x1 PNG → **200**（上游接受图片，模型表 12/12 `is_vl=true`）
+
+---
+
+## 订阅周期感知的统计口径（2026-11-08，P1-10）
+
+`src/qoder/period.js`：把「本周期扣了多少」这个问题做出来——本地账本原本是
+**无界累计**，跨过重置点后总量继续变大，而套餐额度其实已经刷新。
+
+### 四条边界治理规则（照抄 EchoPing07，每条都有具体故障对应）
+
+1. **边界以 `nextResetAt` 为权威**、`expiresAt` 兜底（秒/毫秒/ISO 三种形态都认）；
+   **≥ 2100-01-01 是哨兵值必须过滤**——无期限套餐填 `9999-12-31`，采纳会让
+   「本周期」永不到期。
+2. **首次拿到边界保留已累计值**（periodStart 按边界 − 31 天回推；只有回推值
+   落到未来时才夹到 now——那是「边界远于 31 天」的形态，宁可少算也不要凭空
+   造一个未来的起点）。
+3. **边界未推进/后退 → ignore**（上游接口有缓存，会报旧值）；**前进 < 7 天 →
+   同周期**（只更新边界不清零）；**≥ 7 天 → 真实续期**（periodStart 顺延）。
+4. **均值分母是 `billed_requests`**（仅 billable 帧），不是请求总数——总数含
+   失败/免费帧/断流无 usage 帧，会低估均价。
+
+**接线点**：`/qoder/credits` 在每次 `fetchQuota` 后顺手 `period.observe()`（失败
+不改状态——宁可这次不更新，也不因为一次网络抖动把周期清零）；summary 里新增
+`period` 段（`bounded / cost / billedRequests / avgPerBilledRequest / perAccount`）。
+多账号各是各的周期，「本周期扣费合计」= 各账号本周期之和；**任一账号没有周期
+信息时整体标 `bounded=false`**——把全量算成本周期是假数据。
+
+### 真机实测（2026-11-08）：Free 账号不存在「订阅周期」
+
+- `quota/usage` 响应里**没有任何周期字段**（nextReset/resetAt/periodEnd/
+  expiresAt/cycle 全 none）
+- `/api/v2/user/plan` 的 `end_date=0`（无期限）
+
+所以 Free 号的 `bounded=false` 是**正确结论而不是缺口**——积分明细页显示
+「本周期扣费 7,717.1311（计费 1042 次，均价 7.4061/次）· 部分账号未观察到周期
+边界，此为全量累计口径」。等真出现付费账号（`is_paid_plan=true`）再验一次
+边界是否出现；**在 Free 号上反复找周期字段是无效劳动**。
+
+### 验证
+
+```bash
+node --test test/unit/qoder-period.test.js   # 10 项：哨兵过滤/四条治理规则/null≠0/均值口径
+```
+
+---
+
+## 用量分析页（2026-11-08，P2-17）
+
+端点 `GET /api/admin/qoder/usage?days=N&region=`：reqlog（channel=qoder）⨝
+credits 账本（按 `req_id`）。调研原文「数据源现成，纯前端聚合 + 一个聚合端点」
+——通用维度（按天/按模型/按 Key/指标卡）已在 `/usage/overview`，这里补
+**Qoder 特有的三块**：
+
+1. **按账号归因**——多账号下「哪个号烧了多少」是 FEFO/护栏调参的依据。
+   埋点上线前的老行（无 `account_id`）如实归「(未标注)」，**不按模型表猜归属**。
+2. **积分 / 1M Token 折算**——上游直给单请求 credits，与 reqlog 的 tokens
+   相除得每百万 token 的真实成本密度（比倍率标称值可信：错峰折扣、缓存命中
+   都已体现在实测值里）。
+3. **本周期消耗卡**（P1-10 口径）——`period.perAccount` + 合计；
+   `bounded=false` 时界面如实标「部分账号未观察到周期边界，此为全量累计口径」。
+
+口径三条：
+
+- 只统计 status 200~399 的成功请求进 token/延迟/速率均值——失败请求单独给
+  `failed` 计数，混进均值会把「失败了三次」读成「跑得慢」。
+- credits 缺失（上游没给 usage.credits）的行**不补 0**；折算比率只将有值的
+  行为分母（`credited` 字段）。
+- 吐字速率 = `output_tokens ÷ (ms/1000)`，只对非零 output 与非零 ms 计算。
+
+真机首批（近 30 天，9083 实测）：1183 成功请求 / 172 失败 / 39.4M tokens /
+credits 6,954.38 / 密度 **176.62 积分每百万 token** / 吐字 33.4 tok/s /
+首字 8.7s。前端在积分明细页 Qoder 区新增「用量分析」卡（六指标块 + 按账号 +
+按模型 Top 8 两张表），`fetch` 失败不挡本页其它卡。
+
+---
+
+## 管理端安全加固包（2026-11-08，P2-21 收尾）
+
+调研清单逐项核对后发现**大部分早已落地**（分批来自此前的审计与融合），本批
+只补最后一块——**安全响应头**——并加一套接线自证单测防回退。
+
+### 清单核对结果
+
+| 项 | 状态 |
+|---|---|
+| 登录失败指数退避 + IP 窗口限流（429 + Retry-After） | ✅ 已有（audit P1-5：`loginThrottled` / `loginBlocked` / `recordFail`） |
+| API Key 与密码恒定时间比较 | ✅ 已有（`verifyPwd` 与 session 校验都用 `crypto.timingSafeEqual`） |
+| Cookie HttpOnly + SameSite=Lax（Secure 可控） | ✅ 已有（`DUMATE_ADMIN_SECURE_COOKIE` 只在 https 下置位——127.0.0.1 明文 http 下加了会被浏览器丢弃） |
+| 管理 API 请求体上限 | ✅ 已有（body-limit.js：先回 413 再限时排空） |
+| 静态服务路径穿越防护 | ✅ 已有（`target.startsWith(DIST + path.sep)` 判定，越界回落 index.html） |
+| 前端 XSS | ✅ 干净（全库无 `v-html`——Vue 默认 textContent 渲染） |
+| CORS fail-closed | ✅ 已有（cors.js，P0-1；默认不发 ACAO——这也覆盖了 P2-22） |
+| **安全响应头** | ✅ **本批补齐** |
+
+### 本批新增：安全响应头
+
+- **HTML**（`sendFile` 的 `.html` 分支）带完整 CSP：
+  `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+  img-src 'self' data:; connect-src 'self'; font-src 'self' data:;
+  frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'`
+- **JSON API**（`sendJSON`）与静态资源带最小集：
+  `X-Content-Type-Options: nosniff` + `X-Frame-Options: DENY` +
+  `Referrer-Policy: no-referrer`
+
+**CSP 的取舍**（实测调出来的，别盲目收紧）：`style-src` 必须放开
+`unsafe-inline`——Vue 的 `:style` 绑定与 ECharts 的内联样式都是 style **属性**
+（由 `style-src-attr` 继承），不放开整页裸奔；`img-src` 要带 `data:`（antd 内嵌
+svg 图标）；`script-src 'self'` 够用（Vite chunk 全是同源文件，无内联 script）。
+真机回归：15 个菜单、2 个 ECharts 画布、51 个样式表、0 破图——CSP 未误伤。
+
+**接线自证单测**（`test/unit/admin-security-headers.test.js`，9 项）：除锁本批
+的头之外，还把清单其余各项的存在性一并锁住——防后人把它们当冗余删掉
+（「登录退避是防爆破的唯一防线」这类依赖是隐性的）。
+
+至此管理端公网化前置清单**全部就绪**：公网化只剩改监听地址一件事。

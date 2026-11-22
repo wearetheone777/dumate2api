@@ -28,6 +28,29 @@
       </template>
     </a-alert>
 
+    <!-- 配置示例（P2-8，hub #704）：三协议各一段可直接复制的 cURL。
+         本项目是三协议网关，示例比 hub 的 OpenAI-only 还该全——
+         漏一段就会有人拿 OpenAI 的地址去配 Claude Code（路径不同，必 404）。 -->
+    <a-card :bordered="false" class="mt-4">
+      <a-collapse ghost>
+        <a-collapse-panel key="examples" header="配置示例（OpenAI / Responses / Anthropic / Google）">
+          <div class="text-xs text-slate-500 mb-2">
+            Base URL 一律是本机网关；key 用列表里任一把（或 <code>DUMATE2API_KEY</code>）。
+            模型名带通道前缀（<code>workbuddy/glm-5.3</code> / <code>qoder/gfmodel</code>），
+            不带前缀的走搭子。
+          </div>
+          <div v-for="ex in examples" :key="ex.id" class="mb-3">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-sm font-medium">{{ ex.title }}</span>
+              <a-button type="text" size="small" @click="copyExample(ex)">复制</a-button>
+            </div>
+            <div class="text-xs text-slate-500 mb-1">{{ ex.note }}</div>
+            <pre class="example-pre">{{ ex.text }}</pre>
+          </div>
+        </a-collapse-panel>
+      </a-collapse>
+    </a-card>
+
     <a-card :bordered="false">
       <div class="card-head-row">
         <div>
@@ -83,6 +106,7 @@
             <a-tag v-else-if="record.channel === 'traework'" color="purple">仅 TRAE</a-tag>
             <a-tag v-else-if="record.channel === 'dumate'" color="blue">仅搭子</a-tag>
             <a-tag v-else-if="record.channel === 'qoder'" color="geekblue">仅 Qoder</a-tag>
+            <a-tag v-else-if="record.channel === 'workbuddy'" color="magenta">仅 WorkBuddy</a-tag>
             <a-tag v-else color="default">不限</a-tag>
           </template>
           <template v-else-if="column.key === 'region'">
@@ -100,6 +124,10 @@
             <div v-else class="text-xs text-slate-400">IP: 不限</div>
             <div v-if="record.model_allowlist.length" class="text-xs mt-1">
               模型: <span class="font-mono break-words min-w-0">{{ record.model_allowlist.join(', ') }}</span>
+            </div>
+            <!-- 账号白名单（调研 P1-4）：限定这把 key 能调度哪些账号 -->
+            <div v-if="record.account_allowlist && record.account_allowlist.length" class="text-xs mt-1">
+              账号: <span class="font-mono break-words min-w-0">{{ record.account_allowlist.join(', ') }}</span>
             </div>
           </template>
           <template v-else-if="column.key === 'quota'">
@@ -201,6 +229,17 @@
           />
         </a-form-item>
         <a-form-item
+          label="账号白名单"
+          extra="留空 = 不限。条目写账号 id（1）或 通道:id（workbuddy:1）。限定这把 key 只能调度这些账号——比通道绑定更细的一层；选号时生效，名单里没有的账号不会被选中。"
+        >
+          <a-select
+            v-model:value="form.accounts"
+            mode="tags"
+            style="width: 100%"
+            placeholder="留空表示不限制；如 1, workbuddy:2"
+          />
+        </a-form-item>
+        <a-form-item
           label="父 Key（子 Key 模式）"
           extra="选一个主 Key 后本 Key 成为子 Key：父 Key 停用/删除/过期时它一并失效；父 Key 的每日配额是全家共享上限，本 Key 自己的配额是额外收紧。只支持两级。"
         >
@@ -293,13 +332,15 @@ const editing = ref<ApiKey | null>(null)
 const ipError = ref('')
 
 // 通道绑定选项。留空 = 不限（兼容已有 key）
-// 四条通道都要在列：Qoder 接入时这里漏过一次，表现是「key 没法只绑 Qoder」
+// **五条通道都要在列**：Qoder 接入时这里漏过一次、WorkBuddy 接入时又漏了一次，
+// 表现是「key 没法只绑该通道」——选项漏一项，通道绑定功能对那条通道等于不存在。
 const channelOptions = [
   { label: '不限通道', value: '' },
   { label: '仅百度搭子', value: 'dumate' },
   { label: '仅千问办公', value: 'qwenwork' },
   { label: '仅 TRAE Work', value: 'traework' },
   { label: '仅 Qoder', value: 'qoder' },
+  { label: '仅 WorkBuddy', value: 'workbuddy' },
 ]
 
 // 通道用量标签：channel id → [显示名, AntD 语义色]。
@@ -309,6 +350,7 @@ const usageTag: Record<string, [string, string]> = {
   qwenwork: ['千问', 'cyan'],
   traework: ['TRAE', 'purple'],
   qoder: ['Qoder', 'geekblue'],
+  workbuddy: ['WorkBuddy', 'magenta'],
 }
 const tagFor = (ch: string | number): string[] => usageTag[String(ch)] ?? [String(ch), 'default']
 
@@ -322,7 +364,8 @@ const form = reactive({
   name: '',
   ipText: '',
   models: [] as string[],
-  channel: '' as '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder',
+  accounts: [] as string[],
+  channel: '' as '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder' | 'workbuddy',
   region: '' as '' | 'cn' | 'intl',
   expiresAt: null as Dayjs | null,
   note: '',
@@ -425,6 +468,7 @@ function openCreate() {
   form.name = ''
   form.ipText = ''
   form.models = []
+  form.accounts = []
   // 在千问/TRAE 通道下新建，默认绑定到该通道——用户在这一页点「新建」，
   // 想要的显然是能调该通道模型的 key
   form.channel = isQw.value ? 'qwenwork' : isTw.value ? 'traework' : isQd.value ? 'qoder' : ''
@@ -442,7 +486,8 @@ function openEdit(k: ApiKey) {
   form.name = k.name
   form.ipText = k.ip_allowlist.join('\n')
   form.models = [...k.model_allowlist]
-  form.channel = (k.channel || '') as '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder'
+  form.accounts = [...(k.account_allowlist || [])]
+  form.channel = (k.channel || '') as '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder' | 'workbuddy'
   form.expiresAt = k.expires_at ? dayjs(k.expires_at) : null
   form.note = k.note || ''
   form.quotaRequests = k.daily_limit?.requests || 0
@@ -472,6 +517,7 @@ async function save() {
     name: form.name.trim(),
     ip_allowlist: items,
     model_allowlist: form.models,
+    account_allowlist: form.accounts,
     channel: form.channel,
     region: form.region,
     note: form.note,
@@ -535,6 +581,66 @@ async function copyToken() {
   try {
     await navigator.clipboard.writeText(newToken.value)
     message.success('已复制到剪贴板')
+  } catch (e) {
+    message.warning('复制失败，请手动选中复制')
+  }
+}
+
+// 配置示例（P2-8）：三协议各一段 + cURL。
+// **key 用占位符 $KEY 而不是真实值**：示例卡会被截图/粘贴到聊天里，
+// 印真 key 等于把它泄露到截图里。要复制实际 key 请用列表的「查看/复制」。
+const examples = computed(() => {
+  const base = 'http://127.0.0.1:9080'
+  const model = channelStore.current === 'workbuddy' ? 'workbuddy/glm-5.3'
+    : channelStore.current === 'qoder' ? 'qoder/gfmodel'
+      : channelStore.current === 'traework' ? 'traework/glm-5.2'
+        : channelStore.current === 'qwenwork' ? 'qwen/pro'
+          : 'glm-5'
+  return [
+    {
+      id: 'openai',
+      title: 'OpenAI（/v1/chat/completions）',
+      note: 'cc-switch 的 OpenAI 形态、任何 OpenAI SDK 直连',
+      text: `curl ${base}/v1/chat/completions \\
+  -H "Authorization: Bearer $KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","stream":true,"messages":[{"role":"user","content":"你好"}]}'`,
+    },
+    {
+      id: 'responses',
+      title: 'OpenAI Responses（/v1/responses）',
+      note: 'Codex CLI 0.155+ 只认这个协议（wire_api = "responses"）',
+      text: `curl ${base}/v1/responses \\
+  -H "Authorization: Bearer $KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","stream":true,"input":[{"role":"user","content":"你好"}]}'`,
+    },
+    {
+      id: 'anthropic',
+      title: 'Anthropic（/v1/messages）',
+      note: 'Claude Code 的 ANTHROPIC_BASE_URL 指到根路径（不带 /v1 也行，裸 /messages 同样支持）',
+      text: `curl ${base}/v1/messages \\
+  -H "x-api-key: $KEY" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"${model}","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"你好"}]}'`,
+    },
+    {
+      id: 'google',
+      title: 'Google Generative Language（/v1beta/models/...）',
+      note: 'Gemini SDK / 任何 Google 形态客户端',
+      text: `curl "${base}/v1beta/models/${model}:generateContent" \\
+  -H "x-goog-api-key: $KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}'`,
+    },
+  ]
+})
+
+async function copyExample(ex: { text: string }) {
+  try {
+    await navigator.clipboard.writeText(ex.text)
+    message.success('已复制（记得把 $KEY 换成真实 key）')
   } catch (e) {
     message.warning('复制失败，请手动选中复制')
   }

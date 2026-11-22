@@ -85,18 +85,104 @@ function envInt(name) {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
+/**
+ * Qoder 的闸门参数优先读**运行期配置**（P0-3/P1-6），env 只作兜底。
+ *
+ * 为什么只有 qoder 走这条：本批面板只对 Qoder 开了配置面（
+ * `src/qoder/runtime.js`）。别的通道仍是纯 env——不要让这里变成「所有通道
+ * 都悄悄改了来源」，那会让既有部署的 env 失效且无从察觉。
+ */
+function qoderRuntime() {
+  try { return require('./qoder/runtime'); } catch (e) { return null; }
+}
+
 /** 通道级在途帽（0 = 用池默认） */
 function inflightMaxOf(channel) {
+  if (channel === 'qoder') {
+    const rt = qoderRuntime();
+    if (rt) {
+      const v = Number(rt.pick('concurrency.inflightMax', -1));
+      // -1 = 运行期配置读不到 → 回落到 env；0 = 明确「用池默认」
+      if (Number.isFinite(v) && v >= 0) return v > 0 ? v : 0;
+    }
+  }
   return envInt(`DUMATE_${String(channel).toUpperCase()}_INFLIGHT_MAX`);
+}
+
+/**
+ * 负载均衡策略（P1-7，docs/QODER-GATEWAY-FEATURE-MERGE.md）。
+ *
+ *   'default'        池自己的策略（加权抽签 / rr，由 DUMATE_POOL_PICK_MODE 决定）
+ *   'least-inflight' 最少在途优先——同分时按「最久没被选过」兜底
+ *
+ * 为什么需要它：Qoder 的 10605 排队是**请求级随机**的，而并发越高越容易撞。
+ * 加权抽签会把流量压到余额高的号上（那正是最容易排队的时候）；单号并发闸门
+ * 只能挡住「同一个号打两发」，挡不住「池里明明有闲号却还是压在一个号上」。
+ *
+ * 判据只用池里的 `in_flight`（进程内实时值），不引入新状态、不落盘——
+ * 它约束的是发射顺序，不是账号健康。
+ */
+function leastInflightOrder(uids) {
+  const rows = uids.map((uid) => {
+    let st = null;
+    try { st = pool.status(uid); } catch (e) { st = null; }
+    return {
+      uid,
+      inFlight: (st && Number.isFinite(st.in_flight)) ? st.in_flight : 0,
+      // 单调序号（0 = 从没被选过，最优先）；同序号时退到 wall clock 只为稳定
+      seq: lastPickSeq.has(uid) ? lastPickSeq.get(uid) : 0,
+    };
+  });
+  // 在途少优先；在途相同则最久没被选过的优先
+  rows.sort((a, b) => (a.inFlight - b.inFlight) || (a.seq - b.seq));
+  return rows.map((r) => r.uid);
+}
+
+/** 记录一次选号（时间戳 + 单调序号，两处闸门共用） */
+function markPicked(uid, now) {
+  lastPickAt.set(uid, now);
+  lastPickSeq.set(uid, ++pickSeqCounter);
 }
 
 /** 账号最小请求间隔毫秒（0 = 关） */
 function minIntervalMsOf(channel) {
+  if (channel === 'qoder') {
+    const rt = qoderRuntime();
+    if (rt) {
+      const v = Number(rt.pick('concurrency.minIntervalMs', -1));
+      if (Number.isFinite(v) && v >= 0) return v;
+    }
+  }
   return envInt(`DUMATE_${String(channel).toUpperCase()}_MIN_INTERVAL_MS`);
+}
+
+/**
+ * 通道级选号策略（'' = 用池默认）。
+ * `DUMATE_QODER_PICK_STRATEGY=least-inflight` 或面板 concurrency.pickStrategy
+ * 开启最少在途优先（P1-7）。
+ */
+function pickStrategyOf(channel) {
+  if (channel === 'qoder') {
+    const rt = qoderRuntime();
+    if (rt) {
+      const v = String(rt.pick('concurrency.pickStrategy', '__missing__'));
+      if (v !== '__missing__') {
+        return (v === 'least-inflight') ? 'least-inflight' : '';
+      }
+    }
+  }
+  const raw = String(process.env[`DUMATE_${String(channel).toUpperCase()}_PICK_STRATEGY`] || '').trim().toLowerCase();
+  if (raw === 'least-inflight' || raw === 'least_inflight' || raw === 'lifo') return 'least-inflight';
+  return '';
 }
 
 // 上次选号时刻（uid → ts）。进程内即弃——节奏闸门是运行态观测，不落盘。
 const lastPickAt = new Map();
+// 单调序号（uid → seq）。**不能用墙钟判「最久未被选」**：同一毫秒内多次选号
+// 的 last_pick_at 相等，排序会退化成「恒取第一个」（pool 的防撞号窗口也踩过
+// 同一个坑，所以它用 pick_seq 而不是时间戳）。这里同款。
+let pickSeqCounter = 0;
+const lastPickSeq = new Map();
 
 /** 该账号是否还在最小间隔内（true = 本轮跳过） */
 function withinInterval(uid, minMs, now) {
@@ -135,13 +221,17 @@ function pickCandidate(channel, candidates, opts = {}) {
       // 会话暖账号列表优先（front → fallback，hub #718 的 SessionAffinity）：
       // 绑定账号不可用时先试会话的其他暖账号——它们可能还持有上游前缀缓存；
       // 直接跳回池轮询会让长会话每轮换号丢缓存重算 prefill，Token 消耗翻倍。
+      //
+      // **粘性优先于 least-inflight**（P1-7 的取舍，别改）：前缀缓存命中率
+      // 直接影响实付 token，而「在途均衡」只影响排队概率。两者冲突时选前者；
+      // least-inflight 只在暖列表全不可用时接管分配。
       for (const warm of sticky.recent(sessionKey)) {
         if (exclude.has(warm) || busy.has(warm)) continue;
         if (!byUid.has(warm)) continue;          // 不在候选内（区域/FEFO/调用方过滤）
         if (withinInterval(warm, minMs, now)) continue;
         if (!stickyUsable(warm, opts.model)) continue;
         if (pool.acquire(warm, inFlightMax ? { inFlightMax } : undefined)) {
-          lastPickAt.set(warm, now);
+          markPicked(warm, now);
           sticky.bind(sessionKey, warm);         // promote 到 front，原 front 降为 fallback
           return { account: byUid.get(warm), uid: warm, sessionKey };
         }
@@ -156,7 +246,14 @@ function pickCandidate(channel, candidates, opts = {}) {
       }
     }
     if (!uid) {
-      uid = pool.pick(uids, {
+      // 最少在途优先（P1-7）：先按在途/最久未选排序，再让池在**这个顺序**上
+      // 取第一个可用。不直接返回队首——队首可能正被冷却/在途满/保底拦住，
+      // 那些判据全在池里，绕开它会派给一个不可用的号。
+      let ordered = uids;
+      if (pickStrategyOf(channel) === 'least-inflight') {
+        ordered = leastInflightOrder(uids);
+      }
+      uid = pool.pick(ordered, {
         exclude: [...exclude, ...busy],
         model: opts.model,
         paid: opts.paid,
@@ -166,6 +263,9 @@ function pickCandidate(channel, candidates, opts = {}) {
         expiring: opts.expiring,
         // 通道级在途帽（env 配了才生效；0 = 池默认）
         ...(inFlightMax ? { inFlightMax } : {}),
+        // 池的候选顺序即优先级：least-inflight 时让池直接取第一个可用项
+        // （'first'），而不是在排好的队列上再抽签/轮询——那样顺序就白排了。
+        ...(ordered !== uids ? { pickMode: 'first' } : {}),
       });
       if (uid == null) return null;
       // 闸门放在池选择之后（池还不知道间隔这回事）：选中的账号若在最小
@@ -178,7 +278,7 @@ function pickCandidate(channel, candidates, opts = {}) {
       }
     }
     if (pool.acquire(uid, inFlightMax ? { inFlightMax } : undefined)) {
-      lastPickAt.set(uid, now);
+      markPicked(uid, now);
       if (sessionKey) sticky.bind(sessionKey, uid);
       return { account: byUid.get(uid), uid, sessionKey };
     }
@@ -288,6 +388,17 @@ function noteError(channel, id, info) {
     if (cls && cls.kind === 'hard' && cls.durationMs == null && resetHour != null) {
       cls.durationMs = msUntilHour(resetHour);
     }
+    // **模型不可用（11102/11103/11158）走模型级负缓存，不是账号级失败**
+    //（2026-11-08 融合批）：WorkBuddy 把这类码分类成 `model_unavailable` 并带
+    // 上 model 名，但通用 classify 只认 HTTP 状态与文案，认不出这些业务码，
+    // 于是会落到 `base`（kind:null = 不惩罚）——**看起来无害，实际是漏了负缓存**：
+    // 同一个必然失败的 (账号,模型) 组合会被反复重试，每次都白打一次上游。
+    // 这里显式升级成 kind:'model'，让 pool 的 applyModelBlock 按
+    // 「6h 起、命中翻倍、封顶 24h」的既有语义记住它。
+    const explicitKind = info && typeof info === 'object' ? info.kind : null;
+    if (explicitKind === 'model_unavailable' && info.model) {
+      cls.kind = 'model';
+    }
     pool.noteError(uidOf(channel, id), cls);
   } catch (e) { /* 喂池失败不影响请求 */ }
 }
@@ -296,7 +407,64 @@ function noteError(channel, id, info) {
 function _stickySize() { return sticky.size(); }
 function _stickyClear() { sticky.clear(); }
 
+/**
+ * 写入账号余额快照（2026-11-08 融合批）。
+ *
+ * 出处：GitHub 生态调研的「保留积分下限」档（`pool.creditFloor`）。
+ *
+ * **这个函数补的是一个「机制有、接线没接」的缺口**：`pool.js` 早就有
+ * `creditFloor` + `floorBlockedFor()`（余额低于保底线时选号跳过），但
+ * `channel-pool` 从来没把 `setCredits` 暴露出去，于是**直连通道的余额从未
+ * 写进池**，`floor_blocked` 恒为 false、保底护栏对 WorkBuddy 完全无效。
+ *
+ * 口径：
+ *   - `credits == null` 不写入（查不到 ≠ 0，写 0 会让保底线永久拦住该账号）
+ *   - `total` 可选（套餐总量，用于 UI 展示，不参与判定）
+ * @returns {boolean} 是否写入
+ */
+function noteCredits(channel, id, credits, total) {
+  try {
+    // **必须先判 null，再 Number()**：`Number(null) === 0`、`Number('') === 0`，
+    // 直接 Number 会把「查不到」写成「余额 0」——保底线于是永久拦住该账号，
+    // 表现为「这个号明明有额度却从不被选中」。这是本项目反复强调的
+    // 「null ≠ 0」，在接线处最容易犯。
+    if (credits === null || credits === undefined || credits === '') return false;
+    const c = Number(credits);
+    if (!Number.isFinite(c)) return false;
+    if (typeof pool.setCredits !== 'function') return false;
+    let t;
+    if (total !== undefined && total !== null && total !== '') {
+      const n = Number(total);
+      if (Number.isFinite(n)) t = n;
+    }
+    pool.setCredits(uidOf(channel, id), c, t);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 读回某账号的余额快照（`null` = 从未写入过；用于界面与排障） */
+function creditsOf(channel, id) {
+  try {
+    const snap = typeof pool.snapshot === 'function' ? pool.snapshot() : [];
+    const uid = uidOf(channel, id);
+    const row = (snap || []).find((r) => String(r.id) === String(uid));
+    if (!row) return { credits: null, total: null, floorBlocked: false };
+    return {
+      credits: Number.isFinite(row.credits) ? row.credits : null,
+      total: Number.isFinite(row.credits_total) ? row.credits_total : null,
+      floorBlocked: !!row.floor_blocked,
+    };
+  } catch (e) {
+    return { credits: null, total: null, floorBlocked: false };
+  }
+}
+
 module.exports = {
   uidOf, sessionKeyOf, pickCandidate, availability, release, noteSuccess, noteError,
+  noteCredits, creditsOf,
+  // 策略读取器（离线验证与 /config 端点报当前生效策略用）
+  pickStrategyOf, inflightMaxOf, minIntervalMsOf, leastInflightOrder,
   _stickySize, _stickyClear,
 };

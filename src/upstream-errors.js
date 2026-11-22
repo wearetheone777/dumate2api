@@ -202,14 +202,23 @@ const MODEL_QUEUE_TEXT = /"modelKey"\s*:/i;
  * 排队冷却的**上限**。上游按自己的队列长度算 `waitTime`（实测 queueCount
  * 4697 → waitTime 7015 秒），照单全收等于把账号封近两小时，而队列随时在变。
  * 取一个「够久以防止空转、又短到能自己恢复」的窗口。
+ *
+ * **2026-11-08（P0-3）起改为现读**：原先模块加载时读一次 env 就定死，管理端
+ * 面板改完必须重启网关。现在每次分类都重读，来源是 `qoder/runtime.js`
+ * （limits.throttleMaxMs）——该字段本来就是千问与 Qoder **共用**的上限
+ * （`DUMATE_THROTTLE_MAX_MS`），runtime 的默认值也仍从同一个 env 来，所以
+ * 「只设 env 不碰面板」的部署行为逐字节不变。
  */
-const THROTTLE_MAX_MS = Math.max(
-  1000,
-  parseInt(process.env.DUMATE_THROTTLE_MAX_MS || '600000', 10) || 600000,
-);
+function throttleMaxMs() {
+  try {
+    const v = Number(require('./qoder/runtime').pick('limits.throttleMaxMs', 0));
+    if (Number.isFinite(v) && v >= 1000) return v;
+  } catch (e) { /* runtime 不可用（单测只加载本模块）→ 回落 env */ }
+  return Math.max(1000, parseInt(process.env.DUMATE_THROTTLE_MAX_MS || '600000', 10) || 600000);
+}
 
 /**
- * 排队类限流**冷却的上限**（与上面的 `THROTTLE_MAX_MS` 是两回事，别合并）。
+ * 排队类限流**冷却的上限**（与上面的 throttleMaxMs 是两回事，别合并）。
  *
  * 实测 2026-10-29：排队是**请求级随机**的，上游给的 `retryAfterSeconds:30`
  * **不可信**——照它等 3s 三次只成一次，等 10s / 30s 仍全部 `stillThrottled`，
@@ -222,11 +231,19 @@ const THROTTLE_MAX_MS = Math.max(
  *
  * 取 5 秒：够挡住「同一秒连打」的自我放大，又短到下一轮重试就能真实触达上游。
  * 与 `QUEUE_HANG_COOLDOWN_MS` 同一量级，两者都是「排队不是账号坏了」的处置。
+ *
+ * 2026-11-08（P0-3）起现读 `qoder/runtime.js` 的 queue.cooldownMs。
  */
-const QUEUE_THROTTLE_COOLDOWN_MS = Math.max(
-  0,
-  parseInt(process.env.DUMATE_QODER_QUEUE_COOLDOWN_MS || '5000', 10) || 5000,
-);
+function queueThrottleCooldownMs() {
+  try {
+    const v = Number(require('./qoder/runtime').pick('queue.cooldownMs', -1));
+    if (Number.isFinite(v) && v >= 0) return v;
+  } catch (e) { /* 同上 */ }
+  return Math.max(0, parseInt(process.env.DUMATE_QODER_QUEUE_COOLDOWN_MS || '5000', 10) || 5000);
+}
+
+// 兼容取值的懒代理见文件末尾（module.exports 赋值之后）——在赋值之前定义会被覆盖。
+
 
 /**
  * 「排队挂起」类：上游接了请求却没内容，由 chat.js 的计时器主动断开
@@ -417,10 +434,10 @@ function classifyCore(err) {
     // CALL_COUNT_LIMIT（真·调用配额耗尽，等久了确实会恢复）不同。
     const isQueue = QUEUE_TEXT.test(unescapeDeep(full));
     if (isQueue) {
-      out.retryAfterMs = QUEUE_THROTTLE_COOLDOWN_MS;
+      out.retryAfterMs = queueThrottleCooldownMs();
     } else {
       const ms = throttleRetryMs(full);
-      if (ms) out.retryAfterMs = Math.min(ms, THROTTLE_MAX_MS);
+      if (ms) out.retryAfterMs = Math.min(ms, throttleMaxMs());
       // 上游没给时长（排队挂起是自己掐的）：用短冷却，别套 5 分钟基数。
       else if (QUEUE_HANG_TEXT.test(full)) out.retryAfterMs = QUEUE_HANG_COOLDOWN_MS;
     }
@@ -466,7 +483,19 @@ module.exports = {
   payloadError, envelopeStatus, classify, isThrottle, throttleRetryMs, THROTTLE_TEXT,
   isDeterministic,
   isContentPolicy, CONTENT_POLICY_TEXT,
-  QUEUE_TEXT, QUEUE_THROTTLE_COOLDOWN_MS,
+  QUEUE_TEXT,
+  throttleMaxMs, queueThrottleCooldownMs,
   unescapeDeep,
   traeCodeKind, traeCodeOf,
 };
+
+// 兼容取值的懒代理：`QUEUE_THROTTLE_COOLDOWN_MS` / `THROTTLE_MAX_MS` 在既有
+// 代码（含离线脚本 verify-qoder-throttle.js）里是**值引用**，改成函数会静默
+// 变成 NaN 比较。用 getter 保留原写法，同时每次读都拿到当前生效值
+// （P0-3：面板改冷却上限后不必重启网关）。
+Object.defineProperty(module.exports, 'THROTTLE_MAX_MS', {
+  enumerable: true, get: () => throttleMaxMs(),
+});
+Object.defineProperty(module.exports, 'QUEUE_THROTTLE_COOLDOWN_MS', {
+  enumerable: true, get: () => queueThrottleCooldownMs(),
+});

@@ -1,6 +1,6 @@
 // src/admin/routes/checkin.js - 签到详情（按月 / 按年）
 //
-// 回答「某年某月，哪些账号在哪几天签到了」。三条通道各有各的账，这里合并成
+// 回答「某年某月，哪些账号在哪几天签到了」。各通道各有各的账，这里合并成
 // 同一个形状：
 //   - 本地签到账本（src/checkin-ledger.js）：主口径，只记「签成了」
 //   - 搭子 activity.jsonl：历史比账本长，补它
@@ -10,12 +10,18 @@
 //
 // **千问办公没有签到体系**（积分由服务端按天自动发放），所以这条接口
 // 对它直接 400，前端也不渲染这个卡片。
+//
+// **WorkBuddy 2026-11-08 接入**：账本由 `workbuddy/autocheckin.js` 写
+// （channel='workbuddy'，只记「签成了」）。上游**不提供签到历史**，所以这个
+// 通道只有本地账本 + lastCheckin 两个来源，`note` 如实说明覆盖起点。
+// 国际版没有签到接口——但接口不为此 400：账号仍会列出来（用户要看「这个号
+// 从来没签过」而不是「页面报错」），由 `unsupportedCheckin` 字段交代。
 const accounts = require('../../accounts');
 const records = require('../../records');
 const ledger = require('../../checkin-ledger');
 const { sendJSON } = require('../router');
 
-const CHANNELS = ['dumate', 'traework', 'qoder'];
+const CHANNELS = ['dumate', 'traework', 'qoder', 'workbuddy'];
 
 function pad(n) { return String(n).padStart(2, '0'); }
 function daysInMonth(y, m) { return new Date(y, m, 0).getDate(); }
@@ -36,6 +42,9 @@ function rawAccounts(channel) {
   }
   if (channel === 'traework') {
     return require('../../traework/auth').load().accounts.filter((a) => a.enabled !== false);
+  }
+  if (channel === 'workbuddy') {
+    return require('../../workbuddy/auth').load().accounts.filter((a) => a.enabled !== false);
   }
   return require('../../qoder/auth').load().accounts.filter((a) => a.enabled !== false);
 }
@@ -191,11 +200,23 @@ const routes = [
         months.push({ month: m, days: days.size, accountDays, hasData: accountDays > 0 });
       }
 
-      const accountsOut = [...byId.values()].map((a) => ({
-        ...a,
-        daysInMonth: Object.keys(a.days).filter((d) => d >= monthFrom && d <= monthTo).length,
-        checkedToday: !!a.days[today],
-      }));
+      const accountsOut = [...byId.values()].map((a) => {
+        // 同名遮蔽会 TDZ（Cannot access 'raw' before initialization）：
+        // 外层已有 const raw = rawAccounts(channel)，这里必须换名
+        const rawRow = raw.find((x) => Number(x.id) === Number(a.id));
+        // WorkBuddy 国际版没有签到接口（上游明确不支持）：**账号照列**，
+        // 但标出来，界面显示「不支持」而不是让人以为「这号一直没签」。
+        const wbc = require('../../workbuddy/constants');
+        const unsupportedCheckin = channel === 'workbuddy'
+          && wbc.normalizeRegion(rawRow && rawRow.region) === 'global';
+        return {
+          ...a,
+          daysInMonth: Object.keys(a.days).filter((d) => d >= monthFrom && d <= monthTo).length,
+          checkedToday: !!a.days[today],
+          unsupportedCheckin,
+          region: channel === 'workbuddy' ? wbc.normalizeRegion(rawRow && rawRow.region) : undefined,
+        };
+      });
 
       // 7) 覆盖范围：如实说清「本地从哪天开始有记录」，否则「账本里没有」
       //    会被读成「那天没签到」。
@@ -230,8 +251,12 @@ const routes = [
         : channel === 'qoder'
           ? 'Qoder 上游不提供签到历史；这里合并本地签到账本与积分领取账本'
             + '（领取额，不是剩余额），自 ' + (cov.since || '（暂无）') + ' 起记录。'
-          : 'TRAE 上游不提供签到历史；这里的数据来自本地签到账本，'
-            + '自 ' + (cov.since || '（暂无）') + ' 起记录。';
+          : channel === 'workbuddy'
+            ? 'WorkBuddy 上游不提供签到历史；这里的数据来自本地签到账本（由自动/手动'
+              + '签到写入，只记「签成了」），自 ' + (cov.since || '（暂无）') + ' 起记录。'
+              + '国际版没有签到接口，该区域账号标为「不支持」。'
+            : 'TRAE 上游不提供签到历史；这里的数据来自本地签到账本，'
+              + '自 ' + (cov.since || '（暂无）') + ' 起记录。';
 
       return sendJSON(res, 200, {
         channel,

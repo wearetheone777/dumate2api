@@ -48,3 +48,26 @@ export function relTime(ts: number | null | undefined, now: number = Date.now())
 export function errorWhen(ts: number | null | undefined, now: number = Date.now()): string {
   return ts ? `${relTime(ts, now)}：` : '较早：'
 }
+
+/**
+ * 数据是否已经「过期」（超过 ttlMs 没更新）。
+ *
+ * 为什么单独抽出来：这是「如实标注旧数据」的判据，界面上要据此变色/加话术。
+ * 若写在组件里，只有靠肉眼等够 ttl 才能验证一次，回归时必然漂——而这类
+ * 「看着是新的、其实是旧的」恰恰是本项目最忌讳的假象之一。
+ *
+ * 语义边界（刻意选的方向）：
+ * - `ts` 为空 → **不算过期**。没数据时应显示「尚未读取」，那是另一句话，
+ *   不该被标成「已过期」（旧数据过期 vs 从来没有数据，处置不同）。
+ * - `ttlMs <= 0` → 永不过期（与 expiring/credits-snapshot 的开关口径一致）。
+ * - 时间戳在未来（时钟回拨/跨机）→ 算新鲜，不因负数差值误报过期。
+ */
+export function isStale(
+  ts: number | null | undefined,
+  ttlMs: number,
+  now: number = Date.now(),
+): boolean {
+  if (ts == null) return false
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) return false
+  return now - ts > ttlMs
+}

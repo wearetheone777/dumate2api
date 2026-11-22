@@ -9,7 +9,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-mcp-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-mcp');
 process.env.DUMATE_ADMIN_DATA = TMP;
 process.env.DUMATE_POOL_STATE = path.join(TMP, 'pool-state.json');
 

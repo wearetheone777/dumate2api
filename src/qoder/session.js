@@ -566,7 +566,21 @@ async function claimCampaign(token, region, campaignId, opts = {}) {
     body: {},
     agent: opts.agent || null,
   });
-  if (r.status !== 200 || !r.data) return { ok: false, error: r.error || `HTTP ${r.status}`, raw: r.raw };
+  if (r.status !== 200 || !r.data) {
+    // 同人多号被拒（P0-2）：`SAME_PERSON_ALREADY_CLAIMED` 会以 4xx 回来。
+    // 这不是「签到失败」，而是「额度被同一个人的另一个号领走了」——
+    // 两种处置完全不同（前者该重试/排查，后者该换号轮转），所以单独标记，
+    // 免得界面把它显示成一条普通错误。
+    const blob = String(r.raw || '') + ' ' + String((r.data && (r.data.message || r.data.code)) || '');
+    const samePerson = /SAME_PERSON/i.test(blob);
+    return {
+      ok: false,
+      error: r.error || `HTTP ${r.status}`,
+      raw: r.raw,
+      samePerson,
+      status: samePerson ? 'BLOCKED' : '',
+    };
+  }
   const d = r.data;
   // **领取响应里带到期信息**（benefit.validity），这是「这批积分什么时候作废」
   // 的唯一权威来源——Qoder 没有逐批余额接口（实测 /quota/detail 等一律 503）。
@@ -595,6 +609,57 @@ async function claimCampaign(token, region, campaignId, opts = {}) {
 }
 
 /**
+ * **只读**地核验「某个活动到底发给了谁」（P0-2，2026-11-07 调研）。
+ *
+ * 出处：workbuddy2api 面板 FAQ「Qoder 号池两个号为什么只有一个能领到那 100 积分」
+ * （2026-11-04 真机实测更正版）——每日 100 Credits **按账号各发一份**，只有
+ * 服务端判定「同一个人」时才只发一份（后领的被拒 `SAME_PERSON_ALREADY_CLAIMED`）。
+ * 设备指纹（伪造全套/完全不带 Cosy-* 头）与 agentAccountScope **均不参与判定**。
+ *
+ * 为什么必须核验：本项目 grants 账本以 `grantId` 为幂等键，但「领过了」与
+ * 「真领到了」是两回事——被判同人的号没有积分进账，账本若照记领取额就是
+ * 假数据，FEFO 推算剩余跟着错（会把两个号都当成有积分，实际只有一个有）。
+ *
+ * **端点是 GET**（`/sash/api/v1/me/campaigns/{cid}/reward`），只读、绝不触发
+ * 领取。**绝不拿别的账号的活动实例去调**——那属于用别人的 id 探别人的账，
+ * 越界且会被风控画像记一笔；cid 必须来自本账号自己的 /campaigns 列表。
+ *
+ * 返回：{ ok, status, grantId, samePerson, campaignId, error }
+ *   ok=true 时 status 是上游原值（CLAIMED / BLOCKED / …），**不做二次解释**
+ *   ——判三态是 grants.classifyVerification 的事（纯函数，离线可测）。
+ */
+async function verifyClaim(token, region, campaignId, opts = {}) {
+  const ep = c.endpointsOf(region);
+  if (!campaignId) return { ok: false, error: '缺少 campaignId', status: '', grantId: '', samePerson: false };
+  const url = `${ep.CampaignsBase}/${encodeURIComponent(campaignId)}/reward`;
+  const r = await request(url, {
+    headers: bearerHeaders(token, { 'cosy-clienttype': c.CHECKIN_CLIENT_TYPE }),
+    agent: opts.agent || null,
+  });
+  if (r.status === 404 || r.status === 405) {
+    // 端点不存在＝这个上游版本没这个接口。**如实报不支持**，不猜成「未领取」。
+    return { ok: false, unsupported: true, error: `核验端点不可用（HTTP ${r.status}）`, status: '', grantId: '', samePerson: false };
+  }
+  if (r.status !== 200 || !r.data) {
+    return { ok: false, error: r.error || `HTTP ${r.status}`, status: '', grantId: '', samePerson: false };
+  }
+  const d = r.data;
+  // 形状兜底：status 可能在顶层，也可能包在 reward/benefit 里（上游两种形态都见过）
+  const reward = (d.reward && typeof d.reward === 'object') ? d.reward : d;
+  const status = String(reward.status || d.status || reward.claimStatus || '').trim();
+  const grantId = String(reward.grantId || d.grantId
+    || (reward.benefit && reward.benefit.grantId) || '').trim();
+  // 同人标记：上游用错误码/文案表达（SAME_PERSON_ALREADY_CLAIMED）。
+  // 只看**结构化字段与文案**，不猜。code 也可能就是那串字符串。
+  const blob = [
+    d.code, d.subCode, d.errorCode, reward.code, d.message, d.reason,
+  ].filter(Boolean).map(String).join(' ');
+  const samePerson = /SAME_PERSON/i.test(blob)
+    || /同一(个)?(人|用户)|同人|already claimed by the same/i.test(blob);
+  return { ok: true, status, grantId, samePerson, campaignId, raw: d };
+}
+
+/**
  * 签到一次（查列表 + 领所有可领的）。返回领取明细。
  * 领之前/之后各读一次额度，报出**实际到账差值**——与 TRAE 同一约定：
  * 上游从不直接告诉你发了多少，只看总额会把「没生效」误读成成功。
@@ -619,6 +684,20 @@ async function checkin(token, region, opts = {}) {
     // campaignKey 两个来源都可信：领取响应（claimCampaign 现已带出）与列表条目。
     // 领取响应缺失时用列表值兜底——账本里它参与标识批次，空着没法对账。
     const campaignKey = r.campaignKey || camp.campaignKey || '';
+    // 归属核验（P0-2）：**只读** GET /campaigns/{cid}/reward，绝不触发领取，
+    // cid 只取本账号自己列表里的那个。核验失败不影响签到结论——三态里的
+    // 'unverified' 就是为这种情况准备的（如实标未核实，不猜）。
+    let verification = null;
+    if (r.ok) {
+      try {
+        verification = await verifyClaim(token, region, camp.campaignId, { agent });
+      } catch (e) {
+        verification = { ok: false, error: e.message };
+      }
+    }
+    const cls = r.ok
+      ? require('./grants').classifyVerification(verification, r.grantId || '')
+      : null;
     claimed.push({
       campaignId: camp.campaignId,
       key: campaignKey,
@@ -628,16 +707,21 @@ async function checkin(token, region, opts = {}) {
       ok: r.ok,
       status: r.status || '',
       error: r.error || '',
+      // 领取环节被判「同人已领」时也要透出（不是普通失败）——管理端据此
+      // 显示「额度已被同一个人的另一账号领走」而不是一条模糊的 403。
+      samePerson: r.samePerson === true,
       // 到期信息：领取响应里才有（上游唯一的权威来源）
       grantedAt: r.grantedAt || '',
       validityMode: r.validityMode || '',
       validityDays: r.validityDays,
+      // 三态核验结果透出到管理端（已签灰 / 同人已领点名 / 未核实）
+      ...(cls || {}),
     });
     // 落本地账本：过期提醒的数据源。写失败不影响签到结果本身。
     if (r.ok && opts.account) {
       try {
         const grants = require('./grants');
-        grants.record(grants.fromClaim({ ...r, campaignKey }, opts.account));
+        grants.record(grants.fromClaim({ ...r, campaignKey, ...(cls || {}) }, opts.account));
       } catch (e) { /* 记账失败不影响签到 */ }
     }
   }
@@ -672,6 +756,6 @@ function cachedModels(account) {
 
 module.exports = {
   request, bearerHeaders, exchange, ensureAccount, fetchUserInfo, fetchPlan, importPat, tokenFamilyOf, jobTokenPost,
-  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchProEligibility, claimProBenefit, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, TIMEOUT_MS,
+  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchProEligibility, claimProBenefit, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, verifyClaim, TIMEOUT_MS,
   parseThinkingConfig,
 };

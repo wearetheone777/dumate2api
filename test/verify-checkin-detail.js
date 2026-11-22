@@ -13,7 +13,8 @@ const path = require('path');
 const Module = require('module');
 
 const ROOT = path.resolve(__dirname, '..');
-process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-checkin-'));
+const { tmpDir } = require('./helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-checkin');
 
 function stub(rel, exports) {
   const p = require.resolve(path.join(ROOT, rel));

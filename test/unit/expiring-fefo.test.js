@@ -12,7 +12,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'expiring-fefo-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('expiring-fefo');
 process.env.DUMATE_EXPIRING_SNAPSHOT_FILE = path.join(TMP, 'snapshot.json');
 
 // 在 env 设好之后再加载（filePath() 每次读 env，但模块级清洁从加载前开始）

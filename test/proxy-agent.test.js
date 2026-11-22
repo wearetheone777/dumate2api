@@ -17,6 +17,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { tmpDir } = require('./helpers/tmpdir');
 
 const {
   HttpConnectAgent,
@@ -270,7 +271,7 @@ test('connectViaProxy：CONNECT 停摆按 connectTimeout 超时', async () => {
 });
 
 test('HttpConnectAgent + https 端到端：请求经隧道到达 TLS 目标', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-proxy-test-'));
+  const dir = tmpDir('dumate-proxy-test');
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const cert = makeSelfSignedCert(dir);
   if (!cert) return t.skip('openssl 不可用，跳过 TLS 端到端');
@@ -292,7 +293,7 @@ test('HttpConnectAgent + https 端到端：请求经隧道到达 TLS 目标', as
 });
 
 test('HttpConnectAgent：keepAlive 复用同一条隧道（代理只见到一次 CONNECT）', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-proxy-test-'));
+  const dir = tmpDir('dumate-proxy-test');
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const cert = makeSelfSignedCert(dir);
   if (!cert) return t.skip('openssl 不可用，跳过 TLS 端到端');

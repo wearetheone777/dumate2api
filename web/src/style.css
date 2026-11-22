@@ -776,3 +776,18 @@ code {
   flex-wrap: wrap;
   margin-bottom: 14px;
 }
+
+/* 配置示例卡里的代码块（P2-8）：可横向滚动，不折行——折行会把 curl 的
+   续行反斜杠拆到两行，复制出去直接语法错。 */
+.example-pre {
+  font-family: var(--lab-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  background: #0f172a0a;
+  border: 1px solid #0f172a14;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre;
+}

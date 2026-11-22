@@ -14,7 +14,8 @@ const path = require('path');
 const fs = require('fs');
 
 // 数据目录隔离：logRequest → reqlog.record 会写 requests.jsonl
-process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-wg-anth-'));
+const { tmpDir } = require('../helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-wg-anth');
 const { translateStreamToAnthropic } = require('../../src/web-gateway');
 
 function fakeRes() {

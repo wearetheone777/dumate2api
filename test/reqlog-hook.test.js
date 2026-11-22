@@ -5,9 +5,8 @@
 // DUMATE_ADMIN_DATA 在 require 之前指到 tmp 目录，不碰真实 data/。
 const os = require('os');
 const path = require('path');
-process.env.DUMATE_ADMIN_DATA = require('fs').mkdtempSync(
-  path.join(os.tmpdir(), 'dumate-reqhook-'),
-);
+const { tmpDir } = require('./helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-reqhook');
 const fs = require('fs');
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -143,7 +142,8 @@ test('readArchive：limit 钳制与坏行容忍', () => {
 });
 
 test('空归档：目录还没有日志也不报错', () => {
-  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-reqhook-empty-'));
+const { tmpDir } = require('./helpers/tmpdir');
+  const empty = tmpDir('dumate-reqhook-empty');
   const r = hook.readArchive({ dir: empty, limit: 5 });
   assert.deepEqual(r.rows, []);
   assert.equal(r.hasMore, false);

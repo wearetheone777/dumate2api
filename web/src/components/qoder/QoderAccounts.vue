@@ -170,6 +170,22 @@
                 （{{ remainText(grantOf(a.id)!.expiresAt) }}，推算剩余
                 {{ grantOf(a.id)!.estimatedRemaining == null ? '—' : fmtQ(grantOf(a.id)!.estimatedRemaining) }}）
               </span>
+              <!-- 归属核验（P0-2）：每日积分按账号各发一份，只有服务端判定
+                   「同一个人」时才只发一份。所以「领过了」与「真领到了」是两回事。
+                   三态严格区分，问不出结论就显示「未核实」——不猜不假报。 -->
+              <a-tag
+                :color="verifyColor(grantOf(a.id)!.verification)"
+                class="ml-1"
+                :title="grantOf(a.id)!.verifyNote || ''"
+              >
+                {{ verifyText(grantOf(a.id)!.verification) }}
+              </a-tag>
+              <div v-if="grantOf(a.id)!.verification === 'same_person'" class="text-orange-700 mt-1">
+                额度进了同一个人的另一个号——本号没有积分进账，别按领取额算
+              </div>
+              <div v-else-if="grantOf(a.id)!.verification === 'unverified'" class="text-slate-400 mt-1">
+                归属未核实{{ grantOf(a.id)!.verifyNote ? '：' + grantOf(a.id)!.verifyNote : '' }}
+              </div>
             </div>
             <div v-else-if="creditOf(a.id) && (creditOf(a.id)!.addOnQuota?.remaining ?? 0) > 0" class="mt-2 text-xs text-slate-500">
               有签到积分但无到期记录（本功能上线前领的，无法追溯）
@@ -296,14 +312,44 @@ const creditOf = (id: number) => credits.value.find((c) => c.id === id) || null
 // 需要提醒的那个——给全部批次会淹没在列表里。
 // 数据来自本地账本 + 上游总余额的先领先扣推算（/qoder/grants）。
 // 返回归一化对象（daysLeft 保证是数字），避免模板里到处判 null。
-const grantOf = (id: number): { daysLeft: number; expiresAt: number; amount: number | null; estimatedRemaining: number | null } | null => {
+const grantOf = (id: number): {
+  daysLeft: number
+  expiresAt: number
+  amount: number | null
+  estimatedRemaining: number | null
+  verification: 'claimed' | 'same_person' | 'unverified'
+  verifyNote: string
+} | null => {
   const list = grants.value.filter((g) => g.accountId === id)
   if (!list.length) return null
   const g = list.reduce((m, x) => (x.expiresAt < m.expiresAt ? x : m), list[0])
-  return { daysLeft: g.daysLeft ?? 0, expiresAt: g.expiresAt, amount: g.amount, estimatedRemaining: g.estimatedRemaining }
+  return {
+    daysLeft: g.daysLeft ?? 0,
+    expiresAt: g.expiresAt,
+    amount: g.amount,
+    estimatedRemaining: g.estimatedRemaining,
+    // 老行没有这个字段 → 按 unverified（**不能默认成 claimed**，那是假数据）
+    verification: g.verification || 'unverified',
+    verifyNote: g.verifyNote || '',
+  }
 }
 const fmtQ = (n: number | null | undefined) =>
   n == null ? '—' : n.toLocaleString('zh-CN', { maximumFractionDigits: 4 })
+
+// ---- 归属核验三态（P0-2）----
+// claimed      CLAIMED + grantId 一致 → 真进账
+// same_person  上游判同人 → 额度进了另一个号，本号没有进账
+// unverified   问不出结论 → **如实标未核实，不猜**
+function verifyText(v: string) {
+  if (v === 'claimed') return '已核实进账'
+  if (v === 'same_person') return '同人已领'
+  return '未核实'
+}
+function verifyColor(v: string) {
+  if (v === 'claimed') return 'green'
+  if (v === 'same_person') return 'orange'
+  return 'default'
+}
 
 // ---- 今日签到 ----
 // checkedIn 三态：true=已签 / false=未签 / null=查不出。

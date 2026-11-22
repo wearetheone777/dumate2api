@@ -12,7 +12,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'trae-9074-'));
+const { tmpDir } = require('./helpers/tmpdir');
+const TMP = tmpDir('trae-9074');
 process.env.DUMATE_ADMIN_DATA = TMP; // 必须在 require auth 之前设
 
 const device = require('../src/traework/device');

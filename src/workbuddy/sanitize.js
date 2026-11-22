@@ -219,7 +219,75 @@ function sanitizeMessages(messages) {
   });
 }
 
+/**
+ * 顶层 `tools[]` 数组的清洗（2026-11-08 融合批）。
+ *
+ * 出处：GitHub 生态调研（YehanKD/workbuddy2api 的 WAF 净化覆盖 `tools[]`
+ * 数组与 `tool_calls.arguments`）。本仓库原来只清 `messages[]`，
+ * **顶层工具定义完全没清**——而工具名/描述/参数 schema 里的品牌指纹与
+ * 提示词痕迹和 system 里的一样会被渠道校验看到。
+ *
+ * 三个必须注意的点：
+ *   1. **不能改 `function.name`**：客户端会用这个名字回传 tool_call，改了对不上，
+ *      工具调用直接失败（这是「保留契约」的核心，不是保守）；
+ *   2. `parameters`（JSON Schema）里只有 `description` 是自然语言，**键名与类型
+ *      不能动**——改 schema 结构等于让模型的参数生成失效；
+ *   3. `description` 走 **identity=true** 的清洗（`identity=false` 会跳过
+ *      `IDENTITY_RE`，而「powered by …」这类品牌句正是它在管——第一版写 false，
+ *      被单测当场抓到：整个清洗对 tool description 完全无效）。
+ *
+ * @param {Array} tools OpenAI 形状的 tools 数组
+ * @returns {Array} 清洗后的新数组（不改入参）
+ */
+function sanitizeTools(tools) {
+  if (!Array.isArray(tools)) return tools;
+  const preserve = process.env.DUMATE_WORKBUDDY_PRESERVE_CONTRACT === '1';
+  if (preserve) return tools;
+  return tools.map((t) => {
+    if (!t || typeof t !== 'object') return t;
+    const item = { ...t };
+    const fn = item.function && typeof item.function === 'object' ? { ...item.function } : null;
+    if (!fn) return item;
+    // name / strict / 其它字段原样：改名会让 tool_call 回传对不上
+    if (typeof fn.description === 'string') {
+      fn.description = sanitizeText(fn.description, true);
+    }
+    if (fn.parameters && typeof fn.parameters === 'object') {
+      fn.parameters = sanitizeSchemaDescriptions(fn.parameters);
+    }
+    item.function = fn;
+    return item;
+  });
+}
+
+/**
+ * 递归清洗 JSON Schema 里的 `description` 字段。
+ * **只动 description**：键名、type、required、enum、$ref 等一律原样——
+ * 动结构会让模型生成不出合法参数（比留下指纹更糟）。
+ * @param {object} schema
+ * @param {number} depth 递归深度保护（schema 可能很深，也可能有循环引用）
+ */
+function sanitizeSchemaDescriptions(schema, depth = 0) {
+  if (depth > 12 || !schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) {
+    return schema.map((x) => sanitizeSchemaDescriptions(x, depth + 1));
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (k === 'description' && typeof v === 'string') {
+      // 同上：必须走 identity=true，否则品牌句（IDENTITY_RE 管的那些）原样漏出去
+      out[k] = sanitizeText(v, true);
+    } else if (v && typeof v === 'object') {
+      out[k] = sanitizeSchemaDescriptions(v, depth + 1);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 module.exports = {
   hasFingerprint, sanitizeText, sanitizeContent, sanitizeToolCalls, sanitizeMessages,
+  sanitizeTools, sanitizeSchemaDescriptions,
   FEATURES, REWRITES, IDENTITY_RE,
 };

@@ -71,7 +71,7 @@ const { CHANNELS, normalize } = require('../../channels');
 
 function checkLists(body) {
   const problems = [];
-  for (const field of ['ip_allowlist', 'model_allowlist']) {
+  for (const field of ['ip_allowlist', 'model_allowlist', 'account_allowlist']) {
     if (body[field] === undefined) continue;
     if (!Array.isArray(body[field])) {
       problems.push(`${field} 必须是数组`);
@@ -81,6 +81,18 @@ function checkLists(body) {
       for (const item of body[field]) {
         const v = keysvc.validateCIDR(item);
         if (!v.ok) problems.push(v.reason);
+      }
+    }
+    if (field === 'account_allowlist') {
+      // 账号白名单（调研 P1-4）：条目是账号 id 或 `通道:id`。这里只做形状
+      // 校验——账号是否存在/是否被停用要到选号时才知道，保存时判会误伤
+      // 「先配名单、后加账号」的正常顺序。
+      for (const item of body[field]) {
+        const s = String(item == null ? '' : item).trim();
+        if (!s) { problems.push('account_allowlist 里有空条目'); continue; }
+        if (!/^([a-z]+:)?\d+$/.test(s)) {
+          problems.push(`account_allowlist 条目「${s}」应写成账号 id（1）或 通道:id（workbuddy:1）`);
+        }
       }
     }
   }

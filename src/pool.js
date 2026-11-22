@@ -90,7 +90,15 @@ const DEFAULTS = {
   modelBlockMaxMs: 24 * 60 * 60 * 1000,    // 模型级负缓存封顶
   sessionDeadThreshold: 3,    // 401 类连续计数达阈才禁用（防误杀）
   inFlightMax: 4,             // 每账号在途并发帽（防单账号被打爆触发风控）
-  creditFloor: 0,             // 积分保底线;0 = 关闭（余额数据源由 B 包接入）
+  // 积分保底线;0 = 关闭。**启动时从 env 读**（2026-11-08 融合批）：
+  // 配置在 createPool 时定死（`const o`），没有运行期改入口，所以这里就是
+  // 唯一的生效点。要改成热配置得先把 `o` 从 const 改成可写——那是池层重构，
+  // 不在本批范围。文档里如实写明「重启生效」。
+  // 非法值回 0（关闭）：宁可不用保底线，也不要因为写错而拦住正常账号。
+  creditFloor: (() => {
+    const n = Number(process.env.DUMATE_POOL_CREDIT_FLOOR);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  })(),
   // ── 选号（加权抽签，替代纯轮询）───────────────────────────────────────
   // 'weighted' = 按额度/闲置加权随机抽签；'rr' = 回到轮询。
   // 为什么不再取「额度最高的那个」：那是确定性的，最高分号会吃掉全部流量，
@@ -473,7 +481,16 @@ function createPool(opts = {}) {
       else return markPick(oldestBySeq(ok), now);
     }
 
-    if (o.pickMode === 'rr') {
+    // 调用方可按次覆盖选号方式（channel-pool 的 least-inflight 用它）：
+    //   'first' = 直接取候选序列里的第一个可用项（候选顺序即优先级）
+    //   'rr'    = 轮询
+    // 未指定时用池的常态策略（加权抽签 / rr）。**不改 `o`**：池的配置是
+    // 跨请求共享的，按次覆盖只影响这一次抽签。
+    const mode = optsPick.pickMode || o.pickMode;
+    if (mode === 'first') {
+      return markPick(ok[0], now);
+    }
+    if (mode === 'rr') {
       const id = ok[cursor % ok.length];
       cursor = (cursor + 1) % 1e9;
       return markPick(id, now);

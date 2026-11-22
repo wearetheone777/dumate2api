@@ -9,7 +9,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-qgrants-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const tmp = tmpDir('dumate-qgrants');
 process.env.DUMATE_ADMIN_DATA = tmp;
 
 const grants = require('../../src/qoder/grants');

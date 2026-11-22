@@ -18,6 +18,7 @@ const path = require('node:path');
 const { createPool, msUntilNext4AM } = require('../src/pool');
 const { classify } = require('../src/upstream-errors');
 const { createSticky } = require('../src/sticky');
+const { tmpDir } = require('./helpers/tmpdir');
 
 // ---------------------------------------------------------------------------
 // 测试基建:可注入时钟
@@ -32,7 +33,7 @@ function makeClock() {
 }
 
 function tmpStateFile() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-pool-test-'));
+  const dir = tmpDir('dumate-pool-test');
   return path.join(dir, 'pool-state.json');
 }
 
@@ -164,7 +165,7 @@ test('软冷却:上游给了 retryAfterMs 就按它,不套基数、不递增 str
 });
 
 test('livecfg 热接线:hotSoftCooldown 门控下 softCooldownMs 覆盖软冷却基数', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-pool-hotcfg-'));
+  const dir = tmpDir('dumate-pool-hotcfg');
   const prevData = process.env.DUMATE_ADMIN_DATA;
   process.env.DUMATE_ADMIN_DATA = dir;
   const livecfg = require('../src/livecfg');

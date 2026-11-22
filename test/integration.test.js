@@ -19,7 +19,8 @@ const os = require('os');
 const path = require('path');
 
 // env 必须先于任何 src 模块加载（多数模块在 require 时固化数据目录）
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-integration-'));
+const { tmpDir } = require('./helpers/tmpdir');
+const TMP = tmpDir('dumate-integration');
 process.env.DUMATE_ADMIN_DATA = TMP;
 process.env.DUMATE_POOL_STATE = path.join(TMP, 'pool-state.json');
 delete process.env.DUMATE_PROXY;          // 宿主 env 里若配了代理不得影响用例

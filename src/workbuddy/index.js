@@ -28,30 +28,45 @@ const CHANNEL = 'workbuddy';
 // **11140 不再默认换号**。原来「受限换号循环区内轮完一圈」正是 hub 实测把
 // 7 个号在一次任务里全送走的路径：设备 / 出口指纹被上游扫到时，换号等于
 // 把同一个指纹挨个报给风控。默认值按「宁可少服务一会儿，也别把账号送走」取：
-//   DUMATE_WORKBUDDY_RESTRICTED_ROTATE_MAX   一次请求最多再换几个号（默认 0 = 不换）
-//   DUMATE_WORKBUDDY_RESTRICTION_WAVE_MIN    窗口内几个不同账号被限制就整区域暂停（默认 2）
-//   DUMATE_WORKBUDDY_RESTRICTION_WAVE_WINDOW 连坐判定窗口秒（默认 900）
-//   DUMATE_WORKBUDDY_RESTRICTION_HOLD_SECONDS 整区域暂停秒（默认 1800；0 = 关闭）
-// 暂停是进程内紧急状态（连坐场景下快速失败比持久化重要），不落盘。
-const RESTRICTED_ROTATE_MAX = (() => {
-  const n = parseInt(process.env.DUMATE_WORKBUDDY_RESTRICTED_ROTATE_MAX || '', 10);
-  return Number.isFinite(n) && n >= 0 ? n : 0;
-})();
-const RESTRICTION_WAVE_MIN = Math.max(1, (() => {
-  const n = parseInt(process.env.DUMATE_WORKBUDDY_RESTRICTION_WAVE_MIN || '', 10);
-  return Number.isFinite(n) && n >= 1 ? n : 2;
-})());
-const RESTRICTION_WAVE_WINDOW_MS = Math.max(0, (() => {
-  const n = parseInt(process.env.DUMATE_WORKBUDDY_RESTRICTION_WAVE_WINDOW || '', 10);
-  return Number.isFinite(n) && n >= 0 ? n : 900;
-})()) * 1000;
-const RESTRICTION_HOLD_MS = Math.max(0, (() => {
-  const n = parseInt(process.env.DUMATE_WORKBUDDY_RESTRICTION_HOLD_SECONDS || '', 10);
-  return Number.isFinite(n) && n >= 0 ? n : 1800;
-})()) * 1000;
+//   restrictedRotateMax 一次请求最多再换几个号（默认 0 = 不换）
+//   waveMin             窗口内几个不同账号被限制就整区域暂停（默认 2）
+//   waveWindowSec       连坐判定窗口秒（默认 900）
+//   holdSeconds         整区域暂停秒（默认 1800；**0 = 彻底关闭连坐暂停**）
+//
+// **这四个参数 2026-11-08 起是运行期配置**（`src/workbuddy/runtime.js`，
+// hub P2-11「自定义时长 + 保存更短时长即时截断倒计时」）：面板改完下一个请求
+// 就按新阈值判定，不用重启；env 仍是默认值来源，只设 env 的部署行为不变。
+// 读取是「每次判定现读 + mtime 失效重读」，刻意不缓存成模块级常量——
+// 常量读死正是当初「改时长必须重启」的根因。
+//
+// 暂停本身仍是进程内紧急状态（连坐场景下快速失败比持久化重要），只落一份
+// 观测快照给管理端。**改短 hold 会截断现有倒计时**：hold 存的是
+// { at, until }，现算时把 until 夹到 at + holdMs，所以「面板改小 → 立刻收窄」
+// 不需要额外的信号文件，也不需要等下一次触发。
+const runtime = require('./runtime');
+
+/** 当前连坐参数（毫秒口径，现读运行期配置） */
+function restrictionCfg() {
+  let r;
+  try { r = runtime.Load().restriction; } catch (e) { r = runtime.defaults().restriction; }
+  return {
+    waveMin: Math.max(1, Number(r.waveMin) || 1),
+    waveWindowMs: Math.max(0, Number(r.waveWindowSec) || 0) * 1000,
+    holdMs: Math.max(0, Number(r.holdSeconds) || 0) * 1000,
+    restrictedRotateMax: Math.max(0, Number(r.restrictedRotateMax) || 0),
+  };
+}
 
 const restrictionEvents = new Map(); // region -> Map(uid -> ts)
-const restrictionHold = new Map();   // region -> untilMs
+const restrictionHold = new Map();   // region -> { at, until }
+
+/** 现算的暂停截止时刻（按当前 holdSeconds 截断） */
+function holdUntilOf(region, cfg) {
+  const h = restrictionHold.get(region);
+  if (!h) return 0;
+  if (cfg.holdMs <= 0) { restrictionHold.delete(region); return 0; }
+  return Math.min(Number(h.until) || 0, (Number(h.at) || 0) + cfg.holdMs);
+}
 
 // --- 连坐状态的跨进程观测副本（2026-11-06 加，为管理端 9083 服务）---
 //
@@ -73,13 +88,16 @@ const restrictionClearPath = () => path.join(dataDir(), RESTRICTION_CLEAR_FILE);
 function persistRestriction(now = Date.now()) {
   try {
     fs.mkdirSync(dataDir(), { recursive: true });
+    const cfg = restrictionCfg();
     const regions = {};
-    for (const [region, until] of restrictionHold) {
+    for (const region of [...restrictionHold.keys()]) {
+      // 用现算截止时刻（会按当前 hold 截断），快照才能反映「面板改短后已收窄」
+      const until = holdUntilOf(region, cfg);
       if (until > now) regions[region] = { until, remainingMs: until - now };
     }
     const events = {};
     for (const [region, ev] of restrictionEvents) {
-      const live = [...ev].filter(([, at]) => now - at <= RESTRICTION_WAVE_WINDOW_MS);
+      const live = [...ev].filter(([, at]) => now - at <= cfg.waveWindowMs);
       if (live.length) {
         events[region] = live.map(([uid, at]) => ({ uid, at, agoMs: now - at }));
       }
@@ -87,10 +105,10 @@ function persistRestriction(now = Date.now()) {
     const snap = {
       at: now,
       config: {
-        waveMin: RESTRICTION_WAVE_MIN,
-        waveWindowMs: RESTRICTION_WAVE_WINDOW_MS,
-        holdMs: RESTRICTION_HOLD_MS,
-        restrictedRotateMax: RESTRICTED_ROTATE_MAX,
+        waveMin: cfg.waveMin,
+        waveWindowMs: cfg.waveWindowMs,
+        holdMs: cfg.holdMs,
+        restrictedRotateMax: cfg.restrictedRotateMax,
       },
       regions,
       events,
@@ -172,31 +190,47 @@ function consumeClearSignal(now = Date.now()) {
 
 /** 记一次账号级风控限制；窗口内不同账号数达阈值即整区域暂停，返回暂停到的时刻（0 = 未触发） */
 function noteAccountRestriction(region, uid, now = Date.now()) {
-  if (RESTRICTION_HOLD_MS <= 0) return 0;
+  const cfg = restrictionCfg();
+  // holdSeconds=0 = 彻底关闭连坐暂停（hub P2-11 的「设 0 关闭」）：仍记事件供
+  // 观测，只是不再整区域停服——运维需要能看见「有号在被限制」，否则关掉护栏
+  // 就等于蒙眼。事件留着也意味着后续把 0 改回正值时立即按现有窗口判定。
+  if (cfg.holdMs <= 0) {
+    let ev0 = restrictionEvents.get(region);
+    if (!ev0) { ev0 = new Map(); restrictionEvents.set(region, ev0); }
+    for (const [k, at] of [...ev0]) {
+      if (now - at > cfg.waveWindowMs) ev0.delete(k);
+    }
+    ev0.set(String(uid || '-'), now);
+    persistRestriction(now);
+    return 0;
+  }
   let ev = restrictionEvents.get(region);
   if (!ev) { ev = new Map(); restrictionEvents.set(region, ev); }
   for (const [k, at] of [...ev]) {
-    if (now - at > RESTRICTION_WAVE_WINDOW_MS) ev.delete(k);
+    if (now - at > cfg.waveWindowMs) ev.delete(k);
   }
   ev.set(String(uid || '-'), now);
-  if (ev.size < RESTRICTION_WAVE_MIN) {
+  if (ev.size < cfg.waveMin) {
     persistRestriction(now); // 不足以连坐，但「哪些号已被限制」本身值得观测
     return 0;
   }
-  const until = now + RESTRICTION_HOLD_MS;
-  if (until > (restrictionHold.get(region) || 0)) restrictionHold.set(region, until);
+  const until = now + cfg.holdMs;
+  const prev = restrictionHold.get(region);
+  const prevUntil = prev ? holdUntilOf(region, cfg) : 0;
+  if (until > prevUntil) restrictionHold.set(region, { at: now, until });
   persistRestriction(now);
   return until;
 }
 
 /** 区域连坐暂停剩余毫秒（0 = 没有暂停） */
 function restrictionHoldRemaining(region, now = Date.now()) {
-  const until = restrictionHold.get(region) || 0;
+  const cfg = restrictionCfg();
+  const until = holdUntilOf(region, cfg);
   if (until <= now) return 0;
   // 只在**确实处于暂停**时才检查解除信号：热路径上暂停期间本来就在快速失败，
   // 多一次 stat 无所谓；正常服务时一次都不查。
   consumeClearSignal(now);
-  return Math.max(0, (restrictionHold.get(region) || 0) - now);
+  return Math.max(0, holdUntilOf(region, cfg) - now);
 }
 
 /** 测试与运维观测：清空连坐状态 */
@@ -208,6 +242,17 @@ function _restrictionReset(now = Date.now()) {
 }
 
 /**
+ * 重刷观测快照（管理端改完连坐参数后调用）：把内存态按**当前配置**重新
+ * 夹一遍写回文件，界面不必等下一个请求就能看到「改短已生效」。
+ * 读不到内存（管理端进程）时 also 不改写什么——快照由网关 owner 写，
+ * 那边下一次判定自然更新，这里只是提前一瞬间。
+ */
+function repersistRestriction(now = Date.now()) {
+  persistRestriction(now);
+  return restrictionState(now);
+}
+
+/**
  * 当前连坐状态（管理端与网关同一口径）：内存为准，内存空则回落读落盘快照。
  *
  * 为什么要回落：管理端 9083 与网关 9082 是不同进程，各自 require 本模块拿到
@@ -215,20 +260,22 @@ function _restrictionReset(now = Date.now()) {
  * regions 只保留**仍有效**的暂停（快照里的 until 可能已过期）。
  */
 function restrictionState(now = Date.now()) {
+  const cfg = restrictionCfg();
   const config = {
-    waveMin: RESTRICTION_WAVE_MIN,
-    waveWindowMs: RESTRICTION_WAVE_WINDOW_MS,
-    holdMs: RESTRICTION_HOLD_MS,
-    restrictedRotateMax: RESTRICTED_ROTATE_MAX,
+    waveMin: cfg.waveMin,
+    waveWindowMs: cfg.waveWindowMs,
+    holdMs: cfg.holdMs,
+    restrictedRotateMax: cfg.restrictedRotateMax,
   };
   const liveRegions = {};
-  for (const [region, until] of restrictionHold) {
+  for (const region of [...restrictionHold.keys()]) {
+    const until = holdUntilOf(region, cfg);
     if (until > now) liveRegions[region] = { until, remainingMs: until - now };
   }
   if (Object.keys(liveRegions).length) {
     const events = {};
     for (const [region, ev] of restrictionEvents) {
-      const live = [...ev].filter(([, at]) => now - at <= RESTRICTION_WAVE_WINDOW_MS);
+      const live = [...ev].filter(([, at]) => now - at <= cfg.waveWindowMs);
       if (live.length) events[region] = live.map(([uid, at]) => ({ uid, at, agoMs: now - at }));
     }
     return { at: now, source: 'memory', config, regions: liveRegions, events };
@@ -237,15 +284,32 @@ function restrictionState(now = Date.now()) {
   if (!snap) return { at: null, source: 'none', config, regions: {}, events: {} };
   const fromFile = {};
   for (const [region, v] of Object.entries(snap.regions || {})) {
-    if (v && Number(v.until) > now) fromFile[region] = { until: Number(v.until), remainingMs: Number(v.until) - now };
+    // 快照里的 until 是**写入时**按当时 hold 算的；面板改短后要按当前配置再夹一次，
+    // 否则管理端会在网关还没写入新快照前显示旧倒计时（「改了没生效」的假象）
+    const at = Number(v && v.at) || Number(snap.at) || now;
+    const until = cfg.holdMs > 0 ? Math.min(Number(v.until) || 0, at + cfg.holdMs) : 0;
+    if (until > now) fromFile[region] = { until, remainingMs: until - now };
   }
-  return { at: snap.at || null, source: 'snapshot', config: snap.config || config, regions: fromFile, events: snap.events || {} };
+  return { at: snap.at || null, source: 'snapshot', config, regions: fromFile, events: snap.events || {} };
 }
 
 /**
  * send 失败处置的纯判定（可离线测）：
- *   feed    池动作：none=不喂（参数错）/ model=模型级（6004）/ account=账号级
+ *   feed    池动作：none=不喂（参数错/请求级）/ model=模型级（6004）/ account=账号级
  *   action  rotate=换号 / restrict=记连坐（默认不换号）/ refresh=先刷新重试 / throw=直接抛
+ *
+ * 2026-11-08 融合批补的四类**请求级**失败（GitHub 生态调研：xu20060420fan-cell
+ * 的 14 个 ErrKind 分类机）：
+ *   model_unavailable     (账号,模型) 不可用 → **模型级**喂池（scope:model 负缓存），
+ *                         换号打同模型没意义（模型本身该账号没有），但**不罚账号**
+ *   queue                 排队 → 完全不喂、不换号，如实报位次
+ *   reasoning_unsupported 补默认档能过 → 不喂、不换号（重发由 send 层做）
+ *   tool_pair_mismatch    修历史配对能过 → 不喂、不换号
+ *
+ * 这四类原来都落进 'client' → errorActionOf 的兜底 `feed:'account', action:'throw'`，
+ * 于是「换模型就能过」的请求把健康账号喂成了账号级失败。**这是真实事故形态，
+ * 不是理论洁癖**：一个账号连续被几个不支持 reasoning 的模型请求打中，10 分钟内
+ * 所有模型都会被池标记不可用。
  */
 function errorActionOf(e) {
   if (e && e.paramError) return { feed: 'none', action: 'throw' };
@@ -257,6 +321,12 @@ function errorActionOf(e) {
     // 「token 过期」记成 session_dead 计数。刷新失败由 send 分支补喂
     return { feed: 'none', action: 'refresh' };
   }
+  // ---- 请求级四类：都不许动账号 ----
+  if (kind === 'model_unavailable') return { feed: 'model', action: 'throw' };
+  if (kind === 'queue') return { feed: 'none', action: 'throw', queue: true };
+  if (kind === 'reasoning_unsupported') return { feed: 'none', action: 'throw', reasoning: true };
+  if (kind === 'tool_pair_mismatch') return { feed: 'none', action: 'throw', toolPair: true };
+  if (kind === 'client' || kind === 'not_found') return { feed: 'none', action: 'throw' };
   return { feed: 'account', action: 'throw' };
 }
 
@@ -332,6 +402,10 @@ function statusOf(kind, httpStatus) {
   if (kind === 'session_dead') return 401;
   if (kind === 'restricted') return 403;
   if (kind === 'model_cap') return 429;
+  // 排队也是 429：语义就是「稍后再来」，客户端会退避重试。
+  // 单独列出来是为了让下面 message 里的位次文案有确定的落点，
+  // 而不是靠兜底分支掰出 429/400。
+  if (kind === 'queue') return 429;
   if (kind === 'soft_rate') return 429;
   if (kind === 'not_found') return 502;
   if (kind === 'server') return httpStatus >= 500 ? httpStatus : 502;
@@ -355,6 +429,28 @@ function fefoUidSet() {
   const out = new Set();
   for (const id of ids) out.add(channelPool.uidOf(CHANNEL, id));
   return out;
+}
+
+/**
+ * 额度护栏的排除集合（P1-6）：套餐剩余低于阈值的账号 **id（裸 id）**。
+ *
+ * 三条口径，缺一条就会把护栏变成故障源：
+ *   1. **默认关**：guard.enabled 为假直接返回 null，一行都不多算；
+ *   2. **快照陈旧/缺失 → null**：不拿 6 小时前的余额把请求全拦死，
+ *      退回普通选号（护栏是选号过滤，不是请求拦截）；
+ *   3. **探针不享受豁免也不受罚**：探针本身就要发请求测扣费，被护栏拦掉就
+ *      永远测不出来——调用方（send）按 opts.probe 跳过这层过滤。
+ * @returns {Set<string>|null} 裸 id 集合（字符串）；null = 护栏不生效
+ */
+function lowCreditIdSet(now = Date.now()) {
+  let cfg;
+  try { cfg = runtime.Load().guard; } catch (e) { return null; }
+  if (!cfg || !cfg.enabled) return null;
+  try {
+    return require('./credits-snapshot').lowAccounts(cfg.threshold, now);
+  } catch (e) {
+    return null;   // 快照模块异常 → 护栏不生效（观测面故障不拦请求）
+  }
 }
 
 /** 模型名前置校验（缓存就绪且完全不在表中 → 400 + 可用列表；没就绪放行） */
@@ -396,8 +492,51 @@ async function send(payload, onChunk, opts = {}) {
   //   6004 model_cap   → 只冷却 (账号, 模型)（scope:model 喂池），换号继续打同模型
   //   参数错误         → 不喂池不写 lastError，如实 400（hub v1.10.11 #794）
   const sessionKey = channelPool.sessionKeyOf(payload, opts);
-  const usable = accountsForRegion(authStore.findUsable(), opts.region);
-  if (!usable.length) throw noRegionAccountError(opts.region);
+  let allUsable = accountsForRegion(authStore.findUsable(), opts.region);
+  // **按模型名的区域归属再收窄一次**（2026-11-08 融合批，真机事故驱动）：
+  // 调用方不传 opts.region 时上面那步不做任何过滤，于是两区账号混在一起，
+  // 而模型名是有区域归属的——国内目录的 deepseek-v4.1-flash 发给国际账号，
+  // 上游回的是 **11140 风控码**（不是 11102「模型不存在」），会被误当成
+  // 账号被限制，进而触发连坐暂停把整条通道弄停。
+  //
+  // 只在「显式没限区域」时按模型收窄：调用方已经指定区域时以它为准
+  // （那是 API Key 的运行期约束，语义更强）。判不出区域（null）不拦。
+  let modelRegion = null;
+  if (!opts.region) {
+    try { modelRegion = require('./models').regionOfModel(model); } catch (e) { modelRegion = null; }
+    if (modelRegion) {
+      const narrowed = allUsable.filter((a) => c.normalizeRegion(a.region) === modelRegion);
+      // 收到 0 个就**不窄化**：宁可让上游报 11102，也不要因为「本地以为
+      // 该模型只属于某区」就拒掉一个有账号可用的请求（缓存可能过时）
+      if (narrowed.length) allUsable = narrowed;
+    }
+  }
+  if (!allUsable.length) throw noRegionAccountError(opts.region);
+  // 账号白名单（调研 P1-4）：key.account_allowlist 限定这把 key 能调度哪些账号。
+  // **必须在这里判**——鉴权阶段判不了（那时还不知道会选中谁），而池轮询 / 粘性 /
+  // FEFO 都可能改变最终选中的账号。
+  let scoped = allUsable;
+  let scopeBlocked = 0;
+  if (opts.key && Array.isArray(opts.key.account_allowlist) && opts.key.account_allowlist.length) {
+    const keysvc = require('../keys');
+    scoped = allUsable.filter((a) => keysvc.accountAllowed(opts.key, CHANNEL, a.id));
+    if (!scoped.length) {
+      const e = new Error('该 API Key 的账号白名单（account_allowlist）里没有可用的 WorkBuddy 账号——名单里配的账号不存在、被停用或不在本区域');
+      e.statusCode = 403;
+      throw e;
+    }
+    scopeBlocked = allUsable.length - scoped.length;
+  }
+  // 额度护栏（P1-6）：低于阈值的账号从候选里剔除。**全被剔除时退回全量**
+  // ——「全拦掉」等于把通道弄停，而护栏只是省一次注定失败的上游请求，
+  // 不该比上游本身更严。探针（opts.probe）不过滤：它就是要发请求测扣费。
+  const lowIds = opts.probe ? null : lowCreditIdSet();
+  let usable = scoped;
+  let guardSkipped = 0;
+  if (lowIds && lowIds.size) {
+    const kept = scoped.filter((a) => !lowIds.has(String(a.id)));
+    if (kept.length) { usable = kept; guardSkipped = scoped.length - kept.length; }
+  }
   const tried = new Set();
   const refreshTried = new Set();
   let rotated = 0;
@@ -448,10 +587,16 @@ async function send(payload, onChunk, opts = {}) {
       const act = errorActionOf(e);
       if (!opts.probe) {
         if (act.feed === 'model') {
-          // 6004 模型级冷却：scope 透传给池（applyModelSoftCooldown），账号本身不动
+          // 模型级失败：6004 冷却（scope:model + retryAfterMs）与
+          // 11102/11103/11158 负缓存（kind:'model_unavailable' 由 channel-pool
+          // 升级成 kind:'model'）走同一处——账号本身都不动
           channelPool.noteError(CHANNEL, auth.id, {
-            status: 429, message: e.message, model,
-            scope: 'model', retryAfterMs: e.retryAfterMs,
+            status: Number(e.statusCode) || 429,
+            message: e.message,
+            model,
+            kind: e.kind,
+            scope: 'model',
+            retryAfterMs: e.retryAfterMs,
           });
         } else if (act.feed === 'account') {
           channelPool.noteError(CHANNEL, auth.id, { status: Number(e.statusCode) || 0, message: e.message, model });
@@ -473,7 +618,7 @@ async function send(payload, onChunk, opts = {}) {
           stop.statusCode = 503;
           throw stop;
         }
-        if (rotated < RESTRICTED_ROTATE_MAX) { rotated++; continue; }
+        if (rotated < restrictionCfg().restrictedRotateMax) { rotated++; continue; }
         throw e;
       }
       if (act.action === 'refresh') {
@@ -501,7 +646,16 @@ async function send(payload, onChunk, opts = {}) {
       channelPool.release(uid);
     }
   }
-  // 全部账号都试过（或全受限）：如实抛最后一个错误
+  // 全部账号都试过（或全受限）：如实抛最后一个错误。
+  // 护栏/白名单挡掉过账号时把这件事写进错误串——否则「为什么少了几个号」
+  // 只能靠翻快照或 key 配置才知道。
+  const notes = [];
+  if (guardSkipped > 0) notes.push(`${guardSkipped} 个账号因套餐剩余低于护栏阈值被跳过`);
+  if (scopeBlocked > 0) notes.push(`${scopeBlocked} 个账号不在该 Key 的账号白名单内`);
+  if (notes.length) {
+    const note = `（另有 ${notes.join('；')}）`;
+    if (lastErr && lastErr.message) lastErr.message = `${lastErr.message}${note}`;
+  }
   throw lastErr || noRegionAccountError(opts.region);
 }
 
@@ -548,6 +702,21 @@ async function runConversation(region, auth, payload, onChunk, model, opts = {})
         ? `WWW-Authenticate: ${challenge}\n${text}`
         : text;
       const kind = c.classifyStatus(r.status, classifyInput);
+      // 11-128 取证（P1-5，默认关）：只在命中取证码时写文件，写失败不影响
+      // 请求。**必须带的是我们实际发出去的头与 body**——11-128 判的是请求
+      // 形态，重建一份会有偏差。这里放在分类之后、抛错之前，任何分支都能覆盖。
+      try {
+        const dumpMod = require('./dump');
+        if (dumpMod.mode() !== 'off') {
+          const hit = dumpMod.matchesCode(classifyInput);
+          if (hit) {
+            dumpMod.dump({
+              region, model, status: r.status, code: hit,
+              headers: r.reqHeaders || {}, bodyText: r.bodyText || '',
+            });
+          }
+        }
+      } catch (e) { /* 取证面任何异常都不影响请求 */ }
       // 参数错误（hub v1.10.11 #794）：请求本身的问题——换号、冷却都无意义
       if (r.status === 400 && c.PARAM_ERROR_TEXT_RE.test(text)) {
         const pe = new Error(`workbuddy 400: ${text.slice(0, 200)}`);
@@ -567,6 +736,19 @@ async function runConversation(region, auth, payload, onChunk, model, opts = {})
         const reset = c.parseRateLimitReset(text);
         if (reset) e.retryAfterMs = Math.max(0, reset * 1000 - Date.now());
       }
+      // 排队：把位次翻成人话挂到 error 上，下游（与界面）能说清「为什么慢」。
+      // **message 也要换成人话**：客户端看到的是 message，不是 queueInfo 字段。
+      // 只挂字段不换 message，用户仍然只看到「429 限流」——调研里
+      // dsh-connect-workbuddy 专门做过这件事，不然「排队 3 位」和「账号被限」
+      // 在用户眼里一模一样。
+      if (kind === 'queue') {
+        const q = c.parseQueueInfo(text);
+        if (q) {
+          e.queueInfo = q;
+          e.message = `workbuddy 排队：${q.text}`;
+          if (q.retryAfter != null) e.retryAfterMs = q.retryAfter * 1000;
+        }
+      }
       throw e;
     }
     return r;
@@ -576,8 +758,26 @@ async function runConversation(region, auth, payload, onChunk, model, opts = {})
     // ---- 非流式：强制 stream 收齐再聚合（上游不接受非流式），聚合后判定 ----
     let attempt = 0;
     let curPayload = payload;
+    // 11150 降级（2026-11-08 融合批）：只降一次，剥完还撞就不再重试
+    let reasoningStripped = false;
     for (;;) {
-      const r = await post(buildBody(curPayload));
+      let r;
+      try {
+        r = await post(buildBody(curPayload));
+      } catch (e) {
+        // 模型不吃 effort 参数：剥掉重发一次。**这是在救一个本来能成功的请求**，
+        // 不是掩盖错误——上游文案明确说「reasoning effort is not supported」，
+        // 剥掉即合法请求。剥完仍失败则照常抛，不无限降级。
+        if (e && e.kind === 'reasoning_unsupported' && !reasoningStripped) {
+          const nr = chat.withoutReasoningFields(curPayload);
+          if (nr) {
+            reasoningStripped = true;
+            curPayload = nr.body;
+            continue;
+          }
+        }
+        throw e;
+      }
       const chunks = [];
       let err = null;
       await chat.readStream(r.stream, (chunk) => {
@@ -684,11 +884,13 @@ module.exports = {
   status, send, listModels, listModelEntries, warmupModels, checkin, quota,
   // FEFO 集合推导导出：端到端回归用（verify-expiring-fefo.js）
   fefoUidSet,
+  // 额度护栏（P1-6）：纯推导导出，便于离线测「默认关 / 陈旧失效 / 全拦退回」
+  lowCreditIdSet,
   // 风控连坐 + 失败处置（可离线测的纯函数）
   noteAccountRestriction, restrictionHoldRemaining, _restrictionReset, errorActionOf,
   // 跨进程观测（管理端 9083 读快照、写解除信号；网关侧消费信号）
   restrictionSnapshot, requestClearRestriction, consumeClearSignal,
-  restrictionState,
+  restrictionState, repersistRestriction, restrictionCfg,
   chatCompletion: (p, opts) => send(p, undefined, opts),
   chatCompletionStream: (p, cb, opts) => send(p, cb, opts),
   DEFAULT_MODEL: 'auto',

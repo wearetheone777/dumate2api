@@ -12,7 +12,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-subkey-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-subkey');
 process.env.DUMATE_ADMIN_DATA = TMP;
 delete process.env.DUMATE_KEY_QUOTA;
 

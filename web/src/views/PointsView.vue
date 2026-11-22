@@ -420,6 +420,17 @@
               <template v-if="qdExpiring.estimated === false">（余额没查到，此为领取额口径）</template>
               <template v-else-if="qdExpiring.amount === 0">——这些批次按消耗顺序已用完，到期不损失余额</template>
             </div>
+            <!-- 本周期扣费（P1-10）：按各账号的订阅周期边界切分账本。
+                 bounded=false 说明有账号还没观察到边界——那部分按全量累计计入，
+                 必须标注，否则「本周期扣费」会被读成真的只花了这么多。 -->
+            <div v-if="qdPeriod" class="mt-1">
+              本周期扣费 <b class="num">{{ fmtQw(qdPeriod.cost) }}</b>
+              （计费 {{ qdPeriod.billedRequests }} 次<template v-if="qdPeriod.avgPerBilledRequest != null">，
+              均价 {{ fmtQw(qdPeriod.avgPerBilledRequest) }}/次</template>）
+              <template v-if="qdPeriod.bounded === false">
+                <span class="text-slate-500">· 部分账号未观察到周期边界，此为**全量累计**口径</span>
+              </template>
+            </div>
           </template>
         </a-alert>
 
@@ -509,6 +520,118 @@
           </div>
         </a-card>
 
+        <!-- 用量分析（P2-17）：reqlog ⨝ credits 账本。与上面的「积分消耗明细」
+             分工：那个是**账**（每笔扣了多少），这个是**量**（请求/token/速率/
+             按账号归因/积分密度）。两个口径都来自「经本网关的请求」。 -->
+        <a-card title="用量分析" :bordered="false" class="mt-4">
+          <template #extra>
+            <span class="text-xs text-slate-400">近 {{ qdUsageDays }} 天 · 经本网关的请求</span>
+          </template>
+
+          <a-spin v-if="qdUsageLoading" size="small" />
+          <template v-else-if="qdUsage">
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+              <div>
+                <div class="block-label">请求</div>
+                <div class="num text-lg">{{ qdUsage.totals.requests }}</div>
+                <div v-if="qdUsage.totals.failed" class="text-xs text-red-600">失败 {{ qdUsage.totals.failed }}</div>
+              </div>
+              <div>
+                <div class="block-label">Token</div>
+                <div class="num text-lg">{{ compactNum(qdUsage.totals.totalTokens) }}</div>
+                <div class="text-xs text-slate-400">入 {{ compactNum(qdUsage.totals.inputTokens) }} / 出 {{ compactNum(qdUsage.totals.outputTokens) }}</div>
+              </div>
+              <div>
+                <div class="block-label">credits</div>
+                <div class="num text-lg text-cyan-700">{{ fmtQw(qdUsage.totals.credits) }}</div>
+                <div class="text-xs text-slate-400">上游直给，精确</div>
+              </div>
+              <div>
+                <div class="block-label">平均耗时</div>
+                <div class="num text-lg">{{ qdUsage.totals.avgMs != null ? (qdUsage.totals.avgMs / 1000).toFixed(1) + 's' : '—' }}</div>
+                <div v-if="qdUsage.totals.avgFirstTokenMs != null" class="text-xs text-slate-400">首字 {{ (qdUsage.totals.avgFirstTokenMs / 1000).toFixed(1) }}s</div>
+              </div>
+              <div>
+                <div class="block-label">吐字速率</div>
+                <div class="num text-lg">{{ qdUsage.totals.avgTokPerSec != null ? qdUsage.totals.avgTokPerSec : '—' }} <span class="text-xs text-slate-400">tok/s</span></div>
+                <div class="text-xs text-slate-400">只统计有值的流式请求</div>
+              </div>
+              <div>
+                <div class="block-label">积分密度</div>
+                <div class="num text-lg">
+                  {{ qdDensityPer1M != null ? fmtQw(qdDensityPer1M) : '—' }}
+                  <span class="text-xs text-slate-400">/1M tok</span>
+                </div>
+                <div class="text-xs text-slate-400">credits ÷ tokens，实测成本密度</div>
+              </div>
+            </div>
+
+            <a-divider style="margin: 12px 0" />
+
+            <!-- 按账号归因：FEFO / 护栏调参的依据。老行（埋点上线前）如实归
+                 「未标注」——不按模型表猜归属。 -->
+            <div class="text-xs text-slate-400 mb-1">按账号</div>
+            <a-table
+              size="small"
+              :pagination="false"
+              :data-source="qdUsage.byAccount"
+              :columns="qdUsageAccountColumns"
+              row-key="key"
+            >
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'name'">
+                  <span>{{ record.name }}</span>
+                </template>
+                <template v-else-if="column.key === 'tokens'">
+                  <span class="num">{{ compactNum(record.totalTokens) }}</span>
+                </template>
+                <template v-else-if="column.key === 'credits'">
+                  <span class="num text-cyan-700">{{ fmtQw(record.credits) }}</span>
+                </template>
+                <template v-else-if="column.key === 'per1M'">
+                  <span class="num">{{ record.creditsPer1M != null ? fmtQw(record.creditsPer1M) : '—' }}</span>
+                </template>
+                <template v-else-if="column.key === 'tokps'">
+                  <span class="num">{{ record.avgTokPerSec != null ? record.avgTokPerSec : '—' }}</span>
+                </template>
+              </template>
+            </a-table>
+
+            <div class="text-xs text-slate-400 mt-3">按模型（Top 8）</div>
+            <a-table
+              size="small"
+              :pagination="false"
+              :data-source="qdUsage.byModel.slice(0, 8)"
+              :columns="qdUsageModelColumns"
+              row-key="key"
+            >
+              <template #bodyCell="{ column, record }">
+                <template v-if="column.key === 'credits'">
+                  <span class="num text-cyan-700">{{ fmtQw(record.credits) }}</span>
+                </template>
+                <template v-else-if="column.key === 'per1M'">
+                  <span class="num">{{ record.creditsPer1M != null ? fmtQw(record.creditsPer1M) : '—' }}</span>
+                </template>
+                <template v-else-if="column.key === 'tokens'">
+                  <span class="num">{{ compactNum(record.totalTokens) }}</span>
+                </template>
+              </template>
+            </a-table>
+
+            <div class="text-xs text-slate-400 mt-3">
+              {{ qdUsage.note }}
+              <template v-if="qdUsagePeriodBounded === false">
+                <div class="mt-1">
+                  本订阅周期扣费 <b class="num">{{ fmtQw(qdUsage.period.cost) }}</b>
+                  （计费 {{ qdUsage.period.billedRequests }} 次）——
+                  <span class="text-slate-500">部分账号未观察到周期边界，此为全量累计口径</span>
+                </div>
+              </template>
+            </div>
+          </template>
+          <a-empty v-else description="还没有经网关的请求" />
+        </a-card>
+
         <!-- 逐笔消耗：上游 usage.credits 直给，不做游标差。
              两个口径必须并列——只给逐笔合计会让人以为「总共才花了这么点」，
              而它的账本起点晚于通道接入时间，之前的消耗没有逐笔记录。 -->
@@ -587,12 +710,122 @@
 
     <!-- ============ WorkBuddy：套餐包台账（按账号独立，无逐笔消耗） ============ -->
     <template v-else-if="isWb">
+      <!-- 账号健康速览（2026-11-08 融合批）：积分页的定位是「看数字」，
+           所以这里放最需要一眼看到的两个只读信号——成长状态与模型繁忙度。
+           配置项（开关/阈值/巡检间隔）留在账号页，不重复。 -->
+      <a-row :gutter="[16, 16]" class="mb-4">
+        <a-col :xs="24" :lg="12">
+          <a-card :bordered="false" class="h-full">
+            <template #title>
+              <span class="section-title">成长状态</span>
+              <a-button size="small" class="ml-2" :loading="wbGrowthLoading" @click="loadWbGrowth">
+                查询
+              </a-button>
+            </template>
+            <template #extra>
+              <span class="text-xs text-slate-400">只读</span>
+            </template>
+            <div v-if="!wbGrowth" class="text-xs text-slate-400">尚未查询</div>
+            <div v-else-if="!wbGrowth.ok" class="text-xs text-red-600">
+              查询失败：{{ wbGrowth.error || Object.values(wbGrowth.errors)[0] || '未知原因' }}
+            </div>
+            <div v-else class="text-xs space-y-1">
+              <div>
+                连登
+                <span class="num ml-1">
+                  {{ wbGrowth.streak?.days != null ? `${wbGrowth.streak.days} 天` : '查不到' }}
+                </span>
+                <span v-if="wbGrowth.streak?.nextTierRemaining != null" class="text-slate-400 ml-1">
+                  （再 {{ wbGrowth.streak.nextTierRemaining }} 天到 {{ wbGrowth.streak.nextTier }}）
+                </span>
+                <span class="ml-3 text-slate-400">今日点亮</span>
+                <!-- null（查不到）与 0（没点亮）必须分开说 -->
+                <span class="ml-1" :class="wbGrowth.heatmap?.todayScore ? 'text-green-700' : 'text-orange-700'">
+                  <template v-if="wbGrowth.heatmap?.todayScore == null">查不到</template>
+                  <template v-else-if="wbGrowth.heatmap.todayScore > 0">已点亮</template>
+                  <template v-else>未点亮</template>
+                </span>
+              </div>
+              <div>
+                任务
+                <span class="num ml-1">
+                  <template v-if="wbGrowth.tasks">
+                    已领 {{ wbGrowth.tasks.claimed }}/{{ wbGrowth.tasks.total }}，可做 {{ wbGrowth.tasks.claimable }}
+                  </template>
+                  <template v-else>查不到</template>
+                </span>
+                <span class="ml-3 text-slate-400">能量</span>
+                <span class="num ml-1">{{ wbGrowth.energy?.balance ?? '查不到' }}</span>
+              </div>
+              <div v-if="wbGrowth.streak?.redeemable?.length" class="text-orange-700">
+                连登档位 {{ wbGrowth.streak.redeemable.join(' / ') }} 天已解锁未领取（不领会过期，需到官方客户端领）
+              </div>
+              <div v-if="Object.keys(wbGrowth.errors).length" class="text-orange-700">
+                部分端点失败：{{ Object.entries(wbGrowth.errors).map(([k, v]) => `${k}: ${v}`).join('；') }}
+              </div>
+            </div>
+          </a-card>
+        </a-col>
+        <a-col :xs="24" :lg="12">
+          <a-card :bordered="false" class="h-full">
+            <template #title>
+              <span class="section-title">模型繁忙度</span>
+              <a-button size="small" class="ml-2" :loading="wbBusyLoading" @click="loadWbBusy">探测</a-button>
+            </template>
+            <template #extra>
+              <span class="text-xs text-slate-400">免费只读</span>
+            </template>
+            <div v-if="!wbBusy" class="text-xs text-slate-400">尚未探测</div>
+            <div v-else-if="wbBusy.unsupported" class="text-xs text-slate-400">
+              国际版没有该接口（上游 404）——查不到，不是通道故障
+            </div>
+            <div v-else-if="!wbBusy.ok" class="text-xs text-red-600">探测失败：{{ wbBusy.error }}</div>
+            <div v-else class="text-xs">
+              <div v-if="wbBusy.crowded.length" class="text-orange-700">
+                {{ wbBusy.crowded.length }} 个模型明显拥挤（{{ wbBusy.crowded.slice(0, 5).join('、') }}），建议换模型
+              </div>
+              <div v-else class="text-green-700">没有明显拥挤的模型</div>
+              <div class="text-slate-400 mt-1">
+                共 {{ wbBusy.models.length }} 个模型 · 探测于 {{ new Date(wbBusy.at).toLocaleTimeString('zh-CN', { hour12: false }) }}
+                <template v-if="!wbBusy.guardEnabled">· 仅提示，不参与选号</template>
+              </div>
+            </div>
+          </a-card>
+        </a-col>
+      </a-row>
+
       <a-empty
         v-if="!wbRows.length"
         :description="wbError || `还没有${isIntlRegion() ? '国际' : '国内'}版账号`"
       />
       <template v-else>
         <a-row :gutter="[16, 16]">
+          <!-- 点名补刷（P0-3）：只对「额度 null / 报错」的账号重新查一遍，
+               其余账号一次不发（每号一次刷新要打三个上游端点） -->
+          <a-col :span="24">
+            <a-alert :type="wbNeedRefresh.length ? 'warning' : 'success'" show-icon>
+              <template #message>
+                <span class="flex items-center gap-2 flex-wrap">
+                  余额覆盖 {{ wbRows.length - wbNeedRefresh.length }} / {{ wbRows.length }} 个账号
+                  <a-button
+                    size="small"
+                    :loading="wbRefreshing"
+                    :disabled="!wbNeedRefresh.length"
+                    @click="refreshWbMissing"
+                  >
+                    只补刷缺失的 {{ wbNeedRefresh.length }} 个
+                  </a-button>
+                  <span v-if="wbMissingHint" class="text-xs text-orange-700">{{ wbMissingHint }}</span>
+                </span>
+              </template>
+              <template #description>
+                <span class="text-xs">
+                  查询失败的账号<b>不补 0</b>（余额未知 ≠ 余额为零）。补刷只打这些账号，
+                  其余账号沿用进页面时那次全量结果。
+                </span>
+              </template>
+            </a-alert>
+          </a-col>
           <a-col :xs="12" :lg="6">
             <a-card :bordered="false" class="h-full">
               <a-statistic
@@ -1128,7 +1361,9 @@
     </template>
 
     <!-- 签到详情：按月份/年份查看。千问办公没有签到体系，不渲染。 -->
-    <CheckinDetailCard v-if="!isQw && !isWb" />
+    <!-- 签到详情：WorkBuddy 也接了（2026-11-08）。账本由 autocheckin/手动签到
+         写入，上游不提供历史——note 里如实标注覆盖起点；国际版账号标「不支持」 -->
+    <CheckinDetailCard v-if="!isQw" />
 
     <!-- 计费对账（跨通道）：qoder/traework 的逐模型实扣聚合，倍率漂移一页可见 -->
     <ReconcileCard />
@@ -1154,7 +1389,7 @@ import type { QwCredits, QwCreditRecord } from '@/api/qwenwork'
 import { qoderApi } from '@/api/qoder'
 import type { QoderCreditRow, QoderCreditRecord } from '@/api/qoder'
 import { workbuddyApi } from '@/api/workbuddy'
-import type { WorkBuddyCreditRow } from '@/api/workbuddy'
+import type { WorkBuddyCreditRow, WorkBuddyBusy, WorkBuddyGrowth } from '@/api/workbuddy'
 import type { PointsData, PointsPackage, AllPointsData, AccountPoints } from '@/api/points'
 import type { RecordsData } from '@/api/records'
 import { SERIES, INK, TOOLTIP_BASE, axisStyle, compactNum, exactNum, barSeries } from '@/utils/chartTheme'
@@ -1280,6 +1515,46 @@ const qdUsed = computed(() => {
 
 /** 7 天内到期的批次（推算剩余口径，先领先扣；estimated=false = 领取额降级） */
 const qdExpiring = ref<{ count: number; amount: number; estimated?: boolean }>({ count: 0, amount: 0 })
+// 本周期扣费（P1-10）。null = 后端没给 period 字段（老版本）
+const qdPeriod = ref<{ bounded: boolean; cost: number; billedRequests: number; avgPerBilledRequest: number | null } | null>(null)
+
+// ---- 用量分析（P2-17）：reqlog ⨝ credits，按账号归因 + 积分密度 ----
+const qdUsage = ref<import('@/api/qoder').QoderUsageBucket extends never ? never : any | null>(null)
+const qdUsageLoading = ref(false)
+const qdUsageDays = 30
+const qdUsageAccountColumns = [
+  { title: '账号', key: 'name' },
+  { title: '请求', dataIndex: 'requests', width: 80 },
+  { title: 'Token', key: 'tokens', width: 120 },
+  { title: 'credits', key: 'credits', width: 110 },
+  { title: '积分/1M', key: 'per1M', width: 110 },
+  { title: 'tok/s', key: 'tokps', width: 90 },
+]
+const qdUsageModelColumns = [
+  { title: '模型', dataIndex: 'key' },
+  { title: '请求', dataIndex: 'requests', width: 80 },
+  { title: 'Token', key: 'tokens', width: 120 },
+  { title: 'credits', key: 'credits', width: 110 },
+  { title: '积分/1M', key: 'per1M', width: 110 },
+]
+/** 全窗口的积分密度（credits ÷ totalTokens × 1M），null = 没有可折算的请求 */
+const qdDensityPer1M = computed(() => {
+  if (!qdUsage.value) return null
+  const t = qdUsage.value.totals
+  if (!t.totalTokens || !t.credits) return null
+  return Math.round((t.credits / t.totalTokens) * 1000000 * 10000) / 10000
+})
+const qdUsagePeriodBounded = computed(() => qdUsage.value?.period?.bounded)
+
+async function loadQdUsage() {
+  qdUsageLoading.value = true
+  try {
+    const reg = regionParam() as 'cn' | 'intl' | undefined
+    const r = await qoderApi.usage(qdUsageDays, reg)
+    qdUsage.value = r.data
+  } catch (e) { /* 用量读不到不挡本页其它卡 */ }
+  finally { qdUsageLoading.value = false }
+}
 
 // 占用百分比：上游 percentage 是 0~1 的小数；拿不到时显示 —，不编 0
 const pctWidth = (p: number | null) => {
@@ -1352,6 +1627,9 @@ async function loadQd() {
       amount: c.data.summary?.expiringAmount || 0,
       estimated: c.data.summary?.expiringEstimated,
     }
+    qdPeriod.value = (c.data.summary as any)?.period || null
+    // 用量分析与主数据并行拉（读不到不挡其它卡）
+    loadQdUsage()
     qdRecords.value = rec.data.rows || []
     qdWindow.value = rec.data.window || { cost: 0, requests: 0, exact: 0 }
     qdSince.value = rec.data.since ?? null
@@ -1373,6 +1651,14 @@ const wbError = ref('')
 const wbFefo = ref<{ at: number | null; fresh: boolean; accounts: number; windowDays: number } | null>(null)
 
 /** 单账号 7 天内到期的套餐包剩余合计（已用完的包不计入——到期不构成损失） */
+/**
+ * 7 天内到期的积分合计（精确口径：`remainPrecise` 是浮点，整数 `remain` 是 floor）。
+ *
+ * **必须 round**：表格里直接插值会渲染成 `1569.420000000061`——浮点累加的
+ * 经典表现。截图当场看到才发现（`toLocaleString` 修的是账号页那一处，
+ * 这里是另一处渲染路径）。留两位小数即可，精确口径本身不需要更多精度：
+ * 上游给的 `…Precise` 就叫两位小数。
+ */
 function wbRowExpiring(r: WorkBuddyCreditRow): number {
   const now = Date.now()
   let sum = 0
@@ -1381,7 +1667,8 @@ function wbRowExpiring(r: WorkBuddyCreditRow): number {
       sum += p.remainPrecise != null ? p.remainPrecise : p.remain
     }
   }
-  return sum
+  // 没有临期包时返回 0（模板用 `> 0` 判断），不要 round 成 -0
+  return sum > 0 ? Math.round(sum * 100) / 100 : 0
 }
 
 /** 单个包是否临期（7 天窗口，与 FEFO 选号展示同口径） */
@@ -1404,7 +1691,11 @@ const wbExpiring = computed(() => {
       }
     }
   }
-  return { amount, count }
+  // 浮点累加会得到 1569.4200000000001 这种值。`a-statistic` 的 precision 只在
+  // 值非整数时才生效，而 1569.4200000000001 确实「非整数」——precision=2 能显示
+  // 成 1,569.42，但同一份数据在别的渲染点（表格里）没有 precision，就露馅了。
+  // 统一在这里 round 到两位，两处渲染都干净。
+  return { amount: amount > 0 ? Math.round(amount * 100) / 100 : 0, count }
 })
 
 // 合计优先精确口径（totalPrecise）；任一账号 total 缺失时仍合计已知部分，
@@ -1429,20 +1720,94 @@ const wbColumns = [
   { title: '状态', key: 'err' },
 ]
 
-async function loadWb() {
+async function loadWb(uids?: number[]) {
   loading.value = true
   try {
     const r = regionParam() as 'cn' | 'intl' | undefined
-    const { data } = await workbuddyApi.credits(r)
-    wbRows.value = data.rows || []
+    const { data } = await workbuddyApi.credits(r, uids)
+    if (uids && uids.length) {
+      // 点名补刷（P0-3）：只替换被点名的行，其余行保留当前显示值——接口只
+      // 返回被刷新的账号，整表覆盖会让「没点名的行」凭空消失。
+      const byId = new Map((data.rows || []).map((x) => [x.id, x]))
+      wbRows.value = wbRows.value.map((row) => byId.get(row.id) || row)
+      const missed = uids.filter((id) => !byId.has(id))
+      if (missed.length) wbMissingHint.value = `${missed.length} 个账号未返回结果（可能已停用或被删除）`
+      else wbMissingHint.value = ''
+    } else {
+      wbRows.value = data.rows || []
+      wbMissingHint.value = ''
+    }
     wbFefo.value = data.fefo || null
     wbError.value = ''
   } catch (e: any) {
-    wbRows.value = []
-    wbFefo.value = null
+    if (!uids || !uids.length) wbRows.value = []
+    wbFefo.value = uids && uids.length ? wbFefo.value : null
     wbError.value = e?.response?.data?.error || e?.message || '读取 WorkBuddy 额度失败'
   } finally {
     loading.value = false
+  }
+}
+
+/**
+ * 只点名「额度为 null 或查询报错」的账号补刷（P0-3，hub Unreleased）。
+ *
+ * 为什么需要：每号一次刷新要打三个上游端点（签到状态 + 额度 + 按 TTL 的档位），
+ * 账号一多既慢又更容易被风控注意到。进页面时已经全量刷过一次，这里只补失败
+ * 的那几个。**没有可补的号就不发请求**（按钮同时 disabled）。
+ */
+const wbRefreshing = ref(false)
+const wbMissingHint = ref('')
+
+// 成长状态与模型繁忙度（2026-11-08 融合批）：积分页只放「一眼看健康」的只读信号。
+// 都是按需触发（各打 5 个 / 1 个上游端点），**不进轮询**——与账号页同口径。
+const wbGrowth = ref<WorkBuddyGrowth | null>(null)
+const wbGrowthLoading = ref(false)
+const wbBusy = ref<WorkBuddyBusy | null>(null)
+const wbBusyLoading = ref(false)
+
+async function loadWbGrowth() {
+  wbGrowthLoading.value = true
+  try {
+    const r = regionParam() as 'cn' | 'intl' | undefined
+    const { data } = await workbuddyApi.growth({ region: r })
+    wbGrowth.value = data
+  } catch (e: any) {
+    wbGrowth.value = {
+      ok: false, region: 'cn', streak: null, heatmap: null, tasks: null,
+      energy: null, buddyQuota: null, errors: {},
+      error: e?.response?.data?.error || e?.message || '查询失败', note: '', at: Date.now(),
+    }
+  } finally {
+    wbGrowthLoading.value = false
+  }
+}
+
+async function loadWbBusy() {
+  wbBusyLoading.value = true
+  try {
+    const r = regionParam() as 'cn' | 'intl' | undefined
+    const { data } = await workbuddyApi.busy({ region: r })
+    wbBusy.value = data
+  } catch (e: any) {
+    wbBusy.value = {
+      ok: false, region: 'cn', models: [], levels: {}, crowded: [],
+      unsupported: false, guardEnabled: false,
+      error: e?.response?.data?.error || e?.message || '探测失败', note: '', at: Date.now(),
+    }
+  } finally {
+    wbBusyLoading.value = false
+  }
+}
+const wbNeedRefresh = computed(() =>
+  wbRows.value.filter((r) => r.total == null || !!r.error).map((r) => r.id))
+async function refreshWbMissing() {
+  const ids = wbNeedRefresh.value
+  if (!ids.length) return
+  wbRefreshing.value = true
+  try {
+    await loadWb(ids)
+  } finally {
+    wbRefreshing.value = false
   }
 }
 

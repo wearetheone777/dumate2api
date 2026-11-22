@@ -343,6 +343,10 @@
       <template #extra>
         <!-- 区域切换在顶栏（国内版/国际版）：本页只显示当前区域的模型表 -->
         <a-button size="small" class="ghost-btn mr-2" :loading="billingChecking" @click="runBillingCheck">计费自检</a-button>
+        <!-- 输出上限探测（P2-20）：模型表声称的上限普遍虚高（实测 16 个模型
+             8 个被静默钳制，最狠声称 1M 实际 32K）。这是**显式运维动作**，
+             一次要跑 4 档长输出——不在页面加载时自动跑。 -->
+        <a-button size="small" class="ghost-btn mr-2" :loading="probeRunning" @click="runOutputProbe">输出上限探测</a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="loadQd(true)">刷新</a-button>
       </template>
 
@@ -397,6 +401,63 @@
            与搭子、千问、TRAE 共用同一个组件——Qoder 原本是单独一份 a-table，
            那份没有输出上限、也没有倍率排序 -->
       <ModelInfoTable :channel="'qoder'" :preloaded="qdInfoRows" class="mt-3" />
+
+      <!-- 输出上限实测结论（P2-20）：clamped 标「32K ⚠ 钳制 4×」、at_least 标「64K ✓」。
+           **没测过的模型不在此表**——没测 ≠ 没钳制。 -->
+      <a-alert
+        v-if="probeResult"
+        :type="probeResult.ok ? (probeResult.verdict === 'clamped' ? 'warning' : 'success') : 'error'"
+        show-icon class="mt-3"
+      >
+        <template #message>
+          <template v-if="probeResult.ok">
+            输出上限探测 · {{ probeResult.model }}：
+            <template v-if="probeResult.verdict === 'unbounded'">
+              <b>上游不理 max_tokens</b>——传 {{ fmtK(probeResult.unbounded?.requested) }} 回来
+              {{ fmtK(probeResult.unbounded?.completion) }}，说明没有可测的上限
+            </template>
+            <template v-else-if="probeResult.verdict === 'clamped'">
+              声明 {{ fmtK(probeResult.modelMaxTokens) }}，
+              <b>实测 {{ fmtK(probeResult.clamped) }}（被钳制）</b>
+            </template>
+            <template v-else-if="probeResult.verdict === 'at_least'">
+              至少 {{ fmtK(probeResult.atLeast) }}（追平过该档，未撞顶）
+            </template>
+            <template v-else>测不出（{{ probeResult.verdict }}）——如实记录，不猜</template>
+            <span class="text-slate-500">（{{ Math.round((probeResult.elapsedMs || 0) / 1000) }}s，{{ probeResult.steps?.length || 0 }} 档）</span>
+          </template>
+          <template v-else>输出上限探测失败：{{ probeResult.error }}</template>
+        </template>
+        <template #description>
+          <span class="text-xs">
+            「۞ 不受 max_tokens」不是「上限很大」，是**上游压根不看这个字段**（真机实测：传 4096 回来 24706，其中 reasoning 23513）。
+            所以别再指望靠 max_tokens 钳制 Qoder 的输出量——要控长度只能用提示词。
+          </span>
+        </template>
+      </a-alert>
+      <!-- 探测进度：单档 3~4 分钟，四档十几分钟。轮询期间要给看得见的进度 -->
+      <a-alert v-else-if="probeRunning && probeStatus" type="info" show-icon class="mt-3">
+        <template #message>
+          正在探测 {{ probeStatus.model }}（{{ probeStatus.region }}）…
+          已用 {{ Math.round((probeStatus.elapsedMs || 0) / 1000) }}s
+        </template>
+        <template #description>
+          <span class="text-xs">
+            单档真机约 3~4 分钟（{{ probeStatus.model }} 的四档串行可能十几分钟）。
+            可以离开本页，结果会落盘；回来点「刷新」看结论。
+          </span>
+        </template>
+      </a-alert>
+
+      <div v-if="qdProbeRows.length" class="text-xs text-slate-500 mt-2">
+        已实测 {{ qdProbeRows.length }} 个模型：
+        <span v-for="(p, i) in qdProbeRows.slice(0, 8)" :key="p.model" class="ml-1">
+          <span class="font-mono">{{ p.model }}</span>
+          <span :class="p.verdict === 'clamped' ? 'text-orange-600' : p.verdict === 'at_least' ? 'text-cyan-700' : 'text-slate-400'">
+            {{ p.label }}<template v-if="p.stale">（陈旧）</template>
+          </span><template v-if="i < Math.min(7, qdProbeRows.length - 1)">、</template>
+        </span>
+      </div>
 
       <div class="text-xs text-slate-500 mt-3">
         调用时用前缀名（如 <span class="font-mono">qoder/gfmodel</span>）；不带前缀的名字一律走搭子。
@@ -894,7 +955,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { message } from 'ant-design-vue'
 import client from '@/api/client'
@@ -1009,6 +1070,89 @@ async function runBillingCheck() {
     billingChecking.value = false
   }
 }
+// ---- 输出上限主动探测（P2-20）----
+// 与 max-output.js 的分工：那个是「撞 400 才学」（第一次必然先撞一次，用户
+// 那一轮是失败的）；这个提前测出来。
+//
+// **触发式**（真机实测决定）：单档 `max_tokens=4096` 要 214 秒（completion
+// 24706 / reasoning 23513）。四档串行十几分钟——同步 HTTP 必然超时、浏览器
+// 先断。所以点按钮后立刻返回，进度靠轮询 /output-probe/status。
+const probeRunning = ref(false)
+const probeResult = ref<any>(null)
+const probeStatus = ref<any>(null)
+const qdProbeRows = ref<Array<{ model: string; label: string; verdict: string; stale: boolean }>>([])
+let probeTimer: ReturnType<typeof setInterval> | null = null
+
+/** 千级缩写按 1024（与上下游文档的 32K/64K 读法一致；后端同口径） */
+function fmtK(n: number | null | undefined) {
+  const v = Number(n)
+  if (!Number.isFinite(v) || v <= 0) return '—'
+  return v >= 1024 ? `${Math.round(v / 1024)}K` : String(v)
+}
+
+async function loadProbes() {
+  try {
+    // 探测结论按区域隔离（cn 的结论不套到 global）；区域参数用 intl 口径
+    const reg = qdRegion.value === 'global' ? 'intl' : 'cn'
+    const r = await qoderApi.outputProbes(reg as 'cn' | 'intl')
+    qdProbeRows.value = (r.data.rows || []) as any
+  } catch (e) { /* 探测结果读不到不挡页面 */ }
+}
+
+/** 停掉轮询（组件卸载/探测结束后） */
+function stopProbePolling() {
+  if (probeTimer) { clearInterval(probeTimer); probeTimer = null }
+}
+
+async function runOutputProbe() {
+  // 选最低倍率的模型：探测会真烧额度（**单档就 3~4 分钟**），挑最省的
+  const ranked = [...qdModels.value]
+    .filter((m) => m.key)
+    .sort((a, b) => {
+      const ra = a.rate != null && a.rate > 0 ? a.rate : (a.rateOriginal ?? 99)
+      const rb = b.rate != null && b.rate > 0 ? b.rate : (b.rateOriginal ?? 99)
+      return ra - rb
+    })
+  const target = ranked[0]?.key
+  if (!target) {
+    probeResult.value = { ok: false, model: '', error: '模型表未加载，先刷新' }
+    return
+  }
+  probeRunning.value = true
+  probeResult.value = null
+  try {
+    const r = await qoderApi.outputProbe(target, qdRegion.value)
+    if (!r.data.ok && !r.data.started) {
+      // 409 = 已有探测在跑（重额度动作，同一时刻只允许一个）
+      probeResult.value = { ok: false, model: target, error: r.data.error || '已有探测在跑' }
+      probeRunning.value = false
+      return
+    }
+    probeStatus.value = r.data.status || null
+    // 轮询进度。单档 3~4 分钟、四档十几分钟，所以每 10 秒看一次足够
+    stopProbePolling()
+    probeTimer = setInterval(async () => {
+      try {
+        const s = await qoderApi.outputProbeStatus()
+        probeStatus.value = s.data
+        if (!s.data.running) {
+          stopProbePolling()
+          probeRunning.value = false
+          // 结论在 status.last 里（触发式编排的交付形态）
+          probeResult.value = s.data.last ? { ok: true, ...s.data.last } : null
+          await loadProbes()
+          await loadQd(false)
+        }
+      } catch (e) { /* 单次轮询失败不影响下一次 */ }
+    }, 10000)
+  } catch (e: any) {
+    probeResult.value = { ok: false, model: target, error: e?.response?.data?.error || e?.message || '请求失败' }
+    probeRunning.value = false
+  }
+}
+
+onUnmounted(stopProbePolling)
+
 // 通道元信息（账号数 / 当前账号 / token 到期）来自 /system/status 的 channels.qoder
 const qdStatus = computed(() => channelStore.infos['qoder'] || null)
 const qdCheapCount = computed(() => qdModels.value.filter((m) => m.cheap).length)
@@ -1038,6 +1182,9 @@ async function loadQd(force = false) {
     qdError.value = m.data.error || ''
     qdInfoRows.value = info.data.rows || []
     qdCredits.value = (c.data.rows || []) as QoderCreditRow[]
+    // 已探测的输出上限结论（本地落盘，不打上游）。**不阻塞主表**：
+    // 读不到就不显示那行小字，不影响模型表本身
+    loadProbes().catch(() => { /* 同上 */ })
   } catch (e: any) {
     qdModels.value = []
     qdInfoRows.value = []

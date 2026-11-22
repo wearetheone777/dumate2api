@@ -8,7 +8,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'prompt-guard-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('prompt-guard');
 process.env.DUMATE_ADMIN_DATA = TMP;
 const guard = require('../../src/prompt-guard');
 

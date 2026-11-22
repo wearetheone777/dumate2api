@@ -115,7 +115,8 @@ test('turnIdOf：没有任何 id 时返回 null', () => {
 // computeCosts 读 dataDir()（每次调用时读 DUMATE_ADMIN_DATA），
 // 临时目录写 JSONL 即可离线构造，不需要打桩上游。
 function withTempLedger(fn) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'trae-credits-'));
+const { tmpDir } = require('../helpers/tmpdir');
+  const tmp = tmpDir('trae-credits');
   const prev = process.env.DUMATE_ADMIN_DATA;
   process.env.DUMATE_ADMIN_DATA = tmp;
   try {

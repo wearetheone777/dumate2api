@@ -13,7 +13,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-keyusage-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-keyusage');
 const DATA = path.join(TMP, 'data');
 fs.mkdirSync(DATA, { recursive: true });
 // 探针路径不落进被测账本

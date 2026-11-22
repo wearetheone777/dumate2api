@@ -9,7 +9,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-admin-users-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-admin-users');
 process.env.DUMATE_ADMIN_DATA = TMP;
 
 const auth = require('../../src/admin/auth');

@@ -3,9 +3,8 @@
 // 覆盖：聚合正确性、\x00 桶键防碰撞、滚动窗口、小时桶折叠幂等、
 // 内存上限淘汰、落盘恢复、多进程合并、本地时区桶键、关停开关。
 // 全部走 tmp 目录与注入时钟，不碰真实 data/。
-process.env.DUMATE_ADMIN_DATA = require('fs').mkdtempSync(
-  require('path').join(require('os').tmpdir(), 'dumate-usageagg-shared-'),
-);
+const { tmpDir } = require('./helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-usageagg-shared');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -14,7 +13,7 @@ const path = require('path');
 const usageAgg = require('../src/usage-agg');
 
 function tmpdir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-usageagg-'));
+  return tmpDir('dumate-usageagg');
 }
 
 // 本地 2026-10-25 14:05（固定时刻，避免测试跨小时抖动）

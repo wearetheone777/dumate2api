@@ -10,7 +10,8 @@ const os = require('os');
 const path = require('path');
 
 // 用临时数据目录，避免污染真实账本
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'qoder-grants-'));
+const { tmpDir } = require('./helpers/tmpdir');
+const TMP = tmpDir('qoder-grants');
 process.env.DUMATE_ADMIN_DATA = TMP;
 
 const grants = require('../src/qoder/grants');

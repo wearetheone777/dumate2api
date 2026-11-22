@@ -98,7 +98,8 @@ process.env.DUMATE2API_HOST = '127.0.0.1';
 process.env.DUMATE_AUTOSTART = 'off';
 // 埋点写到临时目录：既隔离真实请求日志（开发实例可能同时在写），
 // 也让下面的断言能只看本次运行的几行。
-process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-reqlog-'));
+const { tmpDir } = require('./helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-reqlog');
 // 2026-11-01 起模型端点强制鉴权——测试用 env 密钥，post() 里带上
 process.env.DUMATE2API_KEY = 'test-key-errterm';
 require(path.join(ROOT, 'src/server.js'));

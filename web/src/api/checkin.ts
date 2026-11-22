@@ -19,6 +19,10 @@ export interface CheckinAccount {
   days: Record<string, CheckinDayInfo>
   daysInMonth: number
   checkedToday: boolean
+  /** WorkBuddy 国际版没有签到接口（上游不提供）——账号照列，标出来别让人误判 */
+  unsupportedCheckin?: boolean
+  /** 仅 WorkBuddy 有：区域（cn/global），用来解释「为什么这号不支持签到」 */
+  region?: 'cn' | 'global'
 }
 
 export interface CheckinMonthSummary {

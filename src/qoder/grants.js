@@ -94,7 +94,77 @@ function fromClaim(r, account, now = Date.now()) {
     validityMode: r.validityMode || '',
     validityDays: r.validityDays,
     modelScope: r.modelScope || null,
+    // 归属核验（P0-2）：'claimed' / 'same_person' / 'unverified'。
+    // 老行没有这两个字段——读侧按 'unverified' 处理（缺失 ≠ 已核验通过）
+    verification: r.verification || 'unverified',
+    verified: r.verified === true ? true : (r.verified === false ? false : null),
+    samePerson: r.samePerson === true,
+    verifyNote: r.verifyNote || '',
     ts: now,
+  };
+}
+
+/**
+ * 账本行补「这条到底有没有真的进账」的核验字段（P0-2）。
+ *
+ * **为什么金额字段旁边还需要它**：`amount` 是「领取额」，而多账号场景下
+ * 服务端可能判定「同一个人」→ 后领的号**没有任何积分进账**（只有先领的那个
+ * 拿到）。账本若只有 amount，FEFO 推算剩余会把这个号也算成有积分，选号跟着错。
+ *
+ * 三态判据（纯函数，离线可测；出处 workbuddy2api 面板 2026-11-04 实测）：
+ *   'claimed'   CLAIMED + grantId 与本号领取响应一致 → 真领到
+ *   'same_person'  BLOCKED + SAME_PERSON → 额度被同一个人的另一账号领走
+ *   'unverified'   问不出结论 → **如实标未核实，不猜不假报**
+ *
+ * @param {object} verify session.verifyClaim 的返回
+ * @param {string} ourGrantId 本号领取响应里的 grantId
+ * @returns {{verification:'claimed'|'same_person'|'unverified', verified:boolean|null, samePerson:boolean, verifyNote:string}}
+ */
+function classifyVerification(verify, ourGrantId) {
+  if (!verify || verify.ok !== true) {
+    // 端点不可用（404/405）与「请求失败」要分开说：前者说明这个上游版本没有
+    // 核验接口（永远未核实），后者是瞬时故障（下次可能核得出来）。
+    const note = verify && verify.unsupported
+      ? '核验端点不可用（该上游版本没有 reward 接口）'
+      : `核验请求失败${verify && verify.error ? `：${verify.error}` : ''}`;
+    return { verification: 'unverified', verified: null, samePerson: false, verifyNote: note };
+  }
+  if (verify.samePerson) {
+    return {
+      verification: 'same_person',
+      verified: false,
+      samePerson: true,
+      verifyNote: '上游判定为同一人已领取（额度进了另一个号）——本号没有积分进账，账本不按领取额计',
+    };
+  }
+  const status = String(verify.status || '').toUpperCase();
+  if (status === 'CLAIMED') {
+    // grantId 一致才是「这条确实记在本号上」。不一致/缺失时报未核实
+    // ——「已领取」与「领到了这个 grantId」是两个粒度。
+    if (verify.grantId && ourGrantId && verify.grantId === ourGrantId) {
+      return { verification: 'claimed', verified: true, samePerson: false, verifyNote: '' };
+    }
+    if (verify.grantId && ourGrantId && verify.grantId !== ourGrantId) {
+      return {
+        verification: 'unverified', verified: null, samePerson: false,
+        verifyNote: `核验返回的 grantId（${verify.grantId}）与本号领取响应（${ourGrantId}）不一致`,
+      };
+    }
+    // 上游没给 grantId：状态对但无法逐条比对，如实未核实
+    return {
+      verification: 'unverified', verified: null, samePerson: false,
+      verifyNote: '上游核验未返回 grantId，无法与本号领取响应比对',
+    };
+  }
+  if (status === 'BLOCKED') {
+    return {
+      verification: 'unverified', verified: false, samePerson: false,
+      verifyNote: `核验状态 BLOCKED 但未给出同人标记（status=${verify.status}）`,
+    };
+  }
+  return {
+    verification: 'unverified', verified: null, samePerson: false,
+    verifyNote: verify.status ? `核验状态未知（status=${verify.status}）` : '核验未返回状态',
   };
 }
 
@@ -167,4 +237,86 @@ function estimateRemaining(batches, remaining) {
   return out;
 }
 
-module.exports = { FILE, filePath, record, readAll, hasGrant, fromClaim, expiring, expired, estimateRemaining };
+/**
+ * 积分到期分布（P2-18）。
+ *
+ * 出处：workbuddy panel「积分构成」视图的**到期分布**——按批次到期日聚合、
+ * 颜色区分账号、危险度色点、**到期前日均需耗量**（拿「推算剩余 ÷ 剩余天数」
+ * 直接算）。
+ *
+ * 为什么要聚合而不只列明细：本项目已有逐批明细（`/grants`），但「哪些天会
+ * 同时作废多少」看不出来——30 天有效期 + 每天领 100 的话，每天都有一笔在
+ * 到期，明细里是一堆相同的行；聚合后才发现「明天一口气作废 300」这种真风险。
+ *
+ * **口径**：amount 仍是**领取额**，`remaining` 才是推算剩余（来自
+ * estimateRemaining 的先领先扣分配）。日均需耗量用**推算剩余**算，
+ * 用领取额算会高估（用户可能早就花掉了）。
+ *
+ * @param {Array} batches 批次列表（调用方只传未过期的）
+ * @param {number} now 当前时刻（可注入）
+ * @returns {Array<{date, grantCount, amounts, remaining, accounts, daysLeft, dailyNeed, warn}>}
+ */
+function expiryDistribution(batches, now = Date.now()) {
+  const byDay = new Map();
+  for (const b of (batches || [])) {
+    if (!b || !b.expiresAt || b.expiresAt <= now) continue;
+    const d = new Date(b.expiresAt);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    let cell = byDay.get(key);
+    if (!cell) {
+      // daysLeft 按**自然日差**算，不是 ceil(ms/86400000)：跨日边界上
+      // 后者会把「明天到期」算成 1 天而「今天 23:59 到期」也算 1 天，
+      // 日均需耗量于是不可比。按日期差才是「还有几天可以花」。
+      const today = new Date(now);
+      const t0 = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+      const t1 = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+      cell = {
+        date: key,
+        grantCount: 0,
+        // 领取额合计（对照口径，不随消耗变）
+        amounts: 0,
+        // 推算剩余合计（真正的「会作废多少」）
+        remaining: 0,
+        accounts: new Set(),
+        daysLeft: Math.max(0, Math.round((t1 - t0) / 86400000)),
+        dailyNeed: 0,
+        warn: '',
+      };
+      byDay.set(key, cell);
+    }
+    cell.grantCount += 1;
+    if (typeof b.amount === 'number') cell.amounts += b.amount;
+    // estimatedRemaining 由调用方算好挂在批次上（Map 取不到时给 0——
+    // 分不出去的批次确实不持有余额）。**null 不参与合计**：null 是
+    // 「推不出来」，把它当 0 会让合计看起来比实际少。
+    if (typeof b.estimatedRemaining === 'number') cell.remaining += b.estimatedRemaining;
+    if (b.accountId != null) cell.accounts.add(b.accountId);
+  }
+  const out = [...byDay.values()].map((cell) => {
+    const days = Math.max(1, cell.daysLeft); // 今天到期按 1 天算，避免除零
+    const remaining = Math.round(cell.remaining * 10000) / 10000;
+    const dailyNeed = Math.round((remaining / days) * 100) / 100;
+    let warn = '';
+    if (cell.daysLeft <= 1 && remaining > 0) warn = 'critical';
+    else if (cell.daysLeft <= 3 && remaining > 0) warn = 'high';
+    else if (cell.daysLeft <= 7 && remaining > 0) warn = 'watch';
+    return {
+      date: cell.date,
+      grantCount: cell.grantCount,
+      amounts: Math.round(cell.amounts * 10000) / 10000,
+      remaining,
+      accounts: [...cell.accounts],
+      accountCount: cell.accounts.size,
+      daysLeft: cell.daysLeft,
+      dailyNeed,
+      warn,
+    };
+  });
+  out.sort((a, b) => a.date.localeCompare(b.date));
+  return out;
+}
+
+module.exports = {
+  FILE, filePath, record, readAll, hasGrant, fromClaim, expiring, expired, estimateRemaining,
+  classifyVerification, expiryDistribution,
+};

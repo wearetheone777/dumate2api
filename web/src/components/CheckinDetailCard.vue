@@ -40,7 +40,10 @@
         <div class="mb-1.5 flex items-center justify-between">
           <div class="flex flex-wrap items-center gap-2">
             <span class="font-medium">{{ a.name }}</span>
-            <a-tag v-if="isCurrentMonth" :color="a.checkedToday ? 'green' : 'orange'">
+            <!-- WorkBuddy 国际版没有签到接口：账号要出现（用户想看「这个号」），
+                 但不能让人以为「它一直没签」——标签说清是上游不支持 -->
+            <a-tag v-if="a.unsupportedCheckin" color="default">不支持签到</a-tag>
+            <a-tag v-else-if="isCurrentMonth" :color="a.checkedToday ? 'green' : 'orange'">
               {{ a.checkedToday ? '今日已签' : '今日未签' }}
             </a-tag>
             <span class="text-xs text-slate-500">本月 {{ a.daysInMonth }} 天</span>

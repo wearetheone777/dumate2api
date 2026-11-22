@@ -11,7 +11,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-wb-err-'));
+const { tmpDir } = require('../helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-wb-err');
 
 const c = require('../../src/workbuddy/constants');
 const wb = require('../../src/workbuddy');

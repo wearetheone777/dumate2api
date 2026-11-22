@@ -12,7 +12,8 @@ const path = require('node:path');
 const setup = require('../../src/agent-setup');
 
 function tmpRoot() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'agent-setup-test-'));
+const { tmpDir } = require('../helpers/tmpdir');
+  return tmpDir('agent-setup-test');
 }
 
 // ---- Claude Code：settings.json 深合并 ----

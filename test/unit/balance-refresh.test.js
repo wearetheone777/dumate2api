@@ -11,7 +11,8 @@ const os = require('node:os');
 const path = require('node:path');
 
 // env 必须在 require 业务模块之前就位（各家 DATA_DIR 都在模块加载时定型）
-process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'balance-refresh-data-'));
+const { tmpDir } = require('../helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('balance-refresh-data');
 process.env.DUMATE_POOL_STATE = path.join(process.env.DUMATE_ADMIN_DATA, 'pool-state.json');
 
 const br = require('../../src/balance-refresh');
@@ -123,4 +124,74 @@ test('snapshot：未启用时说明文案要点出「FEFO 只靠管理端页面�
   const s = br.snapshot();
   assert.equal(s.enabled, false);
   assert.ok(/管理端/.test(s.note));
+});
+
+// ---- 直连通道段（2026-11-08 补）：WorkBuddy 的 FEFO / 护栏快照 ----
+//
+// 背景：WorkBuddy 的两份快照 TTL 都是 6 小时，写方原来只有管理端 /credits
+// （真机上 workbuddy 段的 at 停了 100+ 小时，护栏快照文件从未被创建）。
+// 接进本模块复用 keepalive 的 adapter（取数 + 落盘同一份实现），不重写。
+
+function wbAdapter(calls) {
+  return {
+    channel: 'workbuddy',
+    list: () => [{ id: 41, nickname: '甲' }, { id: 42, nickname: '乙' }],
+    uid: (a) => `workbuddy:${a.id}`,
+    name: (a) => a.nickname,
+    refresh: async () => ({ ok: true, skipped: true }),
+    balance: async (a) => {
+      calls.push(a.id);
+      return a.id === 41
+        ? { ok: true, remain: 10, precise: 10.5, expireNearest: Date.now() + 86400000 }
+        : { ok: false, error: '国际版没有额度接口' };
+    },
+    persistSnapshots: (rows) => {
+      calls.push(['persist', rows.length, rows.filter((r) => r.ok).length]);
+      return { fefoWrote: true, guardWrote: true, entries: 1, failed: 1 };
+    },
+  };
+}
+
+test('collectWorkbuddy：串行取余额 + 一次落盘；失败账号也算进总数', async () => {
+  const calls = [];
+  const out = await br.internals.collectWorkbuddy({ adapter: wbAdapter(calls), delay: 0 });
+  assert.deepEqual(calls, [41, 42, ['persist', 2, 1]], '两个账号各查一次，最后统一落盘一次');
+  assert.equal(out.accounts, 2);
+  assert.equal(out.ok_count, 1);
+  assert.equal(out.fail_count, 1);
+  assert.equal(out.fefoWrote, true);
+  assert.equal(out.rows.find((r) => r.accountId === 41).precise, 10.5, 'precise 透传给落盘层');
+});
+
+test('collectWorkbuddy：无可用账号 → null（不落空快照，避免把旧条目清光）', async () => {
+  const ad = wbAdapter([]);
+  ad.list = () => [];
+  assert.equal(await br.internals.collectWorkbuddy({ adapter: ad, delay: 0 }), null);
+});
+
+test('collectWorkbuddy：adapter 没有 persistSnapshots → null（可选能力缺失要静默退化）', async () => {
+  const ad = wbAdapter([]);
+  ad.persistSnapshots = undefined;
+  assert.equal(await br.internals.collectWorkbuddy({ adapter: ad, delay: 0 }), null);
+});
+
+test('runOnce：直连段失败不拖累主通道结果（单独回执）', async () => {
+  const bad = {
+    channel: 'workbuddy',
+    list: () => [{ id: 51 }],
+    uid: () => 'workbuddy:51',
+    name: () => '丙',
+    refresh: async () => ({ ok: true, skipped: true }),
+    balance: async () => ({ ok: false, error: 'boom' }),
+    persistSnapshots: () => { throw new Error('落盘炸了'); },
+  };
+  const r = await br.runOnce('manual', { list, quota, delay: 0, workbuddy: { adapter: bad, delay: 0 } });
+  assert.equal(r.ok_count, 1, '主通道结果不受影响');
+  assert.ok(r.workbuddy, '直连段要有回执');
+  assert.match(r.workbuddy.error, /落盘炸了/, '异常如实报出，不吞');
+});
+
+test('runOnce：opts.workbuddy = null 可跳过直连段（老用例 / 单通道场景）', async () => {
+  const r = await br.runOnce('manual', { list, quota, delay: 0, workbuddy: null });
+  assert.equal(r.workbuddy, null);
 });

@@ -15,7 +15,8 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-verify-multiuser-'));
+const { tmpDir } = require('./helpers/tmpdir');
+const TMP = tmpDir('dumate-verify-multiuser');
 const ADMIN_PORT = 19093;
 const GW_PORT = 19092;
 const ADMIN_PWD = 'admin-test-123';

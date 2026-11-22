@@ -613,6 +613,60 @@
         </a-col>
       </a-row>
 
+      <!-- 积分到期分布（P2-18）：按到期日聚合「哪天会一口气作废多少」。
+           明细里看不出的真风险（如「明天同时作废 300」）只有聚合后可见。
+           dailyNeed = 推算剩余 ÷ 剩余天数，把「快过期」变成「每天要用 X 才不亏」。 -->
+      <a-card
+        v-if="qdExpiryDist.length"
+        title="积分到期分布"
+        :bordered="false"
+        class="mt-4"
+      >
+        <template #extra>
+          <span class="text-xs text-slate-500">
+            {{ qdExpiryDist.length }} 个到期日 ·
+            共 {{ fmt(qdExpiryDistRemaining) }}（推算剩余）
+          </span>
+        </template>
+        <a-table
+          size="small"
+          :pagination="false"
+          :data-source="qdExpiryDist"
+          :columns="qdExpiryColumns"
+          row-key="date"
+        >
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.key === 'date'">
+              <span class="text-xs">{{ record.date }}</span>
+              <a-tag v-if="record.warn" :color="warnColor(record.warn)" class="ml-1">
+                {{ record.daysLeft === 0 ? '今天到期' : `${record.daysLeft} 天后` }}
+              </a-tag>
+            </template>
+            <template v-else-if="column.key === 'remaining'">
+              <span class="font-medium num" :class="record.remaining > 0 ? 'text-amber-700' : 'text-slate-500'">
+                {{ fmt(record.remaining) }}
+              </span>
+            </template>
+            <template v-else-if="column.key === 'amounts'">
+              <span class="num text-slate-400">{{ fmt(record.amounts) }}</span>
+            </template>
+            <template v-else-if="column.key === 'dailyNeed'">
+              <span class="num" :class="record.warn ? 'text-orange-600' : 'text-slate-500'">
+                {{ record.remaining > 0 ? fmt(record.dailyNeed) : '—' }}
+              </span>
+            </template>
+            <template v-else-if="column.key === 'accounts'">
+              <span class="text-xs text-slate-500">{{ record.accountCount }} 个号 · {{ record.grantCount }} 批</span>
+            </template>
+          </template>
+        </a-table>
+        <div class="text-xs text-slate-500 mt-2">
+          「日均需耗量」= 推算剩余 ÷ 剩余天数（今天到期按 1 天算）——
+          每天至少要用掉这么多，这批才不算白领。<b>余额为 0 的批次不报警</b>：
+          按消耗顺序已经用完了，到期即自然作废，没有浪费。
+        </div>
+      </a-card>
+
       <!-- 积分过期明细。
            Qoder 的积分是**签到领的、30 天后作废**（与千问的月度额度按
            valid_to 刷新、搭子按有效期都不同）。上游没有逐批余额接口，
@@ -1613,7 +1667,7 @@ import TodayUsageCard from '@/components/TodayUsageCard.vue'
 import McpAccessCard from '@/components/McpAccessCard.vue'
 import ChannelBalanceCard from '@/components/ChannelBalanceCard.vue'
 import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
-import { qoderApi, type QoderDashboardAccount, type QoderCreditRow, type QoderGrant } from '@/api/qoder'
+import { qoderApi, type QoderDashboardAccount, type QoderCreditRow, type QoderGrant, type QoderGrantExpiryDay } from '@/api/qoder'
 import { qwenworkApi, type QwCredits, type QwDailyRow, type QwAccount, type QwCreditRecord, type QwAccountsSummary } from '@/api/qwenwork'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
 import { remainText, remainColor } from '@/utils/remain'
@@ -1901,6 +1955,25 @@ const qdGrantsEstTotal = computed(() => {
   if (rows.some((g) => g.estimatedRemaining == null)) return null
   return rows.reduce((s, g) => s + (g.estimatedRemaining || 0), 0)
 })
+
+// 积分到期分布（P2-18）：按到期日聚合，回答「哪天会一口气作废多少」。
+// 与明细同源（推算剩余），只是换个视角——明细里一堆相同的行看不出真风险。
+const qdExpiryDist = ref<QoderGrantExpiryDay[]>([])
+const qdExpiryDistRemaining = computed(() =>
+  qdExpiryDist.value.reduce((s, r) => s + (r.remaining || 0), 0))
+const qdExpiryColumns = [
+  { title: '到期日', key: 'date', width: '20%' },
+  { title: '将作废（推算）', key: 'remaining', width: '18%' },
+  { title: '领取额', key: 'amounts', width: '14%' },
+  { title: '日均需耗量', key: 'dailyNeed', width: '18%' },
+  { title: '涉及', key: 'accounts', width: '30%' },
+]
+function warnColor(w: string) {
+  if (w === 'critical') return 'red'
+  if (w === 'high') return 'orange'
+  if (w === 'watch') return 'gold'
+  return 'default'
+}
 
 // 账号健康快照每张卡要的派生数据。与 TRAE 同构：
 //   - 剩余额度按账号取（额度是账号级的，不能用合计）
@@ -2339,7 +2412,7 @@ async function refreshQd() {
       // 否则失败会被渲染成「合计 0.0000」，与「缺失显示 —」的口径相反。
       qoderApi.credits(r).catch(() => null),
       // 积分过期明细：本地账本 + 各账号总余额的先领先扣推算（上游侧）
-      qoderApi.grants(30).catch(() => ({ data: { rows: [], windowDays: 30 } })),
+      qoderApi.grants(30).catch(() => ({ data: { rows: [], windowDays: 30, distribution: [] } })),
       // 今日用量：与其它通道同一数据源（按当前区域过滤）
       client.get(`/usage/overview?days=14&channel=qoder${r ? `&region=${r}` : ''}`).catch(() => ({ data: null })),
     ])
@@ -2357,6 +2430,7 @@ async function refreshQd() {
     }
     qdGrants.value = (g.data.rows || []) as QoderGrant[]
     qdGrantsWindowDays.value = g.data.windowDays || 30
+    qdExpiryDist.value = (g.data.distribution || []) as QoderGrantExpiryDay[]
     usage.value = u.data
     await channelStore.load()
     lastRefresh.value = new Date().toLocaleTimeString('zh-CN')

@@ -221,4 +221,52 @@ function maxOutputOf(region = 'cn', modelId = '', rows = null) {
   return m ? (Number(m.maxTokens) || 0) : 0;
 }
 
-module.exports = { fetchModels, parseCatalog, parseCreditsRate, cachedModelIds, maxOutputOf, CACHE_MS };
+/**
+ * 按模型名推断它属于哪个区域（2026-11-08 融合批，真机事故驱动）。
+ *
+ * **要解决的真实问题**：`accountsForRegion()` 只在调用方显式传 `opts.region`
+ * 时才收窄账号。不传时 `usable` 是**两区账号混在一起**，而模型名是有区域归属的
+ * ——国内目录里的 `deepseek-v4.1-flash` 发给国际账号，上游直接回 11140
+ * `request illegal`（不是「模型不存在」的 11102，是**风控码**）。这条路径会让
+ * 一次正常的请求看起来像「账号被限制」，进而触发连坐暂停，把整条通道弄停。
+ *
+ * 判据只用**已缓存的目录**（`cachedModelIds`），绝不在这里打上游：
+ * 选号在请求热路径上，为判区域多打一次上游是明确的倒退。
+ *
+ * 返回 null = 判不出来（缓存里两边都没有这个模型名）。**判不出来不要拦**——
+ * 宁可让上游自己报 11102，也不要在本地凭猜测拒掉一个可能合法的模型名
+ * （自定义别名、上游新上线的模型都会落在这一档）。
+ *
+ * @param {string} model
+ * @returns {'cn'|'global'|null}
+ */
+function regionOfModel(model) {
+  const id = String(model || '').trim();
+  if (!id) return null;
+  const inCn = cachedModelIds('cn').includes(id);
+  const inIntl = cachedModelIds('global').includes(id);
+  if (inCn && !inIntl) return 'cn';
+  if (inIntl && !inCn) return 'global';
+  // 两边都有（同名不同价，如 hy4std）或两边都没有 → 判不出来，交给上游
+  return null;
+}
+
+/**
+ * 测试注入点：直接塞入某区域的模型目录缓存（不走上游）。
+ *
+ * 为什么需要它：`regionOfModel` 的收窄行为完全由缓存内容决定，而
+ * `fetchModels` 会真打上游——没有注入点，这条判据就只能测到「无缓存时
+ * 返回 null」这一半，收窄那一半永远没被测到（本项目对这类「没导出的内部
+ * 推导就是没测到的内部推导」已有多次教训）。传 null 清空该区域缓存。
+ */
+function _setCatalog(region, ids) {
+  const reg = c.normalizeRegion(region);
+  if (ids == null) { caches.delete(reg); return; }
+  const list = (Array.isArray(ids) ? ids : []).map((id) => ({ id: String(id) }));
+  caches.set(reg, { at: Date.now(), data: { models: list, ok: true, fetchedAt: Date.now() } });
+}
+
+module.exports = {
+  fetchModels, parseCatalog, parseCreditsRate, cachedModelIds, maxOutputOf,
+  regionOfModel, _setCatalog, CACHE_MS,
+};

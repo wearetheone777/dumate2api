@@ -387,6 +387,110 @@ function builtinAdapters() {
         return { ok: true, remain, error: '' };
       },
     },
+    {
+      // WorkBuddy（2026-11-08 补齐：CHANNEL-WORKBUDDY.md 早就写了这个 adapter，
+      // 代码里一直没有——文档与实现漂移，补的就是这一处）。
+      //
+      // **故意不实现 checkin**：签到已有专职排程（`src/workbuddy/autocheckin.js`
+      // 每日 00:00 + 抖动，带「先查状态、未知不签」的判据）。两边都签虽然幂等，
+      // 但会把上游请求翻倍，且 keepalive 的时点（22:30）签当天太早——
+      // 那天之后的活跃就不计入连登。签到归 autocheckin，保活只管续期与余额。
+      channel: 'workbuddy',
+      list() { return require('./workbuddy/auth').findUsable(); },
+      uid(a) { return `workbuddy:${a.id}`; },
+      name(a) { return a.nickname || a.uid || `账号 ${a.id}`; },
+      async refresh(a) {
+        const authStore = require('./workbuddy/auth');
+        const cur = authStore.get(a.id) || a;
+        if (!authStore.needsRefresh(cur, state.warn_hours * 3600 * 1000)) {
+          return { ok: true, skipped: true, expire_at: cur.expiresAt || null };
+        }
+        // auth.exchange 内部已有 refreshGuard（跨进程轮换竞态）+ 单飞，
+        // 这里不重复实现；成功后必须落盘（新 refreshToken 只此一份）
+        const r = await authStore.exchange(cur);
+        if (r.ok && r.patch) { try { authStore.patch(a.id, r.patch); } catch (e) { /* 落盘失败下轮重试 */ } }
+        const merged = { ...cur, ...(r.patch || {}) };
+        return { ok: !!r.ok, error: r.error || '', expired: !!r.expired, expire_at: merged.expiresAt || null };
+      },
+      async balance(a) {
+        const billing = require('./workbuddy/billing');
+        const region = require('./workbuddy/constants').normalizeRegion(a.region);
+        const q = await billing.fetchCredits(region, a);
+        // **国际版如实 null**：那边没有 credits 接口（订阅按请求数计），
+        // 报 0 会让解冻闭环把「查不到」当成「用完了」
+        if (!q.ok) return { ok: false, error: q.error || (q.unsupported ? '该区域没有额度接口' : ''), remain: null };
+        const remain = q.totalPrecise != null ? q.totalPrecise : q.total;
+        // 精确剩余与最近到期一并带出：snapshot() 要用它们写两份快照。
+        // 取不到如实 null（不是 0）——0 会被读成「用完了」。
+        let expireNearest = null;
+        for (const p of (q.packages || [])) {
+          const at = Number(p && p.expireAt);
+          if (Number.isFinite(at) && at > 0 && (expireNearest == null || at < expireNearest)) expireNearest = at;
+        }
+        return {
+          ok: Number.isFinite(remain),
+          remain: Number.isFinite(remain) ? remain : null,
+          precise: q.totalPrecise != null && Number.isFinite(q.totalPrecise) ? q.totalPrecise : null,
+          expireNearest,
+          error: '',
+        };
+      },
+      /**
+       * 把本轮余额结果落进两份快照：FEFO 临期（`expiring.js`）与额度护栏
+       * （`workbuddy/credits-snapshot.js`）。
+       *
+       * **为什么必须在这里写**（2026-11-08 补的真实缺口）：这两份快照原本
+       * 只有管理端 `/credits` 会写——运维不点开 WorkBuddy 的账号页/积分页，
+       * 快照就停在上次打开的时刻，6 小时后 FEFO 静默退回普通轮询、护栏自动
+       * 失效（都是「安全方向」但等于白做）。而 keepalive 每天本来就打一次
+       * `fetchCredits`（每号一次上游），**到期时间与精确剩余已经到手，却只留
+       * 了余额**——白扔掉的那部分正是快照要的。这里不再多发一次上游请求。
+       *
+       * 口径与 `/credits` 严格一致（同一个 expiring.update / credits-snapshot.update）：
+       *   - 查询失败的账号走 keepIds / 不写入 → 旧条目保留，不当成「无临期/剩 0」
+       *   - 有账号失败时 expiring 的 at 不推进（「部分数据是旧的」不能让快照
+       *     看起来同样新鲜）——代价是长期有号失败时 FEFO 会按 TTL 退回普通轮询
+       *   - 到期时刻只用**未过期且在窗口内**的（已过期的包上游已废止）
+       */
+      persistSnapshots(rows) {
+        const now = Date.now();
+        const expiringSnap = require('./expiring');
+        const creditsSnap = require('./workbuddy/credits-snapshot');
+        const winMs = expiringSnap.windowDays('workbuddy') * 86400000;
+        const okRows = rows.filter((r) => r && r.ok);
+        const failIds = rows.filter((r) => r && !r.ok).map((r) => r.accountId).filter((x) => x != null);
+        const entries = [];
+        for (const r of okRows) {
+          if (r.accountId == null) continue;
+          const at = Number(r.expireNearest);
+          if (Number.isFinite(at) && at > now && at <= now + winMs) {
+            entries.push({ accountId: r.accountId, nearest: at });
+          }
+        }
+        const fefoWrote = expiringSnap.update('workbuddy', entries, { keepIds: failIds });
+        // 护栏快照：本轮是整通道全量扫（keepalive 的 list() 就是全量），
+        // 所以 scope='all'——失败的号由 update 内部按「不写、保留旧条目」处理
+        const guardWrote = creditsSnap.update(
+          okRows.map((r) => ({ id: r.accountId, remain: r.remain, precise: r.precise })),
+          { scope: 'all', now },
+        );
+        // 余额写进池（2026-11-08 融合批）：这是 `pool.creditFloor` 保底线的
+        // **唯一数据源**。补它之前 `channel-pool` 从没暴露 `setCredits`，
+        // 所以直连通道的余额从未进池，`floor_blocked` 恒为 false、
+        // 保底线对 WorkBuddy 完全无效（机制有、接线没接的又一例）。
+        // 精确值优先（整数 remain 是 floor，会把「还差一点」判成「已到线」）。
+        let creditsWrote = 0;
+        try {
+          const channelPool = require('../channel-pool');
+          for (const r of okRows) {
+            if (r.accountId == null) continue;
+            const val = r.precise != null ? r.precise : r.remain;
+            if (channelPool.noteCredits('workbuddy', r.accountId, val, r.remain)) creditsWrote++;
+          }
+        } catch (e) { /* 池写入失败不影响快照 */ }
+        return { fefoWrote, guardWrote, creditsWrote, entries: entries.length, failed: failIds.length };
+      },
+    },
   ];
 }
 
@@ -559,8 +663,16 @@ async function balancePhase(units, cfg, token) {
       }
       rows[i] = {
         channel: u.ad.channel, uid: u.uid, name: u.name,
+        // accountId：通道内的裸账号 id。回落快照（adapter.snapshot）需要它，
+        // 而从 uid（'workbuddy:1'）反解是隐式约定——uid 前缀由各通道自定义，
+        // 反解必然漂。null 表示该 adapter 没提供（多数通道用不到）。
+        accountId: u.a && u.a.id != null ? u.a.id : null,
         ok: !!(b && b.ok),
         remain,
+        // adapter 可以一并带回「精确剩余 / 最近到期」（WorkBuddy 的 fetchCredits
+        // 本来就给了），供 channel.snapshot 写 FEFO / 护栏快照用；没有就 null
+        precise: b && Number.isFinite(b.precise) ? b.precise : null,
+        expireNearest: b && Number.isFinite(b.expireNearest) ? b.expireNearest : null,
         error: (b && b.error) || '',
       };
       if (!(await sleepCtx(cfg.per_account_delay_ms, token))) return;
@@ -640,6 +752,23 @@ async function runOnce(trigger = 'manual', opts = {}) {
       ? { cooling_count: 0, with_balance: 0, unfrozen: [], revive_failed: [] }
       : reconcile(poolApi, balanceRows, cfg);
 
+    // 阶段 4.5：把本轮余额落进通道自己的快照（当前只有 WorkBuddy 需要）。
+    // **必须在这里、不能只在 reconcile 之后**：reconcile 只关心「要不要解冻」，
+    // 而 FEFO / 护栏要的是「到期时刻与精确剩余」——同一批数据，两种用途。
+    // 失败不影响本轮结果（快照是加分项，不是保活的目的）。
+    let snapshots = null;
+    if (!token.aborted && balanceRows.length) {
+      snapshots = {};
+      for (const ad of adapters) {
+        if (typeof ad.persistSnapshots !== 'function') continue;
+        const mine = balanceRows.filter((r) => r.channel === ad.channel);
+        if (!mine.length) continue;
+        try { snapshots[ad.channel] = ad.persistSnapshots(mine); } catch (e) {
+          snapshots[ad.channel] = { error: e.message };
+        }
+      }
+    }
+
     state.last_run_at = Date.now();
     state.last_result = {
       trigger,
@@ -655,6 +784,7 @@ async function runOnce(trigger = 'manual', opts = {}) {
       balance_results: balanceRows,
       unfrozen: rec.unfrozen,
       revive_failed: rec.revive_failed,
+      snapshots,
       pool_mode: poolApi.mode,
     };
     try {
@@ -749,5 +879,7 @@ function configure(patch = {}) {
 module.exports = {
   schedule, stop, runOnce, snapshot, configure, state, setAdapters, setPool,
   // 测试/集成专用：排程纯函数、pool 对接层、可取消原语
-  internals: { computeNextRunAt, normalizePool, makeToken, sleepCtx, expireWarn, reconcile, balancePhase, armAt, shouldCatchup, healthAlerts },
+  // builtinAdapters 一并导出：adapter.snapshot 这类「可选能力」如果拿不到
+  // 真实实现，单测只能自己抄一份假的——抄的那份永远与实现同步，等于没测。
+  internals: { computeNextRunAt, normalizePool, makeToken, sleepCtx, expireWarn, reconcile, balancePhase, armAt, shouldCatchup, healthAlerts, builtinAdapters },
 };

@@ -8,7 +8,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-trae-degrade-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const tmp = tmpDir('dumate-trae-degrade');
 process.env.DUMATE_ADMIN_DATA = tmp;
 const runtime = require('../../src/trae-runtime');
 const tw = require('../../src/traework');

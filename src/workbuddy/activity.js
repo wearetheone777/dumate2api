@@ -137,33 +137,59 @@ function today() {
 
 /**
  * 每日活跃上报（幂等：账号档案 lastActivityReport 是今天就跳过）。
+ *
+ * **返回语义分两层（2026-11-08 真机实测后拆分）**：
+ *   ok       请求已送达且上游回 code===0 —— 只证明「这个 POST 被接了」
+ *   verified 连登天数回读成功（`streakDays != null`）—— 才证明「事件真的被记了」
+ *
+ * 为什么要拆：实测 `/v2/report` **不校验凭证**——用假 accessToken 也返回
+ * `{"code":0,"msg":"OK"}`；而同一假 token 打 `/activity/growth/streak` 是 401。
+ * 也就是说 `code===0` 完全不能证明「这条事件被计入连登」。
+ * 原来的实现把 code 0 当成「上报成功」并据此写 `lastActivityReport`，
+ * 于是凭证失效的账号会**每天"成功"一次、连登一天也不涨**，且从结果里看不出来。
+ * 现在：未 verified 时 msg 明说「无法验证」，`error` 带上回读失败原因，
+ * 上游侧调用方（autocheckin）把「已送达但未验证」单独计数，不冒充成功。
+ *
  * @param {object} account 千问风格账号（含 region / accessToken / uid）
  * @param {object} [opts] { authStore } 测试注入
- * @returns {Promise<{ok:boolean, skipped:boolean, streakDays:number|null, msg:string, error:string}>}
+ * @returns {Promise<{ok:boolean, verified:boolean, skipped:boolean,
+ *   streakDays:number|null, msg:string, error:string}>}
  */
 async function reportActivity(account, opts = {}) {
   const region = c.normalizeRegion(account && account.region) === 'global' ? 'global' : 'cn';
   const authStore = opts.authStore || require('./auth');
   const prev = String((account && account.lastActivityReport) || '');
   if (prev.startsWith(today())) {
-    return { ok: true, skipped: true, streakDays: null, msg: '今日已上报过活跃', error: '' };
+    return { ok: true, verified: false, skipped: true, streakDays: null, msg: '今日已上报过活跃', error: '' };
   }
   if (!account || !account.uid) {
     // hub 口径：不带 userId 的事件会被静默丢弃——宁可跳过也不白发
-    return { ok: false, skipped: false, streakDays: null, msg: '', error: '账号缺 uid，上报会被上游静默丢弃（跳过）' };
+    return {
+      ok: false, verified: false, skipped: false, streakDays: null,
+      msg: '', error: '账号缺 uid，上报会被上游静默丢弃（跳过）',
+    };
   }
   const r = await reportEvents(region, account, [buildChatEvent(account)]);
   if (!r.ok) {
-    return { ok: false, skipped: false, streakDays: null, msg: '', error: r.error || '活跃上报被上游拒绝' };
+    return {
+      ok: false, verified: false, skipped: false, streakDays: null,
+      msg: '', error: r.error || '活跃上报被上游拒绝',
+    };
   }
+  // 送达即记档案：明天不该因为「回读失败」而重发同一条事件（重复上报无收益，
+  // 且会多一次上游请求）。回读是**验证**，不是**重试条件**。
   try { authStore.patch(account.id, { lastActivityReport: `${today()} ${new Date().toTimeString().slice(0, 8)}` }); } catch (e) { /* 记不下不影响结论 */ }
   const days = await fetchStreakDays(region, account);
+  const verified = days != null;
   return {
     ok: true,
+    verified,
     skipped: false,
-    streakDays: days,
-    msg: days == null ? '对话活跃上报成功（连登天数未知）' : `对话活跃上报成功（连续打卡 ${days} 天）`,
-    error: '',
+    streakDays: verified ? days : null,
+    msg: verified
+      ? `对话活跃上报成功（连续打卡 ${days} 天）`
+      : '活跃事件已送达上游（code=0），但连登天数回读失败——无法验证是否真的计入',
+    error: verified ? '' : '连登回读失败（/activity/growth/streak 未返回天数；凭证或该端点权限可能有问题）',
   };
 }
 

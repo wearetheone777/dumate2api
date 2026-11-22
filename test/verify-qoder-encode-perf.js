@@ -69,14 +69,32 @@ assert('encode(JSON) 与参考一致',
 }
 
 // ---- 3. 性能：每 KB 成本必须恒定（防 O(n²) 回归）----
+//
+// **测量纪律（2026-11-08 修偶发假失败）**：原来每个尺寸只测**一次**——
+// 16MB 那次一旦撞上 GC（分配 16MB 本身就容易触发），耗时会被整段 GC 撑大，
+// 比值随机越过阈值 3，表现为「性能用例偶发变红」。而它要防的是**数量级**
+// 回归（O(n²) 会超 10 倍），不是几个百分点的抖动，所以：
+//   1. 先跑一遍预热（让编码路径完成 JIT，1MB 的首次调用明显偏慢）
+//   2. 每个尺寸测 3 次取**最小值**（min-of-N 是基准测试的标准做法：
+//      噪声只会让某次变慢，不会让某次变快，取最小就是对噪声免疫）
+// 阈值不动（仍是 3）——判据不放松，只是把噪声从测量里去掉。
 {
   const sizes = [1, 4, 16]; // MB
+  const bufs = sizes.map((mb) => Buffer.alloc(mb * 1024 * 1024, 0x41));
+  // 预热：小尺寸跑两次（JIT + 首次分配）
+  cosy.encode(bufs[0]);
+  cosy.encode(bufs[0]);
   const perKB = [];
-  for (const mb of sizes) {
-    const buf = Buffer.alloc(mb * 1024 * 1024, 0x41);
-    const t = Date.now();
-    cosy.encode(buf);
-    perKB.push((Date.now() - t) / (mb * 1024));
+  for (let i = 0; i < sizes.length; i++) {
+    const mb = sizes[i];
+    let best = Infinity;
+    for (let run = 0; run < 3; run++) {
+      const t = process.hrtime.bigint();
+      cosy.encode(bufs[i]);
+      const ms = Number(process.hrtime.bigint() - t) / 1e6;
+      if (ms < best) best = ms;
+    }
+    perKB.push(best / (mb * 1024));
   }
   // 线性实现：大输入的每 KB 成本不应明显高于小输入（放宽到 3 倍，
   // 容忍 JIT 预热与 GC 抖动；O(n²) 实现会超出 10 倍以上）

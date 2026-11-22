@@ -17,7 +17,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-wb-restriction-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-wb-restriction');
 process.env.DUMATE_ADMIN_DATA = TMP;
 // 显式钉住连坐参数，别让本机环境变量影响断言
 process.env.DUMATE_WORKBUDDY_RESTRICTION_WAVE_MIN = '2';

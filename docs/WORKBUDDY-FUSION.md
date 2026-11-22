@@ -7,6 +7,61 @@
 
 ---
 
+## 落地状态（2026-11-08 批次）
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| P0-1 后台自动签到调度器 | ✅ 已实现 | `src/workbuddy/autocheckin.js` + `GET/PUT /api/admin/workbuddy/autocheckin` + `POST .../autocheckin/run` + 账号页「自动化与护栏」卡。**国内=签到、国际=网页打卡**（见第六节） |
+| P0-3 自动补积分「只点名缺积分的号」 | ✅ 已实现 | `/credits?uids=1,2`（含 `scope/requested` 回执）+ 积分页「只补刷缺失的 N 个」 |
+| P1-4 API Key 账号白名单 | ✅ 已实现 | `keys.account_allowlist` + `keys.accountAllowed()` + WorkBuddy 选号处过滤 + Key 页表单/列 |
+| P1-5 11-128 / 风控取证开关 | ✅ 已实现 | `src/workbuddy/dump.js`（`DUMATE_WORKBUDDY_DUMP_11_128`）+ `GET /api/admin/workbuddy/dumps` 只读查看；文件名带序号防同毫秒覆盖 |
+| P1-6 额度护栏 | ✅ 已实现（2026-11-08 才真正有数据源，见第八节） | `src/workbuddy/credits-snapshot.js` + `runtime.guard` + `GET/PUT /api/admin/workbuddy/guard` + 选号过滤。**上线后一度从未生效**——写方只有管理端 `/credits`，真机查证快照文件根本不存在 |
+| P1-7 请求体 413 先响应再排空 | ✅ 已实现 | `src/body-limit.js`（server.js 改为转发 + `Connection: close`） |
+| P2-10 启动端口占用检查 | ✅ 已实现 | `src/port-probe.js`（能连上即算占用，`DUMATE_PORT_PROBE=0` 可关） |
+| P2-11 连坐参数面板化 + 保存即截断倒计时 | ✅ 已实现 | `src/workbuddy/runtime.js`（mtime 热读，env 仍是默认值）+ `GET/PUT /api/admin/workbuddy/restriction/config` |
+| 顺带：签到详情页接入 | ✅ 已实现 | `admin/routes/checkin.js` 通道白名单 + 国际版 `unsupportedCheckin` 标记 + `CheckinDetailCard` |
+| 顺带：keepalive adapter（refresh/balance） | ✅ 已实现 | `keepalive.builtinAdapters` 补 workbuddy（**不含 checkin**——签到只有一个排程） |
+| 顺带：国际版网页打卡接通 | ✅ 已实现 | `webagent.dailyActivity` 此前**全库无调用方**，现由 autocheckin 调用 |
+| 顺带：国内对话活跃上报接通 | ✅ 已实现 | `activity.reportActivity` 此前只被证书降级分支调用，正常路径从不点亮连登 |
+| 顺带：活跃「送达 ≠ 计入」判据 | ✅ 已实现 | `/v2/report` 对假 token 也回 code=0（真机实测），拆出 `verified` + `activityUnverified` |
+| P2-8 Key 配置示例卡 | ✅ 已实现 | Key 页「配置示例」折叠面板（四协议 cURL，`buildQuery` 拼当前 base/key） |
+| P2-9 账号表客户端分页 + 轮询去重 | ✅ 已实现 | `web/src/utils/paging.ts`（纯函数 + 单测）+ `WorkBuddyAccounts.vue`（筛选→排序→切页、15s 静默轮询、同签名不重画），见第七节 |
+| 顺带：FEFO / 护栏快照的保鲜 | ✅ 已实现 | `keepalive` 的 workbuddy adapter 顺手写 + `balance-refresh` 扩展到直连通道 + 账号页第四块面板，见第八节。**这是本批最有价值的一条**：修之前两份快照在真机上长期失效 |
+| P1-8 请求级错误分类（GitHub 调研） | ✅ 已实现 | `constants.classifyStatus` 新增 `model_unavailable` / `queue` / `reasoning_unsupported` / `tool_pair_mismatch` + `14018` 积分耗尽；`errorActionOf` 四类都不喂账号；11102 走 pool 模型级负缓存，见 11.6/11.9 |
+| P1-9 模型繁忙度探针 | ✅ 已实现 | `src/workbuddy/busy.js` + `GET /api/admin/workbuddy/busy` + 账号页/积分页；国际版 404 如实标 `unsupported`，默认只提示不拦；真机验证 16 个模型 |
+| P1-10 身份头补全 | ✅ 已实现 | `X-Machine-ID`/`X-Session-ID` **按账号 md5 派生**（防整池被看成一台设备）+ B3 追踪族 + Request-ID 与 Message-ID 同值；严格 A/B 对照证明新头无害，见 11.4 |
+| P1-11 按模型名收窄区域 | ✅ 已实现 | `models.regionOfModel` 用缓存目录判归属，选号时收窄；两侧同名 7 个模型如实返回 null 不拦。修复「国内模型发给国际账号 → 11140」的真机事故，见 11.5 |
+| P1-12 顶层 tools[] 指纹清洗 | ✅ 已实现 | `sanitize.sanitizeTools` + `buildChatBody` 接线；**只清 description，绝不改 name/schema 结构**，见 11.7 |
+| P1-13 成长中心只读聚合 | ✅ 已实现 | `src/workbuddy/growth.js` + `GET /api/admin/workbuddy/growth` + 账号页/积分页。**一个写接口都不调**（伪造事件会被识别为异常），5 个端点真机全部打通，见 11.8 |
+| P1-14 保留积分下限接线 | ✅ 已实现 | `channel-pool.noteCredits` + `pool` 的 `DUMATE_POOL_CREDIT_FLOOR`；补上了「pool 有 creditFloor 但直连通道从没写过余额」的断链，见 11.11 |
+| P1-15 视觉验证能力 | ✅ 已实现 | `tools/ui-shot.js`（Edge headless + CDP，零依赖）+ `test/verify-ui-shot.js` 自检 8 项。当场查出两个纯看接口发现不了的 UI 缺陷，见 11.10 |
+| P0-2 成长任务 / 猫猫旅行 / 盲盒 | ⏸ 未做 | **无证据不预编**：任务事件指纹要真机抓包确认形状，见文件末尾说明 |
+| P3 大件（CodeArts / 生图生视频 / 消息压缩 / DSML / 独立进程监控 / 身份头对齐） | ⏸ 未做 | 见各自条目里的「先抓包验证」纪律 |
+
+**顺带补齐的三处文档-实现漂移**（文档都写着有、代码里其实没有）：
+
+1. `docs/CHANNEL-WORKBUDDY.md` 第 9 条写「keepalive 加 workbuddy adapter
+   （refresh/balance/checkin）」，但 `src/keepalive.js` 的 `builtinAdapters()`
+   里从来没有它。本批补了 refresh + balance，**故意不实现 checkin**——签到归
+   `autocheckin.js`（带「先查状态、未知不签」的判据），两边都签会把上游请求
+   翻倍，且 keepalive 的 22:30 时点签当天太早，之后的活跃不计连登。
+2. `CLAUDE.md` 写「keepalive 的 global 分支由『不支持签到』改为网页打卡」，
+   但 `webagent.dailyActivity`（ACP 会话打卡）**全库无调用方**——国际版账号
+   其实从来没打过卡。
+3. `CLAUDE.md` 写「国内版 `/v2/report` …keepalive 签到后顺带」，但
+   `activity.reportActivity` **只在 webagent 的证书降级分支里**被调用——
+   正常路径下国内账号的连登从来不会点亮。
+
+**顺带修掉一个测量缺陷**：`activity.reportActivity` 原来把 `/v2/report` 的
+`code===0` 当作「上报成功」。真机实测该端点**不校验凭证**（假 accessToken 也回
+`{"code":0,"msg":"OK"}`），而同一假 token 打 `/activity/growth/streak` 是 401——
+`code=0` 只证明请求被接，**不证明事件被计入连登**。旧实现会让凭证失效的账号
+每天「成功」一次而连登一天不涨，且从结果里完全看不出来。现在拆
+`ok`（送达）/ `verified`（回读到天数才算），排程把「送达但未验证」单列为
+`activityUnverified`，界面显示「活跃已送达·未验证」而不是报喜。
+
+---
+
 ## 一、调研对象
 
 | 项目 | 定位 | 技术栈 | 活跃度 |
@@ -224,3 +279,194 @@ hub 的致谢里还埋着四个上游逆向源头，做成长任务时直接看�
 5. **P0-2 成长任务自动化**（先跑 Sliverkiss 的逆向资料 + 抓包确认事件形状，再排期）
 6. **P1-4 账号白名单 / P1-6 额度护栏**（按使用场景决定）
 7. P3 大件（CodeArts / 生图生视频 / 消息压缩）等真实需求出现再评估。
+
+**1~4 与 6 已于 2026-11-08 全落地**（状态表见文首），第 5 项仍卡在「无证据不预编」。
+
+---
+
+## 六、本批实现的关键口径（改动前必读）
+
+### P0-1 自动签到（`src/workbuddy/autocheckin.js`）
+
+- **进程归属是管理端（9083）**，不是调研建议的网关。理由：账号存储是文件 + 文件锁的
+  跨进程共享（`auth.exchange` 自带 refreshGuard），管理端同样能刷新；而两个进程各排一份
+  会把上游请求翻倍——`boot.js` 头注释里「保活不许两个进程各排一份」的同一条纪律。
+- **四条不可放宽的口径**：开关默认关且落盘；每日时点 + **只往后加**的随机抖动；
+  签到前先查状态（**已签跳过、未知状态不签**）；关开关即取消排程并中断进行中的一轮。
+- 「未知状态不签」是这套设计的核心：查不到就当没有答案，不拿一次盲签去赌——盲签失败
+  会污染账号的错误记录，也在风控画像上多一笔无意义请求。
+- 签成写统一签到账本（`channel='workbuddy'`），失败只进 `last_result`，不伪造。
+- 与 keepalive 的分工写在 adapter 注释里：**签到只有一个排程**。
+- **国际版走另一条腿：网页打卡**（2026-11-08 接通）。上游国际版没有签到接口
+  （`checkinStatus` 直接 `unsupported`），只有网页 agent 会话打卡
+  （`webagent.dailyActivity`：ACP 建会话 → 取沙箱 → `session/set_model` →
+  `session/prompt` → 轮询 completed）。**那条代码早就写好却全库无调用方**——
+  `CLAUDE.md` 写着「keepalive 的 global 分支由『不支持签到』改为网页打卡」，
+  实际从来没接上，国际版账号一直在裸奔。
+  接法：cn 跑完**顺序**跑 global（网页打卡十几秒/号、有活跃会话上限 10，不能并发）；
+  不复用签到那套「查状态」判据（幂等由账号档案 `lastWebActivity` 负责）；
+  `claimed` 与 `webDaily` **分开计数**（上游动作不同，合并会误导）；
+  **网页打卡不写签到账本**——`/v2/report` 与 `daily-checkin` 是两种上游动作，
+  混进同一本账会让「签到日历」说谎。
+  真机验证（隔离实例 9127）：国际号 `action=web-daily`，假 token 拿到上游
+  `401 Authorization Required` 如实进 `webDailyFailed`；国内号状态查询失败 →
+  `action=unknown` **没有盲签**。
+
+### P0-3 点名补刷（`/credits?uids=`）
+
+- `uids` 为空/全垃圾 → 按「没点名」处理（全量），否则前端拼错参数会让页面安然显示空表。
+- 未点名的账号**一律进 FEFO 的 `keepIds`**：它们这次没被查，保留旧条目是唯一正确的处置。
+- **代价如实说**：带 keepIds 时 `expiring.js` 不推进快照心跳 `at`（它的语义就是「部分数据
+  是旧的，不能显得同样新鲜」），所以长期只做补刷不延长 FEFO 的 TTL——安全方向。
+- 前端只替换被点名的行；接口少返的行会让行凭空消失，这点在 `loadWb(uids)` 里显式合并。
+
+### P1-4 账号白名单（`keys.account_allowlist`）
+
+- 两种写法都认：裸 id `1`（单通道语境）与 `channel:id`（跨通道）。空数组 = 不限。
+- **判定在选号处，不在鉴权处**：鉴权时刻还不知道会选中哪个账号（池轮询/粘性/FEFO 都会
+  改变结果）。全被名单挡掉时如实 403 并说明原因，不静默换别的账号。
+- 保存时只校验形状（`^([a-z]+:)?\d+$`）——账号是否存在要到选号时才知道，保存时判会
+  误伤「先配名单、后加账号」的正常顺序。
+
+### P1-5 11-128 取证（`src/workbuddy/dump.js`）
+
+- 三档：未设=off / `1`=摘要（**不含提示词明文**，可长期开）/ `full`=带原文（token 已脱敏）。
+- 摘要只记**形状**：头名清单、body 长度与结构（roles/contentLengths/hasTools/…）、UA。
+  这些正是 11-128 判定看的东西。
+- 码值匹配带负向数字断言（`111280` 不被 `11128` 吃掉）。
+- 落盘文件名带 `-full` 便于单独清理；写失败返回 null 不抛（取证不该拖垮请求）。
+- **文件名必须唯一**（2026-11-08 修）：原来只用「ISO 毫秒时间戳 + 码 + 档位」，
+  同一毫秒两次命中会**静默覆盖**。真实场景恰恰最容易同时触发——取证档长期开着、
+  多账号并发撞 11-128 时，覆盖等于丢的就是关键样本。现在追加「进程内自增序号
+  （补零到 6 位）+ 4 位随机」，排序仍按时间前缀，同毫秒内的先后由序号保证。
+  刻意用「先写 .tmp 再 rename 独占」而不是 stat-then-write：后者本身有竞态。
+- **排障纪律写进了文件本身**：「先对照身份头与消息形状，不要先轮换账号」——11-128 是
+  请求形态判定，换号只会让更多号暴露在同一形态下。
+
+### P1-6 额度护栏（`credits-snapshot.js` + `runtime.guard`）
+
+- 快照与 FEFO **同源不同文件**（`/credits` 顺手写）：FEFO 只记窗口内会到期的账号，护栏要
+  全部账号的剩余额；混在一份里会让「删掉护栏」和「删掉 FEFO」互相牵连。
+- **护栏是选号过滤，不是请求拦截**：全被剔除时退回全量——「全拦掉」等于把通道弄停，
+  而护栏只是省一次注定 402 的上游请求，不该比上游本身更严。
+- 快照陈旧/缺失/模块异常 → 返回 null → 护栏自动失效。绝不拿 6 小时前的余额把请求拦死。
+- 探针（`opts.probe`）不过滤：它就是要发请求测扣费，被拦掉就永远测不出来。
+
+### P1-7 413 先响应再排空（`src/body-limit.js`）
+
+- 一超限**立刻 resolve(null)** → handler 当场回 413（带 `Connection: close`），后台只排空
+  `DUMATE_BODY_DRAIN_MS`（默认 5s）后 destroy。
+- 原来的「读完才回」正是 hub #799 说的坑：大包上传中 RST 会让客户端只看到「连接被重置」，
+  于是把它当瞬态错误重试/换号重放（Qoder 那条 RST → 整池熔断同源）。
+
+### P2-10 端口占用检查（`src/port-probe.js`）
+
+- **能连上就算占用**，哪怕 `/health` 不回话——「卡死的旧实例」正是最该拦的情形。
+- 只报告并退出码 1，不自作主张 kill：杀进程是使用者的决定。
+- `DUMATE_PORT_PROBE=0` 可关（第三方编排/容器里端口由外部占用时用）。
+
+### P2-11 连坐参数面板化（`src/workbuddy/runtime.js`）
+
+- 四个参数从 `index.js` 的模块级常量改成**现读运行期配置**（mtime 热读）——常量读死
+  正是「改时长必须重启」的根因。
+- **env 仍是默认值来源**：不写配置文件时行为逐字节不变。
+- `holdSeconds=0` = 彻底关闭连坐暂停，但**仍记事件**（关掉护栏不等于蒙眼）。
+- 改短 hold **立即截断现有倒计时**：hold 存 `{at, until}`，现算时夹到 `at + holdMs`；
+  快照回读时按当前配置再夹一次，管理端不会显示过期数字。不需要额外的信号文件。
+
+
+## 七、P2-9 客户端分页 + 轮询去重（2026-11-08 第二批）
+
+融进 `web/src/components/workbuddy/WorkBuddyAccounts.vue`，**行为判据抽到
+`web/src/utils/paging.ts`** 并配单测（`test/unit/workbuddy-accounts-paging.test.js`，
+14 项）。抽出去的理由很实际：分页边界（越界、页大小非法、空集合）与「排序作用
+于全量还是当页」这类问题**在界面上看不出来**，只能靠断言锁。
+
+### 三条口径
+
+1. **筛选 → 排序 → 切页**，顺序不能换。先切页再排序会让每页各自成序，
+   翻页时同一个账号在不同位置出现，用户会以为数据在乱跳。
+2. **页码一律夹紧**。删账号、改筛选、减小每页条数都会让当前页越界；不夹就
+   渲染成一片空白，而且界面不会解释为什么空。`pageSlice` 对越界页码返回**最后
+   一页**而不是 `[]`（返回空数组等于「数据没了」的错误结论）。
+3. **`null` 排在最后**，升序降序都一样。余额取不到是「未知」，不是 0；
+   按 0 排会让未知沉底（升序）或冒充「最紧急」（降序），两种都误导。
+
+### 轮询去重（两层，缺一层都不够）
+
+- **同签名不赋值**：响应体的稳定 JSON 当签名，不变就不写 `ref`。Vue 的依赖链
+  整个不触发，DOM 一个节点都不动——这是「不重画」的唯一可靠做法，
+  「延迟赋值」仍然重画。`sameSig` 用严格 JSON 比较：`null ≠ 0`、
+  `undefined ≠ null`、键序不同也算不同（宁可多画一次，不漏更新）。
+- **在途不叠加**：上一轮没回来就发下一轮，会在慢接口上堆请求（账号多时
+  `/credits` 要逐号打上游），且回来的顺序不定。只有**轮询**被档掉；
+  操作后的回落必须真读，否则删了账号界面还挂着它。
+
+另加**请求序号**：轮询那一轮可能比手动刷新晚回来，后到的旧数据会把刚删掉的
+账号画回来。只认最新一次发出的请求的结果。
+
+### 三条实测数据（隔离实例 9133 + 63 个假账号，`DUMATE_ADMIN_DATA` 指向临时目录）
+
+在真实浏览器里打点验证（MutationObserver + `data-probe-id` 标记），不是靠肉眼：
+
+| 场景 | 观测 |
+|---|---|
+| 63 个账号、50/页 | 分页条出「第 1 / 2 页」+ 本页 50 个；翻到第 2 页 1 个 |
+| 页大小改 100 | 页大小选择器**真的生效**（1/1 页、本页 51），且分页条**没有消失**（改了大小就继续显示，否则调不回来） |
+| 数据未变的 3 个轮询周期 | **DOM 变动 0 条**（childList/characterData/attributes 全为 0），52 张卡的探针标记全部保留 |
+| 数据变化后 | 卡片重新渲染、新昵称如实显示 |
+
+页大小选项是**纯数字字符串**（`'50'`/`'100'`/`'200'`，不是 `'50 / 页'`）：
+ant-design-vue 内部按 `Number(value)` 解析并回传给事件，带单位会变成 `NaN`，
+表现为「页大小选择器点了没反应」。单位放在分页器左侧的说明文字里。
+
+### 轮询的三条约束
+
+- **只在 WorkBuddy 页签跑**：组件级定时器，随 `v-if` 销毁即自动停，比在全局
+  watch 里开关定时器少一处状态。
+- **页面不可见时跳过**（`document.hidden`）：后台标签页里的轮询只是给管理端
+  加请求，而额度这类数据的时效性以分钟计，15 秒的意义只在「我在看」。
+- **切回来立即拉一次**（`visibilitychange`）：否则从别的窗口切回来会先看到最多
+  15 秒的旧数据——而额度/连坐状态恰恰是切回来最想看的。
+- 有弹窗（导入/改名/代理/分组）时不轮询：整表重画会把正在输入的框刷掉内容。
+
+### 已知边界（没有顺手改，留着是因为各有取舍）
+
+- **只做了 WorkBuddy 账号页**。其余四个通道的账号组件是各自独立的模板，
+  共用逻辑得先抽 composable；现在硬套会把三套不同形状的行类型混在一起。
+  `paging.ts` 是纯函数、零 Vue 依赖，后续要复用直接 import 即可。
+- **服务端仍全量返回 `/status`（含 rows）**。分页只在客户端做，接口形状不变——
+  改服务端分页要动 `/status`、`/credits` 与 FEFO 快照三处，且会让「本页 50 个」
+  与「护栏要知道全部账号余额」产生冲突。当前账号量级（两位数到几百）下
+  客户端分页够用。
+
+
+### 补记：P2-9 首版的一处自造缺陷（2026-11-08）
+
+首版轮询直接复用 `load()`，而 `load()` 会拉 `/credits`——**每账号 4 次上游请求**。
+实测 40 个账号时 15 秒一次 = 每小时 3.8 万次上游。这条已在 `CHANNEL-WORKBUDDY.md`
+第 11.2 条详述，此处只留一句给后来者：**新增定时器时先算「一次 tick 打几个上游
+请求 × 账号数 × tick 频率」，再决定它该调哪个接口**。轮询该调的是「读本地状态」
+的那个接口，不是「顺手什么都有」的那个。
+
+## 八、FEFO / 护栏快照的保鲜缺口（2026-11-08 第三批）
+
+**真机证据**：`data/expiring-snapshot.json` 的 workbuddy 段 `at` 距今
+**101.7 小时**（TTL 6h）、`data/workbuddy-credits-snapshot.json` **文件不存在**。
+即：FEFO 临期优先长期失效，P1-6 额度护栏从上线至今没生效过一秒钟。
+
+原因是两份快照的写方只有管理端 `/credits`。运维不点开 WorkBuddy 页面，
+它们就停在上次打开的时刻。而 `keepalive` 每天本来就打一次 `fetchCredits`，
+**到期时间与精确剩余已经到手，却只留了余额**——白扔的正是快照要的。
+
+补两条腿，都不新增上游请求：每日 keepalive 顺手写（`adapter.persistSnapshots`）
++ 低频巡检（`balance-refresh` 扩展到直连通道）。详细口径与真机数据见
+`docs/CHANNEL-WORKBUDDY.md` 第 11.3 条。
+
+顺带补上的还有 `balance-refresh` 的**前端入口**——它此前只有接口没有界面
+（旧文档明写「前端视图未做」），等于把修复挂在一个运维找不到的开关上。
+
+留给后来者的判据：**新增定时器/快照类功能时，先问「谁负责让它保持新鲜、
+那个人的节奏够不够」**。9 小时前那批把签到、护栏、FEFO 都补齐了，但没算
+TTL 与执行频率的关系，于是三样东西都「实现了却长期不生效」——这比没实现
+更难发现，因为界面上一切正常。

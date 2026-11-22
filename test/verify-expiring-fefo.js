@@ -13,7 +13,8 @@ const os = require('os');
 const path = require('path');
 const assert = require('assert');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'fefo-e2e-'));
+const { tmpDir } = require('./helpers/tmpdir');
+const TMP = tmpDir('fefo-e2e');
 // 隔离：快照文件与数据目录都指到临时位置，绝不碰真实 data/
 process.env.DUMATE_EXPIRING_SNAPSHOT_FILE = path.join(TMP, 'snapshot.json');
 process.env.DUMATE_ADMIN_DATA = TMP;

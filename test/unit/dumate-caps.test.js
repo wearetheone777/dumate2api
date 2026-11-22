@@ -10,7 +10,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-caps-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-caps');
 process.env.DUMATE_ADMIN_DATA = TMP; // 在 require 之前
 delete process.env.DUMATE_DUMATE_CAPS_FILE;
 const caps = require('../../src/dumate-caps');

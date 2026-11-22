@@ -121,6 +121,43 @@ export interface QoderGrant {
   /** 距到期天数（向上取整；已过期时为 0） */
   daysLeft: number | null
   expired: boolean
+  /**
+   * 归属核验三态（P0-2，docs/QODER-GATEWAY-FEATURE-MERGE.md）。
+   *
+   * 每日积分**按账号各发一份**，只有服务端判定「同一个人」时才只发一份
+   * （后领的被拒 `SAME_PERSON_ALREADY_CLAIMED`）。所以「领过了」与「真领到了」
+   * 是两回事——被判同人的号没有积分进账，账本照记领取额就是假数据。
+   *
+   * `claimed` 真领到 / `same_person` 额度进了同一个人的另一个号 /
+   * `unverified` **问不出结论（不猜不假报）**。老行缺失按 unverified 显示。
+   */
+  verification?: 'claimed' | 'same_person' | 'unverified'
+  /** true 已核实进账 / false 核实未进账 / null 未核实（**null 不是 false**） */
+  verified?: boolean | null
+  samePerson?: boolean
+  /** 核验的说明（为什么未核实、额度被谁领走） */
+  verifyNote?: string
+}
+
+/** 到期分布的一行（P2-18）：某一天会作废多少 */
+export interface QoderGrantExpiryDay {
+  /** 到期日（本地时区 YYYY-MM-DD） */
+  date: string
+  /** 这天到期的批次数 */
+  grantCount: number
+  /** 领取额合计（对照口径，不随消耗变） */
+  amounts: number
+  /** **推算剩余**合计——真正会作废的数量 */
+  remaining: number
+  /** 涉及的账号 id（同一天可能多账号一起到期） */
+  accounts: number[]
+  accountCount: number
+  /** 距今天数（自然日差，今天到期为 0） */
+  daysLeft: number
+  /** 到期前日均需耗量 = 推算剩余 ÷ max(1, daysLeft) */
+  dailyNeed: number
+  /** critical（≤1 天）/ high（≤3 天）/ watch（≤7 天）/ ''（其余） */
+  warn: '' | 'critical' | 'high' | 'watch'
 }
 
 /**
@@ -301,6 +338,11 @@ export const qoderApi = {
     expiringGrantedAmount: number
     /** expiringAmount 是否推算口径 */
     estimated: boolean
+    /**
+     * 到期分布（P2-18）：按到期日聚合「哪天会一口气作废多少」。
+     * 明细里看不出的真风险（明天同时作废 300）只有聚合后可见。
+     */
+    distribution?: QoderGrantExpiryDay[]
     note: string
   }>(`/qoder/grants?days=${days}${region ? `&region=${region}` : ''}`),
   checkin: (id?: number) => client.post('/qoder/checkin', id ? { id } : {}),
@@ -342,4 +384,309 @@ export const qoderApi = {
   removeAccount: (id: number) => client.delete(`/qoder/accounts/${id}`),
   patchAccount: (id: number, fields: { enabled?: boolean; preferred?: boolean }) =>
     client.patch<{ ok: boolean; account?: QoderAccount }>(`/qoder/accounts/${id}`, fields),
+
+  // ---- 运行期配置（P0-3，热生效：保存后网关下一次判定就读到新值） ----
+  runtime: () => client.get<QoderRuntime>('/qoder-runtime'),
+  saveRuntime: (patch: Partial<Pick<QoderRuntimeConfig, 'timeouts' | 'queue' | 'limits' | 'repair' | 'concurrency'>>) =>
+    client.put<{ ok: boolean; config?: QoderRuntimeConfig; changed?: Record<string, object>; restartFields?: string[]; error?: string }>(
+      '/qoder-runtime', patch,
+    ),
+  /** 删除面板配置，全部字段回落到 env 默认值 */
+  resetRuntime: () => client.delete<{ ok: boolean; removed: boolean; config: QoderRuntimeConfig }>('/qoder-runtime'),
+
+  // ---- 自动签到排程（P0-1） ----
+  autocheckin: () => client.get<QoderAutoCheckin>('/qoder-runtime/autocheckin'),
+  saveAutocheckin: (payload: { enabled?: boolean; hour?: number; minute?: number; jitter_minutes?: number; include_intl?: boolean }) =>
+    client.put<QoderAutoCheckin & { ok: boolean; error?: string }>('/qoder-runtime/autocheckin', payload),
+  /** 立即跑一轮（触发式：结果靠 autocheckin() 轮询） */
+  runAutocheckin: () => client.post<{ ok: boolean; started: boolean }>('/qoder-runtime/autocheckin/run'),
+
+  /**
+   * 模型锁池视图（P2-19）。本地快照，不打上游。
+   *
+   * 回答「Qoder 用不了是通道挂了还是某个模型在排队」。限流是 (账号, 模型)
+   * 粒度的，所以「某个模型用不了」不等于通道挂了——换模型往往立刻可用。
+   */
+  modelLocks: (region?: 'cn' | 'intl') =>
+    client.get<QoderModelLocks>(`/qoder/model-locks${region ? `?region=${region}` : ''}`),
+
+  // ---- 输出上限主动探测（P2-20）----
+  /**
+   * 探一个模型的真实输出上限。**触发式**：立刻返回 started，进度靠
+   * `outputProbeStatus()` 轮询。
+   *
+   * **单档真机约 3~4 分钟**（max_tokens=4096 实测 214 秒），四档串行十几分钟
+   * ——所以做成异步，不做同步 HTTP。同一时刻只允许一个（409 = 已有在跑）。
+   */
+  outputProbe: (model: string, region?: 'cn' | 'global') =>
+    client.post<{
+      ok: boolean
+      started?: boolean
+      model?: string
+      region?: string
+      status?: QoderProbeStatus
+      error?: string
+      note?: string
+    }>('/qoder/output-probe', { model, region }, { timeout: 120000 }),
+
+  /** 探测任务状态（不阻塞：只读进程内状态） */
+  outputProbeStatus: () =>
+    client.get<QoderProbeStatus & { ok: boolean }>('/qoder/output-probe/status'),
+
+  /** 已探测结论一览（本地落盘，不打上游） */
+  outputProbes: (region?: 'cn' | 'intl') =>
+    client.get<{
+      region?: string
+      count: number
+      rows: Array<{
+        model: string
+        region: string
+        verdict: string
+        claimed: number | null
+        actual: number | null
+        /** 「32K ⚠ 钳制 4×」/「64K ✓」/「?」 */
+        label: string
+        ts: number
+        stale: boolean
+      }>
+      note: string
+    }>(`/qoder/output-probes${region ? `?region=${region}` : ''}`),
+
+  /**
+   * 用量分析（P2-17）：reqlog ⨝ credits 账本（按 req_id）。
+   * 通用维度在 /usage/overview；这里补 Qoder 特有的账号归因、积分/1M 折算、
+   * 本周期消耗（P1-10 口径）。
+   */
+  usage: (days = 30, region?: 'cn' | 'intl') =>
+    client.get<{
+      days: number
+      region?: string
+      totals: {
+        requests: number
+        ok: number
+        failed: number
+        inputTokens: number
+        outputTokens: number
+        totalTokens: number
+        credits: number
+        avgMs: number | null
+        avgFirstTokenMs: number | null
+        avgTokPerSec: number | null
+      }
+      byAccount: QoderUsageBucket[]
+      byModel: QoderUsageBucket[]
+      daily: Array<{ day: string; requests: number; tokens: number; credits: number; credited: number }>
+      period: {
+        bounded: boolean
+        cost: number
+        billedRequests: number
+        perAccount: Array<{ id: number; name: string; bounded: boolean; cost: number; billedRequests: number; avg: number | null }>
+      }
+      note: string
+    }>(`/qoder/usage?days=${days}${region ? `&region=${region}` : ''}`),
+}
+
+/** 用量分析的一个桶（按账号或按模型） */
+export interface QoderUsageBucket {
+  key: string
+  name?: string
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  credits: number
+  /** 有 credits 的请求数（折算比率的分母口径） */
+  credited: number
+  /** 积分 / 1M Token（真实成本密度）。null = 没有 credited 请求 */
+  creditsPer1M: number | null
+  avgTokPerSec: number | null
+}
+
+/** 模型锁池视图的一行 */
+export interface QoderModelLock {
+  model: string
+  /** 被这个模型锁住的账号 id（已去前缀） */
+  accounts: string[]
+  accountCount: number
+  /** 最早有一个号解锁的时刻 */
+  earliestUntil: number
+  earliestInMs: number
+  /** **全池**解锁的时刻——与 earliestInMs 别混 */
+  allClearUntil: number
+  allClearInMs: number
+  /** 该模型最多撞了几次 */
+  maxHits: number
+  /** 主因（上游原文，截断 160 字） */
+  reason: string
+  reasons: Array<{ text: string; count: number }>
+  /** 粗分：queue（等就好）/ quota / model / other。**不给处置建议** */
+  kind: 'queue' | 'quota' | 'model' | 'other'
+}
+
+/** 探测任务状态（触发式编排的轮询目标） */
+export interface QoderProbeStatus {
+  running: boolean
+  model: string
+  region: string
+  startedAt: number | null
+  finishedAt: number | null
+  elapsedMs: number
+  last: {
+    model: string
+    region: string
+    /**
+     * clamped     被钳制（clamped 是实测值）
+     * at_least    追平过该档（真实上限 ≥ atLeast）
+     * unbounded   **上游不理 max_tokens**（真机：传 4096 回来 24706）
+     *             ——这不是「上限很大」，是「没有可测的上限」
+     * inconclusive 测不出（如实记录，不猜）
+     */
+    verdict: 'clamped' | 'at_least' | 'unbounded' | 'inconclusive'
+    clamped: number | null
+    atLeast: number | null
+    unbounded: { requested: number; completion: number } | null
+    modelMaxTokens: number | null
+    steps: Array<{ requested: number; completion: number | null; finish: string | null; verdict: string; declared?: number; error?: string }>
+    elapsedMs: number
+    ts: number
+    error?: string
+  } | null
+}
+
+export interface QoderModelLocks {
+  region?: string
+  models: QoderModelLock[]
+  /** true = 没有任何模型被锁（正常态） */
+  cleared: boolean
+  totalAccounts: number
+  lockedAccounts: number
+  /** 可选账号数 = 总数 − 被锁账号数 */
+  available: number
+  note: string
+}
+
+/**
+ * Qoder 运行期配置（热生效）。三组值并排给出，是因为它们**可能不一致**：
+ *   envDefaults  环境变量（部署时的意图）
+ *   config       面板落盘值
+ *   effective    **真正生效值**（还要过 chat.js 自己的兜底）
+ * 界面显示 effective，同时把不一致标出来——否则「我明明改过」会变成悬案。
+ */
+export interface QoderRuntimeConfig {
+  timeouts: {
+    /** 首字节超时（ms，0 = 关闭）。挡「连响应头都不给」的挂起 */
+    firstByteMs: number
+    /** 「无内容」超时（ms，0 = 关闭）。挡「先回空 ack 再沉默」的排队形态 */
+    contentMs: number
+    /** 读空闲超时（ms，每块数据重置，0 = 关闭）。必须大于首字节超时 */
+    readIdleMs: number
+    /** 请求体上限（MB），对齐阿里云 SLB 30MB 硬限 */
+    maxBodyMb: number
+  }
+  queue: {
+    /** 官方排队轮询协议（requestSetId 稳定 + queue/status 放行信号） */
+    pollEnabled: boolean
+    /** 排队等待的整次请求预算（ms，所有账号共享） */
+    pollBudgetMs: number
+    /** 快速轮询总预算（ms，0 = 拿到限流立刻 429） */
+    patienceMs: number
+    /** 快速轮询间隔（ms）。过长会直接累加到用户等待 */
+    stepMs: number
+    /** 每轮排队睡眠（ms，0 = 按上游 retryAfterSeconds，夹 [5s,20s]） */
+    pollIntervalMs: number
+    /** 排队类限流的短冷却（ms）。与「账号坏了」区分开 */
+    cooldownMs: number
+  }
+  limits: {
+    /** 冷却上限（ms）。上游实测给过 7015 秒，照单全收＝封号两小时 */
+    throttleMaxMs: number
+    /** FEFO 临期窗口（天，0 = 关闭） */
+    fefoDays: number
+  }
+  repair: {
+    /** 「播报即收尾」重试上限（0 = 关闭修复） */
+    retry: number
+    /** 正文缓冲门阈值（字符）。超过就转直发，避免长回答被扣住 */
+    holdCap: number
+  }
+  /**
+   * 单号并发闸门与节奏（P1-6/P1-7）。
+   * **默认 0 全关**——调研建议 Qoder 默认并发 1，但那是「先埋点观察 10605 率
+   * 再定阈值」的结论。升级时静默把吞吐砍四分之三不是该做的事。
+   */
+  concurrency: {
+    /** 单号同时在途上限（0 = 用池默认 4）。设 1 = 超出本地排队 */
+    inflightMax: number
+    /** 单号最小请求间隔（ms，0 = 关）。约束发射节奏，不是请求时长 */
+    minIntervalMs: number
+    /** `''` = 池默认加权抽签；`least-inflight` = 最少在途优先 */
+    pickStrategy: '' | 'least-inflight'
+  }
+}
+
+export interface QoderRuntime {
+  file: string
+  fields: string[]
+  subfields: Record<string, string[]>
+  config: QoderRuntimeConfig
+  envDefaults: QoderRuntimeConfig
+  /** **真正生效值**（含调用方兜底），与 config 不同时界面要标红 */
+  effective: {
+    timeouts: QoderRuntimeConfig['timeouts']
+    /** 闸门参数的实际生效值（含 env 兜底与池默认）。null = channel-pool 不可用 */
+    concurrency: QoderRuntimeConfig['concurrency'] | null
+  }
+  /** 需重启才生效的字段（本项目为空数组＝全部热生效，如实报空） */
+  restartFields: string[]
+  note: string
+}
+
+/** 自动签到排程（P0-1） */
+export interface QoderAutoCheckin {
+  ok?: boolean
+  error?: string
+  enabled: boolean
+  hour: number
+  minute: number
+  jitter_minutes: number
+  /** 是否把国际版账号也纳入（campaigns 只在 cn 有活动，默认 false） */
+  include_intl: boolean
+  per_account_delay_ms: number
+  retry_backoff_ms: number
+  last_run_at: number | null
+  next_run_at: number | null
+  running: boolean
+  last_result: {
+    trigger: string
+    started_at: number
+    duration_ms: number
+    aborted: boolean
+    region: string
+    accounts: number
+    claimed: number
+    already: number
+    /** 当天无可领活动（**有意不重试**，不是失败） */
+    skipped: number
+    /** 状态查不出来 → 不签（不拿盲签去赌） */
+    unknown: number
+    /** 当日失败退避中 */
+    backoff: number
+    failed: number
+    /** 本轮实际到账合计（上游余额差值，不是领取额合计） */
+    gained: number
+    results: Array<{
+      id: number
+      name: string
+      region: 'cn' | 'global'
+      ok: boolean
+      action: 'claim' | 'already' | 'skipped' | 'unknown' | 'backoff' | 'refresh'
+      already?: boolean
+      pending?: number | null
+      gained?: number | null
+      claimed?: number
+      error: string
+      note?: string
+    }>
+  } | null
+  rationale: string[]
 }

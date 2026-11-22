@@ -10,7 +10,8 @@ const os = require('os');
 const path = require('path');
 
 // 必须先重定向数据目录再 require 模块
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-keepalive-test-'));
+const { tmpDir } = require('./helpers/tmpdir');
+const TMP = tmpDir('dumate-keepalive-test');
 process.env.DUMATE_ADMIN_DATA = TMP;
 
 const keepalive = require('../src/keepalive');

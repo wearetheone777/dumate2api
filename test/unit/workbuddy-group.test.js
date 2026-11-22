@@ -10,7 +10,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-wb-group-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-wb-group');
 process.env.DUMATE_ADMIN_DATA = TMP;
 
 const auth = require('../../src/workbuddy/auth');

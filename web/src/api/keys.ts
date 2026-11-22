@@ -10,8 +10,11 @@ export interface ApiKey {
   enabled: boolean
   ip_allowlist: string[]
   model_allowlist: string[]
+  /** 账号白名单（2026-11-08，调研 P1-4）：留空 = 不限。
+   *  条目是账号 id（`1`）或 通道:id（`workbuddy:1`）；限定这把 key 能调度哪些账号 */
+  account_allowlist?: string[]
   /** 通道绑定：'' = 不限；设了就只允许走该通道的模型 */
-  channel?: '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder'
+  channel?: '' | 'dumate' | 'qwenwork' | 'traework' | 'qoder' | 'workbuddy'
   /** 每日配额（2026-11-07）：0/缺省 = 不限；超限该 key 的请求一律 429，本地零点重置 */
   daily_limit: { requests?: number; tokens?: number } | null
   /** 父 Key id（2026-11-08 子 Key）：null = 独立 Key。

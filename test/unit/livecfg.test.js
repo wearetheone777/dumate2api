@@ -9,7 +9,8 @@ const os = require('os');
 const path = require('path');
 
 // livecfg 按调用时读 env；reqlog 在 require 时固化 LOG_DIR——都必须先设目录
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-livecfg-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const tmp = tmpDir('dumate-livecfg');
 process.env.DUMATE_ADMIN_DATA = tmp;
 
 const livecfg = require('../../src/livecfg');

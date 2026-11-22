@@ -12,7 +12,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-chanbal-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-chanbal');
 process.env.DUMATE_ADMIN_DATA = TMP;
 // 固定 TTL，避免受外部 env 影响
 process.env.DUMATE_CHANNEL_BALANCE_TTL_MS = '60000';

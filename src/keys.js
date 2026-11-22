@@ -197,6 +197,13 @@ function validate(key, ip, model, channel) {
     return { ok: false, reason: 'channel_not_allowed' };
   }
 
+  // 账号白名单（2026-11-08，调研 P1-4）：account_allowlist 存**账号 id**
+  // （字符串，跨通道就用 `通道:id` 前缀形式）。语义是「这把 key 只能调度这些
+  // 账号」——比通道绑定更细的一层。判定放在**选号处**而不是这里：鉴权阶段
+  // 还不知道最终会选中哪个账号（池轮询 / 粘性 / FEFO 都可能改变结果），
+  // 在这里判只能判「有没有配」，判不出「选中的那个在不在名单里」。
+  // 这里只做形状校验的兜底（配了空数组等于不限，与 model_allowlist 同口径）。
+
   // 区域绑定：intl key 打纯国内通道直接拒（上游连国际端点都不存在，
   // 放进运行时只会变成「没有可用账号」这种无信息量报错）。cn key 打
   // 国内通道天然通过；qoder/traework 的账号级过滤在 send 里做——
@@ -333,6 +340,8 @@ function create(opts = {}) {
       model_allowlist: normalizeList(opts.model_allowlist),
       // 通道绑定：留空 = 不限（网关按模型名前缀分流）
       channel: normalizeChannel(opts.channel),
+      // 账号白名单（2026-11-08，调研 P1-4）：留空数组 = 不限（与 model_allowlist 同口径）
+      account_allowlist: normalizeAccountList(opts.account_allowlist),
       // 区域绑定：留空 = 不限；'cn'/'intl' 只对 qoder/traework 有区分度
       region: normalizeRegionKey(opts.region),
       // 每日配额（2026-11-07）：{ requests?, tokens? }，0/缺省 = 不限
@@ -394,6 +403,45 @@ function normalizeParentId(v) {
   return Number.isInteger(n) && n > 0 ? n : null;
 }
 
+/**
+ * 账号白名单清洗（2026-11-08，调研 P1-4）。
+ *
+ * 条目形态两种，都原样保留成字符串：
+ *   `1`            裸账号 id —— 只在**单通道**语境下有意义（调用方知道是哪条通道）
+ *   `workbuddy:1`  带通道前缀 —— 跨通道时用它，避免「id=1」在五条通道里各指一个号
+ *
+ * **不做数字归一**：账号 id 在各通道都是自增数字，但存成字符串才能与
+ * `channelPool.uidOf()` 的键位（`通道:id`）直接比对。空数组 = 不限（与
+ * model_allowlist 同口径，避免「清空名单」变成「一把都调不了」）。
+ */
+function normalizeAccountList(v) {
+  if (!Array.isArray(v)) return [];
+  const seen = new Set();
+  for (const item of v) {
+    const s = String(item == null ? '' : item).trim();
+    if (!s) continue;
+    seen.add(s);
+  }
+  return [...seen];
+}
+
+/**
+ * 某账号是否在这把 key 的账号白名单里。
+ * 名单为空 → 全放行（不限）。判定要同时认两种写法：裸 id 与 `通道:id`。
+ * @param {object} key
+ * @param {string} channel 通道 id（dumate / workbuddy / ...）
+ * @param {number|string} accountId 账号 id
+ * @returns {boolean}
+ */
+function accountAllowed(key, channel, accountId) {
+  const list = normalizeList(key && key.account_allowlist);
+  if (!list.length) return true;
+  const id = String(accountId == null ? '' : accountId).trim();
+  if (!id) return false;
+  const withChannel = channel ? `${channel}:${id}` : '';
+  return list.some((entry) => entry === id || (withChannel && entry === withChannel));
+}
+
 function update(id, patch = {}) {
   return filelock.withLock(filePath(), () => {
     cache = { mtime: -1, data: null };
@@ -405,6 +453,7 @@ function update(id, patch = {}) {
     if (patch.expires_at !== undefined) k.expires_at = patch.expires_at || null;
     if (patch.ip_allowlist !== undefined) k.ip_allowlist = normalizeList(patch.ip_allowlist);
     if (patch.model_allowlist !== undefined) k.model_allowlist = normalizeList(patch.model_allowlist);
+    if (patch.account_allowlist !== undefined) k.account_allowlist = normalizeAccountList(patch.account_allowlist);
     if (patch.channel !== undefined) k.channel = normalizeChannel(patch.channel);
     if (patch.region !== undefined) k.region = normalizeRegionKey(patch.region);
     if (patch.daily_limit !== undefined) k.daily_limit = normalizeDailyLimit(patch.daily_limit);
@@ -460,6 +509,8 @@ module.exports = {
   ipMatches,
   modelMatches,
   globToRegExp,
+  normalizeAccountList,
+  accountAllowed,
   tokenFromHeaders,
   tokenMatches,
   hash,

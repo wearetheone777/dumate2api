@@ -12,9 +12,10 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-process.env.DUMATE_ADMIN_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-sticky-'));
+const { tmpDir } = require('../helpers/tmpdir');
+process.env.DUMATE_ADMIN_DATA = tmpDir('dumate-sticky');
 // 池状态写临时文件（不污染真实 data/pool-state.json）
-process.env.DUMATE_POOL_STATE = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-sticky-state-')) + '/pool-state.json';
+process.env.DUMATE_POOL_STATE = tmpDir('dumate-sticky-state') + '/pool-state.json';
 
 const { createSticky } = require('../../src/sticky');
 const channelPool = require('../../src/channel-pool');

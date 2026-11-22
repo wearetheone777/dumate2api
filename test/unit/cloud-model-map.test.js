@@ -12,7 +12,8 @@ const os = require('os');
 const path = require('path');
 
 // env 先于模块加载：modelmap 的 DATA_DIR 在 require 时固化
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-cloudmap-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-cloudmap');
 process.env.DUMATE_ADMIN_DATA = TMP;
 
 const modelmap = require('../../src/modelmap');

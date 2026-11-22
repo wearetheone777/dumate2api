@@ -28,6 +28,10 @@ const channelPool = require('../channel-pool');
 const CHANNEL = 'qoder';
 // 出站代理工厂（E 包接线）：runOnce 按账号解析 agent
 const proxyAgent = require('../proxy-agent');
+// 运行期配置（P0-3）：排队/冷却/FEFO/修复参数一律现读，改阈值不必重启网关
+const runtime = require('./runtime');
+// 风控信号遥测（P1-11）：只记计数供 /health 读，不参与任何判定
+const telemetry = require('./telemetry');
 
 /**
  * 预热**模型表**：runOnce 从同步缓存里取「该模型的最大上下文档位」（1M），
@@ -292,6 +296,10 @@ const DUP_COOLDOWN_MS = 5000;
  */
 function poolInfoOf(e, model) {
   const code = Number(e.statusCode) || 0;
+  // VL 前置拒绝（P2-24）：拒绝的是「模型不支持图像」这件事，与账号健康
+  // 无关——绝不能因此罚号/进冷却（否则一次误配的请求能把整个池打冷）。
+  // 走 400 + 不惩罚，与审核拒绝同一条处置。
+  if (e.visionBlocked) return { status: 400, message: e.message, model };
   const qk = e.quotaKind || quotaKindOfText(e.message);
   if (qk === 'version') return { status: 400, message: e.message, model };
   if (qk) {
@@ -350,14 +358,16 @@ async function postWithFallback(candidates, fn, isDelivered) {
 // 这里不重复那个坑。
 // ---------------------------------------------------------------------------
 function queuePollDeadline() {
-  if (process.env.DUMATE_QODER_QUEUE_POLL === '0') return 0;
-  const budget = Math.max(0, parseInt(process.env.DUMATE_QODER_QUEUE_POLL_BUDGET_MS || '60000', 10) || 0);
+  // 运行期配置（P0-3）：这三组排队参数此前是模块加载时读一次 env 就定死，
+  // 调阈值要重启网关。runtime.pick 读不到时回落到原字面默认值。
+  if (runtime.pick('queue.pollEnabled', true) !== true) return 0;
+  const budget = Math.max(0, Number(runtime.pick('queue.pollBudgetMs', 60000)) || 0);
   return budget > 0 ? Date.now() + budget : 0;
 }
 
 function queuePollIntervalMs(retryAfterMs) {
-  const env = Number(process.env.DUMATE_QODER_QUEUE_POLL_INTERVAL_MS);
-  if (Number.isFinite(env) && env > 0) return env; // 测试注入
+  const env = Number(runtime.pick('queue.pollIntervalMs', 0));
+  if (Number.isFinite(env) && env > 0) return env; // 面板/测试注入
   return Math.min(Math.max(retryAfterMs || 5000, 5000), 20000);
 }
 
@@ -386,7 +396,7 @@ function queueTypeOf(message) {
  * 普通选号），绝不因账本问题挡住请求。
  */
 function fefoUidSet(usable) {
-  const days = Number(process.env.DUMATE_QODER_FEFO_DAYS ?? 3);
+  const days = Number(runtime.pick('limits.fefoDays', 3));
   if (!(days > 0)) return null;
   try {
     const set = new Set();
@@ -522,6 +532,20 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   const modelMeta = cachedModels.find((m) => m.key === modelKey);
   const ctxMax = process.env.DUMATE_QODER_CONTEXT === 'default' ? null : (modelMeta && modelMeta.maxInputTokens);
 
+  // **VL 前置校验（P2-24）**：非视觉模型传图在本地 400，不放行到上游。
+  // 图片是 base64 data URI，一次请求可能几十 MB——放行后被拒等于白传一遍，
+  // 还多一次 413 风险（SLB 30MB 硬限）。判据在 vl-guard.js：只在模型表**明确
+  // 说**「不是多模态」时拒绝，表不可用/模型不在表里一律放行（误拒的代价是
+  // 「本来能用的模型被挡住」，比放行重得多）。
+  {
+    const vl = require('./vl-guard').checkVision({
+      messages: payload && payload.messages,
+      modelKey,
+      models: cachedModels,
+    });
+    if (vl.blocked) throw require('./vl-guard').visionError(vl);
+  }
+
   // COSY 会话与账号身份绑定：uid / device_token 都进签名。
   // machineId/Token/Type 每账号一份（登录时生成并持久化）。
   const sess = cosy.newSession({
@@ -537,7 +561,8 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   }, auth.machineId || '', auth.machineToken || '', auth.machineType || '5');
 
   // 「播报即收尾」（共享判定见 src/repair.js）：带工具的请求启用缓冲门 + 修复重试。
-  const caps = repair.envCaps('QODER');
+  // 参数取自运行期配置（P0-3）：面板改完下一次请求就生效，不必重启网关。
+  const caps = repairCaps();
   const repairable = chat.hasFunctionTools(payload) > 0 && caps.REPAIR_MAX > 0;
   // request_id 每轮新生成（单次请求的标识，复用可能被上游当幂等重试合并）；
   // session_id 钉住：修复轮是同一段对话的下一句。request_set_id（排队槽位键）
@@ -1006,10 +1031,21 @@ const MAX_ATTEMPTS = 4;
  *
  * 默认 6 秒。`0` 关闭（拿到限流就立刻回 429）。
  */
-const QUEUE_PATIENCE_MS = Math.max(0, parseInt(process.env.DUMATE_QODER_QUEUE_PATIENCE_MS || '6000', 10) || 0);
+const QUEUE_PATIENCE_MS_DEFAULT = 6000;
 
 /**
- * 排队重试的间隔（ms）。
+ * 排队快速轮询的总预算（ms，现读）。
+ * `0` 关闭（拿到限流就立刻回 429）。
+ */
+function queuePatienceMs() {
+  const v = Number(runtime.pick('queue.patienceMs', QUEUE_PATIENCE_MS_DEFAULT));
+  return Number.isFinite(v) && v >= 0 ? v : QUEUE_PATIENCE_MS_DEFAULT;
+}
+
+const QUEUE_RETRY_STEP_MS_DEFAULT = 1500;
+
+/**
+ * 排队重试的间隔（ms，现读）。
  *
  * 实测：限流信封返回极快（150~1000ms），所以间隔不需要长——**过长的间隔
  * 恰恰是用户感知的「慢」**。原来的 3000ms 让每次空转都要多等 3 秒，
@@ -1018,13 +1054,23 @@ const QUEUE_PATIENCE_MS = Math.max(0, parseInt(process.env.DUMATE_QODER_QUEUE_PA
  * 取 1500ms：足够让上游侧翻页；再密则没有额外收益（实测连打 12 次全被拒），
  * 再疏则直接累加到用户等待（原 3000ms × 5 轮 = 15 秒纯等待）。
  */
-const QUEUE_RETRY_STEP_MS = Math.max(200, parseInt(process.env.DUMATE_QODER_QUEUE_STEP_MS || '1500', 10) || 1500);
+function queueRetryStepMs() {
+  const v = Number(runtime.pick('queue.stepMs', QUEUE_RETRY_STEP_MS_DEFAULT));
+  return Number.isFinite(v) && v >= 200 ? v : QUEUE_RETRY_STEP_MS_DEFAULT;
+}
 
 /**
- * 主循环的尝试上限。与上面两个常量匹配：6s ÷ 1.5s = 4 次。
+ * 主循环的尝试上限。与上面两个值匹配：6s ÷ 1.5s = 4 次。
  * 非排队类失败（换号）仍受 MAX_ATTEMPTS 约束，所以取两者较大值。
+ *
+ * 现读（每次 send 算一次）：面板把 patience 调大后，单次请求的轮数要跟着变，
+ * 否则「设了 30 秒」实际仍只轮 4 次。
  */
-const MAX_ATTEMPTS_QUEUE = Math.max(MAX_ATTEMPTS, Math.ceil(QUEUE_PATIENCE_MS / QUEUE_RETRY_STEP_MS) + 1);
+function maxAttemptsQueue() {
+  const patience = queuePatienceMs();
+  const step = queueRetryStepMs();
+  return Math.max(MAX_ATTEMPTS, Math.ceil(patience / step) + 1);
+}
 
 /**
  * 发对话请求。主账号失败且错误「换号有救」时，按可用列表顺序转移。
@@ -1079,6 +1125,36 @@ function noRegionAccountError(region) {
   return e;
 }
 
+/**
+ * 「播报即收尾」的修复参数（现读，P0-3）。
+ *
+ * 与 `repair.envCaps('QODER')` 的关系：后者是 env 口径的默认值来源，本函数在
+ * 它之上叠加运行期配置——**面板没配就与之前逐字节一致**（runtime 的默认值本身
+ * 也从同一批 env 读），配了就按面板值生效。
+ */
+function repairCaps() {
+  const env = repair.envCaps('QODER');
+  const retry = Number(runtime.pick('repair.retry', env.REPAIR_MAX));
+  const hold = Number(runtime.pick('repair.holdCap', env.HOLD_CAP));
+  return {
+    REPAIR_MAX: Number.isFinite(retry) && retry >= 0 ? Math.floor(retry) : env.REPAIR_MAX,
+    HOLD_CAP: Number.isFinite(hold) && hold > 0 ? hold : env.HOLD_CAP,
+  };
+}
+
+/**
+ * 遥测专用的分类调用（P1-11）。
+ *
+ * 与喂池的 `poolInfoOf` 分开：后者会把 105 映射成 401、把额度码映射成 429 +
+ * 显式时长（那是**处置**），而遥测要的是**上游原样反应**（那是**观测**）。
+ * 混用会让「排队」在遥测里显示成「429 限流」——两者对排障的含义不同。
+ */
+function classifyForTelemetry(e, model) {
+  const ue = require('../upstream-errors');
+  const cls = ue.classify({ status: Number(e.statusCode) || 0, message: String(e.message || ''), model });
+  return { ...cls, throttled: ue.isThrottle(e.message), policy: e.policy === true || ue.isContentPolicy(e.message) };
+}
+
 async function send(payload, onChunk, opts = {}) {
   const tried = new Set();
   const errors = [];
@@ -1102,6 +1178,11 @@ async function send(payload, onChunk, opts = {}) {
   const runOpts = queueDeadline > 0 ? { ...opts, queueDeadline, requestSetId } : opts;
   // FEFO 候选集只算一次（账本是静态的，轮询内不会变）
   const expiring = fefoUidSet(usable);
+  // 排队参数在**进入循环前取一次**：一次请求内部必须自洽（同一请求的轮数
+  // 上限、间隔、预算不能因为面板中途保存而改变语义）。下一次 send 会读到新值。
+  const patienceMs = queuePatienceMs();
+  const retryStepMs = queueRetryStepMs();
+  const maxAttempts = maxAttemptsQueue();
   let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring });
   if (!sel) {
     // 入口被**排队软冷却**挡住时，等掉它再试——**不能秒失败**。
@@ -1115,14 +1196,14 @@ async function send(payload, onChunk, opts = {}) {
     // 等掉它再发一次很可能就过了。所以这里等（封顶到重试预算），而不是
     // 直接拒。只有「禁用/熔断/在途满」这类要人介入的才立刻报 503。
     const av = channelPool.availability(CHANNEL, usable, { model });
-    if (av.softOnly && av.nextInMs > 0 && av.nextInMs <= QUEUE_PATIENCE_MS) {
+    if (av.softOnly && av.nextInMs > 0 && av.nextInMs <= patienceMs) {
       await sleep(av.nextInMs);
       sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring });
     }
     if (!sel) throw noAccountError(usable, model);
   }
 
-  for (let i = 0; i < MAX_ATTEMPTS_QUEUE; i++) {
+  for (let i = 0; i < maxAttempts; i++) {
     const account = sel.account;
     const uid = sel.uid; // 本次尝试占用的池记录；catch 里换号后 finally 只放它
     tried.add(account.id);
@@ -1138,6 +1219,9 @@ async function send(payload, onChunk, opts = {}) {
       const result = await runOnce(account, payload, onChunk, runOpts, meter);
       // 成功喂池：清熔断/软退避/防误杀计数
       channelPool.noteSuccess(CHANNEL, account.id);
+      // 风控遥测（P1-11）：只记计数，不参与任何判定。探针模式也记——
+      // 探针读的是上游真实反应，正是最干净的风控样本。
+      try { telemetry.note('ok'); } catch (e2) { /* 埋点失败不影响请求 */ }
       // 成功即清除上次的失败标记（与千问同一约定：一次瞬时失败不该永远挂着）
       if (account.lastError) {
         try { authStore.patch(account.id, { lastError: '' }); }
@@ -1147,6 +1231,13 @@ async function send(payload, onChunk, opts = {}) {
     } catch (e) {
       const code = Number(e.statusCode) || 0;
       const throttled = isThrottle(e.message);
+      // 风控遥测（P1-11）：把这次失败归到 queued / throttled / rejected 三类之一，
+      // 供 /health 回答「通道坏了还是上游让我们等」。**判据复用
+      // upstream-errors 的分类**（不另写一套正则，两套必然漂移）。
+      try {
+        const cls = classifyForTelemetry(e, model);
+        telemetry.note(telemetry.kindOf(cls), { queueType: queueTypeOf(e.message) });
+      } catch (e2) { /* 埋点失败绝不影响响应 */ }
       // 失败喂池：105（Login expired）按 401 进防误杀计数；额度类业务码
       // （112/110/114/430）按 poolInfoOf 的专门处置（固定冷却/不惩罚），
       // 其余按 classify。
@@ -1182,11 +1273,11 @@ async function send(payload, onChunk, opts = {}) {
         // Codex / Claude Code 对 429 会自动退避重试，用户还能看到明确提示，
         // 比网关静默空转透明得多。
         const transientOnly = errors.every((x) => x.throttled || x.status === '网络错误');
-        if (transientOnly && i < MAX_ATTEMPTS_QUEUE - 1 && Date.now() - startedAt < QUEUE_PATIENCE_MS) {
+        if (transientOnly && i < maxAttempts - 1 && Date.now() - startedAt < patienceMs) {
           // 还有预算：等一个短间隔让上游侧翻页，再按可用列表轮转。
           // **绕过 pickCandidate 的冷却过滤**——冷却只是防打爆的观测，
           // 不是上游的判决，排队期间它会挡住本该发出去的尝试。
-          await sleep(QUEUE_RETRY_STEP_MS);
+          await sleep(retryStepMs);
           tried.clear();
           const idx = i % usable.length;
           const cand = usable[idx];

@@ -47,6 +47,8 @@ const traeRuntime = require('./trae-runtime');
 // 启动接线（集成阶段）：池状态机恢复 / 热配置 / 出站代理 / 计量挂钩探活。
 // 保活排程不在这里启动——它由管理端进程经 task-scheduler 持有（见 boot.js）。
 const boot = require('./boot');
+// 启动前端口占用检查（调研 P2-10）：纯检测模块，不监听、不 kill
+const portProbe = require('./port-probe');
 
 const PROXY_PORT = parseInt(process.env.DUMATE2API_PORT || '9080', 10);
 const PROXY_HOST = process.env.DUMATE2API_HOST || '127.0.0.1';
@@ -259,7 +261,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
     // TRAE 宝身份标记（2026-11-03）：resolve() 把 `traebao/` 前缀剥掉后才到
     // provider 手里，send() 靠 payload.model 认不出身份——显式经 opts 传。
     if (route.personalAssistant) req._personalAssistant = true;
-    const providerOpts = { reqId, onAccount, onModel, onLink, onDegraded, region: ctx.region || '', personalAssistant: !!route.personalAssistant };
+    const providerOpts = { reqId, onAccount, onModel, onLink, onDegraded, region: ctx.region || '', personalAssistant: !!route.personalAssistant, key: req._apiKey || null };
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
       const result = await provider.send(payload, undefined, providerOpts);
@@ -671,40 +673,26 @@ function forwardWithFallback(portOrTarget, path, method, headers, body, clientRe
   }
 }
 
-// 请求体上限（审计 P1-1a）：网关是匿名可达的一侧，readBody 不设限等于让
-// 一次 POST 把内存吃满、再被 JSON.parse 二次放大。默认 32MB——聊天请求带
-// base64 图片也有富余。DUMATE_MAX_BODY_MB 可调。
-const MAX_BODY_BYTES = Math.max(1, parseInt(process.env.DUMATE_MAX_BODY_MB || '32', 10)) * 1024 * 1024;
+// 请求体上限与「超限先回 413 再限时排空」（审计 P1-1a + 调研 P1-7，hub #799）。
+// 实现搬到 src/body-limit.js：那边是纯流逻辑、可离线测；这里只留一句转发。
+//   默认 32MB（聊天请求带 base64 图片也有富余），`DUMATE_MAX_BODY_MB` 可调；
+//   **超限当场 resolve(null)**，handler 立刻回 413，后台只排空 `DUMATE_BODY_DRAIN_MS`
+//   （默认 5s）——原来的「读完才回」会让大包上传中的 RST 把 413 吞掉，客户端
+//   当成瞬态错误重试/换号重放（Qoder 那条 RST → 整池熔断的同源坑）。
+const bodyLimit = require('./body-limit');
+const MAX_BODY_BYTES = bodyLimit.maxBodyBytes();
 
 function readBody(req) {
-  // 超限标记：鉴权预读阶段超限时已经把流读干净，这里直接短路，
-  // 不再尝试二次消费
-  if (req._bodyTooLarge) return Promise.resolve(null);
-  // 鉴权阶段可能已经为模型白名单预读过请求体；流只能消费一次，
-  // 直接返回缓存，否则 handler 拿到空串
-  if (typeof req._rawBody === 'string') return Promise.resolve(req._rawBody);
-  return new Promise((resolve) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', (c) => {
-      size += c.length;
-      if (size > MAX_BODY_BYTES) {
-        req._bodyTooLarge = true;
-        chunks.length = 0;
-        // 继续把剩余数据读干净，连接才能正常收尾；handler 统一回 413
-        req.resume();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on('end', () => resolve(req._bodyTooLarge ? null : Buffer.concat(chunks).toString('utf8')));
-  });
+  return bodyLimit.readBody(req, { maxBytes: MAX_BODY_BYTES });
 }
 
 // 请求体超限的统一出口。各端点正常错误形状不同，但 413 极少触发，
 // 统一 OpenAI 形状即可（客户端只看状态码）。
+// **多带 `Connection: close`**：超限时我们并不保证把上传读完（只排空很短一段），
+// 长连接继续复用会让下一请求落在半截的流上；显式关闭最省事也最诚实。
 function sendBodyTooLarge(res) {
-  return sendJSON(res, 413, { error: { message: 'Request body too large', type: 'invalid_request_error' } });
+  return sendJSON(res, 413, { error: { message: 'Request body too large', type: 'invalid_request_error' } },
+    { Connection: 'close' });
 }
 
 // 非流式上游响应的累积上限（审计 P1-1b）：上游半信任，流量不可控，
@@ -2349,17 +2337,30 @@ const server = http.createServer(async (req, res) => {
           })(),
           // Qoder：凭证自持（device flow 换取），**连 wasm 都不需要**
           // （签名是纯本地算法）。needsClient=false 明确表示不依赖任何客户端安装。
+          //
+          // telemetry（P1-11）：最近 10 分钟的排队/限流/拒绝计数。回答
+          // 「Qoder 用不了是通道坏了，还是上游让我们等」——两者在客户端
+          // 看起来完全一样（都要等），处置却完全不同（等 vs 换号/重登）。
+          // 计数只用于观测，不参与选号。
           qoder: (() => {
             try {
               const reg = regionParamOf(req);
               const st = require('./qoder').status();
-              if (!reg) return { direct: true, ready: st.ready, needsClient: false, accounts: st.accounts, error: st.error || '' };
+              let telemetry = null;
+              try { telemetry = require('./qoder/telemetry').snapshot(); }
+              catch (e2) { telemetry = null; }
+              if (!reg) {
+                return {
+                  direct: true, ready: st.ready, needsClient: false,
+                  accounts: st.accounts, error: st.error || '', telemetry,
+                };
+              }
               const rows = require('./qoder/auth').list()
                 .filter((a) => (String(a.region || 'cn').toLowerCase() === 'cn' ? 'cn' : 'intl') === reg);
               const ready = rows.some((a) => a.enabled);
               return {
                 direct: true, ready, needsClient: false,
-                accounts: rows.length, region: reg,
+                accounts: rows.length, region: reg, telemetry,
                 error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
               };
             } catch (e) {
@@ -2573,7 +2574,31 @@ const server = http.createServer(async (req, res) => {
       return await handleAnthropicCountTokens(req, res);
     }
 
-    // 404
+    // 404 —— 其中「重复 /v1 前缀」单独给一条可执行的提示（P2-24，融合自
+    // qoder2api-hub）。这是接入第一高频错误：base URL 已经带了 /v1，客户端
+    // 又按自己的约定拼一次，于是打过来的是 /v1/v1/xxx。
+    //
+    // **不能只回一句 Not found**：用户看到的是「网关 404」，会去怀疑网关坏了/
+    // 模型不存在，而真因是 base URL 写重了一段。提示里直接给出该改的地址形态，
+    // 并且**不静默重写**（重写等于替用户猜意图，而他明明配错了）。
+    const dupV1 = url.match(/^\/v1(\/v1)+(\/.*)?$/);
+    if (dupV1) {
+      const cleanUrl = `/v1${dupV1[2] || ''}`;
+      // 日志留一条：这类错误靠自己发现很难，运维看日志能立刻定位
+      console.warn(`[gateway] 检测到重复 /v1 前缀：${url} → 应改为 ${cleanUrl}`);
+      sendJSON(res, 404, {
+        error: {
+          message: `路径里 /v1 重复了（收到 ${url}）。base URL 已包含 /v1 时不要再拼一次——`
+            + `把 base URL 设为 http://<host>:<port>/v1 后，请求路径直接写 ${cleanUrl.replace(/^\/v1/, '') || '/'}；`
+            + `或把 base URL 改为 http://<host>:<port>，请求路径写 ${cleanUrl}。`,
+          type: 'invalid_request_error',
+          code: 'duplicated_v1_prefix',
+          hint: { received: url, expected: cleanUrl },
+        },
+      });
+      return;
+    }
+
     sendJSON(res, 404, { error: { message: `Not found: ${url}`, type: 'invalid_request_error' } });
   } catch (err) {
     fail(err);
@@ -2584,6 +2609,21 @@ const server = http.createServer(async (req, res) => {
 async function start() {
   log('Starting dumate2api...');
   log(`Proxy will listen on ${PROXY_HOST}:${PROXY_PORT}`);
+
+  // 启动前端口占用检查（调研 P2-10，hub `--probe-only`）：
+  // **Windows 的 SO_REUSEADDR 允许重复监听**——旧实例卡死但仍绑着端口时，
+  // 内核把新连接分给它，新起的进程永远收不到请求，表现是「看板一直是空的、
+  // 接口返回旧数据」，进程活着日志干净。所以先探一次：能连上就算占用。
+  // 只报告不自作主张 kill（杀进程是使用者的决定）。
+  if (portProbe.enabled()) {
+    const r = await portProbe.probe(PROXY_HOST, PROXY_PORT);
+    if (r.occupied) {
+      log(`✗ ${PROXY_HOST}:${PROXY_PORT} 已被占用：${r.note}`);
+      log('  继续监听会变成重复绑定（Windows 允许，但内核可能把连接给旧实例）。');
+      log('  处理：先 stop.bat / 托盘「关闭服务」再启动，或改 DUMATE2API_PORT。');
+      process.exit(1);
+    }
+  }
 
   // 运行时模块启动接线（pool 恢复 / livecfg / 出站代理 / 计量探活），见 boot.js
   try { boot.init({ log }); } catch (e) { log(`⚠ 启动接线异常（不阻断监听）: ${e.message}`); }

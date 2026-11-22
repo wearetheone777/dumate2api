@@ -1,6 +1,14 @@
 // web/src/api/workbuddy.ts - WorkBuddy 通道的接口类型
 import client from '@/api/client'
 
+/** 拼查询串：空值跳过，数组按逗号连（`uids=1,2`） */
+function buildQuery(q: { region?: 'cn' | 'intl'; uids?: number[] }): string {
+  const parts: string[] = []
+  if (q.region) parts.push(`region=${q.region}`)
+  if (q.uids && q.uids.length) parts.push(`uids=${q.uids.join(',')}`)
+  return parts.length ? `?${parts.join('&')}` : ''
+}
+
 export interface WorkBuddyAccount {
   id: number
   uid: string
@@ -81,6 +89,105 @@ export interface WorkBuddyDashAccount {
   refreshTail: string
 }
 
+/**
+ * 模型繁忙度（`GET /workbuddy/busy`）。
+ *
+ * 三条界面必须如实传达的事实：
+ *   1. `unsupported` 为真 = 国际版上游没有这个接口（404）。这是**查不到**，
+ *      要显示成灰字说明，不能标红成故障。
+ *   2. `guardEnabled` 默认 false = **只提示不拦**。如果界面让人以为「已避开
+ *      繁忙模型」，那是撒谎——实际仍会打过去。
+ *   3. `crowded` 只含 congested / unavailable 两档。`busy` 是偏忙，不是拥挤。
+ */
+export interface WorkBuddyBusy {
+  ok: boolean
+  region: 'cn' | 'global'
+  /** 本次探测的模型 id（点名或目录全量） */
+  models: string[]
+  /** model → idle|normal|busy|congested|unavailable */
+  levels: Record<string, string>
+  /** 明显该避开的模型 id（congested / unavailable） */
+  crowded: string[]
+  /** 国际版没有该接口（404）：查不到，不是故障 */
+  unsupported: boolean
+  /** 繁忙度是否参与选号拦截（默认 false，需环境变量显式开启） */
+  guardEnabled: boolean
+  error: string
+  note: string
+  at: number
+}
+
+/**
+ * 成长中心（`GET /workbuddy/growth`）—— **只读**。
+ *
+ * **为什么只有读没有写**：调研实证「伪造 /v2/report 成长事件会被上游识别为
+ * 异常（2026-10-15 起国际版收紧）」，且接取/领奖的 body 形状被标为
+ * 「未在 unlocked 态验证」。所以界面只能展示，不能代替用户去领。
+ *
+ * 五个字段**各自可空**：任一上游端点失败时它是 null，失败原因在 `errors` 里
+ * 逐项记明。界面必须区分「查到了是 0」与「没查到（null）」——这是本项目
+ * 反复强调的一条（null ≠ 0）。
+ */
+export interface WorkBuddyGrowth {
+  ok: boolean
+  region: 'cn' | 'global'
+  accountId?: number
+  accountName?: string
+  streak: {
+    days: number | null
+    monthTotal: number | null
+    nextTier: string | null
+    nextTierRemaining: number | null
+    makeupCards: { balance: number | null; max: number | null }
+    /** 已解锁但还没领的档位（「必须手动领，不领会过期」） */
+    redeemable: number[]
+    tiers: Array<{ tier: number; count: number | null; status: string }>
+  } | null
+  heatmap: {
+    lit: number
+    total: number
+    today: string | null
+    /** 今天的 score；**0 是「查到了没点亮」，null 是「查不到」** */
+    todayScore: number | null
+    recent: Array<{ date: string; score: number }>
+  } | null
+  tasks: {
+    total: number
+    claimed: number
+    /** 排除 locked 与已过期后的「现在能做的」数量 */
+    claimable: number
+    creditTotal: number
+    creditClaimed: number
+    pending: Array<{
+      code: string
+      title: string
+      desc: string
+      type: string
+      /** auto 类不接受接取，且是 single 任务的前置 */
+      auto: boolean
+      acceptStatus: string
+      credit: number
+      energy: number
+      progress: { current: number; target: number }
+      locked: boolean
+      hasReward: boolean
+      expired: boolean
+    }>
+  } | null
+  energy: { balance: number | null; earned: number | null; consumed: number | null } | null
+  buddyQuota: {
+    affordable: number | null
+    balance: number | null
+    costPerOpen: number | null
+    maxOpenCount: number | null
+  } | null
+  /** 逐项失败原因（key 为字段名） */
+  errors: Record<string, string>
+  note: string
+  error?: string
+  at: number
+}
+
 export interface WorkBuddyModel {
   id: string
   name: string
@@ -156,6 +263,77 @@ export interface WorkBuddyRestriction {
   events: Record<string, Array<{ uid: string; at: number; agoMs: number }>>
 }
 
+/** 连坐参数（P2-11：运行期可改，改短即时截断倒计时） */
+export interface WorkBuddyRestrictionConfig {
+  waveMin: number
+  waveWindowSec: number
+  holdSeconds: number
+  restrictedRotateMax: number
+}
+
+/** 自动签到排程（P0-1） */
+export interface WorkBuddyAutoCheckin {
+  enabled: boolean
+  hour: number
+  minute: number
+  jitter_minutes: number
+  per_account_delay_ms: number
+  last_run_at: number | null
+  last_result: {
+    trigger: string
+    started_at: number
+    duration_ms: number
+    aborted: boolean
+    region: 'cn' | 'global'
+    accounts: number
+    claimed: number
+    already: number
+    unknown: number
+    failed: number
+    /** 国际版网页打卡成功数（与签到分开计数——上游动作不同） */
+    webDaily?: number
+    /** 国际版网页打卡失败数 */
+    webDailyFailed?: number
+    /** 国内版对话活跃上报成功数（点亮 growth 连登，第三个上游体系） */
+    activity?: number
+    /** 活动中「已送达但回读失败」的数量——不冒充成功（见 reportActivity 注释） */
+    activityUnverified?: number
+    /** 国内版活跃上报失败数 */
+    activityFailed?: number
+    results: Array<{
+      id: number
+      name: string
+      region: 'cn' | 'global'
+      ok: boolean
+      /** web-daily = 国际版网页打卡 / activity = 国内版连登活跃，都不是签到 */
+      action: 'claim' | 'already' | 'unknown' | 'unsupported' | 'web-daily' | 'activity'
+      already: boolean
+      streakDays: number | null
+      /** 仅 activity 行：连登天数回读成功才为 true（送达 ≠ 计入） */
+      verified?: boolean
+      error: string
+      msg?: string
+    }>
+  } | null
+  next_run_at: number | null
+  running: boolean
+  rationale?: string[]
+}
+
+/** 额度护栏（P1-6） */
+export interface WorkBuddyGuard {
+  config: {
+    enabled: boolean
+    threshold: number
+    /** 保留积分下限（0 = 关闭）。**真正生效的是 poolFloor，这个值要重启才落到 pool** */
+    creditFloor?: number
+  }
+  snapshot: { at: number | null; fresh: boolean; accounts: number; ttlMs: number }
+  /** pool 当前实际生效的保底线（启动时读 env，运行期改不了） */
+  poolFloor?: number | null
+  note?: string
+}
+
 export const workbuddyApi = {
   status: (region?: 'cn' | 'intl') =>
     client.get<WorkBuddyStatus>(`/workbuddy/status${region ? `?region=${region}` : ''}`),
@@ -164,6 +342,63 @@ export const workbuddyApi = {
   /** 解除指定区域的连坐暂停（写信号给网关，并乐观更新快照） */
   clearRestriction: (region: 'cn' | 'intl') =>
     client.post<{ ok: boolean; region?: string; error?: string }>('/workbuddy/restriction/clear', { region }),
+  /** 连坐参数（P2-11）：改完立即生效，改短时长会即时截断现有倒计时 */
+  restrictionConfig: () =>
+    client.get<{
+      ok: boolean
+      config: WorkBuddyRestrictionConfig
+      envDefaults: WorkBuddyRestrictionConfig
+      file: string
+      note: string
+    }>('/workbuddy/restriction/config'),
+  saveRestrictionConfig: (payload: Partial<WorkBuddyRestrictionConfig>) =>
+    client.put<{
+      ok: boolean
+      config?: WorkBuddyRestrictionConfig
+      changed?: Partial<WorkBuddyRestrictionConfig>
+      state?: WorkBuddyRestriction
+      error?: string
+    }>('/workbuddy/restriction/config', payload),
+  /** 额度护栏（P1-6）：选号时跳过剩余低于阈值的账号 */
+  guard: () => client.get<WorkBuddyGuard & { poolFloor?: number | null }>('/workbuddy/guard'),
+  saveGuard: (payload: { enabled?: boolean; threshold?: number; creditFloor?: number }) =>
+    client.put<{ ok: boolean; config?: { enabled: boolean; threshold: number; creditFloor?: number }; error?: string }>(
+      '/workbuddy/guard',
+      payload,
+    ),
+  /** 自动签到排程（P0-1）：打开时立即跑一轮，关闭时取消排程 */
+  autocheckin: () => client.get<WorkBuddyAutoCheckin>('/workbuddy/autocheckin'),
+  saveAutocheckin: (payload: { enabled?: boolean; hour?: number; minute?: number; jitter_minutes?: number }) =>
+    client.put<WorkBuddyAutoCheckin & { ok: boolean; error?: string }>('/workbuddy/autocheckin', payload),
+  /** 立即跑一轮自动签到（触发式：结果靠 autocheckin() 轮询） */
+  runAutocheckin: () => client.post<{ ok: boolean; started: boolean }>('/workbuddy/autocheckin/run'),
+  /**
+   * 余额巡检（FEFO / 护栏保鲜）。
+   *
+   * **不属于 workbuddy 前缀**：本体是 `src/balance-refresh.js`，与搭子网页池
+   * 共用同一份配置与同一个定时器（多起一个定时器只会让上游看到更密的节奏）。
+   * 放在这里只是因为它从 WorkBuddy 账号页操作——接口归属跟页面归属不是一回事。
+   */
+  balanceRefresh: () => client.get<{
+    ok: boolean
+    enabled: boolean
+    minutes: number
+    last_run_at: number | null
+    running: boolean
+    interval_active: boolean
+    note: string
+    last_result: {
+      ok_count?: number
+      accounts?: number
+      workbuddy?: { ok_count?: number; accounts?: number; entries?: number; error?: string } | null
+    } | null
+  }>('/auto-checkin/balance-refresh'),
+  saveBalanceRefresh: (payload: { enabled?: boolean; minutes?: number }) =>
+    client.post<{ ok: boolean; enabled?: boolean; minutes?: number; error?: string }>(
+      '/auto-checkin/balance-refresh',
+      payload,
+    ),
+  runBalanceRefresh: () => client.post<Record<string, unknown>>('/auto-checkin/balance-refresh/run-now'),
   dashboard: (region?: 'cn' | 'intl') =>
     client.get<{
       accounts: WorkBuddyDashAccount[]
@@ -184,10 +419,40 @@ export const workbuddyApi = {
       rateNote: string
     }>(`/workbuddy/models${qs}`)
   },
-  credits: (region?: 'cn' | 'intl') =>
+  /**
+   * 模型实时繁忙度（2026-11-08 融合批）。
+   *
+   * 上游 `/v2/chat/busy` 是唯一「免费、不扣额度、不动账号状态」的接口。
+   * 两条必须由界面如实传达的口径：
+   *   - `unsupported`：国际版上游 404，是「查不到」不是「通道坏了」
+   *   - `guardEnabled`：默认 false —— 繁忙度**只作参考、不参与选号**，
+   *     要拦必须显式开环境变量（界面据此显示「仅提示」还是「已启用拦截」）
+   */
+  busy: (opts: { region?: 'cn' | 'intl'; models?: string[] } = {}) => {
+    const q: string[] = []
+    if (opts.region) q.push(`region=${opts.region}`)
+    if (opts.models && opts.models.length) q.push(`models=${opts.models.join(',')}`)
+    const qs = q.length ? '?' + q.join('&') : ''
+    return client.get<WorkBuddyBusy>(`/workbuddy/busy${qs}`)
+  },
+  /**
+   * 成长中心（**只读**）。一次打 5 个上游只读端点，所以只在用户点开时调，
+   * 不进任何轮询。`id` 指定账号；不传用该区域第一个可用账号。
+   */
+  growth: (opts: { region?: 'cn' | 'intl'; id?: number } = {}) => {
+    const q: string[] = []
+    if (opts.region) q.push(`region=${opts.region}`)
+    if (opts.id) q.push(`id=${opts.id}`)
+    const qs = q.length ? '?' + q.join('&') : ''
+    return client.get<WorkBuddyGrowth>(`/workbuddy/growth${qs}`)
+  },
+  credits: (region?: 'cn' | 'intl', uids?: number[]) =>
     client.get<{
       count: number
       region?: string
+      /** all = 全量刷新；partial = 只刷了 uids 点名的账号（其余行沿用旧值） */
+      scope?: 'all' | 'partial'
+      requested?: number[]
       rows: WorkBuddyCreditRow[]
       summary: {
         total: number
@@ -198,7 +463,7 @@ export const workbuddyApi = {
       }
       /** FEFO 快照新鲜度（expiring.info()）：at 为空 = 没有快照；fresh=false = 超 TTL */
       fefo?: { at: number | null; fresh: boolean; accounts: number; windowDays: number }
-    }>(`/workbuddy/credits${region ? `?region=${region}` : ''}`),
+    }>(`/workbuddy/credits${buildQuery({ region, uids })}`),
   checkin: (id?: number, group?: string) =>
     client.post('/workbuddy/checkin', id ? { id } : group ? { group } : {}),
   /** 计费自检：最低倍率的付费模型发一条小请求，按套餐剩余额差值实测扣费 */

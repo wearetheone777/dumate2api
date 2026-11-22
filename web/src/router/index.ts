@@ -16,6 +16,7 @@ const AgentSetup = () => import('@/views/AgentSetupView.vue')
 const Users = () => import('@/views/UsersView.vue')
 const ServerLogs = () => import('@/views/ServerLogsView.vue')
 const TraeRuntime = () => import('@/views/TraeRuntimeView.vue')
+const QoderRuntime = () => import('@/views/QoderRuntimeView.vue')
 const OpsAlerts = () => import('@/views/OpsAlertsView.vue')
 
 const router = createRouter({
@@ -42,6 +43,8 @@ const router = createRouter({
         { path: 'logs', component: ServerLogs, meta: { title: '运行日志', key: 'logs', adminOnly: true } },
         // TRAE 运行策略：写运行期配置（降级/Max/护栏/暂停），admin 专属
         { path: 'trae-runtime', component: TraeRuntime, meta: { title: 'TRAE 运行策略', key: 'trae-runtime', adminOnly: true } },
+        // Qoder 运行策略：超时/排队/冷却热生效 + 自动签到排程（P0-1/P0-3），admin 专属
+        { path: 'qoder-runtime', component: QoderRuntime, meta: { title: 'Qoder 运行策略', key: 'qoder-runtime', adminOnly: true } },
         // 运维告警：七类规则阈值 + 活跃告警 + 指标端点。viewer 可看（只读），写操作服务端拦
         { path: 'alerts', component: OpsAlerts, meta: { title: '运维告警', key: 'alerts' } },
         // 「任务记录」已并入「积分明细」（见 CLAUDE.md）。这里保留重定向：

@@ -12,7 +12,8 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-wb-act-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-wb-act');
 process.env.DUMATE_ADMIN_DATA = TMP; // 在 require 之前
 
 const activity = require('../../src/workbuddy/activity');
@@ -106,6 +107,7 @@ test('reportActivity：上报成功 + 连登回读 + 档案落 lastActivityRepor
     authStore: { patch: (id, p) => { patched[id] = p; Object.assign(a, p); } },
   });
   assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.verified, true);
   assert.strictEqual(r.skipped, false);
   assert.strictEqual(r.streakDays, 3);
   assert.ok(/连续打卡 3 天/.test(r.msg), r.msg);
@@ -124,14 +126,28 @@ test('reportActivity：上游 code≠0 如实失败', async () => {
   assert.ok(r.error);
 });
 
-test('reportActivity：streak 查询失败不影响上报结论', async () => {
+test('reportActivity：streak 查询失败 → ok 但 verified=false（送达≠计入）', async () => {
+  // 2026-11-08 真机实测：/v2/report **不校验凭证**，假 accessToken 也回
+  // {"code":0,"msg":"OK"}；而同一假 token 打 /activity/growth/streak 是 401。
+  // 所以 code===0 只证明「POST 被接了」，不能证明「事件被计入连登」。
+  // 旧实现把它当成成功并在 error 里留空——凭证失效的账号会每天「成功」
+  // 一次而连登一天不涨，且从结果里完全看不出来。
   activity._setRequestImpl(fakeHttp({
     serve(pathName) {
-      if (pathName.endsWith('/v2/report')) return JSON.stringify({ code: 0 });
-      return 'not-json';
+      if (pathName.endsWith('/v2/report')) return JSON.stringify({ code: 0, msg: 'OK' });
+      return 'not-json';   // 回读失败（401 HTML / 非 JSON）
     },
   }));
-  const r = await activity.reportActivity({ ...ACCOUNT, lastActivityReport: '' }, { authStore: { patch() {} } });
-  assert.strictEqual(r.ok, true);
+  const patched = {};
+  const r = await activity.reportActivity(
+    { ...ACCOUNT, lastActivityReport: '' },
+    { authStore: { patch: (id, p) => { patched[id] = p; } } },
+  );
+  assert.strictEqual(r.ok, true, '请求确实送达了');
+  assert.strictEqual(r.verified, false, '但没能验证是否计入');
   assert.strictEqual(r.streakDays, null);
+  assert.ok(/无法验证/.test(r.msg), r.msg);
+  assert.ok(r.error, '未验证必须有原因，不能留空冒充成功');
+  // 送达即记档案：明天不该为「回读失败」重发同一条事件
+  assert.ok(patched[ACCOUNT.id] && patched[ACCOUNT.id].lastActivityReport, '送达后仍要记幂等档案');
 });

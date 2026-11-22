@@ -7,7 +7,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-trae-ops-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const tmp = tmpDir('dumate-trae-ops');
 process.env.DUMATE_ADMIN_DATA = tmp;
 
 const batch = require('../../src/traework/batch');

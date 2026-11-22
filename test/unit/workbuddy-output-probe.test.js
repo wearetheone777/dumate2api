@@ -11,7 +11,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-wb-probe-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const TMP = tmpDir('dumate-wb-probe');
 process.env.DUMATE_ADMIN_DATA = TMP;
 
 const probe = require('../../src/workbuddy/output-probe');

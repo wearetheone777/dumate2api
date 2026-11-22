@@ -10,7 +10,8 @@ const os = require('os');
 const path = require('path');
 
 // 通道 status() 按 mtime 读 data/ 下的账号文件——指向空临时目录即「零账号」
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dumate-router-'));
+const { tmpDir } = require('../helpers/tmpdir');
+const tmp = tmpDir('dumate-router');
 process.env.DUMATE_ADMIN_DATA = tmp;
 
 const router = require('../../src/upstream-router');
