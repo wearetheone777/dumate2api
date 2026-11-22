@@ -114,8 +114,8 @@ async function onSubmit() {
   inset: 0;
   pointer-events: none;
   background-image:
-    linear-gradient(rgba(15, 23, 42, 0.022) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(15, 23, 42, 0.022) 1px, transparent 1px);
+    linear-gradient(var(--lab-grid-line-strong) 1px, transparent 1px),
+    linear-gradient(90deg, var(--lab-grid-line-strong) 1px, transparent 1px);
   background-size: 46px 46px;
   mask-image: radial-gradient(circle at 50% 42%, #000 0%, transparent 72%);
 }
@@ -168,7 +168,7 @@ async function onSubmit() {
   /* 窄屏留出 16px 边距，卡片不会贴边或被裁 */
   width: min(420px, calc(100vw - 32px));
   padding: 40px 40px 32px;
-  background: rgba(255, 255, 255, 0.94);
+  background: var(--lab-login-card);
   backdrop-filter: blur(20px);
   border: 1px solid var(--lab-border-strong);
   border-radius: 20px;
@@ -314,6 +314,19 @@ async function onSubmit() {
   color: var(--lab-text-mute);
   letter-spacing: 0.4px;
   opacity: 0.8;
+}
+
+/* 夜间模式：卡片底、辉光强度、投影按深色重算。
+   辉光在深底上同强度会变成眩光，压到浅色的一半以下；
+   卡片阴影改用纯黑（深底上带蓝的阴影会泛灰边）。 */
+html.dark .glow {
+  opacity: 0.14;
+}
+html.dark .login-card {
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.55),
+    0 0 0 1px rgba(34, 211, 238, 0.06),
+    0 0 80px rgba(34, 211, 238, 0.03);
 }
 
 /* 用户要求减少动效时：辉光漂浮、品牌扫光、卡片入场全部关掉 */

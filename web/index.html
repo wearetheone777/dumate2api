@@ -4,10 +4,37 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="light" />
-    <!-- 与 style.css 的 --lab-bg 同值：地址栏/移动端状态栏配色跟着页面底走 -->
+    <meta name="color-scheme" content="light dark" />
+    <!-- 与 style.css 的 --lab-bg 同值：地址栏/移动端状态栏配色跟着页面底走。
+         stores/theme.ts 在切换时改写这里的 content -->
     <meta name="theme-color" content="#f2f4f8" />
     <title>DuMate 控制台</title>
+    <!-- 首帧前的主题判定：必须在样式与打包产物之前同步执行。
+         否则深色用户会先看到一块白底再被 JS 翻成深色（白闪），
+         这种闪一下比没有夜间模式更难受。判据与 stores/theme.ts 保持一致：
+         localStorage 里的 light/dark 为准，缺省（auto）跟随系统。 -->
+    <script>
+      (function () {
+        try {
+          var mode = localStorage.getItem('dumate.admin.theme') || 'auto'
+          var dark =
+            mode === 'dark' ||
+            (mode === 'auto' &&
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) {
+            document.documentElement.classList.add('dark')
+            document.documentElement.style.colorScheme = 'dark'
+            var meta = document.querySelector('meta[name="theme-color"]')
+            if (meta) meta.setAttribute('content', '#0b111c')
+          } else {
+            document.documentElement.style.colorScheme = 'light'
+          }
+        } catch (e) {
+          /* 隐私模式禁用 localStorage：按浅色渲染，不影响使用 */
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

@@ -6,7 +6,18 @@
 // 已锁定的口径），差异只在输入是标准 OpenAI chunk（COSY 两通道解信封后的形状）。
 const { test } = require('node:test');
 const assert = require('assert');
+const { makeTmpData } = require('../helpers/tmpdata');
+
+// 隔离热配置（P1-9）：envCaps 的 REPAIR_MAX 现在多一层面板覆盖，读的是
+// livecfg.json。不钉临时目录的话，本机面板上真配过 Qoder 重试次数就会让
+// 「env=2」这条断言失败——机器相关，正是 pool.js 那条「测试池对机器真实
+// 配置不敏感」纪律要避免的。临时目录不存在文件 → 全走 env/默认。
+const tmp = makeTmpData('repair-gate');
+process.env.DUMATE_ADMIN_DATA = tmp.dir;
+
 const repair = require('../../src/repair');
+const livecfg = require('../../src/livecfg');
+livecfg._resetForTest();
 
 const BROADCAST = '当前进度：8%｜已完成：枚举文件｜下一步：读取台账。';
 const DONE = '当前进度：100%｜三条命令已全部并行执行完成。';

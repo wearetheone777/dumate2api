@@ -25,6 +25,43 @@ export interface ReqLogRow {
   // **权威来源是 provider 上报**（多账号轮询下只有它知道选中的是哪一个），
   // 没有则按通道读当前凭证兜底。两者都拿不到时缺省——界面显示「—」。
   account?: string
+  /**
+   * 尝试链（2026-11-16 P1-5）：`picked`/`skip`/`error`/`ok`/`failover` 的时间轴。
+   * **只有判据**（谁、什么时候、为什么、结果），不含请求体/响应体。
+   * 历史行没有这个字段；超过 8 条会截断并置 `attempts_truncated`。
+   */
+  attempts?: Array<{
+    accountId: number | null
+    account: string
+    outcome: 'picked' | 'ok' | 'error' | 'skip' | 'failover' | string
+    reason: string
+    at: number
+    ms?: number
+  }>
+  attempts_truncated?: boolean
+  /**
+   * 内联图片体量（2026-11-16 P1-6）：四张数分别回答「几张图 / 其中几张是内联 /
+   * 内联总字节 / 单张最大」。外链图只进 `image_count` 不进 `image_bytes`——
+   * 大小在上游手里，量不出来就不假装量得出来。
+   * 旧行没有这几个字段（缺省 0），不要读成「确认没图」以外的含义。
+   */
+  image_count?: number
+  image_inline?: number
+  image_bytes?: number
+  image_max_bytes?: number
+  /** 最大那张的 MIME（如 image/png）；没有内联图时为空 */
+  image_format?: string
+  /**
+   * 路由组（P1-7）：命中的组名与成员序号，如 `fast 3/3`；空 = 没走组。
+   * 与响应头 `X-Route-Group` 同值。
+   */
+  route_group?: string
+  /**
+   * 会话粘性键（P2-11）：同一条会话的所有请求共享这个值，换号时前后行能对上。
+   * 空 = 这条请求不粘（无首条 user / 非直连通道 / 调用方显式未给）。
+   * 只在本地用，不会发给上游。
+   */
+  session_key?: string
   // 区域（2026-11-03 国际版）：traework/qoder 随实际服务账号记录。
   // 旧行与纯国内通道（搭子/千问）没有这个字段——空缺不读成国内
   region?: 'cn' | 'intl' | ''

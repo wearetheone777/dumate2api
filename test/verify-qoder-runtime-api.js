@@ -105,7 +105,9 @@ async function call(method, url, body) {
 function cleanup() {
   try { fs.unlinkSync(path.join(TMP, 'qoder-runtime.json')); } catch (e) { /* 不存在 */ }
   try { fs.unlinkSync(path.join(TMP, 'qoder-autocheckin.json')); } catch (e) { /* 不存在 */ }
+  try { fs.unlinkSync(path.join(TMP, 'livecfg.json')); } catch (e) { /* 不存在 */ }
   try { require('../src/qoder/runtime')._resetForTest(); } catch (e) { /* ignore */ }
+  try { require('../src/livecfg')._resetForTest(); } catch (e) { /* ignore */ }
 }
 
 (async () => {
@@ -134,17 +136,21 @@ function cleanup() {
     cleanup();
     const w = await call('PUT', '/api/admin/qoder-runtime', {
       timeouts: { contentMs: 12345, maxBodyMb: 7 },
-      concurrency: { inflightMax: 1, pickStrategy: 'least-inflight' },
+      concurrency: { pickStrategy: 'least-inflight' },
     });
     assert.strictEqual(w.status, 200);
     assert.strictEqual(w.body.ok, true);
     assert.strictEqual(w.body.config.timeouts.contentMs, 12345);
     // effective 是「真正生效值」——chat.js 的读取器要看到同一个数
     assert.strictEqual(w.body.effective.timeouts.contentMs, 12345, 'effective 要跟着变');
-    assert.strictEqual(w.body.effective.concurrency.inflightMax, 1);
+    assert.strictEqual(w.body.effective.concurrency.pickStrategy, 'least-inflight');
+    // 闸门旋钮（inflightMax/minIntervalMs）P1-9 起归 livecfg 的 throttle 表，
+    // 走「通道风控」页提交；effective 要跨来源读到它（不必重启）。
+    require('../src/livecfg').Store({ throttle: { qoder: { inflightMax: 1 } } });
     const g = await call('GET', '/api/admin/qoder-runtime');
     assert.strictEqual(g.body.config.timeouts.contentMs, 12345);
     assert.strictEqual(g.body.effective.timeouts.maxBodyMb, 7, '请求体上限也热生效');
+    assert.strictEqual(g.body.effective.concurrency.inflightMax, 1, 'livecfg 闸门值跨来源热生效');
     cleanup();
   });
 

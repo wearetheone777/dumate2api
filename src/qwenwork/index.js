@@ -327,7 +327,7 @@ async function send(payload, onChunk, opts = {}) {
   const model = payload && payload.model ? String(payload.model).replace(/^qwen\//, '') : '';
   // 会话粘性键：同一会话尽量落到同一账号（TRAE/长上下文场景省重放），
   // channel-pool 内部判定不健康即解绑换号
-  const sessionKey = channelPool.sessionKeyOf(payload, opts);
+  const sessionKey = channelPool.sessionKeyFor(payload, opts);
   const usable = authStore.findUsable();
   if (!usable.length) throw new Error('千问办公没有可用账号，请先添加一个');
 

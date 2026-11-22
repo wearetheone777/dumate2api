@@ -103,6 +103,77 @@ function errOf(res) {
   return d.message || d.msg || d.error_message || `HTTP ${res.status}`;
 }
 
+/**
+ * 积分钱包分池（2026-11-15 融合 P0-3，数据面）。
+ *
+ * 分成三桶，**互不合并**：
+ *   dumate        上游明确标了 product:"dumate" 的包
+ *   unspecified   上游没给 product 字段的包（多数账号只有这一桶）
+ *   others        明确标了其他产品的包（实例：product:"comate"，另一个百度产品
+ *                 共用同一钱包——社区实测 5,000 分，被算进搭子余额就是虚报）
+ *
+ * 另按 `status` 标出可花费的部分：`active`（或上游没给 status）才算；
+ * `inactive` 是排队的未来期，计入会成倍虚报。
+ *
+ * 只做汇总，不改变调用方对 total/used/left 的使用——口径切换要等真机字段核对。
+ */
+function splitPools(packages) {
+  /** 空桶 / 分组累加器。unknown 计数让「不知道」不被写成 0（review #10） */
+  const bucket = () => ({ total: 0, used: 0, packs: 0, packsUnknown: 0, partial: false });
+  const acc = { dumate: bucket(), unspecified: bucket(), others: [] };
+  const otherByIdx = new Map();
+  const active = bucket();
+  // 缺失 / 空串 / 非数值 → null（**不是 0**）。0 会被下游读成「余额用完」，
+  // 与「上游没给这个字段」是两件事（CLAUDE.md：余额 null ≠ 0）。
+  const num = (v) => {
+    if (v === undefined || v === null || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const add = (b, t, u) => {
+    b.packs += 1;
+    if (t == null || u == null) { b.packsUnknown += 1; b.partial = true; return; }
+    b.total += t;
+    b.used += u;
+  };
+  for (const p of Array.isArray(packages) ? packages : []) {
+    if (!p || typeof p !== 'object') continue;
+    const t = num(p.total);
+    const u = num(p.used);
+    const spendable = !p.status || p.status === 'active';
+    if (spendable) add(active, t, u);
+    if (!p.product) {
+      add(acc.unspecified, t, u);
+    } else if (p.product === 'dumate') {
+      add(acc.dumate, t, u);
+    } else {
+      let row = otherByIdx.get(p.product);
+      if (!row) { row = { product: p.product, ...bucket() }; otherByIdx.set(p.product, row); acc.others.push(row); }
+      add(row, t, u);
+    }
+  }
+  // left：只有该桶的每个包都读到了数字才给精确值；有一个未知就如实 null
+  // （部分和不是余额——把它当余额会在界面上少报，且无法解释差额）。
+  const finish = (b) => {
+    b.left = b.partial ? null : Math.max(0, b.total - b.used);
+    if (b.partial && b.packs === b.packsUnknown) {
+      // 整桶都读不到数字：0 是编的，null 才如实
+      b.total = null;
+      b.used = null;
+    }
+    return b;
+  };
+  for (const row of acc.others) finish(row);
+  finish(acc.dumate);
+  finish(acc.unspecified);
+  finish(active);
+  acc.active = active;
+  acc.note = acc.others.length
+    ? 'others 是共用同一钱包的其他产品积分，不可用于搭子模型'
+    : (acc.dumate.total ? '' : '上游没有 product 字段，全部落在 unspecified——不要当成搭子专属额度');
+  return acc;
+}
+
 // 出站 agent 解析（E 包收口补点）：调用方持有**原始账号记录**（load()/getRaw()
 // 的元素，proxy 字段全量可用）时用它把本次动作挂到账号自己的代理上。
 // 无代理返回 null（直连）；配置非法**抛错**——调用方让本次操作以失败收场，
@@ -144,29 +215,70 @@ const api = {
   },
 
   // ---- 积分 ----
+  //
+  // 2026-11-15 融合 P0-3（数据面）：社区 2026-11-13 实测发现 quota_overview 的
+  // `totalPoints` 把**别的百度产品**的包也算进来了（他们的账号里有一个 5,000 分
+  // 的 `product:"comate"` 包），另外排队的月度授予是 `status:"inactive"`（未来期，
+  // 计入会虚报数倍余额）。
+  //
+  // 本轮**只加字段、不改口径**：顶层 total/used/left 一字不动（既有消费方
+  // ——dumate-points 伪模型、额度总览、FEFO 快照——行为零变化），另给
+  // `packages[].product/status/points_expire_at` 与 `pools` 分组。
+  //
+  // 为什么先不改口径：那三个字段名是**别人账号**上的实测，本仓从未在自己账号上
+  // 见过（`product` 可能根本不存在）。按「没测到不许写成通过」，先用
+  // `node test/probe-dumate-points.js` 落 raw 核对字段名，再动展示——
+  // 否则会把「字段不存在」误判成「余额为 0」（CLAUDE.md：余额 null ≠ 0）。
   async quotaOverview(cookie, eopts = {}) {
     const res = await request(cookie, 'GET', '/api/dumate/points/quota_overview?clientType=desktop&timezone=Asia%2FShanghai', undefined, eopts);
     if (!res.ok) return { ok: false, error: errOf(res), expired: res.expired };
     const r = pick(res) || {};
-    const total = Number(r.totalPoints || 0);
-    const used = Number(r.usedPoints || 0);
+    // 缺失 / 非数值 → null，**不回填 0**（review #10）。0 会被下游读成
+    // 「额度用完了」：dumate-points 会报 0 余额、FEFO 会把账号当耗尽、
+    // 余额曲线会记一笔假跌破。上游偶发少字段时这是真实会发生的事。
+    const num = (v) => {
+      if (v === undefined || v === null || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const total = num(r.totalPoints);
+    const used = num(r.usedPoints);
+    const left = total != null && used != null ? Math.max(0, total - used) : null;
+    const subs = Array.isArray(r.subscription) ? r.subscription : [];
+    const incs = Array.isArray(r.incremental) ? r.incremental : [];
+    const packages = [].concat(subs, incs).map((p) => {
+      const t = num(p.totalPoints);
+      const u = num(p.usedPoints);
+      return {
+        kind: subs.includes(p) ? 'subscription' : 'incremental',
+        package_type: p.packageType || '',
+        source: p.source || '',
+        total: t,
+        used: u,
+        left: t != null && u != null ? Math.max(0, t - u) : null,
+        granted_at: p.startDate ? p.startDate * 1000 : null,
+        expire_at: p.expireDate ? p.expireDate * 1000 : null,
+        // —— P0-3 新增（上游没给就是空，**不猜成 'dumate'**）——
+        product: p.product !== undefined && p.product !== null ? String(p.product) : '',
+        status: p.status !== undefined && p.status !== null ? String(p.status) : '',
+        // 积分什么时候死（与 expireDate「订阅什么时候到期」是两个口径）
+        points_expire_at: p.pointsExpireDate ? Number(p.pointsExpireDate) * 1000 : null,
+      };
+    });
     return {
       ok: true,
       total,
       used,
-      left: Math.max(0, total - used),
+      left,
+      // 顶层余额是否可信（三个字段要么全有值，要么 left 为 null）。调用方
+      // 聚合时据此区分「0」与「不知道」，不必自己判 `left === null`。
+      balanceKnown: left != null,
       subscribed: !!r.isSubscribed,
       throttled: !!(r.modelThrottleInfo && r.modelThrottleInfo.throttled),
-      packages: [].concat(r.subscription || [], r.incremental || []).map((p) => ({
-        kind: (r.subscription || []).includes(p) ? 'subscription' : 'incremental',
-        package_type: p.packageType || '',
-        source: p.source || '',
-        total: Number(p.totalPoints || 0),
-        used: Number(p.usedPoints || 0),
-        left: Math.max(0, Number(p.totalPoints || 0) - Number(p.usedPoints || 0)),
-        granted_at: p.startDate ? p.startDate * 1000 : null,
-        expire_at: p.expireDate ? p.expireDate * 1000 : null,
-      })),
+      packages,
+      // 分池汇总。`unspecified` 是「上游没给 product 字段」的那一桶——
+      // 与 `dumate` 分开，因为把 unspecified 当 dumate 正是社区那次虚报的成因。
+      pools: splitPools(packages),
       raw: r,
     };
   },
@@ -301,4 +413,4 @@ const api = {
   },
 };
 
-module.exports = { BASE, request, pick, errOf, agentFor, api };
+module.exports = { BASE, request, pick, errOf, agentFor, splitPools, api };

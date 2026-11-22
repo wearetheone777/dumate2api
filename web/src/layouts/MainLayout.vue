@@ -1,6 +1,12 @@
 <template>
-  <a-layout class="min-h-screen lab-shell">
-    <a-layout-sider v-model:collapsed="collapsed" collapsible :width="216" breakpoint="md" class="lab-sider">
+  <a-layout class="min-h-screen lab-shell" :class="{ 'reading-mode': readingMode }">
+    <a-layout-sider
+      v-model:collapsed="siderCollapsed"
+      :collapsible="!readingMode"
+      :width="216"
+      breakpoint="md"
+      class="lab-sider"
+    >
       <div class="lab-logo">
         <span class="logo-mark"><AppLogo :size="19" /></span>
         <span v-if="!collapsed" class="logo-text">DuMate<span class="logo-accent">控制台</span></span>
@@ -48,6 +54,11 @@
         <a-menu-item v-if="isAdmin" key="trae-runtime">
           <template #icon><ControlOutlined /></template>
           <span>运行策略</span>
+        </a-menu-item>
+        <!-- 通道风控（P1-9）：并发/间隔/重试/限流上限 + 通道级复位，admin 专属 -->
+        <a-menu-item v-if="isAdmin" key="channel-policy">
+          <template #icon><SafetyCertificateOutlined /></template>
+          <span>通道风控</span>
         </a-menu-item>
         <!-- Qoder 运行策略：超时/排队/冷却热生效 + 自动签到（P0-1/P0-3）。
              只在 Qoder 通道下出现——它是通道级配置，套到别的通道上是误导 -->
@@ -133,6 +144,57 @@
           </div>
         </div>
         <a-space :size="10">
+          <!-- 主题切换：三态下拉而不是单键翻转。
+               单键只能两态，而 'auto' 是默认值——用户首次进站时是「跟随系统」，
+               单键翻转会把他从 auto 里拽出来，之后就再也不跟随系统了。
+               图标按**生效**主题画（不是按选择），这样 auto 下也能一眼看出现在是什么颜色。 -->
+          <a-dropdown :trigger="['click']" placement="bottomRight">
+            <a-button size="small" class="ghost-btn theme-btn" :title="themeTitle">
+              <template #icon>
+                <svg v-if="isDark" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"
+                  />
+                </svg>
+                <svg v-else viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+                  <circle cx="12" cy="12" r="4.4" fill="currentColor" />
+                  <g stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                    <path d="M12 2.4v2.2M12 19.4v2.2M2.4 12h2.2M19.4 12h2.2" />
+                    <path d="M5.2 5.2l1.6 1.6M17.2 17.2l1.6 1.6M18.8 5.2l-1.6 1.6M6.8 17.2l-1.6 1.6" />
+                  </g>
+                </svg>
+              </template>
+              <span class="theme-btn-text">{{ themeShort }}</span>
+            </a-button>
+            <template #overlay>
+              <a-menu :selected-keys="[themeMode]" @click="onThemeMode">
+                <a-menu-item key="light">浅色</a-menu-item>
+                <a-menu-item key="dark">深色</a-menu-item>
+                <a-menu-item key="auto">跟随系统</a-menu-item>
+              </a-menu>
+            </template>
+          </a-dropdown>
+          <!-- 自动刷新（P2-12）：共享一个定时器，页面不可见时不刷。
+               挂看板时不用一直手点；间隔选项与「不自动刷新」同一份常量。 -->
+          <a-select
+            v-model:value="autoRefreshMs"
+            size="small"
+            class="refresh-select"
+            :options="REFRESH_OPTIONS"
+            :title="`自动刷新：${refreshingCount ? '正在更新' : '按间隔重新拉取当前页数据'}`"
+          />
+          <a-tag v-if="refreshingCount" color="processing" class="refresh-tag">更新中</a-tag>
+          <!-- 阅读模式：只改排版（侧栏收起 + 字号/数字放大），**不隐藏任何数据** -->
+          <a-button
+            size="small"
+            class="ghost-btn"
+            :type="readingMode ? 'primary' : 'default'"
+            :title="readingMode ? '退出阅读模式' : '阅读模式：放大数字、收起侧栏（不隐藏数据）'"
+            @click="readingMode = !readingMode"
+          >
+            {{ readingMode ? '退出阅读' : '阅读模式' }}
+          </a-button>
           <a-tag class="user-tag">{{ auth.user?.username }}</a-tag>
           <a-button size="small" class="ghost-btn" @click="onLogout">退出</a-button>
         </a-space>
@@ -147,14 +209,22 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined } from '@ant-design/icons-vue'
+import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import client from '@/api/client'
 import { auth, isAdmin } from '@/stores/auth'
 import { channelStore, CHANNELS } from '@/stores/channel'
 import { regionStore, hasRegion } from '@/stores/region'
+import { isDark, themeMode, setThemeMode, type ThemeMode } from '@/stores/theme'
+import { autoRefreshMs, readingMode, refreshingCount, REFRESH_OPTIONS } from '@/stores/ui'
 
 const collapsed = ref(false)
+// 自动刷新与阅读模式（P2-12）：状态在 stores/ui.ts，跨页持久化
+const siderCollapsed = computed({
+  get: () => readingMode.value || collapsed.value,
+  // 阅读模式下禁用折叠按钮，这个 setter 只在普通模式生效
+  set: (v: boolean) => { collapsed.value = v },
+})
 const router = useRouter()
 const route = useRoute()
 
@@ -246,6 +316,23 @@ async function onLogout() {
   router.push('/login')
 }
 
+// ---------- 主题切换 ----------
+// 按钮上的短标签按「用户的选择」显示（auto 就写自动），图标按「生效结果」画：
+// 两者会不一致（auto + 系统深色 = 写「自动」画月亮），这是刻意的——
+// 标签回答「我选了什么」，图标回答「现在是什么」。
+const themeShort = computed(() =>
+  themeMode.value === 'auto' ? '自动' : themeMode.value === 'dark' ? '深色' : '浅色'
+)
+const themeTitle = computed(
+  () =>
+    `主题：${isDark.value ? '深色' : '浅色'}` +
+    (themeMode.value === 'auto' ? '（跟随系统）' : '') +
+    ' · 点击切换'
+)
+function onThemeMode({ key }: { key: string }) {
+  setThemeMode(key as ThemeMode)
+}
+
 // URL 参数直达通道/区域视图（?channel=workbuddy&region=cn）：让「某通道某
 // 区域的管理视图」可以被链接分享、被书签直达，也让自动化走查不必依赖点击
 // 顶栏切换器。只认合法值，非法参数静默忽略（不报错——URL 是数据不是指令）。
@@ -275,11 +362,11 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
 
 /* 侧栏：比内容区再深一档灰，靠明度分层而不是靠边框 */
 .lab-sider {
-  background: #edf1f6 !important;
+  background: var(--lab-sider-bg) !important;
   border-right: 1px solid var(--lab-border);
 }
 .lab-sider :deep(.ant-layout-sider-trigger) {
-  background: #e4e9f0;
+  background: var(--lab-sider-trigger);
   border-top: 1px solid var(--lab-border);
   color: var(--lab-text-mute);
 }
@@ -415,7 +502,7 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
 }
 .ch-btn:hover {
   color: var(--lab-text);
-  background: rgba(15, 23, 42, 0.04);
+  background: var(--lab-hover);
 }
 .ch-btn.on {
   background: var(--lab-primary-dim);
@@ -466,7 +553,7 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
   padding: 0 20px;
   height: 58px;
   line-height: 58px;
-  background: rgba(255, 255, 255, 0.82);
+  background: var(--lab-header-bg);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--lab-border);
   position: sticky;
@@ -483,7 +570,7 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
   color: var(--lab-text-mute);
 }
 .crumb-sep {
-  color: #b6c0cd;
+  color: var(--lab-border-strong);
 }
 .crumb-cur {
   color: var(--lab-text);
@@ -512,6 +599,36 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
   }
 }
 
+/* 自动刷新选择器：窄一点，别把顶栏挤成两行 */
+.refresh-select {
+  width: 116px;
+}
+.refresh-tag {
+  margin-inline-end: 0;
+}
+
+/* 阅读模式（P2-12）：**只改排版，不隐藏任何数据**。
+   目标是「挂墙/投影时一眼看清数字」：收起侧栏、放大字号与关键数字、
+   收紧表头与行的间隙。任何「为了清爽」而藏字段的做法都不在这里做——
+   看板上少的那一列，就是下一次排障时的盲点。 */
+.reading-mode :deep(.lab-content) {
+  font-size: 15px;
+}
+.reading-mode :deep(.num) {
+  font-size: 1.12em;
+  letter-spacing: 0.2px;
+}
+.reading-mode :deep(.ant-table) {
+  font-size: 13.5px;
+}
+.reading-mode :deep(.ant-table-tbody > tr > td) {
+  padding-block: 10px;
+}
+.reading-mode :deep(.stat-value),
+.reading-mode :deep(.block-label) {
+  font-size: 13px;
+}
+
 /* 窄屏适配：面包屑只留当前页名，避免顶栏溢出 */
 @media (max-width: 900px) {
   .lab-header {
@@ -529,4 +646,18 @@ watch(() => regionStore.current, () => { channelStore.load(); loadAccountAlerts(
   }
 }
 
+
+/* 主题切换按钮：太阳/月亮图标 + 极短标签。
+   标签保留是因为纯图标在「自动」态下说不出当前是什么（图标只表达生效结果）。 */
+.theme-btn {
+  display: inline-flex;
+  align-items: center;
+}
+.theme-btn-text {
+  font-size: 12px;
+  letter-spacing: 0.3px;
+}
+.theme-btn svg {
+  display: block;
+}
 </style>

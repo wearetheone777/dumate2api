@@ -124,7 +124,16 @@
       <!-- 模型信息表：倍率 / 折扣 / 上下文 / 输出上限，字段带来源标记。
            与搭子、千问共用同一个组件——三条通道的字段形状统一，
            三份实现必然各自漂移 -->
-      <ModelInfoTable :channel="'traework'" :preloaded="twInfoRows" class="mt-3" />
+      <ModelInfoTable
+        :channel="'traework'"
+        :preloaded="twInfoRows"
+        :scope="twInfoMeta.scope"
+        :scopes="twInfoMeta.scopes"
+        :cached="twInfoMeta.cached"
+        :merged="twInfoMeta.merged"
+        class="mt-3"
+        @clear-cache="clearTwModelCache"
+      />
 
       <div class="text-xs text-slate-500 mt-3">
         调用时用前缀名（如 <span class="font-mono">traework/glm-5.2</span>）；不带前缀的名字一律走搭子。
@@ -695,6 +704,39 @@
       </a-alert>
     </a-card>
 
+    <!-- 路由组（P1-7）：一个对外模型名 → 多条通道按可用性择优。
+         为什么只读：组的写入是「改路由表」，写错的后果是请求静默走错通道（响应仍 200）。
+         先让「此刻会走谁 / 跳过了谁 / 为什么」可见，编辑后面再做 -->
+    <a-card title="路由组" :bordered="false" class="mt-4">
+      <template #extra>
+        <span class="text-xs text-slate-400 mr-2">{{ rgFile }}</span>
+        <a-button size="small" class="ghost-btn" :loading="rgLoading" @click="loadRouteGroups">刷新</a-button>
+      </template>
+      <a-empty v-if="!rgGroups.length" description="未配置路由组（data/route-groups.json）" />
+      <div v-else class="space-y-3">
+        <div v-for="g in rgGroups" :key="g.name">
+          <div class="flex items-center gap-2">
+            <span class="font-mono">{{ g.name }}</span>
+            <a-tag :color="g.chosen ? 'green' : 'red'">
+              {{ g.chosen ? `此刻走第 ${g.chosen.index} 个：${g.chosen.model}` : '此刻全部不可用（请求会回 503 并逐条说明）' }}
+            </a-tag>
+          </div>
+          <div class="text-xs mt-1 space-y-0.5">
+            <div v-for="m in g.members" :key="m.index">
+              <span class="text-slate-500">{{ m.index }}.</span>
+              <span class="font-mono ml-1">{{ m.model }}</span>
+              <span class="text-slate-500 ml-1">→ {{ m.channel }}</span>
+              <a-tag :color="m.ok ? 'green' : 'default'" class="ml-1">{{ m.ok ? '可用' : '不可用' }}</a-tag>
+              <span v-if="!m.ok" class="text-orange-600 ml-1">{{ m.reason }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <a-alert v-if="rgDropped.length" type="warning" show-icon class="mt-2" :message="`配置里有 ${rgDropped.length} 条未生效`">
+        <div v-for="(d, i) in rgDropped" :key="i" class="text-xs">{{ d.name || '(无名)' }}：{{ d.why }}</div>
+      </a-alert>
+    </a-card>
+
     <!-- 搭子的积分：与 TRAE 的额度卡同构，回答「这些模型花的是哪份额度」。
          与千问的三池、TRAE 的 credits 是三套账，数字不能相加 -->
     <a-card title="搭子积分" :bordered="false">
@@ -980,6 +1022,23 @@ interface Row {
 }
 
 const map = ref<ModelMapData | null>(null)
+// 路由组（P1-7）：只读观测面
+const rgGroups = ref<Array<any>>([])
+const rgDropped = ref<Array<{ name: string; why: string }>>([])
+const rgFile = ref('route-groups.json')
+const rgLoading = ref(false)
+async function loadRouteGroups() {
+  rgLoading.value = true
+  try {
+    const { data } = await client.get('/route-groups')
+    rgGroups.value = data.groups || []
+    rgDropped.value = data.dropped || []
+    rgFile.value = data.file || 'route-groups.json'
+  } catch (e: any) {
+    // 403 / 404 都按「没有这个能力」处理，不弹错——组是可选能力
+    rgGroups.value = []
+  } finally { rgLoading.value = false }
+}
 // 当前通道。千问与 TRAE 的模型表都由上游下发（只读），搭子的别名映射是
 // 另一套——三者互不适用，同页并列只会让人以为改别名能影响直连通道的路由。
 // 千问与 TRAE 分开判定：两者的账不同（三池 vs 单 credits），
@@ -1317,6 +1376,25 @@ const twTotals = computed(() => {
   return { remain, limit, checked }
 })
 
+// TRAE 模型表缓存的元信息（2026-11-16 P0-1）：谁取的表、命中没、是否多账号合并。
+// 单独一个 ref 而不是塞进 rows——它是「数据的来源」，不是某一行的字段。
+const twInfoMeta = ref<{
+  scope: { id: string; accountId: string; fn: string; version: string } | null
+  scopes: Array<{ id: string; accountId: string; fn: string; version: string; ageMs: number; stale: boolean; models: number }>
+  cached: boolean
+  merged: boolean
+}>({ scope: null, scopes: [], cached: false, merged: false })
+
+/** 清 TRAE 模型表缓存后重取（换了会员等级 / 新加账号时不必等 TTL） */
+async function clearTwModelCache() {
+  try {
+    await traeworkApi.clearModelCache(twRegion.value)
+  } catch (e: any) {
+    message.warning(`清缓存失败：${e?.message || e}`)
+  }
+  await loadTwModels(true)
+}
+
 // 千问模型：直接问 /qwenwork/models，不再从 /models/map 的 channels 里蹭
 const qwModels = ref<Array<{ id: string; name: string; prefixed: string }>>([])
 const qwError = ref('')
@@ -1542,6 +1620,12 @@ async function loadTwModels(force = false) {
   twRows.value = credits.data.rows || []
   twUsage.value = (usage.data.rows || []) as any
   twInfoRows.value = info.data.rows || []
+  twInfoMeta.value = {
+    scope: (info.data as any).scope || null,
+    scopes: (info.data as any).scopes || [],
+    cached: (info.data as any).cached === true,
+    merged: (info.data as any).merged === true,
+  }
   twLinks.value = links.data || null
   // 元信息（账号数 / token 到期）来自通道状态，进页面时顶栏可能还没拉过
   await channelStore.load()
@@ -1707,6 +1791,7 @@ async function reset() {
 
 onMounted(async () => {
   await load()
+  await loadRouteGroups()
   if (!isQw.value && !isTw.value && !isQd.value) {
     await loadGateway()
     await loadCaps()

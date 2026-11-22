@@ -36,8 +36,12 @@ const { cachedTokensOf } = require('./usage-norm');
 // 这里保留 MODEL_MAP 导出以兼容既有引用，值是默认表。
 const MODEL_MAP = modelmap.DEFAULT_ALIASES;
 
-function mapModel(name) {
-  return modelmap.mapModel(name);
+// 转发 opts（catalog 等）：server.js 的四个协议入口都按链路传
+// `{ catalog: ... }`，早先这个包装只接 name，第二个实参被吞掉——清单里的
+// 云端路由名（kimi-k31 / glm-53…）一律被兜底成 model-text，HTTP 200 返回
+// 另一个模型的答案（静默错模型）。
+function mapModel(name, opts) {
+  return modelmap.mapModel(name, opts);
 }
 
 /** Anthropic 工具定义 → OpenAI tools。形状不对的整条丢弃（不是整轮失败） */

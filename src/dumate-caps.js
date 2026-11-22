@@ -87,7 +87,17 @@ function learn(model, errorText) {
   return true;
 }
 
-/** clamp 用的上限：学习值 > 静态表 > null（调用方回落全局 DUMATE_MAX_MAX_TOKENS） */
+/**
+ * clamp 用的上限，三级来源：
+ *   ① 学习值（撞 400 时从上游错误体解析，7 天 TTL）
+ *   ② 静态实测表（OUTPUT_CAPS，真机二分/错误体得来）
+ *   ③ 桌面端模型清单的 limit.output（dumate-catalog，2026-11-15 融合 P0-1）
+ *   都没有 → null（调用方回落全局 DUMATE_MAX_MAX_TOKENS）
+ *
+ * ②必须先于③：清单里的 output 是**客户端展示值**，与上游真值可能不同
+ * （实例：model-text 清单 384000 vs 上游错误体 393216）。把展示值当上限
+ * 会让每次都少给 9k 预算，而超限是整轮失败——宁可给真值。
+ */
 function capOf(model, now = Date.now()) {
   const k = String(model || '').slice(0, 100);
   if (!k) return null;
@@ -96,7 +106,16 @@ function capOf(model, now = Date.now()) {
     const n = Number(hit.n);
     if (Number.isFinite(n) && n > 0 && Number(hit.at) && now - Number(hit.at) <= TTL_MS) return n;
   }
-  return Object.prototype.hasOwnProperty.call(OUTPUT_CAPS, k) ? OUTPUT_CAPS[k] : null;
+  if (Object.prototype.hasOwnProperty.call(OUTPUT_CAPS, k)) return OUTPUT_CAPS[k];
+  try {
+    // 延迟 require：catalog 会读盘，且它自己的缓存按 mtime 失效，不需要在这里缓存
+    const catalog = require('./dumate-catalog');
+    const meta = catalog.get(k);
+    if (meta && meta.limit && Number.isFinite(meta.limit.output) && meta.limit.output > 0) {
+      return meta.limit.output;
+    }
+  } catch (e) { /* 清单不可用就回落全局上限 */ }
+  return null;
 }
 
 module.exports = { OUTPUT_CAPS, parseCap, learn, capOf, filePath, TTL_MS };

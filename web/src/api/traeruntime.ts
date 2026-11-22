@@ -24,6 +24,16 @@ export interface TraeRuntimeConfig {
     modelTokens: number | null
   }
   gatewayPaused: boolean
+  /**
+   * 跨区容灾（P0-3，默认关）：只有本区一个可用账号都没有时才改派对方区，
+   * 且要求 API Key 未绑区域、对方区有账号、该模型在对方区表里已知。
+   */
+  crossRegionFailover: { enabled: boolean; to: '' | 'cn' | 'intl' }
+  /**
+   * 每模型默认思考档（P0-4）：`{模型模式: 档位}`，模式支持精确名 / `前缀*` / `*`。
+   * 只对**客户端没给档位**的请求生效，且只在该模型 descriptor 声明了支持档位时才套。
+   */
+  defaultReasoning: Record<string, string>
 }
 
 export interface TraeRuntimeResponse {

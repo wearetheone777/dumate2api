@@ -21,6 +21,7 @@ const crypto = require('crypto');
 const { pool, DEFAULTS } = require('./pool');
 const { createSticky } = require('./sticky');
 const { classify } = require('./upstream-errors');
+const throttle = require('./throttle');
 
 const sticky = createSticky();
 
@@ -29,8 +30,53 @@ function uidOf(channel, id) {
 }
 
 /**
- * 会话键。优先 opts.sessionKey；否则用首条 user 消息文本的短指纹。
- * 取不到（空消息/非标准形状）返回空串 = 本请求不粘，走普通轮询。
+ * 取「文本」：字符串直接用，parts 数组**按原顺序直接拼接**所有 text 片段。
+ *
+ * 拼接用空串而不是换行：`[{text:'同一段'},{text:'话'}]` 与 `'同一段话'` 是同一段
+ * 话的两种编码，键必须一致——否则同一段 system 经不同协议/不同客户端进来会
+ * 分裂成两个粘性键，粘性等于没做。指纹只用于本地选号，不需要保留换行语义。
+ */
+function textOf(v) {
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) {
+    return v
+      .map((p) => (p && typeof p === 'object' && typeof p.text === 'string' ? p.text : ''))
+      .join('');
+  }
+  return '';
+}
+
+/**
+ * 会话的 system 文本（**跨协议同一口径**）：Anthropic 入口在顶层 `system`，
+ * OpenAI 入口在 `messages` 里 role=system 的第一条。两处都认，才能保证
+ * 「同一段话经不同协议进来」拿到同一个指纹。
+ */
+function systemTextOf(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  const top = textOf(payload.system);
+  if (top.trim()) return top;
+  const msgs = Array.isArray(payload.messages) ? payload.messages : [];
+  const sys = msgs.find((m) => m && m.role === 'system');
+  return sys ? textOf(sys.content) : '';
+}
+
+/**
+ * 会话键。优先 opts.sessionKey；否则用**首条 user 文本 + system**的短指纹。
+ * 取不到首条 user（空消息/非标准形状）返回空串 = 本请求不粘，走普通轮询。
+ *
+ * **为什么必须含 system（2026-11-16，调研 P2-11）**：只看首条 user 时，「继续」
+ * 这种一句话开场的会话在**不同 system** 下会撞同一个键——两个项目共用一段
+ * 「继续」就共用一个粘性账号，前一秒还在 A 项目上下文里，后一秒被塞进 B 项目
+ * 的前缀缓存，命中率与上下文恢复成本双双恶化。
+ *
+ * 三个已确认的前提（不成立时这条改动就该回退）：
+ *   1. 两个协议都把 system **每轮重发**（Claude Code 顶层 `system`；Codex/OpenAI
+ *      在 messages 里）——所以同一会话的 system 在轮次之间是稳定的，键也稳定；
+ *   2. 绑定表**只在内存**（`sticky.js`），升级即随进程重启清空，没有迁移问题；
+ *   3. 键只在本地用（选号 + 粘性表），不进上游、不进日志原文。
+ *
+ * system 用**全文**哈希而不截断：system 的差异常在尾部（追加的项目约定），
+ * 截断会把「改过的 system」认成同一个；user 侧仍截 2048（那是既有的稳定锚点）。
  */
 function sessionKeyOf(payload, opts) {
   if (opts && opts.sessionKey != null && String(opts.sessionKey).trim()) {
@@ -39,16 +85,16 @@ function sessionKeyOf(payload, opts) {
   try {
     const msgs = payload && Array.isArray(payload.messages) ? payload.messages : [];
     const first = msgs.find((m) => m && m.role === 'user');
-    let text = '';
-    if (first) {
-      if (typeof first.content === 'string') text = first.content;
-      else if (Array.isArray(first.content)) {
-        const part = first.content.find((p) => p && typeof p === 'object' && typeof p.text === 'string');
-        text = part ? part.text : '';
-      }
-    }
+    const text = first ? textOf(first.content) : '';
     if (!text.trim()) return '';
-    return `m:${crypto.createHash('sha1').update(text.slice(0, 2048)).digest('hex').slice(0, 20)}`;
+    const sys = systemTextOf(payload);
+    const digest = crypto.createHash('sha1')
+      .update(sys)
+      .update('\u0000')                       // 分隔符：防「system 尾部 + user 头部」拼出同一串
+      .update(text.slice(0, 2048))
+      .digest('hex')
+      .slice(0, 20);
+    return `m:${digest}`;
   } catch (e) {
     return '';
   }
@@ -68,7 +114,7 @@ function stickyUsable(uid, model) {
 // ---------------------------------------------------------------------------
 // 节奏闸门（2026-11-04，DEV-CHECKLIST #15 / 融合 qoder2api-hub 风控文档）
 //
-// 两层，都**默认关**（不配 env 时行为与之前逐字节一致）：
+// 两层，都**默认关**（不配 env / 面板不填时行为与之前逐字节一致）：
 //   1. 通道级在途帽 DUMATE_{CHANNEL}_INFLIGHT_MAX —— 覆盖池默认的
 //      inFlightMax（4）。Qoder 的 10605 排队是 (账号, 模型) 粒度的请求级
 //      随机，但单账号并发过高会推高风控画像；hub 的处置等级里「单号并发
@@ -78,36 +124,13 @@ function stickyUsable(uid, model) {
 //      而不是「上次 release」：间隔约束的是发射节奏，不是请求时长。
 // 两个值都只在 pickCandidate / availability 里消费；先埋点观察 10605 率
 // 再定阈值，所以默认全关。
+//
+// 2026-11-16（调研 P1-9）：两个旋钮从「只认环境变量」升级为**面板可热改**。
+// 取值一律经 `src/throttle.js`（优先级 面板 > env > 内置默认），本文件不再
+// 直接读 process.env —— 两套读法会让界面显示与实际生效静默不一致。
 // ---------------------------------------------------------------------------
 
-function envInt(name) {
-  const n = parseInt(process.env[name] || '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;
-}
-
-/**
- * Qoder 的闸门参数优先读**运行期配置**（P0-3/P1-6），env 只作兜底。
- *
- * 为什么只有 qoder 走这条：本批面板只对 Qoder 开了配置面（
- * `src/qoder/runtime.js`）。别的通道仍是纯 env——不要让这里变成「所有通道
- * 都悄悄改了来源」，那会让既有部署的 env 失效且无从察觉。
- */
-function qoderRuntime() {
-  try { return require('./qoder/runtime'); } catch (e) { return null; }
-}
-
-/** 通道级在途帽（0 = 用池默认） */
-function inflightMaxOf(channel) {
-  if (channel === 'qoder') {
-    const rt = qoderRuntime();
-    if (rt) {
-      const v = Number(rt.pick('concurrency.inflightMax', -1));
-      // -1 = 运行期配置读不到 → 回落到 env；0 = 明确「用池默认」
-      if (Number.isFinite(v) && v >= 0) return v > 0 ? v : 0;
-    }
-  }
-  return envInt(`DUMATE_${String(channel).toUpperCase()}_INFLIGHT_MAX`);
-}
+/** 通道级在途帽（0 = 用池默认）。面板 > env > 0。 */
 
 /**
  * 负载均衡策略（P1-7，docs/QODER-GATEWAY-FEATURE-MERGE.md）。
@@ -144,16 +167,26 @@ function markPicked(uid, now) {
   lastPickSeq.set(uid, ++pickSeqCounter);
 }
 
-/** 账号最小请求间隔毫秒（0 = 关） */
+/** 账号最小请求间隔毫秒（0 = 关）。面板 > env > 0；面板填 0 是**显式关断**。 */
 function minIntervalMsOf(channel) {
-  if (channel === 'qoder') {
-    const rt = qoderRuntime();
-    if (rt) {
-      const v = Number(rt.pick('concurrency.minIntervalMs', -1));
-      if (Number.isFinite(v) && v >= 0) return v;
-    }
-  }
-  return envInt(`DUMATE_${String(channel).toUpperCase()}_MIN_INTERVAL_MS`);
+  const v = throttle.knob(channel, 'minIntervalMs');
+  return v == null ? 0 : v;
+}
+
+/**
+ * Qoder 的选号策略优先读**运行期配置**（面板），env 只作兜底。
+ *
+ * 为什么只有 qoder 走这条：面板只对 Qoder 开了配置面（`src/qoder/runtime.js`）。
+ * 闸门参数（inflightMax / minIntervalMs）已统一走 `throttle.knob`（面板 > env）。
+ */
+function qoderRuntime() {
+  try { return require('./qoder/runtime'); } catch (e) { return null; }
+}
+
+/** 通道级在途帽（0 = 用池默认）。面板 > env > 0。 */
+function inflightMaxOf(channel) {
+  const v = throttle.knob(channel, 'inflightMax');
+  return v == null ? 0 : v;
 }
 
 /**
@@ -189,6 +222,24 @@ function withinInterval(uid, minMs, now) {
   if (!minMs) return false;
   const last = lastPickAt.get(uid) || 0;
   return now - last < minMs;
+}
+
+/**
+ * 算会话键，并**顺手通知调用方**（`opts.onSessionKey`）。
+ *
+ * 为什么要有这个包装而不是各处直接调 `sessionKeyOf`：请求日志要能按会话分组看
+ * 「这条会话为什么换号」，而键是在 provider 里算的、日志是在 server.js 里写的。
+ * 让 5 个调用点各自记得回调，迟早漏一个（漏了的表现是「某些通道的会话键恒空」，
+ * 且不报错）。所以键的产生与上报绑在同一个函数里。
+ *
+ * 回调失败一律吞掉：埋点绝不能影响选号。
+ */
+function sessionKeyFor(payload, opts) {
+  const key = sessionKeyOf(payload, opts);
+  if (key && opts && typeof opts.onSessionKey === 'function') {
+    try { opts.onSessionKey(key); } catch (e) { /* 埋点失败不影响请求 */ }
+  }
+  return key;
 }
 
 /**
@@ -315,6 +366,14 @@ function availability(channel, candidates, opts = {}) {
   let softOnly = true;
   let busy = false;
   let seen = 0;
+  // 逐账号判据（P1-5 尝试链的数据源）：只给「为什么没选它」，最多 20 条。
+  // 不记录凭证、不记录模型内容——理由都是本地状态词，可以直接进请求日志。
+  const details = [];
+  const DETAIL_MAX = 20;
+  const why = (a, reason) => {
+    if (details.length >= DETAIL_MAX) return;
+    details.push({ id: Number(a.id), name: String(a.nickname || a.uid || '').slice(0, 40), reason });
+  };
   for (const a of list) {
     const uid = uidOf(channel, a.id);
     let st = null;
@@ -324,10 +383,9 @@ function availability(channel, candidates, opts = {}) {
     const mc = opts.model ? (st.model_cooldowns || []).find((m) => m.model === opts.model) : null;
     const modelCooled = !!mc;
     if (st.state === 'healthy' && !st.floor_blocked && !modelCooled) {
-      if (withinInterval(uid, minMs, now) || (st.in_flight || 0) >= maxInFlight) {
-        busy = true; softOnly = false; continue;
-      }
-      return { usable: true, nextInMs: 0, softOnly: false, busy };
+      if (withinInterval(uid, minMs, now)) { why(a, 'interval'); busy = true; softOnly = false; continue; }
+      if ((st.in_flight || 0) >= maxInFlight) { why(a, 'inflight'); busy = true; softOnly = false; continue; }
+      return { usable: true, nextInMs: 0, softOnly: false, busy, details };
     }
     // 账号健康、只是**这个模型**在排队：属于「稍后再来」（429 + 可重试），
     // 不是通道故障（503）。少了这条分支，模型级冷却会掉进下面的
@@ -335,14 +393,19 @@ function availability(channel, candidates, opts = {}) {
     if (modelCooled && st.state === 'healthy' && !st.floor_blocked) {
       const ms = Math.max(0, (mc.until || 0) - Date.now());
       if (ms > 0 && (!nextInMs || ms < nextInMs)) nextInMs = ms;
+      why(a, `model_cooling:${mc.model || ''}`);
       continue;
     }
-    if (!st.cooling) { softOnly = false; continue; }          // disabled / paused / 保底拦截
+    if (!st.cooling) { softOnly = false; why(a, st.disabled ? 'disabled' : (st.paused ? 'paused' : 'floor_blocked')); continue; }
     if (st.cool_kind !== 'soft') softOnly = false;            // breaker / hard
     const ms = Math.max(0, (st.cool_remaining_s || 0) * 1000);
     if (ms > 0 && (!nextInMs || ms < nextInMs)) nextInMs = ms;
+    why(a, `cooling:${st.cool_kind || ''}`);
   }
-  return { usable: false, nextInMs, softOnly: seen > 0 && list.length > 0 && softOnly, busy };
+  return {
+    usable: false, nextInMs, softOnly: seen > 0 && list.length > 0 && softOnly, busy,
+    details, details_truncated: details.length >= DETAIL_MAX,
+  };
 }
 
 /** 成功喂池（清熔断/软退避/防误杀计数） */
@@ -462,7 +525,7 @@ function creditsOf(channel, id) {
 }
 
 module.exports = {
-  uidOf, sessionKeyOf, pickCandidate, availability, release, noteSuccess, noteError,
+  uidOf, sessionKeyOf, sessionKeyFor, systemTextOf, pickCandidate, availability, release, noteSuccess, noteError,
   noteCredits, creditsOf,
   // 策略读取器（离线验证与 /config 端点报当前生效策略用）
   pickStrategyOf, inflightMaxOf, minIntervalMsOf, leastInflightOrder,

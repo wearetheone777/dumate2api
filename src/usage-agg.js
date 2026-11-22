@@ -19,6 +19,17 @@
 //   3. 时间片桶键用本地时区（与管理端其它账本一致、与用户直觉一致），不是
 //      UTC；窗口计算的「整点」也按本地时区取。
 //
+// 2026-11-16（调研 P2-13）补两组**口径上本来就该有、但一直缺**的指标：
+//   - TTFB（`first_token_ms`）：以前只有 /overview 现扫 jsonl 算今日均值，
+//     明细一滚就没了；现在按桶累加（样本数/和/min/max/>3s 计数/8 段直方图），
+//     直方图让 p50/p90 也能跨轮转保留。**分母只数「报了 TTFB 的请求」**——
+//     老日志没这个字段时当 0 算会把均值拉低，那是最典型的假数字。
+//   - 缓存写入（`cache_creation_input_tokens`）：命中率的分母必须把它剔掉。
+//     定义：命中率 = 读命中 /（读命中 + 纯新输入），其中「纯新 = 非缓存输入 −
+//     写入」。写入的 token 没被读过一次，算进分母等于把「预热轮」当成「没命中」，
+//     每加一段前缀就凭空掉几个百分点。分母为 0 时命中率是 **null 而不是 0**
+//     （没样本 ≠ 全miss），与仓库「null ≠ 0」同一条纪律。
+//
 // 多进程：网关 / web 网关 / chatlab 三个进程都会走 reqlog.record。本文件是
 // 读改写型 JSON（不是追加式），flush 时在 filelock 内先采纳磁盘上本进程没有
 // 的桶（键并集、同键以本进程累计为准）再整体替换——并发下最多低估、不会
@@ -45,6 +56,71 @@ const FILE_VERSION = 1;
 // 值中清除——键的切分因此无歧义。
 const SEP = '\x00';
 const SCOPE_RE = /^([hd]):(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}))?$/;
+
+/**
+ * TTFB 直方图的分段上界（毫秒）。**8 段是有意压小的**：分桶账本要 JSON 落盘，
+ * 每桶存 8 个整数已经够拿 p50/p90，再细分只会让 5 万个桶的文件变大而不增加决策价值。
+ * 最后一段没有上界（> 30s）。
+ */
+const TTFB_EDGES = [250, 500, 1000, 2000, 5000, 10000, 30000];
+
+/** 一次 TTFB 落在第几段（0..TTFB_EDGES.length） */
+function histBucketOf(ms) {
+  const v = Number(ms);
+  if (!Number.isFinite(v) || v < 0) return -1;
+  for (let i = 0; i < TTFB_EDGES.length; i++) {
+    if (v < TTFB_EDGES[i]) return i;
+  }
+  return TTFB_EDGES.length;
+}
+
+/**
+ * 从直方图取分位数。返回 `{ms, lo, hi}`：
+ *   ms = 命中段的上界（**近似值**，UI 显示成「≈」）
+ *   lo/hi = 该段的真实区间，最后一段 hi 为 null（表示「以上」）
+ * 找不到样本返回 null——**不是 0**。
+ */
+function percentileOf(hist, p) {
+  const list = Array.isArray(hist) ? hist : [];
+  const total = list.reduce((a, b) => a + (Number(b) || 0), 0);
+  if (!total) return null;
+  const want = Math.min(1, Math.max(0, Number(p) || 0)) * total;
+  let seen = 0;
+  for (let i = 0; i < list.length; i++) {
+    seen += Number(list[i]) || 0;
+    if (seen >= want) {
+      const lo = i === 0 ? 0 : TTFB_EDGES[i - 1];
+      const hi = i < TTFB_EDGES.length ? TTFB_EDGES[i] : null;
+      return { ms: hi == null ? lo : hi, lo, hi };
+    }
+  }
+  const lo = TTFB_EDGES[TTFB_EDGES.length - 1];
+  return { ms: lo, lo, hi: null };
+}
+
+/**
+ * 命中率（0~1）与它的分子分母。**分母 = 读命中 + 纯新输入**，把缓存写入剔掉。
+ * 分母 0 → `null`（没样本），不是 0（全 miss）。
+ */
+function hitRateOf(cached, noncached, creation, reported) {
+  const cc = Math.max(0, Number(cached) || 0);
+  const ci = Math.max(0, Number(noncached) || 0);
+  const cw = Math.max(0, Number(creation) || 0);
+  // `reported` = 这一行里**有多少条请求的上游真的报了缓存字段**。
+  // 一条都没报时命中率是 null：「这个通道不上报缓存」与「全 miss」是两件事，
+  // 把前者显示成 0% 会让人去查一个根本不存在的问题（同 null ≠ 0）。
+  const rep = reported == null ? 1 : Math.max(0, Number(reported) || 0);
+  const fresh = Math.max(0, ci - cw);
+  const denom = cc + fresh;
+  return {
+    numerator: cc,
+    denominator: denom,
+    fresh_tokens: fresh,
+    cache_write_tokens: cw,
+    reported: rep,
+    rate: (rep > 0 && denom > 0) ? Math.round((cc / denom) * 10000) / 10000 : null,
+  };
+}
 
 // 维度值清洗：去掉桶键分隔符，防注入式碰撞。空值归空串（入键后仍唯一）。
 function dim(v) {
@@ -110,6 +186,21 @@ function normalizeBucket(raw) {
     cc: num(raw.cc),
     c0: num(raw.c0),
     c0p: num(raw.c0p),
+    // P2-13 新增：缓存写入与 TTFB（含 8 段直方图）。**这里是第三份字段清单**
+    // （addEntry 造桶、mergeInto 合并、本函数从磁盘读回），三处必须同进同退——
+    // 2026-11-16 实测漏过：种子数据写盘成功，管理端读回来 ttfb_samples 恒 0。
+    // 回归守卫在 test/unit/usage-ttfb-hitrate.test.js 的「重启后字段不丢」。
+    cw: num(raw.cw),
+    cwn: num(raw.cwn),
+    cr: num(raw.cr),
+    fn: num(raw.fn),
+    fl: num(raw.fl),
+    fmin: raw.fmin == null ? null : Number(raw.fmin),
+    fmax: raw.fmax == null ? null : Number(raw.fmax),
+    fslow: num(raw.fslow),
+    fh: Array.isArray(raw.fh)
+      ? Array.from({ length: TTFB_EDGES.length + 1 }, (_, i) => num(raw.fh[i]))
+      : null,
   };
 }
 
@@ -153,6 +244,31 @@ function create(opts = {}) {
     if (typeof timer.unref === 'function') timer.unref();
   }
 
+  /**
+   * 同键桶的唯一合并实现。**只此一处**：TTFB 直方图与缓存写入这些新字段
+   * 加进来时，只要有两份合并代码就必然有一份会漏（漏了的表现是「小时桶有、
+   * 折叠成日桶后没了」，且不报错）。`dst` 是被改的那一份。
+   */
+  function mergeInto(dst, src) {
+    dst.q += src.q; dst.e += src.e; dst.p += src.p; dst.c += src.c;
+    dst.t += src.t; dst.l += src.l; dst.ln += src.ln;
+    dst.ci += src.ci || 0; dst.cc += src.cc || 0;
+    dst.c0 += src.c0 || 0; dst.c0p += src.c0p || 0;
+    dst.cw = (dst.cw || 0) + (src.cw || 0);
+    dst.cwn = (dst.cwn || 0) + (src.cwn || 0);
+    dst.cr = (dst.cr || 0) + (src.cr || 0);
+    if (src.fn) {
+      dst.fn = (dst.fn || 0) + src.fn;
+      dst.fl = (dst.fl || 0) + src.fl;
+      dst.fmin = Math.min(dst.fmin == null ? Infinity : dst.fmin, src.fmin);
+      dst.fmax = Math.max(dst.fmax == null ? 0 : dst.fmax, src.fmax);
+      dst.fslow = (dst.fslow || 0) + (src.fslow || 0);
+      if (!Array.isArray(dst.fh)) dst.fh = new Array(TTFB_EDGES.length + 1).fill(0);
+      for (let i = 0; i < src.fh.length; i++) dst.fh[i] += src.fh[i];
+    }
+    return dst;
+  }
+
   // 把超出保留期的小时桶折叠为日桶。幂等：先累加再删源桶，反复折叠不重复计数。
   function rollup(nowMs) {
     const cutoff = (Number(nowMs) || now()) - hourlyKeepMs;
@@ -167,11 +283,7 @@ function create(opts = {}) {
       buckets.delete(key);
       const dst = buckets.get(bucketKey({ ...b, s: day }));
       if (!dst) buckets.set(bucketKey({ ...b, s: day }), { ...b, s: day });
-      else {
-        dst.q += b.q; dst.e += b.e; dst.p += b.p; dst.c += b.c;
-        dst.t += b.t; dst.l += b.l; dst.ln += b.ln;
-        dst.ci += b.ci; dst.cc += b.cc; dst.c0 += b.c0; dst.c0p += b.c0p;
-      }
+      else mergeInto(dst, b);
     }
     if (moves.length) {
       dirty = true;
@@ -236,16 +348,30 @@ function create(opts = {}) {
       cc: cached,
       c0: fullPrice ? 1 : 0,
       c0p: fullPrice ? input : 0,
+      // 缓存写入（P2-13）：命中率的分母要剔掉它。`cwn` 数「有多少条真的报了
+      // 写入字段」——只有 Anthropic 系通道会报，没报的通道不能当「写入 0」算。
+      cw: Math.max(0, Number(entry.cache_creation_tokens) || 0),
+      cwn: entry.cache_creation_reported ? 1 : 0,
+      // 上报过缓存字段的请求数：命中率的分母之外还要这个，否则
+      // 「通道不上报缓存」会被显示成「命中率 0%」
+      cr: entry.cached_reported ? 1 : 0,
     };
+    // TTFB（P2-13）：**只数有值的请求**。老日志没这个字段就不进样本，
+    // 不会被当成 0ms 把均值拉低（这是最典型的假数字）。
+    if (Number.isFinite(entry.first_token_ms) && entry.first_token_ms >= 0) {
+      const ft = Number(entry.first_token_ms);
+      b.fn = 1;
+      b.fl = ft;
+      b.fmin = ft;
+      b.fmax = ft;
+      b.fslow = ft > 3000 ? 1 : 0;
+      b.fh = new Array(TTFB_EDGES.length + 1).fill(0);
+      b.fh[histBucketOf(ft)] += 1;
+    }
     const key = bucketKey(b);
     const cur = buckets.get(key);
-    if (cur) {
-      cur.q++; cur.e += b.e; cur.p += b.p; cur.c += b.c;
-      cur.t += b.t; cur.l += b.l; cur.ln += b.ln;
-      cur.ci += b.ci; cur.cc += b.cc; cur.c0 += b.c0; cur.c0p += b.c0p;
-    } else {
-      buckets.set(key, b);
-    }
+    if (cur) mergeInto(cur, b);
+    else buckets.set(key, b);
     dirty = true;
     if (buckets.size > maxBuckets) {
       rollup(now());
@@ -301,6 +427,9 @@ function create(opts = {}) {
     }
   }
 
+  function histogramP50(h) { return percentileOf(h, 0.5); }
+  function histogramP90(h) { return percentileOf(h, 0.9); }
+
   // 把一组桶累加成一行统计。均值必须带样本数加权，不能对每桶均值再平均。
   function finish(a) {
     return {
@@ -315,6 +444,28 @@ function create(opts = {}) {
       cached_tokens: a.cc,
       avg_ms: a.ln ? Math.round(a.l / a.ln) : 0,
       ms_samples: a.ln,
+      // 缓存写入（P2-13）：写入 token 与「报了这个字段的请求数」。
+      cache_creation_tokens: a.cw || 0,
+      cache_creation_reported: a.cwn || 0,
+      /** 上游报了缓存字段的请求数：0 表示这一行的命中率不可知（不是 0%） */
+      cache_reported: a.cr || 0,
+      // TTFB（P2-13）：avg 的分母是 fn（报了 TTFB 的请求数），不是 q。
+      // 无样本时 avg/p50/p90 都是 **null**（不是 0）——没有样本 ≠ 首字 0ms。
+      ttfb_avg_ms: a.fn ? Math.round(a.fl / a.fn) : null,
+      ttfb_samples: a.fn || 0,
+      ttfb_min_ms: a.fn ? a.fmin : null,
+      ttfb_max_ms: a.fn ? a.fmax : null,
+      ttfb_slow: a.fslow || 0,
+      ttfb_p50: histogramP50(a.fh),
+      ttfb_p90: histogramP90(a.fh),
+    };
+  }
+
+  /** 给一行统计补命中率（`hitRateOf` 是唯一实现） */
+  function withHitRate(row) {
+    return {
+      ...row,
+      cache_hit: hitRateOf(row.cached_tokens, row.input_noncached_tokens, row.cache_creation_tokens, row.cache_reported),
     };
   }
 
@@ -342,11 +493,13 @@ function create(opts = {}) {
     const channel = dim(opts2.channel);
     const windowed = !!(from || to);
 
-    const acc = () => ({ q: 0, e: 0, p: 0, c: 0, t: 0, l: 0, ln: 0, ci: 0, cc: 0, c0: 0, c0p: 0 });
-    const add = (a, b) => {
-      a.q += b.q; a.e += b.e; a.p += b.p; a.c += b.c; a.t += b.t; a.l += b.l; a.ln += b.ln;
-      a.ci += b.ci || 0; a.cc += b.cc || 0; a.c0 += b.c0 || 0; a.c0p += b.c0p || 0;
-    };
+    // 累加器与 mergeInto 是同一套字段。**这里也要跟着加**：快照是另一条
+    // 汇总路径（桶 → 分组行），漏一个字段的表现是「桶里有、页面上没有」。
+    const acc = () => ({
+      q: 0, e: 0, p: 0, c: 0, t: 0, l: 0, ln: 0, ci: 0, cc: 0, c0: 0, c0p: 0,
+      cw: 0, cwn: 0, cr: 0, fn: 0, fl: 0, fmin: null, fmax: null, fslow: 0, fh: null,
+    });
+    const add = (a, b) => mergeInto(a, b);
     const total = acc();
     const byChannel = new Map();
     const byAccount = new Map();
@@ -387,7 +540,7 @@ function create(opts = {}) {
       }));
 
     return {
-      totals: finish(total),
+      totals: withHitRate(finish(total)),
       // 全价请求洞察（hub v1.7.21）：prompt ≥ 阈值且确认零缓存的请求——
       // 换前缀/新开会话/压缩后首轮的高成本形态，单行日志看不出来。
       // credit_share 本项目不做：各通道积分口径不同且埋点无统一 credits
@@ -398,9 +551,11 @@ function create(opts = {}) {
         prompt_tokens: total.c0p,
         prompt_share: total.p > 0 ? Number((total.c0p / total.p).toFixed(4)) : 0,
       },
-      by_channel: keyed(byChannel),
-      by_account: keyed(byAccount),
-      by_model: keyed(byModel),
+      // 命中率（P2-13）：分子分母都摊在行上，页面与调用方都能自己复核。
+      // 口径只有一处实现（hitRateOf）——分母剔掉缓存写入，空分母是 null。
+      by_channel: keyed(byChannel).map(withHitRate),
+      by_account: keyed(byAccount).map(withHitRate),
+      by_model: keyed(byModel).map(withHitRate),
       series: seriesRows,
       buckets: matched,
       since: since ? since.slice(2) : '',
@@ -448,4 +603,5 @@ module.exports = {
   rollup: () => shared().rollup(Date.now()),
   flushNow: () => shared().flushNow(),
   describe: () => shared().describe(),
+  TTFB_EDGES, histBucketOf, percentileOf, hitRateOf,
 };

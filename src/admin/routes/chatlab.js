@@ -472,7 +472,11 @@ const routes = [
       }
 
       const cfg = modelmap.load();
-      const mapped = modelmap.mapModel(model || cfg.fallback);
+      // 试调台的搭子分支**只走网页池**（上面的 pool 就是 web-pool），所以
+      // 永远是云端链路：清单路由名（kimi-k31 等）必须直传。早先不传
+      // {catalog:true} 会把它们兜底成 model-text——试调台选了 kimi 跑的
+      // 却是 deepseek，两侧都 200（review #7）。
+      const mapped = modelmap.mapModel(model || cfg.fallback, { catalog: true });
 
       const payload = {
         model: mapped,

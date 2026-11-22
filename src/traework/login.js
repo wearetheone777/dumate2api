@@ -40,8 +40,13 @@ function newDeviceIds() {
  *
  * @param {{deviceId:string, machineId:string}} ids
  * @param {string} [region] 'cn'（缺省）| 'intl'
+ * @param {{trace?:string, redirect?:string}} [opts]
+ *   trace：回环登录时由 `oauth-callback.js` 生成的 state（**必须与回调校验用同一个**）；
+ *          不传就现造一个（手贴回调的老路径行为不变）。
+ *   redirect：回环监听的端口可能被 `DUMATE_TRAEWORK_LOGIN_PORT` 改过，
+ *            `auth_callback_url` 必须跟着改，否则授权页会跳到没人监听的地址。
  */
-function buildAuthUrl(ids, region) {
+function buildAuthUrl(ids, region, opts = {}) {
   const consoleHost = c.regionOf(region) === 'intl' ? c.CONSOLE_HOST_INTL : c.CONSOLE_HOST;
   const params = {
     login_version: '1',
@@ -51,8 +56,8 @@ function buildAuthUrl(ids, region) {
     auth_type: 'local',
     client_id: c.CLIENT_ID,
     redirect: '0',
-    login_trace_id: crypto.randomBytes(8).toString('hex'),
-    auth_callback_url: REDIRECT,
+    login_trace_id: String((opts && opts.trace) || crypto.randomBytes(8).toString('hex')),
+    auth_callback_url: String((opts && opts.redirect) || REDIRECT),
     machine_id: ids.machineId,
     device_id: ids.deviceId,
     x_device_id: ids.deviceId,
@@ -83,9 +88,21 @@ function parseCallback(text) {
   const qIdx = s.indexOf('?');
   const qs = new URLSearchParams(qIdx >= 0 ? s.slice(qIdx + 1) : s);
 
+  // **先按原样解析，再退回去 decode**：真机上粘回来的回调有两种形态——
+  // 有的客户端把 userInfo 百分号编码，有的（实测小米平板/国内版）原样带花括号。
+  // 反过来做（先 decodeURIComponent）在第二种形态上直接抛错，被 catch 吞掉后
+  // uid/nickname/tenant 全是空串——账号照样能落盘，但显示名丢了，界面上会出现
+  // 「未命名账号」，而错误原因是静默的。
   const parseJson = (v) => {
     if (!v) return null;
-    try { return JSON.parse(decodeURIComponent(v)); } catch (e) { return null; }
+    // 尾部多一个逗号是**真机上遇到过的**：粘回来的 `userJwt={...},&userInfo={...}`
+    // 里那个 `,` 落在值内，JSON.parse 直接失败 → uid/昵称/租户全空（账号仍能落盘，
+    // 但界面上是「未命名账号」，而失败原因静默）。所以先削尾逗号再解析。
+    const attempt = (raw) => {
+      try { return JSON.parse(raw); } catch (e) { /* 继续试 */ }
+      try { return JSON.parse(String(raw).replace(/,\s*$/, '')); } catch (e) { return null; }
+    };
+    return attempt(v) || attempt(decodeURIComponent(v));
   };
 
   const userInfo = parseJson(qs.get('userInfo')) || {};
@@ -107,6 +124,10 @@ function parseCallback(text) {
     // 回调里有时直接带 access token，省一次 ExchangeToken（但我们仍会换，
     // 因为 refreshToken 轮换后必须落盘新的，不能只存回调给的这个）
     jwtToken: String(userJwt.Token || ''),
+    // `userJwt.RefreshToken` 是**另一个候选**：2026-11-17 实测里，回调顶层
+    // `refreshToken` 与 JWT 里那个是两串不同的值（JWT 的 source_id 指向后者）。
+    // 谁才是换票认的那个必须实测——解析层两个都交给调用方，别在这里猜。
+    jwtRefreshToken: String(userJwt.RefreshToken || ''),
   };
 }
 
@@ -209,4 +230,83 @@ async function exchangeAndSave(opts) {
   return { ok: true, account: authStore.list().find((a) => a.id === saved.id) };
 }
 
-module.exports = { REDIRECT, newDeviceIds, buildAuthUrl, parseCallback, exchangeAndSave };
+// ==================== 授权码 + PKCE（调研 P0-2b）====================
+//
+// 现有登录走 `auth_type=local`，回调直接给 `refreshToken`——**已经真机验证可用**
+// （2026-11-17 实测，见 CHANNEL-TRAEWORK.md）。另一条路是官方新版客户端
+// （INTL 1.107.1）的授权码 + PKCE：URL 多一个 `code_challenge`(S256)，
+// 回调回 `authCodeInfo.AuthCode`，换票用 `/trae/api/v3/oauth/ExchangeToken`
+// 且 body 是 `{ClientID, AuthCode, CodeVerifier, DeviceInfo, IDEVersion}`。
+//
+// **CN 上这套是否成立仍是未知的**（调研文档明确写着「未用真实账号完成官方授权」）：
+//   - CN 授权页会不会接受 `code_challenge`（忽略它照样回 refreshToken？）
+//   - CN 的授权码换票路径是 `/trae/...` 还是 `/cloudide/api/v3/trae/oauth/ExchangeToken`
+// 两个问题都要一次真实登录才能回答，所以这里**只实现无争议的部分**（PKCE 计算、
+// URL 拼装、回调解析），换票发请求留给验证脚本——**不在产品路径里猜端点**。
+// 猜错的代价是把一个能用的登录流程改坏，而不是多一个用不了的功能。
+
+/**
+ * PKCE 一对（RFC 7636）：verifier 43 字符 base64url，challenge = base64url(sha256(verifier))。
+ * verifier **只留在本地**，回调里不该出现它。
+ */
+function newPkce() {
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+  return { verifier, challenge };
+}
+
+/**
+ * 在既有授权 URL 上追加 PKCE 参数（其余参数一个不动——它们是逆向出来的，
+ * 少一个就会被判非法客户端、页面卡在「认证中…」）。
+ * @param {{deviceId:string, machineId:string}} ids
+ * @param {string} [region]
+ * @param {{challenge:string, trace?:string, redirect?:string}} opts challenge 必填
+ */
+function buildAuthCodeUrl(ids, region, opts = {}) {
+  const base = buildAuthUrl(ids, region, opts);
+  if (!opts || !opts.challenge) return base;
+  const u = new URL(base);
+  u.searchParams.set('code_challenge', String(opts.challenge));
+  u.searchParams.set('code_challenge_method', 'S256');
+  return u.toString();
+}
+
+/**
+ * 从授权码回调里取 `AuthCode`。
+ *
+ * 回调形状（INTL 1.107.1 静态证据）：`...&authCodeInfo={"AuthCode":"..."}`。
+ * 与 `userInfo` 一样**两种编码都容忍**（原样 JSON / 百分号编码 / 值尾多逗号），
+ * 理由见 `parseCallback` 里那段注释——同一个页面两种编码都出现过。
+ * 取不到返回空串（调用方据此判断「这次登录不是授权码流程」）。
+ */
+function parseAuthCodeCallback(text) {
+  const s = String(text || '').trim();
+  const qIdx = s.indexOf('?');
+  let qs;
+  try { qs = new URLSearchParams(qIdx >= 0 ? s.slice(qIdx + 1) : s); } catch (e) { return ''; }
+  const parse = (v) => {
+    if (!v) return null;
+    const attempt = (raw) => {
+      try { return JSON.parse(raw); } catch (e) { /* 继续 */ }
+      try { return JSON.parse(String(raw).replace(/,\s*$/, '')); } catch (e) { return null; }
+    };
+    return attempt(v) || attempt(decodeURIComponent(v));
+  };
+  const info = parse(qs.get('authCodeInfo')) || {};
+  return String(info.AuthCode || info.authCode || qs.get('AuthCode') || qs.get('authCode') || qs.get('code') || '').trim();
+}
+
+/**
+ * 回环回调地址（与 oauth-callback.js 的监听端口必须一致）。
+ * 默认 18080 = REDIRECT 的历史值（2026-11-03 真机验证过的那条 URL）。
+ */
+function redirectFor(port) {
+  const n = Number(port);
+  return n > 0 ? `http://127.0.0.1:${n}/authorize` : REDIRECT;
+}
+
+module.exports = {
+  REDIRECT, redirectFor, newDeviceIds, buildAuthUrl, parseCallback, exchangeAndSave,
+  // P0-2b（授权码 + PKCE）：只做无争议的纯计算，见上方注释
+  newPkce, buildAuthCodeUrl, parseAuthCodeCallback,
+};

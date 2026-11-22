@@ -22,6 +22,14 @@
 //   - softCooldownMs   429 软冷却基数（<=0 或缺省 = 用调用方内置默认）。
 //     消费者：池状态机生产单例（pool.js 的 hotSoftCooldown 门控热读，
 //     测试池不读——保持单测对机器真实配置不敏感）。
+//   - throttle         通道风控旋钮（P1-9）：`{通道: {inflightMax, minIntervalMs,
+//     retryMax}}`。**解析优先级与语义只在 src/throttle.js 里实现一份**，本文件
+//     只负责把这几个数存住。null 值 = 该旋钮回落到 env/默认；提交 `{通道:null}`
+//     = 整条通道重置。消费方：channel-pool（并发/间隔）、repair（短故障重试）。
+//   - throttleMaxMs   排队限流冷却上限（全局单值，ms）。0 = 回落 env/默认。
+//   - imageBudget     内联图片上限与压缩（P1-6）：`{maxBytes, maxTotalBytes, maxEdge}`。
+//     maxBytes/maxTotalBytes 单位字节，0 = 不限；maxEdge 是**长边像素**，0 = 不缩。
+//     解析在 src/image-budget.js；这里只存。
 //
 // 落盘 data/livecfg.json（tmp+rename 原子写 + filelock 跨进程互斥，与
 // qoder/auth.js 同一套写纪律）。文件里只会有白名单键——磁盘上多出的键
@@ -33,7 +41,15 @@ const filelock = require('./filelock');
 
 const FILE = 'livecfg.json';
 
-const FIELDS = ['recordClientInfo', 'hiddenModels', 'softCooldownMs'];
+const FIELDS = ['recordClientInfo', 'hiddenModels', 'softCooldownMs', 'throttle', 'throttleMaxMs', 'imageBudget'];
+
+/**
+ * 通道风控旋钮的**存储形状**（只存，不解释语义——解释在 src/throttle.js）。
+ * 与 `src/throttle.js` 的 CHANNELS/KNOBS 必须一致：两处不一致会让「界面能填、
+ * 后端读不到」。单测 test/unit/throttle-config.test.js 锁这条。
+ */
+const THROTTLE_CHANNELS = ['qwenwork', 'traework', 'qoder', 'workbuddy'];
+const THROTTLE_KNOBS = ['inflightMax', 'minIntervalMs', 'retryMax'];
 
 function dataDir() {
   return process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', 'data');
@@ -48,7 +64,28 @@ function defaults() {
     recordClientInfo: true,
     hiddenModels: [],
     softCooldownMs: 0,
+    // 空表 = 全部旋钮跟随 env/默认。只在面板真的设了某项时才写盘，
+    // 读取侧（throttle.Load 的 materialize）补全成完整形状。
+    throttle: {},
+    throttleMaxMs: 0,
+    imageBudget: { maxBytes: 0, maxTotalBytes: 0, maxEdge: 0 },
   };
+}
+
+/** 把存储里的稀疏 throttle 补成全通道全旋钮形状（null = 未设） */
+function materializeThrottle(table) {
+  const src = (table && typeof table === 'object' && !Array.isArray(table)) ? table : {};
+  const out = {};
+  for (const ch of THROTTLE_CHANNELS) {
+    const row = (src[ch] && typeof src[ch] === 'object' && !Array.isArray(src[ch])) ? src[ch] : {};
+    const cell = {};
+    for (const k of THROTTLE_KNOBS) {
+      const v = row[k];
+      cell[k] = (typeof v === 'number' && Number.isFinite(v) && v >= 0) ? v : null;
+    }
+    out[ch] = cell;
+  }
+  return out;
 }
 
 /**
@@ -91,6 +128,70 @@ function sanitize(patch, { strict = false } = {}) {
         continue;
       }
       out.softCooldownMs = Math.round(n);
+    } else if (key === 'throttleMaxMs') {
+      if (v == null) continue;
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 0) {
+        if (strict) throw new Error('throttleMaxMs 必须是非负数字（毫秒，0 = 跟随环境变量/默认）');
+        continue;
+      }
+      out.throttleMaxMs = Math.round(n);
+    } else if (key === 'throttle') {
+      if (v == null) continue;
+      if (typeof v !== 'object' || Array.isArray(v)) {
+        if (strict) throw new Error('throttle 必须是 `{通道: {旋钮: 数值}}` 对象');
+        continue;
+      }
+      const table = {};
+      for (const [rawCh, rawRow] of Object.entries(v)) {
+        const ch = String(rawCh || '').trim().toLowerCase();
+        if (!THROTTLE_CHANNELS.includes(ch)) {
+          if (strict) throw new Error(`未知通道: ${rawCh}（可用: ${THROTTLE_CHANNELS.join(', ')}）`);
+          continue;
+        }
+        // null = 整条通道重置（回到 env/默认）。**必须能表达**，否则面板一旦
+        // 覆盖过就再也回不去（0 是「显式关断」，不是「未设」）。
+        if (rawRow === null) { table[ch] = null; continue; }
+        if (typeof rawRow !== 'object' || Array.isArray(rawRow)) {
+          if (strict) throw new Error(`throttle.${ch} 必须是对象或 null`);
+          continue;
+        }
+        const cell = {};
+        for (const [rawK, rawV] of Object.entries(rawRow)) {
+          const k = String(rawK || '').trim();
+          if (!THROTTLE_KNOBS.includes(k)) {
+            if (strict) throw new Error(`未知旋钮: ${rawK}（可用: ${THROTTLE_KNOBS.join(', ')}）`);
+            continue;
+          }
+          if (rawV === null) { cell[k] = null; continue; }
+          const n = Number(rawV);
+          if (!Number.isFinite(n) || n < 0) {
+            if (strict) throw new Error(`throttle.${ch}.${k} 必须是非负数字或 null`);
+            continue;
+          }
+          cell[k] = Math.round(n);
+        }
+        table[ch] = cell;
+      }
+      out.throttle = table;
+    } else if (key === 'imageBudget') {
+      if (v == null) continue;
+      if (typeof v !== 'object' || Array.isArray(v)) {
+        if (strict) throw new Error('imageBudget 必须是 `{maxBytes, maxTotalBytes}` 对象');
+        continue;
+      }
+      const cell = {};
+      for (const k of ['maxBytes', 'maxTotalBytes', 'maxEdge']) {
+        if (v[k] === undefined || v[k] === null) continue;
+        const n = Number(v[k]);
+        if (!Number.isFinite(n) || n < 0) {
+          const unit = k === 'maxEdge' ? '长边像素，0 = 不缩' : '字节，0 = 不限';
+          if (strict) throw new Error(`imageBudget.${k} 必须是非负数字（${unit}）`);
+          continue;
+        }
+        cell[k] = Math.round(n);
+      }
+      out.imageBudget = cell;
     }
   }
   return out;
@@ -118,12 +219,55 @@ function current() {
 }
 
 /**
- * 读当前配置。**返回私有拷贝**：顶层浅拷 + hiddenModels 数组复制，
- * 调用方随意改动都不影响下一个读者（审计教训，见文件头）。
+ * 读当前配置。**返回私有拷贝**：顶层浅拷 + hiddenModels 数组复制 +
+ * throttle 逐通道复制，调用方随意改动都不影响下一个读者（审计教训，见文件头）。
+ *
+ * `throttle` 在这里**补成全通道全旋钮形状**（未设 = null）：磁盘上只该有
+ * 真被设过的项，而界面与 /system/throttle 需要一个稳定的表结构——让每个
+ * 读者自己补齐等于把同一段补全逻辑写四份。
  */
 function Load() {
   const snap = current();
-  return { ...snap, hiddenModels: [...snap.hiddenModels] };
+  return {
+    ...snap,
+    hiddenModels: [...snap.hiddenModels],
+    throttle: materializeThrottle(snap.throttle),
+    imageBudget: { ...(snap.imageBudget || {}) },
+  };
+}
+
+/**
+ * 把 patch 合进基线快照。**只有 throttle 需要逐层合并**：
+ * 普通字段是整体替换（patch 语义），而 throttle 是两级表（通道 → 旋钮）——
+ * 整体替换会让「只改 qoder 的间隔」把 traework 的配置整条抹掉，或让「清掉
+ * 一项重试次数」连带清掉同一通道的并发帽。所以：
+ *
+ *   {通道: null}            → 整条通道重置（回到 env/默认）
+ *   {通道: {旋钮: 数值}}    → 只改这几项，兄弟项保留
+ *   {通道: {旋钮: null}}    → 只清这一项
+ *   {通道: {}}              → 无变化（不是重置；重置要显式 null）
+ */
+function mergeInto(base, patch) {
+  const out = { ...base, ...patch };
+  if (patch.imageBudget) {
+    // 两个键是同一件事的两面，逐键合并才符合 patch 语义
+    out.imageBudget = { ...(base.imageBudget || {}), ...patch.imageBudget };
+  }
+  if (patch.throttle) {
+    const table = { ...(base.throttle || {}) };
+    for (const [ch, row] of Object.entries(patch.throttle)) {
+      if (row === null) { delete table[ch]; continue; }
+      const cell = { ...(table[ch] || {}) };
+      for (const [k, v] of Object.entries(row)) {
+        if (v === null || v === undefined) delete cell[k];
+        else cell[k] = v;
+      }
+      if (Object.keys(cell).length) table[ch] = cell;
+      else delete table[ch];
+    }
+    out.throttle = table;
+  }
+  return out;
 }
 
 /**
@@ -138,7 +282,7 @@ function Store(patch) {
     cache = { mtime: -1, snap: defaults() };
     const base = current();
     const clean = sanitize(patch, { strict: true });
-    const snap = { ...base, ...clean };
+    const snap = mergeInto(base, clean);
     fs.mkdirSync(dataDir(), { recursive: true });
     const target = filePath();
     const tmp = `${target}.tmp`;
@@ -171,4 +315,8 @@ function _resetForTest() {
   cache = { mtime: -1, snap: defaults() };
 }
 
-module.exports = { FILE, FIELDS, filePath, defaults, sanitize, Load, Store, applyHiddenModels, _resetForTest };
+module.exports = {
+  FILE, FIELDS, THROTTLE_CHANNELS, THROTTLE_KNOBS,
+  filePath, defaults, sanitize, mergeInto, materializeThrottle, Load, Store,
+  applyHiddenModels, _resetForTest,
+};

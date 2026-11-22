@@ -238,6 +238,44 @@
           <div class="text-xs text-slate-500 mt-1">{{ fmtTime(detail.ts) }}</div>
         </div>
 
+        <!-- 尝试链（2026-11-16 P1-5）：把「为什么是这个号 / 为什么跳过 / 为什么失败」
+             按时间摊开。这是 P0-3 那批判据的**验收面**——不然只能靠翻代码猜。 -->
+        <div v-if="detail.attempts && detail.attempts.length" class="mb-4">
+          <div class="text-xs text-slate-400 mb-1">
+            尝试链
+            <span v-if="detail.attempts_truncated" class="text-amber-600">（超过 8 条，已截断）</span>
+          </div>
+          <div class="space-y-1">
+            <div
+              v-for="(a, i) in detail.attempts"
+              :key="i"
+              class="flex flex-wrap items-baseline gap-x-2 text-xs"
+            >
+              <a-tag :color="attemptColor(a.outcome)" class="shrink-0">{{ attemptLabel(a.outcome) }}</a-tag>
+              <span class="font-mono text-slate-500">+{{ a.at }}ms</span>
+              <span class="text-slate-300">{{ a.account || '—' }}</span>
+              <span class="text-slate-400 break-all">{{ a.reason || '' }}</span>
+              <span v-if="a.ms != null" class="text-slate-500">耗时 {{ a.ms }}ms</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 内联图片体量（2026-11-16 P1-6）：压缩还没做，先把「这次带了多大」摊开。
+             没有这个数，讨论「要不要压、压到多少」只能靠猜；外链图单独计——
+             大小在上游手里，我们不假装量得出来。 -->
+        <div v-if="detail.image_count" class="mb-4">
+          <div class="text-xs text-slate-400 mb-1">内联图片</div>
+          <div class="text-xs text-slate-300">
+            共 {{ detail.image_count }} 张 · 内联 {{ detail.image_inline || 0 }} 张
+            <span class="font-mono">（{{ fmtBytes(detail.image_bytes) }}）</span>
+            · 单张最大 <span class="font-mono">{{ fmtBytes(detail.image_max_bytes) }}</span>
+            <span v-if="detail.image_format" class="text-slate-500"> · {{ detail.image_format }}</span>
+            <span v-if="(detail.image_count || 0) > (detail.image_inline || 0)" class="text-slate-500">
+              · 外链 {{ (detail.image_count || 0) - (detail.image_inline || 0) }} 张（大小未知，不计预算）
+            </span>
+          </div>
+        </div>
+
         <div class="detail-grid">
           <div class="detail-label">来源 IP</div>
           <div class="detail-value">{{ detail.ip || '—' }}</div>
@@ -250,6 +288,18 @@
 
           <div class="detail-label">映射模型</div>
           <div class="detail-value font-mono text-xs">{{ detail.mapped_model || '—' }}</div>
+
+          <!-- 会话粘性键（P2-11）：回答「这条会话是不是一直用同一个号」。
+               放在通道/账号上方——它解释的是账号那一列为什么会变。 -->
+          <template v-if="detail.session_key">
+            <div class="detail-label">会话键</div>
+            <div class="detail-value font-mono text-xs">{{ detail.session_key }}</div>
+          </template>
+
+          <template v-if="detail.route_group">
+            <div class="detail-label">路由组</div>
+            <div class="detail-value font-mono text-xs">{{ detail.route_group }}</div>
+          </template>
 
           <div class="detail-label">通道</div>
           <div class="detail-value">
@@ -439,6 +489,7 @@ import client from '@/api/client'
 import { channelStore, CHANNELS, isDirectChannel, channelParam } from '@/stores/channel'
 import { regionParam } from '@/stores/region'
 import type { ReqLogRow, ReqLogsData, PointsRecord, PointsRecordsData } from '@/api/reqlogs'
+import { useAutoRefresh } from '@/stores/ui'
 
 const data = ref<ReqLogsData | null>(null)
 const loading = ref(false)
@@ -455,6 +506,28 @@ const pointsPageSize = 50
 const filterAccount = ref<number | null>(null)
 
 const detail = ref<ReqLogRow | null>(null)
+
+/** 尝试链的颜色/标签（与后端 outcome 词汇表一一对应，新增词汇记得同步） */
+function attemptColor(outcome: string) {
+  if (outcome === 'ok') return 'green'
+  if (outcome === 'error') return 'red'
+  if (outcome === 'skip') return 'orange'
+  if (outcome === 'failover') return 'geekblue'
+  return 'default'
+}
+/** 字节 → 人眼可读（与后端 image-budget.human 同口径：MB 一位小数 / KB 取整） */
+function fmtBytes(n?: number | null) {
+  const v = Number(n || 0)
+  if (!v) return '0'
+  if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`
+  return `${Math.round(v / 1024)} KB`
+}
+
+function attemptLabel(outcome: string) {
+  return ({
+    picked: '选中', ok: '成功', error: '失败', skip: '跳过', failover: '跨区',
+  } as Record<string, string>)[outcome] || outcome
+}
 const detailOpen = ref(false)
 
 // 当前通道。网关请求按通道在**服务端**过滤；「积分消费明细」是搭子上游的
@@ -651,6 +724,9 @@ watch(() => channelStore.current, () => {
   load()
 })
 
+
+// 自动刷新（P2-12）：注册后由顶栏的间隔开关驱动，卸载时自动注销
+useAutoRefresh(load)
 onMounted(() => load())
 </script>
 

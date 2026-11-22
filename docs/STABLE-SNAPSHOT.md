@@ -14,6 +14,7 @@
 
 - **逐字节比对**确认 `stable/src` 与 `src` 的闭包完全一致（数量相等且内容相同）
 - 对快照跑 `node --check` 与一次**独立启动**（换个临时端口，如 `DUMATE2API_PORT=19099`），确认三条通道就绪
+- **单独复制 `src/dumate-catalog.default.json`**：闭包只跟 `require` 到的 `.js`，这份**读盘资产**不在闭包里（`dumate-catalog.js` 用 fs 路径读它）。漏了会让快照的清单第三级兜底变成空表，`/v1/models` 静默少 20 个条目
 - 更新 `stable/SNAPSHOT_FROM.txt`：**指纹 + 算法 + 来源提交 + 本次覆盖了什么 + 验证记录**
 
 **指纹算法必须写进 `SNAPSHOT_FROM.txt`**。历史上记过一个 `f7e7a810…` 但没记算法，后来试了二十多种拼接变体都复现不出来，那个值永久失效。现行算法：`sha256( 按相对路径排序后 [相对路径 + LF + 内容] 拼接 )`，UTF-8 编码。

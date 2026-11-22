@@ -441,3 +441,139 @@ provider config 自带顶层 `model_context_window = 200000` +
 `model_auto_compact_token_limit = 170000`（**取四个模型的最小值**，声明不得高于
 任何一个可选模型），catalog 条目另补 per-model 的 context_window。
 脚本：`~/.cc-switch/fix_traework_context.py`（幂等，带备份）。
+
+**凭证被拒的处置：`session_dead` 而不是熔断（2026-11-16，调研 P0-3）**。
+`classify` 原来把**裸 403** 归进 `breaker`（服务故障：等一会儿会自愈，指数退避到 6 小时，
+且是账号级）。但 403 的真实语义多半是「这份凭证/这个身份不被允许」——等多久都不会自愈，
+只有重新登录能解（NextAgentX v2026.11.141713 的原始症状就是「账号被所有模型排除」）。
+现在的判据**分状态码**，因为 403 在上游是多义的：
+① `401` → 凭证语义无歧义，直接 `session_dead`；
+② `403 + 凭证/授权文案`（`AUTH_REJECT_TEXT`：invalid token / permission denied / 请重新登录 /
+凭证失效…）→ `session_dead`；
+③ **裸 403（无语义线索）保持原判定 `breaker`**——Qoder 实测过 403 还表达额度
+（业务码 112/110/114）与限流（RESOURCE_LIMIT），把「不知道」当「凭证失效」会累计
+N 次禁用账号，那是另一种误伤；
+④ 两条例外照旧且必须排在前面：`403 + 模型不可用` → `model`（换模型就好）、
+`403 + 1005/订阅专享` → `model`、内容审核 → `kind: null`（不惩罚账号）。
+`session_dead` 走**防误杀计数**（连续 N 次才禁用），并且可以一键恢复（见下）。
+降级编排（`degrade.js`）显式排除凭证被拒：同一份凭证换模型/换区都是白试一次，
+会把「请重新登录」拖成两倍耗时。离线验证：`test/unit/trae-auth-reject.test.js`。
+
+**单账号人工恢复 `POST /api/admin/traework/accounts/:id/recover`（2026-11-16）**。
+清冷却 / 熔断 / 401 防误杀计数 / 禁用标记，并清掉账号上的 `lastError` 牌子；
+响应回 `before`（恢复前的可用性快照）与 `clearedLastError`，让「到底解掉了什么」可核对。
+与批量 `resume` **刻意不同语义**：批量恢复默认**保留**上游冷却（`force` 才清，
+防一次点击把刚被上游拒掉的号整批放出来），单号恢复**总是**清（人工逐个点下去
+就等于「我确认这个号现在可用」）。前端账号卡有「恢复」按钮。
+
+**跨区容灾（默认关，`crossRegionFailover`）**。
+**只有本区确实一个可用账号都没有**时才把请求改派到对方区，三个前置缺一不可：
+① API Key 未绑区域（钉了区域的 Key 跨区等于绕过鉴权约束）；② 对方区**真有账号**
+且该模型在对方区的模型表里**已就绪且已知**（`isKnownModel` 在表没预热时是放行语义，
+拿它单独判定等于没证据就发请求）；③ 只试一次（`opts.failoverTried`）。
+刻意不做「一遇 429 就跨区」——那只是把压力搬到另一个区，还会让「本区都在冷却」
+这个事实在日志里消失。命中时写 `X-Traework-Failover: cn->intl`（头已发则写 SSE
+注释帧），与降级同一纪律：**绝不静默换区域**。判定是纯函数
+`src/traework/failover.js`，执行（递归重发）留在 `index.js`。
+
+**默认思考档（2026-11-16，调研 P0-4）**。客户端不带 `reasoning_effort` 时，按运行态
+`defaultReasoning`（`{模型模式: 档位}`）给一个默认值。三条边界压在同一层
+（`src/reasoning-apply.js`，纯函数）：**客户端优先**（任何形态都算，含 `thinking.budget_tokens`
+换算出的档）、**没有 descriptor 就不套**（档位只认 `support_thinking`+`options`，表没预热时
+「不知道」不等于「支持」）、**只向下钳**并说明被钳过。档位词表复用 `remote.js` 的
+`EFFORT_LEVELS`/`normalizeLevel`/`clampLevel`，不写第二份。套用事实写
+`X-Reasoning-Applied: default:<档位>`（头已发则 SSE 注释帧）与埋点
+`reasoning_source/reasoning_requested/reasoning_effective`。
+**上游没有「默认档」字段的证据**：`reasoning_effort_config` 只声明
+`support_thinking` 与 `options`；XCool 的 `reasoning_default` 是它自己的输出命名。
+要复核就跑 `node test/probe-traework-reasoning.js [cn|intl] --all`（只读，不发对话、不耗积分）。
+注意 `defaultReasoning` 在 `Store/merge` 里是**整体替换**：深合并会让「删掉一行」永远删不掉。
+
+**登录的本机回环自动回调（2026-11-16，调研 P0-2a）**。发起登录时在
+`127.0.0.1`（默认 18080，可用 `DUMATE_TRAEWORK_LOGIN_PORT` 改）起一个**临时**监听，
+官方授权页跳回来就接住并换票入库；老的手动粘贴路径保留（浏览器与网关不同机、
+容器部署、端口被占用时用它）。端点：`/login/start`、`/login/status`（轮询，不返回
+任何凭证）、`/login/cancel`、`/login/complete`（粘贴）。
+端口不随机是刻意的：18080 是真机验证过的那条 `auth_callback_url`；端口被占用时
+**明确报错并让前端退回粘贴**，不静默换端口（换了等于把授权页指向没人监听的地址）。
+安全边界：只绑回环 · 校验 Host（防 DNS rebinding）· 无 CORS · `state` 单次消费 +
+10 分钟到期 + 收到即关监听 · 回调 query 不进日志。**`state` 的校验是"带了就必须对、
+没带就放行并标 `trace_verified:false`"**——上游是否在所有地区回显 `login_trace_id`
+没有证据（hub v1.6.0 也没有国内版证据），严格拒绝可能打挂国内版登录。
+
+**今日补签与睡眠唤醒补跑（2026-11-16，调研 P1-8）**。两个入口共用同一份判定
+（`src/traework/makeup.js` 的 `plan()`）：搭子的每日定时任务在「时间点已过但今天
+没跑过」时**立刻补跑一次**（`shouldCatchUp()` + 落盘 `last_run_day` 做幂等），
+TRAE 侧则提供 `POST /api/admin/traework/checkin/makeup`（默认 dryRun）回答
+「今天还差谁」。
+「今天签过」的两条证据缺一不可：本地账本今天有该账号的行（`claim` 与 `already`
+**都算**）、或账号 `lastCheckin` 落在今天；只认账本会把上线前就签过的号误判成没签。
+窗口默认 09:17–23:30，窗口外不产生待补并在 `skipped` 里写明原因，不静默返回空。
+
+**登录回调的两种形态（2026-11-17 小米平板真机实测，`parseCallback`）**。网页授权完成后
+跳回的 `127.0.0.1:18080/authorize?...` 里，`userInfo` / `userJwt` 这两段 JSON 的编码形态
+**不统一**：
+
+| 形态 | 现象 |
+|---|---|
+| 百分号编码 | `userInfo=%7B%22UserID%22...` —— 老实现先 `decodeURIComponent` 再 `JSON.parse`，能解析 |
+| **原样带花括号**（本次实测） | `userInfo={"UserID":"..."}` —— 老实现先 decode，遇到 `\"` 转义序列直接抛错，被 catch 吞掉 → **uid/昵称/租户全空**，账号能落盘但显示成「未命名账号」 |
+| **值尾多一个逗号**（本次实测） | `userJwt={"RefreshToken":"..."},&userInfo=...` —— 那个 `,` 落在值内，`JSON.parse` 失败 → 整段变空 |
+
+修法：`parseJson` **先按原样解析，失败再试 decode**，且解析前削掉尾逗号；两种解码路径都试过
+再放弃。单测锁在 `test/unit/trae-oauth-callback.test.js`（原样 JSON / 尾逗号 / 两个候选 token）。
+
+**回调里有两个 refresh token，换票认的是顶层那个**：本次实测顶层 `refreshToken`
+（`mJK7pA0d…`）与 `userJwt.RefreshToken`（`vzoS97eF…`）是**两串不同的值**，且 JWT 的
+`source_id` 指向后者。`ExchangeToken` 用**顶层** `refreshToken` 一次成功（`ok=true`），
+不需要 JWT 里那个——代码里「顶层优先、JWT 兜底」的顺序是对的，`jwtRefreshToken` 只作备份。
+
+**回调 URL 里的 `host` 必须照用**：本次是 `https://api.trae.com.cn`（国内落点）。换票主机
+按「回调 host > 显式 apiHost > 区域候选链」取，别用候选链去猜——国际账号的落点是
+`api-sg-central.trae.ai`，猜错就是 401。
+
+### P0-2b（授权码 + PKCE）：CN 侧的真实契约（2026-11-17 真机探明）
+
+用**真实账号**在小米平板上走了一次带 PKCE 的授权（`code_challenge` + `S256`），结论分三层：
+
+**① CN 授权页确实支持 PKCE —— 这条以前是未知的。**
+回调里没有 `refreshToken`，而是：
+
+```json
+{"AuthCode":"Qy****"（已过期，仅示意）,"ExpireAt":1794919272583,"ExpireDuration":600000}
+```
+
+`loginTraceID` 与我们生成的 `login_trace_id` 一致（`pkce1`），有效期就是文档说的 **10 分钟**。
+所以「CN 只支持 refreshToken 流程」这个假设是错的，两条路并存。
+
+**② 换票端点存在，且在 CN 主机上就是调研文档给的那条路径。**
+`POST https://api.trae.com.cn/trae/api/v3/oauth/ExchangeToken`（**不是**我们换 refreshToken 用的
+`/cloudide/api/v3/trae/oauth/ExchangeToken`）。路径错会 404，它是 **400 + 结构化错误**，
+证明路由命中、进到了参数校验。
+
+**③ 请求体两个字段的类型被逐个问出来了，但还差最后一块。**
+
+| 字段 | 结果 |
+|---|---|
+| `ClientID` / `AuthCode` / `CodeVerifier` / `IDEVersion` | 按既有值发，无报错 |
+| `DeviceInfo` | **必须是 map，不是字符串**。实测 **P-256 JWK**（`{kty:'EC',crv:'P-256',x,y}`）被接受；传 base64 SPKI 会被拒：`.(1)req.(5)DeviceInfo: invalid request value, expected map` |
+| `DeviceProof` | **也必须是 map**。传 base64 签名会被拒：`.(1)req.(6)DeviceProof: invalid request value, expected map`。内层结构**未知** |
+
+只发 `DeviceInfo`（不给 `DeviceProof`）时，服务端回
+**`20405 Device proof required.`** —— 说明它要的是「用私钥签一个东西」的证明对象，
+不是可选字段。用 dummy 授权码继续探内层形状时，错误退化成通用的
+`无效参数：{__Message.field}.`（Code 10101）——**模板占位没有被替换**，也就再问不出内层字段名了。
+
+**因此 P0-2b 的状态是「有证据的阻塞」，不是「待做」**：要么对新客户端（1.107.1）做静态分析
+拿到 `DeviceProof` 的构造（签什么、字段名、JWS 还是自定义结构），要么对真实授权码做形状枚举
+（**每次枚举都可能消耗那张单次授权码**，代价是重登一次，不划算）。
+
+**为什么可以先不追**：现有 `refreshToken` 流程**真机可用**（2026-11-17 实测加号 + 对话成功），
+而授权码流程并不带来用户可见的好处（一样是浏览器登录 + 手工/回环回调）。它的价值只在
+「不依赖长期 refreshToken」这一类安全收益上——**优先级低于其余待办**。
+
+**踩到的两个坑（都记着）**：
+- 错误消息里的 `.(1)req.(5)DeviceInfo` / `.(6)DeviceProof` 是**字段序号**，能直接指出哪个字段类型错——
+  用它做类型探测比盲猜快得多（dummy 授权码即可，不消耗真码）；
+- 真码只有 10 分钟且**单次**，探测顺序必须先探 schema（用 dummy）再发真码，
+  否则一次类型错误就可能把真码烧掉（本次真码在 schema 探明后才用，仍赶上 device proof 阻断）。

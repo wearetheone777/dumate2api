@@ -4,6 +4,26 @@
 // 躺一堆 glm-5 -> glm-5 的自映射。透传后别名表只承担真正的改名映射。
 const { test } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+// 自带 model-map 夹具（理由同 claude-route.test.js）：`data/` 被 gitignore，
+// 不能假设机器上已有 auto-l* / glm-5.2 这些别名。
+const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'modelmap-passthrough-'));
+fs.writeFileSync(path.join(TMP, 'model-map.json'), JSON.stringify({
+  aliases: {
+    'auto-l0': 'dm-auto-model/text.L0',
+    'auto-l1': 'dm-auto-model/text.L1',
+    'auto-l2': 'dm-auto-model/text.L2',
+    'glm-5.2': 'glm-5',
+  },
+  upstream_models: ['model-text', 'model-artifact-validate', 'glm-5'],
+  exposed: ['model-text', 'model-artifact-validate', 'glm-5'],
+  fallback: 'model-text',
+}));
+process.env.DUMATE_ADMIN_DATA = TMP;
+
 const mm = require('../../src/modelmap');
 
 test('mapModel：upstream_models 里的真名直接透传（无需别名条目）', () => {

@@ -15,6 +15,13 @@
 const path = require('path');
 const ROOT = path.resolve(__dirname, '..');
 
+// 隔离热配置（P1-9）：chat.repairMax() 现在每次现读 repair.envCaps，而它
+// 多一层面板覆盖（livecfg.json）。钉一个空临时目录 → 只走 env/默认，
+// 本机面板上配了什么都不会影响本文件。
+const { makeTmpData } = require('./helpers/tmpdata');
+const tmp = makeTmpData('traework-repair');
+process.env.DUMATE_ADMIN_DATA = tmp.dir;
+
 const chat = require(path.join(ROOT, 'src/traework/chat.js'));
 const authStore = require(path.join(ROOT, 'src/traework/auth.js'));
 const credits = require(path.join(ROOT, 'src/traework/credits.js'));
@@ -92,7 +99,7 @@ const evDone = () => ({ event: 'done', data: { finish_reason: 'stop' } });
 }
 
 {
-  const long = 'x'.repeat(chat.HOLD_CAP + 50);
+  const long = 'x'.repeat(chat.holdCap() + 50);
   const { out, gate } = drive([evText(long)], true);
   ok(gate.result().live === true, '超过 HOLD_CAP 转直发');
   ok(out.length === 1, '超阈值后正文立即下发');
@@ -130,18 +137,24 @@ async function runScenario(script) {
   };
   chat.readStream = async (stream, onEvent) => { for (const e of stream.events) onEvent(e); };
   const chunks = [];
+  // 会话键回传（P2-11 补）：provider 算出的粘性键要经 opts.onSessionKey 交给网关，
+  // 否则请求日志里没有它，「这条会话为什么换号」就永远查不了。
+  const sessionKeys = [];
   await traework.send({
     model: 'traework/Doubao-Seed-Evolving',
-    messages: [{ role: 'user', content: '继续创作小说的内容一次3章' }],
+    messages: [
+      { role: 'system', content: '你是小说助手' },
+      { role: 'user', content: '继续创作小说的内容一次3章' },
+    ],
     tools: [{ type: 'function', function: { name: 'exec_command', description: 'x', parameters: { type: 'object' } } }],
     stream: true,
-  }, (s) => chunks.push(JSON.parse(s)));
-  return { bodies, chunks };
+  }, (s) => chunks.push(JSON.parse(s)), { onSessionKey: (k) => sessionKeys.push(k) });
+  return { bodies, chunks, sessionKeys };
 }
 
 (async () => {
   {
-    const { bodies, chunks } = await runScenario([ATTEMPT1, ATTEMPT2]);
+    const { bodies, chunks, sessionKeys } = await runScenario([ATTEMPT1, ATTEMPT2]);
     ok(bodies.length === 2, '只重试一次（上游被调 2 次）');
     const lastMsgText = (b) => {
       const m = JSON.parse(b).messages.slice(-1)[0];
@@ -155,6 +168,9 @@ async function runScenario(script) {
     const textChunks = chunks.filter((c) => c.choices[0] && c.choices[0].delta.content);
     ok(textChunks.length === 1, '正文只下发一次（不重复两轮播报）');
     ok(textChunks[0].choices[0].delta.content === BROADCAST, '下发的是重试轮的正文');
+    // 会话键回传（P2-11 补）：同一条会话的两轮必须是同一个键，且首轮就上报
+    ok(sessionKeys.length >= 1 && /^m:/.test(sessionKeys[0]), `provider 必须回传会话键（实得 ${JSON.stringify(sessionKeys)}）`);
+    ok(new Set(sessionKeys).size === 1, '同一会话各轮回传的键必须一致（否则日志里分不了组）');
   }
 
   {
@@ -184,12 +200,15 @@ async function runScenario(script) {
   }
 
   {
-    // 关闭修复（REPAIR_MAX=0）→ 只调一次上游
-    const saved = chat.REPAIR_MAX;
-    chat.REPAIR_MAX = 0;
+    // 关闭修复（DUMATE_TRAEWORK_REPAIR_RETRY=0）→ 只调一次上游。
+    // 2026-11-16（P1-9）：改用真机制（env）而不是改模块常量——常量已改成
+    // `chat.repairMax()` 现读，改常量不再有任何效果，那样「测过了」是假的。
+    process.env.DUMATE_TRAEWORK_REPAIR_RETRY = '0';
+    ok(chat.repairMax() === 0, 'repairMax() 现读 env（无需重启）');
     const { bodies } = await runScenario([ATTEMPT1, ATTEMPT2]);
     ok(bodies.length === 1, 'DUMATE_TRAEWORK_REPAIR_RETRY=0 时不重试');
-    chat.REPAIR_MAX = saved;
+    delete process.env.DUMATE_TRAEWORK_REPAIR_RETRY;
+    ok(chat.repairMax() === 1, '恢复默认 1');
   }
 
   chat.postStream = realPost;

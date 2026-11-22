@@ -83,6 +83,48 @@ const DEFAULT_EXPOSED = [
   'glm-5',
 ];
 
+// 「同一后端」的模型名（2026-11-15）。用途：管理端模型信息表**合并显示**——
+// 用户明确要求「模型显示不要重复」：`model-text` / `deepseek-v41-flash` /
+// `dm-auto-model/text.L0` / `mm.L0` 四个名字跑的是同一个
+// `deepseek-v4.1-flash-low-latency`，列四行等于同一份价格写四遍。
+//
+// 只收**有两份证据**的映射，不猜：
+//   ① `DUMATE_REAL` 的 real 字段（`X-Dumate-Gw-Realmodel` 真机回传）；
+//   ② `MODEL_NAMES` 的人工标注里点明明说「同后端」的条目。
+// 不在表里的名字 backend 就是它自己——宁可少合并，也不要把两个不同后端
+// 合成一行（那会让用户以为换个名字不加钱）。
+const BACKEND_OF = {
+  // —— 实测同价，确认同后端（2026-11-15 全量倍率，四个名字都是 2.02 积分/千out）——
+  'model-text': 'deepseek-v4.1-flash-low-latency',
+  'deepseek-v41-flash': 'deepseek-v4.1-flash-low-latency',
+  'dm-auto-model/text.L0': 'deepseek-v4.1-flash-low-latency',
+  'dm-auto-model/mm.L0': 'deepseek-v4.1-flash-low-latency',
+  // —— 只有 Realmodel 证据、没测过价的映射 ——
+  'glm-5': 'glm-5.2',
+  // —— 自动档 L1/L2 **不合并**（实测价格差得远，见下）——
+  //   dm-auto-model/text.L1  10.0387  vs kimi-k3           6.2295
+  //   dm-auto-model/text.L2   3.0630  vs qwen3.8-max       1.9038
+  //   dm-auto-model/mm.L2     2.0000  vs qwen3.8-max       1.9038
+  // 早先按 MODEL_NAMES 的标注把 L1→kimi-k3、L2→qwen3.8-max 当成同后端，
+  // 2026-11-15 全量实测**推翻**了它：自动档有额外溢价（L1 比自跑 kimi-k3 贵 61%）。
+  // 合并会让人以为「用自动档不加钱」，正好反了。所以自动档各自独立成行，
+  // 名字里保留「（自动档 L1）」的标注说明它是什么。
+};
+
+/** 某名字实际落在哪个后端；未登记时返回自身（剥 [1M]） */
+function backendOf(name) {
+  const base = String(name || '').replace(/\[1M\]$/i, '').trim();
+  return BACKEND_OF[base] || base;
+}
+
+// 本仓**实测过**的模型名（`/v1/models` 的 verified 标记与告警白名单用）。
+// 两类证据分开记，别合并成一句「已支持」：
+//   - 本地 8980 链路：DEFAULT_UPSTREAM 三个（2026-10-21 探测，2026-11-06 复核）
+//   - 云端网关链路：DEFAULT_CLOUD_UPSTREAM 七个路由名（2026-11-06 真机全 200）
+// 桌面端模型清单（dumate-catalog）里另外 10 个**没有被任何链路实测过**——
+// 它们仍是候选集，进 /v1/models 时标 verified:false。
+const VERIFIED_MODELS = new Set([...DEFAULT_UPSTREAM, ...DEFAULT_CLOUD_UPSTREAM]);
+
 const DEFAULTS = {
   aliases: DEFAULT_ALIASES,
   upstream_models: DEFAULT_UPSTREAM,
@@ -238,8 +280,72 @@ function normalizeIncomingModel(name, channel) {
   return /\[1M\]$/i.test(s) ? s.replace(/\[1M\]$/i, '') : null;
 }
 
-// 与改造前的 mapModel 行为一致：查不到就回落到 fallback
-function mapModel(name) {
+// ---------------- 桌面端模型清单（dumate-catalog，2026-11-15 融合 P0-1） ----------------
+//
+// 清单本身由 src/dumate-catalog.js 管理（真相源 → 快照 → 包内默认，三级降级）。
+// 这里只做三件事：给 mapModel 一份 id 集合（防静默兜底）、给 /v1/models 一份
+// 可暴露条目、给界面一份 verified 判据。**不缓存**——catalog 自己按 mtime 失效，
+// 多一层缓存只会让「改了客户端配置但网关没反应」。
+
+let _catalogWarned = false;
+
+function catalogEntry() {
+  try {
+    return require('./dumate-catalog').load();
+  } catch (e) {
+    if (!_catalogWarned) {
+      _catalogWarned = true;
+      // 只报一次：清单坏了不该每条请求刷一行日志
+      console.warn(`[modelmap] 模型清单不可用（${e.message}），模型面回落到别名表`);
+    }
+    return { models: {}, source: 'none', asOf: '' };
+  }
+}
+
+/** 清单里的 id 集合（mapModel 直传判据） */
+function catalogModels() {
+  return new Set(Object.keys(catalogEntry().models));
+}
+
+/**
+ * 清单条目是否允许出现在对外模型面（/v1/models 与管理端模型信息表）。
+ * `DUMATE_EXPOSE_CATALOG=0` 回到「只列 exposed」的老行为——两处必须用
+ * 同一个判据，否则会出现「/v1/models 不列、管理端却显示 20 行直传」。
+ */
+function catalogExposeEnabled() {
+  return String(process.env.DUMATE_EXPOSE_CATALOG || '') !== '0';
+}
+
+/** 该名字是否有实测依据（本地或云端链路）；清单里的候选反之 */
+function isVerifiedModel(id) {
+  return VERIFIED_MODELS.has(String(id || '').replace(/\[1M\]$/i, ''));
+}
+
+/**
+ * /v1/models 需要**额外**暴露的清单条目（不含 exposed 里已有的）。
+ * `DUMATE_EXPOSE_CATALOG=0` 关闭（回到只有 exposed 三条的老行为）。
+ * 返回 [{ id, meta, verified }]，顺序按 id 字典序，避免界面抖动。
+ */
+function catalogExposed() {
+  if (!catalogExposeEnabled()) return [];
+  const cfg = load();
+  const known = new Set(cfg.exposed);
+  const cat = catalogEntry();
+  return Object.keys(cat.models)
+    .filter((id) => !known.has(id))
+    .sort()
+    .map((id) => ({ id, meta: cat.models[id], verified: isVerifiedModel(id) }));
+}
+
+/** 清单来源与版本（管理端展示用；'desktop' / 'snapshot' / 'default' / 'none'） */
+function catalogStatus() {
+  const c = catalogEntry();
+  return { source: c.source, asOf: c.asOf, count: Object.keys(c.models).length };
+}
+
+// 查不到就回落到 fallback（与改造前一致）。
+// opts.catalog=true 时额外认桌面端模型清单里的云端路由名（见函数内注释）。
+function mapModel(name, opts) {
   const cfg = load();
   if (!name) return cfg.fallback;
   // [1M] 后缀是「1M 上下文」标记（Claude Code / Claude Desktop 的约定），
@@ -251,6 +357,18 @@ function mapModel(name) {
   // 没有自映射条目的真名会静默落 fallback，逼着配置里躺一堆 glm-5 -> glm-5
   // 的自映射。别名表现在只承担「真正的改名映射」（如 auto-l0 简写）。
   if (cfg.upstream_models.includes(base)) return base;
+  // 桌面端模型清单里的名字**按链路**直传（2026-11-15 融合 P0-1）。
+  //
+  // 为什么必须按链路：清单里的名字是**云端网关路由名**（kimi-k31 / glm-53 …），
+  // 本地 8980 后端只认三个（model-text / model-artifact-validate / glm-5）。
+  // 在桌面链路直传 = 把 8980 不认识的名字发过去吃 404；而回归守卫
+  // （test/unit/cloud-model-map.test.js）明确要求本地链路仍落 fallback。
+  // 反过来，网页凭证链路（`DUMATE_SOURCE=web`，**默认**）直接打云端网关，
+  // 那 7 个路由名真机 200——这时兜底才是错的：客户端选 kimi-k31 却拿到
+  // deepseek 的回答，且响应 200 无从察觉（静默吞模型）。
+  //
+  // 所以由调用方通过 opts.catalog 声明「本次是云端链路」；不传保持老行为。
+  if (opts && opts.catalog && catalogModels().has(base)) return base;
   return cfg.aliases[base] || cfg.fallback;
 }
 
@@ -259,18 +377,25 @@ function mapModel(name) {
  * web-gateway 9084 已废弃，但其接线处同函数无需改动）。
  *
  * 与 mapModel 的关键差别：两条链路的模型名空间不同（本地 8980 只认
- * model-text / model-artifact-validate / glm-5，云端只认 cloud_upstream 六个
- * 路由名——2026-11-06 实测，见 DEFAULT_CLOUD_UPSTREAM 注释）。归一顺序：
+ * model-text / model-artifact-validate / glm-5；云端认 cloud_upstream 七个
+ * 2026-11-06 实测路由名 + 桌面端清单里的 22 个客户端路由名）。归一顺序：
  *   1. [1M] 剥壳后命中 cloud_upstream → 原样（kimi-k31 等真名直调）；
- *   2. cloud_aliases（本地名 → 云端名，如 glm-5 → glm-53）命中 → 映射；
- *   3. 普通别名表能映射到云端名的（gpt-4o → model-text）→ 用映射结果；
- *   4. 其余 → fallback（model-text 两边同名同后端，是安全的公共兜底）。
+ *   2. 桌面端模型清单里的名字（2026-11-15）→ 原样（客户端自己的路由名）；
+ *   3. cloud_aliases（本地名 → 云端名，如 glm-5 → glm-53）命中 → 映射；
+ *   4. 普通别名表能映射到云端名的（gpt-4o → model-text）→ 用映射结果；
+ *   5. 其余 → fallback（model-text 两边同名同后端，是安全的公共兜底）。
  */
 function toCloudModel(name) {
   const cfg = load();
   if (!name) return cfg.fallback;
   const base = String(name).replace(/\[1M\]$/i, '');
   if (cfg.cloud_upstream.includes(base)) return base;
+  // 桌面端模型清单里的名字（2026-11-15）：这是客户端自己在云端网关上用的
+  // 路由名，云端链路必须原样放行。不认它们就会兜底成 model-text——客户端
+  // 选 qwen3.5-27b / dm-auto-model/text.L0 却拿到 deepseek 的答案，200 无
+  // 从察觉（与 mapModel 的 {catalog} 同一判据，两处必须一致）。
+  // 云端若真的不接受某个名字，应当如实 404 而不是静默换模型。
+  if (catalogModels().has(base)) return base;
   const viaCloud = cfg.cloud_aliases[base];
   if (viaCloud && cfg.cloud_upstream.includes(viaCloud)) return viaCloud;
   const viaAlias = cfg.aliases[base];
@@ -336,4 +461,12 @@ module.exports = {
   reset,
   mapModel,
   toCloudModel,
+  VERIFIED_MODELS,
+  BACKEND_OF,
+  backendOf,
+  catalogModels,
+  catalogExposed,
+  catalogExposeEnabled,
+  catalogStatus,
+  isVerifiedModel,
 };

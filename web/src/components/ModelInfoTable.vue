@@ -12,6 +12,16 @@
       <div class="text-xs text-slate-500">
         <template v-if="channel === 'traework'">
           倍率与上下文来自上游下发（{{ rows.length }} 个模型）
+          <span v-if="scope" class="block mt-1 text-[11px] text-slate-400">
+            缓存作用域：账号 {{ scope.accountId || '（该区任意）' }} · function {{ scope.fn }} · v{{ scope.version }}
+            · 指纹 {{ scope.id }}{{ cached ? ' · 命中缓存' : ' · 刚重取' }}
+            <span v-if="merged" class="text-amber-600">· 多账号合并（能力取宽、上限取窄）</span>
+            <span v-if="scopes && scopes.length > 1" class="ml-1">
+              · 本区共 {{ scopes.length }} 份（{{
+                scopes.map((x) => (x.accountId || '?') + '@' + ageText(x.ageMs) + (x.stale ? ' 已过期' : '')).join('、')
+              }}）
+            </span>
+          </span>
         </template>
         <template v-else-if="channel === 'qoder'">
           倍率（price_factor）与上下文来自上游下发（{{ rows.length }} 个模型）·
@@ -24,7 +34,7 @@
           上游没有模型列表接口；真实后端与上限来自真机实测（{{ rows.length }} 个）
         </template>
       </div>
-      <a-space v-if="channel === 'traework' || channel === 'qoder'">
+      <a-space v-if="channel === 'traework' || hasRate">
         <a-switch
           v-if="channel === 'traework'"
           v-model:checked="visibleOnly"
@@ -32,7 +42,13 @@
           checked-children="仅可见"
           un-checked-children="全部"
         />
-        <a-select v-model:value="sort" size="small" style="width: 130px" :options="sortOptions" />
+        <!-- 清缓存重取：换了会员等级 / 新加账号后不必等 TTL 到期 -->
+        <a-button v-if="channel === 'traework'" size="small" @click="emit('clear-cache')">
+          清缓存重取
+        </a-button>
+        <!-- 排序：只要有倍率数据就给下拉。早先写死「TRAE / Qoder 才有」，
+             结果搭子拿到 22 个实测倍率后反而没法排序（2026-11-15 用户反馈） -->
+        <a-select v-if="hasRate" v-model:value="sort" size="small" style="width: 130px" :options="sortOptions" />
       </a-space>
     </div>
 
@@ -40,7 +56,7 @@
       size="small"
       :loading="loading"
       :scroll="{ x: 860 }"
-      :pagination="rows.length > 20 ? { pageSize: 20, size: 'small', showSizeChanger: false } : false"
+      :pagination="rows.length > 30 ? { pageSize: 30, size: 'small', showSizeChanger: false } : false"
       :data-source="displayRows"
       :columns="columns"
       row-key="prefixed"
@@ -72,8 +88,18 @@
           <div v-if="record.realModel" class="text-xs text-slate-500 font-mono">
             实跑 {{ record.realModel }}
           </div>
-          <div v-if="!record.native" class="text-xs text-slate-500">
+          <!-- 同后端的其他名字（后端已合并成一行）。列出来是为了「名字没丢」——
+               用户仍能用这些名字调用，只是价格与主名相同，不值得单占一行 -->
+          <div v-if="record.alsoKnownAs?.length" class="text-xs text-slate-400 font-mono">
+            也叫 {{ record.alsoKnownAs.join(' / ') }}
+          </div>
+          <!-- target === id 时不是「别名」，是直传：桌面清单条目就属于这种，
+               早先只判 !native 会显示成「别名 → 自己」，读起来像配错了 -->
+          <div v-if="!record.native && record.target !== record.id" class="text-xs text-slate-500">
             别名 → {{ record.target }}
+          </div>
+          <div v-else-if="!record.native" class="text-xs text-slate-500">
+            直传（桌面清单）
           </div>
         </template>
 
@@ -87,7 +113,10 @@
             <!-- 搭子是实测口径（积分/千token），不是标称倍率（×）——单位混着
                  显示会让人拿它跟 TRAE/Qoder 的倍率比大小 -->
             <a-tooltip v-if="record.channel === 'dumate'" :title="record.rateNote || ''">
-              <div class="rate-num num">{{ record.rate.toFixed(2) }} <span class="text-xs text-slate-500">积分/千tok</span></div>
+              <div class="rate-num num">
+                {{ record.rate.toFixed(2) }}
+                <span class="text-xs text-slate-500">{{ record.rateUnitText || '积分/千tok' }}</span>
+              </div>
             </a-tooltip>
             <div v-else class="rate-num num">{{ record.rate.toFixed(2) }}×</div>
           </div>
@@ -186,6 +215,12 @@
           <a-tag v-else-if="record.capability === 'chat_model'" color="blue">对话</a-tag>
           <span v-else class="text-xs text-slate-500">{{ record.capability || '—' }}</span>
           <div v-if="record.multimodal" class="text-xs text-slate-400">多模态</div>
+          <!-- 搭子思考档位：清单里只有 deepseek-v41-flash 带 variants（四档实测口径） -->
+          <div v-if="record.reasoningEfforts?.length" class="text-xs text-slate-400">
+            档位 {{ record.reasoningEfforts.join('/') }}
+          </div>
+          <!-- verified === false 只出现在桌面清单条目上：名字存在但本仓没实测过 -->
+          <a-tag v-if="record.verified === false" color="orange" class="mt-1">未实测</a-tag>
         </template>
 
         <template v-else-if="column.key === 'prefixed'">
@@ -197,7 +232,8 @@
     <div class="text-xs text-slate-500 mt-3">
       <span class="src-tag">上游</span> 接口下发 ·
       <span class="src-tag">实测</span> 本项目实测 ·
-      <span class="src-tag">配置</span> 本地配置。
+      <span class="src-tag">配置</span> 本地配置 ·
+      <span class="src-tag">清单</span> 桌面客户端模型清单声明（未实测）。
       拿不到的字段显示「—」——<b>不估算</b>，因为一个编出来的上下文上限会让人
       以为真能用满，直到请求失败才发现。
     </div>
@@ -215,13 +251,36 @@ const props = defineProps<{
   channel: 'dumate' | 'qwenwork' | 'traework' | 'qoder'
   /** 外部传入的数据（模型页已按通道拉过时可复用，避免重复请求） */
   preloaded?: ModelInfoRow[] | null
+  /**
+   * 模型表缓存的**作用域**（2026-11-16 P0-1，只有 TRAE 有）。
+   * 展示它是因为「能力判断错了」时必须能回答「这张表是谁取的」。
+   */
+  scope?: { id: string; accountId: string; fn: string; version: string } | null
+  /** 该区缓存里的全部作用域（账号多了以后谁的表现在在被用） */
+  scopes?: Array<{ id: string; accountId: string; fn: string; version: string; ageMs: number; stale: boolean; models: number }>
+  /** 本次数据是命中缓存还是重取的 */
+  cached?: boolean
+  /** 行是由多个账号作用域合并出来的（能力取宽、上限取窄） */
+  merged?: boolean
 }>()
+
+const emit = defineEmits<{ (e: 'clear-cache'): void }>()
+
+/** 缓存年龄说人话：「12 分钟前」比时间戳有用 */
+function ageText(ms: number) {
+  const m = Math.max(0, Math.round((ms || 0) / 60000))
+  if (m < 1) return '刚刚'
+  if (m < 60) return `${m} 分钟前`
+  return `${Math.round(m / 60)} 小时前`
+}
 
 const rows = ref<ModelInfoRow[]>([])
 const error = ref('')
 const loading = ref(false)
 const visibleOnly = ref(true)
 const sort = ref<'rate-desc' | 'rate-asc' | 'name'>('rate-desc')
+/** 有没有任何一行带倍率——决定排序下拉是否出现（搭子从 2026-11-15 起有实测倍率） */
+const hasRate = computed(() => rows.value.some((r) => r.rate != null))
 const sortOptions = [
   { label: '倍率 高→低', value: 'rate-desc' },
   { label: '倍率 低→高', value: 'rate-asc' },
@@ -231,7 +290,9 @@ const sortOptions = [
 const columns = [
   { title: '#', key: 'rank', width: '5%' },
   { title: '模型', key: 'name', width: '22%' },
-  { title: '消耗倍率', key: 'rate', width: '16%' },
+  // 搭子的数字是**实测积分成本**（积分/千 output token），不是标称倍率；
+  // 表头带「（实测）」避免被当成官方价目表。排序下拉见左上角。
+  { title: props.channel === 'dumate' ? '消耗倍率（实测）' : '消耗倍率', key: 'rate', width: '16%' },
   // TRAE 有会员折扣，Qoder 没有——同一列按通道换标题，换成两套组件会各自漂移
   { title: props.channel === 'qoder' ? '档位属性' : '会员折扣', key: 'discount', width: '14%' },
   { title: '上下文', key: 'ctx', width: '13%' },
@@ -242,12 +303,15 @@ const columns = [
 
 const rateHint = computed(() =>
   props.channel === 'dumate'
-    ? '未实测：搭子没有标称倍率，点上方「计费自检」可实测该列（积分/千token，7 天有效）'
+    ? '未实测：搭子没有标称倍率，点上方「计费自检」可实测该列（积分/千token，7 天有效）；想一次测多个可用 node test/probe-dumate-rates.js'
     : '上游未下发该模型的倍率',
 )
 
 const srcText = (s?: ModelFieldSource | null) =>
-  s === 'upstream' ? '上游' : s === 'measured' ? '实测' : s === 'config' ? '配置' : '—'
+  s === 'upstream' ? '上游'
+    : s === 'measured' ? '实测'
+      : s === 'config' ? '配置'
+        : s === 'desktop' ? '清单' : '—'
 
 const maxRate = computed(() => {
   const list = rows.value.map((m) => m.rate).filter((r): r is number => r != null)

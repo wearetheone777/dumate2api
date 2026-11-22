@@ -108,7 +108,7 @@ function newReqId() {
 // 是两回事：前者是「确认零缓存」（全价请求），后者是「未知」（不能当 0 算）。
 function pickUsage(u) {
   if (!u || typeof u !== 'object') {
-    return { input: 0, output: 0, total: 0, cached: 0, cachedReported: false };
+    return { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false };
   }
   const input = Number(u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0) || 0;
   const output = Number(u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0) || 0;
@@ -122,13 +122,23 @@ function pickUsage(u) {
     num(u.cached_tokens),
   ].filter((v) => v != null);
   const cached = cands.length ? Math.max(...cands) : 0;
-  return { input, output, total, cached, cachedReported: cands.length > 0 };
+  // 缓存**写入**（2026-11-16，调研 P2-13）：只有 Anthropic 系协议分读写两段
+  // （`cache_creation_input_tokens`）。命中率的分母要把写入剔掉——写入的 token
+  // 这一轮没被读过，算进分母等于把「预热轮」当成「没命中」。
+  // `creationReported` 区分「报了写入 0」与「这条协议没有写入概念」：
+  // 后者不能当 0 写入去算分母（会虚高命中率）。
+  const creationCands = [num(u.cache_creation_input_tokens)].filter((v) => v != null);
+  const creation = creationCands.length ? Math.max(...creationCands) : 0;
+  return {
+    input, output, total, cached, cachedReported: cands.length > 0,
+    creation, creationReported: creationCands.length > 0,
+  };
 }
 
 // 从 SSE 文本里扫出 usage。流式响应没有单一的 usage 字段，
 // 必须逐行解析 data: 负载，取最后一个带 usage 的块。
 function usageFromSSE(text) {
-  let best = { input: 0, output: 0, total: 0, cached: 0, cachedReported: false };
+  let best = { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false };
   for (const line of text.split('\n')) {
     if (!line.startsWith('data:')) continue;
     const payload = line.slice(5).trim();

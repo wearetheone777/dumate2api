@@ -1161,7 +1161,7 @@ async function send(payload, onChunk, opts = {}) {
   const model = payload && payload.model ? String(payload.model).replace(/^qoder\//, '') : '';
   const startedAt = Date.now();
   // 会话粘性 + 池选号（冷却/熔断/禁用/暂停/在途满跳过），见 channel-pool.js
-  const sessionKey = channelPool.sessionKeyOf(payload, opts);
+  const sessionKey = channelPool.sessionKeyFor(payload, opts);
   // 区域约束（API Key 的 region，2026-11-01）：'cn' → 只用国内账号，'intl' →
   // 只用国际（global）账号，'' = 不限。请求的模型名不编码区域，区域约束只能
   // 落在账号池选择上——不加过滤的话，intl key 的请求会被 FEFO/轮询派给国内

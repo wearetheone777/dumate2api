@@ -22,6 +22,9 @@
 //     `[object Object]`（旧实现的 bug），脏串还会被写进账号的 lastError
 //   - 正常数据帧（choices / usage）没有这些字段，不会被误伤；
 //     `code: 0` / `code: 'success'` 这类成功标记也明确不认
+// 风控旋钮的解析（P1-9）：面板 > env > 默认。见 throttleMaxMs 的注释。
+const throttle = require('./throttle');
+
 function payloadError(obj) {
   if (!obj || typeof obj !== 'object') return null;
 
@@ -153,6 +156,39 @@ const MODEL_TEXT = /model[^\n]{0,40}(not available|not found|not exist|unsupport
 const CONTENT_POLICY_TEXT = /DataInspectionFailed|inappropriate content|input text data may contain|ContentFilter|SensitiveContent|content_policy_rejected/i;
 
 /** 这条错误串是不是上游内容审核拒绝（重试/换号无用） */
+/**
+ * 凭证/授权被拒（401/403 家族）。2026-11-16（调研 P0-3）。
+ *
+ * 为什么要单独一类：`classifyCore` 原来把**裸 403** 归进 breaker（服务故障）。
+ * breaker 的语义是「上游坏了，等一会儿会好」，会按指数退避把账号锁到 6 小时，
+ * 而且是**账号级**——一个模型被拒，该账号的其它模型一起不可用。但 403 的真实
+ * 含义多半是「这份凭证/这个身份不被允许」：等多久都不会自愈，只有重新登录能解。
+ * （NextAgentX v2026.11.141713 修的就是这一类，症状叫「账号被所有模型排除」。）
+ *
+ * 判据**分状态码**，因为 403 在上游是多义的（有实测）：
+ *   · 401 → 凭证语义，无歧义，直接 session_dead；
+ *   · 403 → **必须有正向的凭证/授权证据**（AUTH_REJECT_TEXT 命中）才归 session_dead。
+ *     Qoder 实测过 403 还可能是额度（业务码 112/110/114）与限流（RESOURCE_LIMIT），
+ *     这两类各有自己的分支；**未知语义的裸 403 保持原判定（breaker）不动**——
+ *     把"不知道"当"凭证失效"会造成另一种误伤（累计 N 次 → 禁用账号）。
+ * 两条排除项各有实测依据：
+ *   · 内容审核（DataInspectionFailed 家族）拒绝的是这批内容，换号重发还会被拒；
+ *   · 订阅专享（1005 / subscription-only）换模型即可用，属 model 类。
+ * 落点是 `session_dead`（防误杀：连续 N 次才禁用，且管理端可一键恢复），不是 breaker。
+ */
+const AUTH_REJECT_TEXT = /unauthori[sz]ed|permission[ _-]?denied|invalid[ _-]?token|token[^\n]{0,16}(?:invalid|expired|expire)|请?重新登录|登录(?:已)?(?:失效|过期)|凭证[^\n]{0,12}(?:失效|过期|无效)/i;
+
+function isAuthReject(status, full) {
+  const st = Number(status) || 0;
+  if (st !== 401 && st !== 403) return false;
+  const text = unescapeDeep(String(full || ''));
+  if (isContentPolicy(text)) return false;
+  if (/\b1005\b/.test(text) || /订阅专享|subscription[- ]only/i.test(text)) return false;
+  if (st === 401) return true;
+  // 403 要正向证据：文案里得出现凭证/授权/重登这类词。裸 403 不动（见头注释）。
+  return AUTH_REJECT_TEXT.test(text);
+}
+
 function isContentPolicy(message) {
   return CONTENT_POLICY_TEXT.test(unescapeDeep(String(message == null ? '' : message)));
 }
@@ -199,26 +235,27 @@ const QUEUE_TEXT = /"serviceAvailable"\s*:\s*false/i;
 const MODEL_QUEUE_TEXT = /"modelKey"\s*:/i;
 
 /**
- * 排队冷却的**上限**。上游按自己的队列长度算 `waitTime`（实测 queueCount
- * 4697 → waitTime 7015 秒），照单全收等于把账号封近两小时，而队列随时在变。
- * 取一个「够久以防止空转、又短到能自己恢复」的窗口。
+ * 排队冷却的**上限**（毫秒）。上游按自己的队列长度算 `waitTime`（实测
+ * queueCount 4697 → waitTime 7015 秒），照单全收等于把账号封近两小时，
+ * 而队列随时在变。取一个「够久以防止空转、又短到能自己恢复」的窗口。
  *
- * **2026-11-08（P0-3）起改为现读**：原先模块加载时读一次 env 就定死，管理端
- * 面板改完必须重启网关。现在每次分类都重读，来源是 `qoder/runtime.js`
- * （limits.throttleMaxMs）——该字段本来就是千问与 Qoder **共用**的上限
- * （`DUMATE_THROTTLE_MAX_MS`），runtime 的默认值也仍从同一个 env 来，所以
- * 「只设 env 不碰面板」的部署行为逐字节不变。
+ * 2026-11-16（调研 P1-9）由模块级常量改为热读：面板 > `DUMATE_THROTTLE_MAX_MS`
+ * > 600000，下限 1000。
+ *
+ * 为什么必须是函数：原来是 `require` 时算一次的 const，管理端改完要重启
+ * **三个进程**才生效；而它是「上游给的等待时长封顶」，属于最需要现场调的
+ * 一类参数（实测上游按队列长度给 7015 秒）。下限 1000 保留旧口径——0 会把
+ * 封顶变成 0，等于关掉封顶，那会让上游给的 7015 秒照单全收。
+ *
+ * 该字段是千问与 Qoder **共用**的上限；解析实现在 `src/throttle.js`（唯一一处），
+ * 本文件不读 process.env。
  */
 function throttleMaxMs() {
-  try {
-    const v = Number(require('./qoder/runtime').pick('limits.throttleMaxMs', 0));
-    if (Number.isFinite(v) && v >= 1000) return v;
-  } catch (e) { /* runtime 不可用（单测只加载本模块）→ 回落 env */ }
-  return Math.max(1000, parseInt(process.env.DUMATE_THROTTLE_MAX_MS || '600000', 10) || 600000);
+  return throttle.throttleMaxMs().value;
 }
 
 /**
- * 排队类限流**冷却的上限**（与上面的 throttleMaxMs 是两回事，别合并）。
+ * 排队类限流**冷却的上限**（与上面的 `throttleMaxMs()` 是两回事，别合并）。
  *
  * 实测 2026-10-29：排队是**请求级随机**的，上游给的 `retryAfterSeconds:30`
  * **不可信**——照它等 3s 三次只成一次，等 10s / 30s 仍全部 `stillThrottled`，
@@ -456,7 +493,12 @@ function classifyCore(err) {
   if (isContentPolicy(full)) return { ...base, kind: null, policy: true };
   if (status === 401) return { ...base, kind: 'session_dead' };
   if (status === 402 || HARD_TEXT.test(message)) return { ...base, kind: 'hard' };
+  // 403 分两种，顺序不能换：先说「这个模型不可用」（换模型就好），
+  // 再说「这份凭证被拒」（要重登）。**两者都不该进熔断**——熔断意味着
+  // 等一会儿会自愈，而这两类都不会（2026-11-16 修，见 isAuthReject 注释）。
   if (status === 403 && MODEL_TEXT.test(message)) return { ...base, kind: 'model' };
+  // 403 + 正向凭证证据 → session_dead；裸 403 仍落下面的 breaker（语义未知不猜）
+  if (isAuthReject(status, full)) return { ...base, kind: 'session_dead' };
   if (status === 0 || status >= 500 || status === 403) return { ...base, kind: 'breaker' };
   // 其余 4xx（400/404/422...）:请求本身的问题,不惩罚账号
   return base;
@@ -482,6 +524,7 @@ function classify(err) {
 module.exports = {
   payloadError, envelopeStatus, classify, isThrottle, throttleRetryMs, THROTTLE_TEXT,
   isDeterministic,
+  isAuthReject, AUTH_REJECT_TEXT,
   isContentPolicy, CONTENT_POLICY_TEXT,
   QUEUE_TEXT,
   throttleMaxMs, queueThrottleCooldownMs,

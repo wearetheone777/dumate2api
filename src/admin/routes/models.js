@@ -254,10 +254,25 @@ const routes = [
       // 只有 qoder/traework 有区域概念，其余通道忽略
       const regionRaw = decodeURIComponent(((req.url.match(/[?&]region=([^&]*)/) || [])[1] || '')).toLowerCase();
       const region = ['cn', 'global', 'intl'].includes(regionRaw) ? regionRaw : '';
+      // 账号级视图（2026-11-16 P0-1）：模型表里倍率/档位/max_mode 都按账号下发，
+      // 传了 accountId 就取该账号那一份；不传是该区聚合视图（能力取宽、上限取窄）
+      const accountId = decodeURIComponent(((req.url.match(/[?&]accountId=([^&]*)/) || [])[1] || ''));
       try {
         if (ch) {
-          const r = await require('../../model-info').rowsFor(ch, { force, all, region });
-          return sendJSON(res, 200, { channel: ch, rows: r.rows, error: r.error, region: region || undefined });
+          const r = await require('../../model-info').rowsFor(ch, { force, all, region, accountId });
+          return sendJSON(res, 200, {
+            channel: ch,
+            rows: r.rows,
+            error: r.error,
+            region: region || undefined,
+            accountId: accountId || undefined,
+            // 作用域：谁取的表、命中没、是否聚合（traework 才有）
+            scope: r.scope || undefined,
+            cacheScope: r.cacheScope || undefined,
+            cached: r.cached === true ? true : undefined,
+            scopes: r.scopes || undefined,
+            merged: r.merged === true ? true : undefined,
+          });
         }
         const r = await require('../../model-info').allRows({ force });
         return sendJSON(res, 200, { channel: '', rows: r.rows, errors: r.errors });

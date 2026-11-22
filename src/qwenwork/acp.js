@@ -458,7 +458,7 @@ async function send(payload, onChunk, opts = {}) {
   let lastErr = null;
   for (let i = 0; i < Math.min(3, usable.length); i++) {
     const sel = channelPool.pickCandidate(CHANNEL, usable.filter((a) => !tried.has(a.id)), {
-      sessionKey: channelPool.sessionKeyOf(payload, opts),
+      sessionKey: channelPool.sessionKeyFor(payload, opts),
       model: `qwen-acp/${model}`,
     });
     if (!sel) break;

@@ -491,7 +491,7 @@ async function send(payload, onChunk, opts = {}) {
   //   401 session_dead → 先刷新 token 重试同账号（hub #441），刷新失败才判死换号
   //   6004 model_cap   → 只冷却 (账号, 模型)（scope:model 喂池），换号继续打同模型
   //   参数错误         → 不喂池不写 lastError，如实 400（hub v1.10.11 #794）
-  const sessionKey = channelPool.sessionKeyOf(payload, opts);
+  const sessionKey = channelPool.sessionKeyFor(payload, opts);
   let allUsable = accountsForRegion(authStore.findUsable(), opts.region);
   // **按模型名的区域归属再收窄一次**（2026-11-08 融合批，真机事故驱动）：
   // 调用方不传 opts.region 时上面那步不做任何过滤，于是两区账号混在一起，

@@ -47,8 +47,9 @@ async function fetchRow(a) {
 
 /**
  * 汇总网页池余额。opts.load / opts.quota 供测试注入，缺省走真实模块。
- * 返回 { at, rows, okCount, failCount, disabledCount, totalLeft }；
- * totalLeft 只累成功行，全部失败时为 null（不是 0）。
+ * 返回 { at, rows, okCount, failCount, unknownCount, disabledCount, totalLeft, partial }；
+ * totalLeft 只累**已知**余额（成功但 left=null 的账号不进合计），没有一个
+ * 已知值时为 null（不是 0）。partial 表示这是「已知部分和」。
  */
 async function summary(opts = {}) {
   const load = opts.load || (() => accounts.load().accounts);
@@ -57,15 +58,23 @@ async function summary(opts = {}) {
   const enabled = all.filter((a) => a.enabled);
   const rows = await Promise.all(enabled.map(quota));
   const okRows = rows.filter((r) => r.ok);
+  // 查询成功 ≠ 读数已知：上游可能 200 但少余额字段（left=null）。合计只累
+  // **已知**值，「不知道」既不当 0 也不当失败（review #10）。
+  const known = okRows.filter((r) => Number.isFinite(r.left));
+  const unknownCount = okRows.length - known.length;
   return {
     at: Date.now(),
     rows,
     okCount: okRows.length,
     failCount: rows.length - okRows.length,
+    unknownCount,
     disabledCount: all.length - enabled.length,
-    totalLeft: okRows.length
-      ? Math.round(okRows.reduce((s, r) => s + (r.left || 0), 0) * 100) / 100
+    totalLeft: known.length
+      ? Math.round(known.reduce((s, r) => s + r.left, 0) * 100) / 100
       : null,
+    // partial：合计是「部分和」（有账号读不到余额）。界面必须标出来，
+    // 否则部分和被读成全量。
+    partial: unknownCount > 0,
   };
 }
 
@@ -90,17 +99,22 @@ function renderText(s) {
     if (s.disabledCount > 0) lines.push(`另有 ${s.disabledCount} 个停用账号未计入。`);
     return lines.join('\n');
   }
+  const fmt = (v) => (v == null ? '未知' : v);
   for (const r of s.rows) {
     if (r.ok) {
-      lines.push(`- ${r.name}：剩余 ${r.left} / 总 ${r.total}（已用 ${r.used}）${r.throttled ? '［限速中］' : ''}`);
+      lines.push(`- ${r.name}：剩余 ${fmt(r.left)} / 总 ${fmt(r.total)}（已用 ${fmt(r.used)}）${r.throttled ? '［限速中］' : ''}`);
     } else {
       lines.push(`- ${r.name}：查询失败（${r.error}；到管理端 WebAccounts 检查登录态）`);
     }
   }
   if (s.totalLeft != null) {
-    lines.push(`合计剩余：${s.totalLeft}（成功 ${s.okCount} / 失败 ${s.failCount}）`);
+    const tail = s.unknownCount ? `，另有 ${s.unknownCount} 个账号余额未知未计入` : '';
+    lines.push(`合计剩余${s.partial ? '（已知部分）' : ''}：${s.totalLeft}（成功 ${s.okCount} / 失败 ${s.failCount}${tail}）`);
   } else {
-    lines.push(`合计剩余：无（${s.failCount}/${s.rows.length} 个账号查询失败，不编数）`);
+    const why = s.okCount === 0
+      ? `${s.failCount}/${s.rows.length} 个账号查询失败`
+      : '查询成功的账号都没有返回余额读数';
+    lines.push(`合计剩余：未知（${why}，不编数）`);
   }
   if (s.disabledCount > 0) lines.push(`另有 ${s.disabledCount} 个停用账号未计入。`);
   lines.push('说明：读数来自网页凭证池（dumate.cn 网页端）；桌面链路（8980）登录态的余额不在此列。');

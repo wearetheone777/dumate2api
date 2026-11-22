@@ -160,6 +160,9 @@ function create(opts = {}) {
    */
   function observe(o) {
     if (!o || typeof o !== 'object') return null;
+    // 显式挡 null：Number(null) === 0 会把「余额未知」记成一次跌破到 0 的
+    // 观测（曲线上凭空出现一次清零又恢复）。只认真正的数值输入。
+    if (o.balance === null || o.balance === undefined || o.balance === '') return null;
     const balance = Number(o.balance);
     if (!Number.isFinite(balance)) return null;
     const account = dim(o.account).slice(0, 200);

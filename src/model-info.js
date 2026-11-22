@@ -22,6 +22,9 @@ const SRC = {
   upstream: '上游',
   measured: '实测',
   config: '配置',
+  // 桌面客户端模型清单（dumate-catalog）声明的值。**不是实测**——本仓只真机
+  // 验过 7 个云端路由名，清单里另外 15 个是客户端配置写的，界面必须分开标。
+  desktop: '清单',
 };
 
 // 搭子：上游没有模型列表接口（/models、/model/list 实测 404）。但**真实后端、
@@ -76,15 +79,42 @@ const QW_META = {
  * 上下文与预算来自实测/配置，**没有倍率概念**——搭子的计费在上游账单里，
  * 本地拿不到单价，所以 rate 一律 null。
  */
+/**
+ * 本次进程的搭子链路是不是**云端**（清单名可直传）。
+ *
+ * 与 server.js 的 catalogLink 同源：`DUMATE_DUMATE_SOURCE=web`（默认）恒为
+ * 云端；auto 模式下桌面链路优先，但管理员配的 exposed 里若出现清单名，
+ * 它仍应解析成自己而不是 fallback——否则模型表会把 model-text 的实测值
+ * 挂在 kimi-k31 名下（review #8）。管理端与网关用同一份 env 启动。
+ */
+function cloudLink() {
+  try {
+    const router = require('./upstream-router');
+    if (router.dumateSource() === 'web') return true;
+    // auto：网页池可用时，桌面 4xx 会被 forwardWithFallback 用原 body 转给
+    // 网页池——与 server.js 的 catalogLink 同一判据，避免两边对「清单名
+    // 能不能路由」给出相反结论。
+    return require('./fallback-web').available();
+  } catch (e) { return false; }
+}
+
+/** 清单「追加行」是否启用：链路是云端且没有用 DUMATE_EXPOSE_CATALOG=0 关掉 */
+function catalogRowsEnabled() {
+  return cloudLink() && modelmap.catalogExposeEnabled();
+}
+
 function dumateRows() {
   const cfg = modelmap.load();
   const upstream = new Set(cfg.upstream_models);
-  const budget = require('./budget');
-  // 实测倍率缓存（懒加载：读不到就按未实测处理，不影响行结构）
-  let rateOf = null;
+  // 实测倍率缓存（懒加载：读不到就按未实测处理，不影响行结构）。
+  //
+  // 2026-11-15 起取的是 `rateValueForTarget`（两种口径分先后：双点解斜率的
+  // 积分/千 **output** 优先，单次前后差的积分/千 **token** 兜底），不再直接
+  // 读 `billed`——两个口径单位不同，靠 `rateUnit` 标出来给界面写单位用。
+  let rateValOf = null;
   try {
     const billing = require('./dumate-billing');
-    rateOf = (t) => billing.rateForTarget(t);
+    rateValOf = (backend) => billing.rateValueForTarget(backend);
   } catch (e) { /* 缓存模块不可用按 null */ }
   const rows = [];
   // 暴露列表里的每个名字都列出来（含别名），因为它们都是客户端可传的
@@ -93,13 +123,26 @@ function dumateRows() {
     // 查不到就回落 fallback（默认 model-text）。早先这里写 `|| id`，
     // 界面于是把 claude-3-5-sonnet / gpt-4o 显示成「别名 → 自身」，
     // 与实际转发行为不符（它们实际走 model-text）。
-    const target = cfg.aliases[id] || (upstream.has(id) ? id : cfg.fallback);
+    //
+    // 例外是云端清单名（kimi-k31 等）：云端网关按这个名字路由，它就是
+    // 自己的 target。不认这一点会把它解析成 fallback，然后拿 model-text
+    // 的实测窗口/倍率冒充它（review #8）。
+    const target = dumateTargetOf(id);
     // 真实后端与上限按 **target** 查：别名（claude-* 等）实际走的就是目标
     // 模型的后端，展示目标的实测值才是真实语义。
     const real = DUMATE_REAL[target] || null;
-    const rateEntry = rateOf ? rateOf(target) : null;
+    // 没有实测时，若 target 是桌面清单里的名字，退回**清单声明值**并标
+    // 来源 'desktop'（与追加的清单行同一口径）。不这么做的话，把
+    // kimi-k31 手动加进 exposed 反而会让它在模型页显示「—」，而没加进
+    // exposed 的同一行却显示清单值——同一份数据两种视图。
+    const decl = real ? null : dumateCatalogOf(target);
+    // 倍率按**真实后端**取：同一后端的多个名字（model-text / deepseek-v41-flash /
+    // text.L0 / mm.L0）必然同价，各查各的会出现「同一份价格四种数字」的错觉
+    const backend = modelmap.backendOf(target);
+    const rv = rateValOf ? rateValOf(backend) : null;
     rows.push({
       id,
+      backend,
       // 可读名是**本地标注**（上游没有模型列表接口），来源单独标出来
       name: modelmap.displayName(id),
       nameSource: modelmap.MODEL_NAMES[id] ? 'config' : null,
@@ -114,21 +157,25 @@ function dumateRows() {
       // TTL。搭子没有标称倍率，这里填的是**实测值**——没有实测就如实 null
       // （模型页「计费自检」按钮补测）。别名行显示 target 的倍率，因为
       // 计费跟着实际落到的模型走。
-      rate: rateEntry ? rateEntry.billed : null,
-      rateSource: rateEntry ? 'measured' : null,
-      rateNote: rateEntry
-        ? `实测于 ${new Date(rateEntry.measuredAt).toLocaleString('zh-CN')}（${rateEntry.tokens} tokens 花了 ${rateEntry.cost} 积分；综合输入+输出，余额两位小数限制精度）`
-        : null,
-      contextWindow: real ? real.context : null,
+      rate: rv ? rv.value : null,
+      rateSource: rv ? 'measured' : null,
+      rateUnit: rv ? rv.unit : null,
+      rateUnitText: rv ? rv.unitText : null,
+      rateNote: rv ? `实测于 ${new Date(rv.measuredAt).toLocaleString('zh-CN')}：${rv.note}` : null,
+      contextWindow: real ? real.context : (decl ? decl.context : null),
       contextWindowMin: null,
-      contextSource: real ? 'measured' : null,
-      contextNote: real ? real.contextNote : '该模型未实测（上游不吐元数据，也没有 400 错误体可泄漏）',
+      contextSource: real ? 'measured' : (decl ? 'desktop' : null),
+      contextNote: real
+        ? real.contextNote
+        : (decl ? '桌面端模型清单声明，本仓未实测（清单存在 ≠ 有调用权限）' : '该模型未实测（上游不吐元数据，也没有 400 错误体可泄漏）'),
       // 输出上限：上游真实范围（dumate-caps 同源实测），不是网关钳制下限。
       // 网关还有一层输出预算下限（65536，思维链兜底）——传小值会被抬高，
       // 但「上限」列回答的是上游接受多少，两个数不是一个问题。
-      maxTokens: real ? real.maxTokens : null,
-      maxTokensSource: real ? 'measured' : null,
-      maxTokensNote: real ? (real.maxTokensNote || '网关另有输出预算下限 65536（思维链兜底），客户端传小值会被抬到下限') : null,
+      maxTokens: real ? real.maxTokens : (decl ? decl.maxTokens : null),
+      maxTokensSource: real ? 'measured' : (decl ? 'desktop' : null),
+      maxTokensNote: real
+        ? (real.maxTokensNote || '网关另有输出预算下限 65536（思维链兜底），客户端传小值会被抬到下限')
+        : (decl ? '清单声明的输出上限；与上游 400 错误体的真值冲突时以后者为准（dumate-caps 优先）' : null),
       // 多模态：按**映射 target** 的档位语义判（dm-auto-model/mm.* 是上游自己的
       // 多模态命名空间）。2026-11-07 前这里硬编码 false——mm 档位一旦进暴露
       // 列表就会被标成纯文本，与它名字的语义相反。
@@ -149,25 +196,170 @@ function dumateRows() {
       capability: 'chat_model',
       // 上游没给模型列表，这里把「别名实际落到哪里」讲清楚——
       // 比笼统的「无接口」更有用：用户能据此判断一个名字是不是真的换了模型
-      note: upstream.has(id) ? DUMATE_NOTE : `客户端名，网关按别名转到 ${target}`,
+      note: upstream.has(id)
+        ? DUMATE_NOTE
+        : (target === id
+          ? '云端清单路由名，网关按同名直传（桌面链路会兜底成 model-text，不能这么用）'
+          : `客户端名，网关按别名转到 ${target}`),
     });
   }
-  return rows;
+
+  // 桌面端模型清单（2026-11-15 融合 P0-1）：客户端配置里那 22 个对话入口。
+  // exposed 只覆盖 3 个——其余在这里补出来，否则「管理端看不见的模型，客户端
+  // 却能选到」（/v1/models 已按链路追加清单条目）。
+  //
+  // 字段来源标记用 `'desktop'`：这不是实测（本仓只真机验过 7 个云端路由名），
+  // 是**客户端声明的值**。界面据此显示「清单」而不是「实测」——不混淆两者
+  // 是这个项目反复强调的纪律（过期/推断的数字比缺失更害人）。
+  // **只在链路真的能路由它们时才追加**（review #13）：桌面链路下这些名字
+  // 会被 mapModel 兜底成 model-text，DUMATE_EXPOSE_CATALOG=0 时 /v1/models
+  // 也不列它们——管理端照旧显示 20 行「直传」会让操作者以为可路由。
+  let cat = null;
+  if (catalogRowsEnabled()) {
+    try { cat = require('./dumate-catalog').load(); } catch (e) { cat = null; }
+  }
+  if (cat && cat.models) {
+    const known = new Set(cfg.exposed);
+    for (const id of Object.keys(cat.models).sort()) {
+      if (known.has(id)) continue;
+      const meta = cat.models[id];
+      const lim = meta.limit || {};
+      const verified = modelmap.isVerifiedModel(id);
+      const backend = modelmap.backendOf(id);
+      const rv = rateValOf ? rateValOf(backend) : null;
+      rows.push({
+        id,
+        backend,
+        name: modelmap.displayName(id),
+        nameSource: modelmap.MODEL_NAMES[id] ? 'config' : 'desktop',
+        prefixed: id,
+        channel: 'dumate',
+        native: false,
+        target: id,
+        realModel: null,
+        realModelSource: null,
+        rate: rv ? rv.value : null,
+        rateSource: rv ? 'measured' : null,
+        rateUnit: rv ? rv.unit : null,
+        rateUnitText: rv ? rv.unitText : null,
+        rateNote: rv ? `实测于 ${new Date(rv.measuredAt).toLocaleString('zh-CN')}：${rv.note}` : null,
+        contextWindow: lim.context || null,
+        contextWindowMin: null,
+        contextSource: 'desktop',
+        contextNote: `桌面端模型清单声明（${cat.asOf || '未标日期'}），本仓未实测`,
+        maxTokens: lim.output || null,
+        maxTokensSource: 'desktop',
+        maxTokensNote: '清单声明的输出上限；与上游 400 错误体的真值冲突时以后者为准（dumate-caps 优先）',
+        multimodal: !!meta.attachment,
+        multimodalSource: 'desktop',
+        jsonMode: false,
+        jsonModeSource: 'measured',
+        jsonModeNote: 'response_format 仅 qianfan/ 前缀（千帆原生透传）支持；应用别名链路不支持',
+        links: { app: true, qianfanRaw: false },
+        // 只有 deepseek-v41-flash 在清单里带 variants（2026-11-13 社区实测的四档）
+        capability: meta.reasoning ? 'reasoning_model' : 'chat_model',
+        reasoningEfforts: meta.variants ? Object.keys(meta.variants) : null,
+        verified,
+        note: verified
+          ? '桌面端清单条目；该名字在本仓实测集合里（云端网关 2026-11-06 真机 200）'
+          : '桌面端清单条目；本仓未实测过这个名字，客户端选它可能 404（清单存在 ≠ 有调用权限）',
+      });
+    }
+  }
+
+  // 合并同后端的多个名字（2026-11-15，用户要求「模型显示不要重复」）。
+  //
+  // 起因：`model-text` / `deepseek-v41-flash` / `dm-auto-model/text.L0` / `mm.L0`
+  // 跑的是同一个 deepseek-v4.1-flash-low-latency，表里列四行等于把同一份价格
+  // 写四遍，还会让人以为「换个名字价钱不一样」。
+  //
+  // 合并规则：
+  //   · 主行按 rank 选——上游原生名(native) > 有实测元数据 > 清单名；
+  //   · 其余名字进 `alsoKnownAs`，界面在模型名下面列出来（不删信息，只去重）；
+  //   · `**只有 backend 相同的才合并**`，「同系换代」（glm-5 → glm-5.2 与
+  //     glm-53）**不合并**——它们是不同后端、不同价。
+  //   · `/v1/models` 不受影响：那边要列全部可调用名（客户端得选得到）。
+  const rankOf = (r) => (r.native ? 0 : r.contextSource === 'measured' ? 1 : 2);
+  const merged = [];
+  const byBackend = new Map();
+  for (const r of rows) {
+    const key = r.backend || r.id;
+    const prev = byBackend.get(key);
+    if (!prev) {
+      r.alsoKnownAs = [];
+      byBackend.set(key, r);
+      merged.push(r);
+      continue;
+    }
+    // 档位信息要跨合并保留：`deepseek-v41-flash` 是唯一带 variants 的名字，
+    // 它被并进 `model-text` 后如果不管，界面上「档位 none/low/high/max」就消失了。
+    const mergeEfforts = (a, b) => {
+      const set = new Set([...(a || []), ...(b || [])]);
+      return set.size ? [...set] : null;
+    };
+    if (rankOf(r) < rankOf(prev)) {
+      // 后来的名字更权威：它当主行，原主行降级成别名
+      r.alsoKnownAs = [prev.id, ...(prev.alsoKnownAs || [])];
+      r.reasoningEfforts = mergeEfforts(r.reasoningEfforts, prev.reasoningEfforts);
+      merged[merged.indexOf(prev)] = r;
+      byBackend.set(key, r);
+    } else {
+      prev.alsoKnownAs.push(r.id);
+      prev.reasoningEfforts = mergeEfforts(prev.reasoningEfforts, r.reasoningEfforts);
+    }
+  }
+  return merged;
 }
 
 /**
  * 暴露名 → 映射 target（与 dumateRows 循环内同一算法，抽出来给 /v1/models 用
  * ——两处各写一份早晚会漂移，别名语义改动时只会改到一处）。
+ *
+ * `opts.catalog` 缺省按当前链路判（云端才认清单名）。清单名是**云端网关的
+ * 路由名**：没有别名、也不在本地 upstream_models 里，但它不是未知名字——
+ * 必须解析成自己，否则会落到 fallback 并借用 model-text 的实测元数据。
  */
-function dumateTargetOf(id) {
+function dumateTargetOf(id, opts) {
+  const catalog = opts && opts.catalog !== undefined ? !!opts.catalog : cloudLink();
   const cfg = modelmap.load();
   const upstream = new Set(cfg.upstream_models);
-  return cfg.aliases[id] || (upstream.has(id) ? id : cfg.fallback);
+  if (cfg.aliases[id]) return cfg.aliases[id];
+  if (upstream.has(id)) return id;
+  if (catalog && modelmap.catalogModels().has(String(id || ''))) return id;
+  return cfg.fallback;
 }
 
 /** target → 实测元数据（DUMATE_REAL 查表；查不到返回 null，不编） */
 function dumateRealOf(target) {
   return DUMATE_REAL[target] || null;
+}
+
+/**
+ * target → 桌面端模型清单里的元数据（2026-11-15 融合 P0-1）。
+ *
+ * 与 DUMATE_REAL 的分工：那是**本仓实测**的真值（上游 400 错误体 / 二分夹逼），
+ * 只有 7 条；这是**客户端配置声明**的值（来源 dumate-catalog 三级降级），覆盖
+ * 22 条但含展示值。调用方按 `realOf = DUMATE_REAL || 本函数` 的顺序取——
+ * 实测赢过声明，这条顺序不能反（实例：model-text 声明 384000 vs 实测 393216）。
+ *
+ * `catalog: true` 是来源标记，界面据此区分「实测」与「客户端声明」，别丢。
+ */
+function dumateCatalogOf(target) {
+  try {
+    const meta = require('./dumate-catalog').get(target);
+    if (!meta || !meta.limit) return null;
+    return {
+      real: meta.id || target,
+      context: meta.limit.context,
+      maxTokens: meta.limit.output,
+      catalog: true,
+      attachment: !!meta.attachment,
+      reasoning: !!meta.reasoning,
+      toolCall: meta.tool_call !== false,
+    };
+  } catch (e) {
+    return null;
+  }
 }
 
 /** 千问的行。倍率本地拿不到（计费在 qwenwork.cn 的积分池里），如实 null */
@@ -381,15 +573,23 @@ async function qoderRows({ region = '' } = {}) {
  * 「哪个模型花多少」答不上来（这些条目的倍率/上下文全是 null）。
  * 排查「为什么某个名字调不通」时传 { all: true } 看全量。
  */
-async function traeworkRows({ visibleOnly = false, all = false, force = false, region = 'cn' } = {}) {
+async function traeworkRows({ visibleOnly = false, all = false, force = false, region = 'cn', accountId = '' } = {}) {
   const models = require('./traework/models');
-  const r = await models.fetchModels({ force, region: region || 'cn' });
+  // accountId 可空：给了就取该账号那一份能力表（倍率/档位/max_mode 才是这个号的真值），
+  // 不给沿用「该区最新一份」。作用域摘要随结果回传，界面上要能看见。
+  const r = await models.fetchModels({ force, region: region || 'cn', accountId });
   let list = r.models;
   if (!all) list = list.filter(models.isUsableRow);
   else if (visibleOnly) list = list.filter((m) => m.visible);
   return {
     ok: r.ok,
     error: r.error,
+    scope: r.scope || null,
+    cacheScope: r.cacheScope || '',
+    cached: r.cached === true,
+    scopes: models.cacheScopes(region || 'cn'),
+    // 合并过的行要露出痕迹：能力字段是聚合值时必须能解释「为什么说支持」
+    merged: list.some((m) => (m.mergedScopes || 0) > 1),
     rows: list.map((m) => ({
       id: m.id,
       name: m.name,
@@ -427,6 +627,10 @@ async function traeworkRows({ visibleOnly = false, all = false, force = false, r
       maxMode: m.maxMode === true,
       // 套餐门槛：上游 descriptor 显式声明才 true，其余 null（不猜）
       upgradeRequired: m.upgradeRequired === true ? true : null,
+      // 聚合痕迹（2026-11-16 P0-1）：>1 表示这一行由多个账号作用域合并而来，
+      // rateScopeAmbiguous 表示各账号倍率不一致（会员折扣差异，不是坏数据）
+      mergedScopes: m.mergedScopes || 1,
+      rateScopeAmbiguous: m.rateScopeAmbiguous === true,
     })),
   };
 }
@@ -457,7 +661,14 @@ async function qwenRows() {
 
 /** 某条通道的行 */
 async function rowsFor(channel, opts = {}) {
-  if (channel === 'dumate') return { rows: dumateRows(), error: '' };
+  if (channel === 'dumate') {
+    const rows = dumateRows();
+    // visibleOnly：cc-switch / agent-setup 自动选档用。只留下**现在真的能
+    // 路由**的行——清单候选（verified:false）是本仓没实测过的名字，自动
+    // 写进 ANTHROPIC_DEFAULT_*_MODEL 可能直接 404（review #5）。
+    // exposed 行没有 verified 字段（显式配置的别名，语义上总是可见），保留。
+    return { rows: opts.visibleOnly ? rows.filter((r) => r.verified !== false) : rows, error: '' };
+  }
   if (channel === 'qwenwork') {
     const rows = await qwenRows();
     return { rows, error: '' };
@@ -465,14 +676,18 @@ async function rowsFor(channel, opts = {}) {
   if (channel === 'qoder') return { rows: await qoderRows(opts), error: '' };
   if (channel === 'traework') {
     const r = await traeworkRows(opts);
-    return { rows: r.rows, error: r.error };
+    // 作用域摘要一起回：界面要能显示「这张表是哪份/是不是聚合出来的」
+    return {
+      rows: r.rows, error: r.error,
+      scope: r.scope, cacheScope: r.cacheScope, cached: r.cached, scopes: r.scopes, merged: r.merged,
+    };
   }
   return { rows: [], error: `未知通道 ${channel}` };
 }
 
 module.exports = {
   SRC, allRows, rowsFor, dumateRows, qwenworkRows, qwenRows, traeworkRows, qoderRows,
-  dumateTargetOf, dumateRealOf,
+  dumateTargetOf, dumateRealOf, dumateCatalogOf,
   setQwenKeys, setQwenModels, qwenworkCachedEntries, setQoderModels,
   DUMATE_NOTE, DUMATE_REAL, QW_CONTEXT, CHANNELS: channels.CHANNELS,
 };

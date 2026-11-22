@@ -130,6 +130,53 @@
       </div>
     </a-card>
 
+    <a-card :bordered="false" title="默认思考档（客户端没给档位时才套）" class="mb-4">
+      <div class="text-xs text-slate-400 mb-3">
+        模式写法：精确模型名（<code>glm-5.2</code>）／前缀通配（<code>gemini*</code>）／兜底 <code>*</code>；
+        优先级 精确 &gt; 最长前缀 &gt; <code>*</code>。<br />
+        <span class="text-amber-600">只在该模型 descriptor 明确声明支持档位时才会套用</span>——表没就绪或没声明就不猜；
+        超出支持范围会向下钳，并写进
+        <code>X-Reasoning-Applied: default:&lt;档位&gt;</code> 与请求日志（<code>reasoning_source</code>）。
+      </div>
+      <div v-if="reasoningRows.length" class="space-y-2 max-w-3xl">
+        <div v-for="(row, i) in reasoningRows" :key="i" class="flex items-center gap-2">
+          <a-input v-model:value="row.pattern" :disabled="!isAdmin" placeholder="模型名或模式，如 glm-5.2 / gemini*" />
+          <a-select v-model:value="row.tier" :disabled="!isAdmin" :options="tierOptions" style="width: 150px" />
+          <a-button size="small" danger :disabled="!isAdmin" @click="removeReasoningRow(i)">删除</a-button>
+        </div>
+      </div>
+      <div v-else class="text-xs text-slate-400 mb-2">未配置：网关不会给任何请求套默认档。</div>
+      <a-button size="small" class="mt-2" :disabled="!isAdmin" @click="addReasoningRow">添加一行</a-button>
+      <a-alert
+        v-if="!isAdmin"
+        type="info"
+        show-icon
+        class="mt-3"
+        message="viewer 只读：写操作由服务端拦（403 admin_only）"
+      />
+    </a-card>
+
+    <a-card :bordered="false" title="跨区容灾（默认关）" class="mb-4">
+      <div class="flex items-center justify-between max-w-3xl">
+        <div>
+          <div>本区一个可用账号都没有时，改派对方区</div>
+          <div class="text-xs text-slate-400">
+            四条前置缺一不可：API Key 未绑区域 · 对方区真有账号 · 该模型在对方区<b>表已就绪且已知</b> · 只试一次。<br />
+            命中写 <code>X-Traework-Failover: cn-&gt;intl</code>；刻意不做「一遇 429 就跨区」。
+          </div>
+        </div>
+        <a-space>
+          <a-switch v-model:checked="form.crossRegionFailover.enabled" :disabled="!isAdmin" />
+          <a-select
+            v-model:value="form.crossRegionFailover.to"
+            :disabled="!isAdmin || !form.crossRegionFailover.enabled"
+            :options="[{ label: '自动（对方区）', value: '' }, { label: '国内 cn', value: 'cn' }, { label: '国际 intl', value: 'intl' }]"
+            style="width: 150px"
+          />
+        </a-space>
+      </div>
+    </a-card>
+
     <a-card :bordered="false" title="全站暂停">
       <div class="flex items-center justify-between max-w-3xl">
         <div>
@@ -191,7 +238,16 @@ const form = reactive<TraeRuntimeConfig>({
   pickStrategy: 'round-robin',
   accountGuard: { enabled: false, reserveCredits: null, reserveBelow: null, dailyTokens: null, dailyCredits: null, modelTokens: null },
   gatewayPaused: false,
+  crossRegionFailover: { enabled: false, to: '' },
+  defaultReasoning: {},
 })
+// 默认思考档用「行」编辑（对象直接绑表格很难受）：保存时再折成 {模式: 档位}
+const reasoningRows = ref<Array<{ pattern: string; tier: string }>>([])
+const tierOptions = [
+  { label: 'light', value: 'light' },
+  { label: 'high', value: 'high' },
+  { label: 'extra_high', value: 'extra_high' },
+]
 // a-input-number 不接受 null 作为 v-model 初值：用 0 做展示位，保存时转 null
 const warnBelow = ref(0)
 const reserveCredits = ref(0)
@@ -224,6 +280,7 @@ function copyForm(c: TraeRuntimeConfig) {
   dailyTokens.value = c.accountGuard.dailyTokens ?? 0
   dailyCredits.value = c.accountGuard.dailyCredits ?? 0
   modelTokens.value = c.accountGuard.modelTokens ?? 0
+  reasoningRows.value = Object.entries(c.defaultReasoning || {}).map(([pattern, tier]) => ({ pattern, tier }))
 }
 
 async function load() {
@@ -254,7 +311,22 @@ function patch(): Partial<TraeRuntimeConfig> {
       modelTokens: modelTokens.value > 0 ? modelTokens.value : null,
     },
     gatewayPaused: form.gatewayPaused,
+    crossRegionFailover: { ...form.crossRegionFailover },
+    // 空模式的行直接丢弃（界面上点了「添加」但没填，不该写进配置）
+    defaultReasoning: Object.fromEntries(
+      reasoningRows.value
+        .map((r) => [String(r.pattern || '').trim(), String(r.tier || '').trim()])
+        .filter(([k, v]) => k && v),
+    ),
   }
+}
+
+/** 新增一行默认档（默认给最常见的 high，用户改键即可） */
+function addReasoningRow() {
+  reasoningRows.value = [...reasoningRows.value, { pattern: '', tier: 'high' }]
+}
+function removeReasoningRow(i: number) {
+  reasoningRows.value = reasoningRows.value.filter((_, idx) => idx !== i)
 }
 
 async function save() {

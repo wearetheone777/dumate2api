@@ -26,6 +26,11 @@ const runtime = require('../../src/qoder/runtime');
 function cleanup() {
   try { fs.unlinkSync(runtime.filePath()); } catch (e) { /* 不存在 */ }
   runtime._resetForTest();
+  // P1-9 起闸门旋钮/冷却上限归 livecfg 管，本文件用同一个数据目录——
+  // 不清掉会读到上一条用例提交的面板值（跨文件残留同理）。
+  const livecfg = require('../../src/livecfg');
+  try { fs.unlinkSync(livecfg.filePath()); } catch (e) { /* 不存在 */ }
+  livecfg._resetForTest();
 }
 
 test('默认值来自 env：只设环境变量时行为与手写常量一致', () => {
@@ -201,9 +206,12 @@ test('chat.js 的三个计时器与请求体上限走运行期配置（热生效
 test('upstream-errors 的两个冷却常量是懒读（面板改上限后不必重启）', () => {
   cleanup();
   const ue = require('../../src/upstream-errors');
+  const livecfg = require('../../src/livecfg');
   assert.strictEqual(ue.THROTTLE_MAX_MS, 600000);
   assert.strictEqual(ue.QUEUE_THROTTLE_COOLDOWN_MS, 5000);
-  runtime.Store({ limits: { throttleMaxMs: 120000 }, queue: { cooldownMs: 2000 } });
+  // P1-9：上限走 livecfg.throttleMaxMs，排队冷却仍走 qoder/runtime.queue.cooldownMs
+  livecfg.Store({ throttleMaxMs: 120000 });
+  runtime.Store({ queue: { cooldownMs: 2000 } });
   assert.strictEqual(ue.THROTTLE_MAX_MS, 120000, 'getter 每次读当前生效值');
   assert.strictEqual(ue.QUEUE_THROTTLE_COOLDOWN_MS, 2000);
   // 分类结果跟着变：排队类限流用新的短冷却
@@ -217,13 +225,15 @@ test('upstream-errors 的两个冷却常量是懒读（面板改上限后不必�
 test('并发闸门（P1-6）：面板值热生效，0 = 用池默认，env 仍是兜底', () => {
   cleanup();
   const cp = require('../../src/channel-pool');
+  const livecfg = require('../../src/livecfg');
   // 默认：0 = 不改变现有行为（不给 Qoder 静默加限制）
   assert.strictEqual(runtime.defaults().concurrency.inflightMax, 0);
   assert.strictEqual(cp.inflightMaxOf('qoder'), 0);
   assert.strictEqual(cp.minIntervalMsOf('qoder'), 0);
   assert.strictEqual(cp.pickStrategyOf('qoder'), '');
 
-  runtime.Store({ concurrency: { inflightMax: 1, minIntervalMs: 800, pickStrategy: 'least-inflight' } });
+  livecfg.Store({ throttle: { qoder: { inflightMax: 1, minIntervalMs: 800 } } });
+  runtime.Store({ concurrency: { pickStrategy: 'least-inflight' } });
   assert.strictEqual(cp.inflightMaxOf('qoder'), 1, '面板设 1 立刻生效（不必重启）');
   assert.strictEqual(cp.minIntervalMsOf('qoder'), 800);
   assert.strictEqual(cp.pickStrategyOf('qoder'), 'least-inflight');
@@ -242,7 +252,7 @@ test('并发闸门：只认白名单策略名（填错不静默变成关闭）',
 test('并发闸门：别的通道不受影响（只对 qoder 开了配置面）', () => {
   cleanup();
   const cp = require('../../src/channel-pool');
-  runtime.Store({ concurrency: { inflightMax: 1 } });
+  require('../../src/livecfg').Store({ throttle: { qoder: { inflightMax: 1 } } });
   assert.strictEqual(cp.inflightMaxOf('qoder'), 1);
   assert.strictEqual(cp.inflightMaxOf('traework'), 0, 'TRAE 仍走 env（未配置时为 0）');
   cleanup();

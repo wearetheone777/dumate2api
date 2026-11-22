@@ -1691,6 +1691,7 @@ import type { PointsData, AccountsData } from '@/api/points'
 import type { StatsSummary, DailyRow } from '@/api/stats'
 import type { UsageOverview } from '@/api/usage'
 import { SERIES, INK, TOOLTIP_BASE, axisStyle, compactNum, exactNum, lineSeries } from '@/utils/chartTheme'
+import { useAutoRefresh } from '@/stores/ui'
 
 interface DashAccount {
   id: number
@@ -2877,8 +2878,24 @@ function onResize() {
   qdTokChart?.resize()
 }
 
+// 主题切换（夜间模式）重绘：ECharts 画在 canvas 上，读不到 CSS 变量，
+// 主题常量由 stores/theme.ts 在广播前改好，这里只管按新值重建 option。
+// 各 render 函数自己守卫「没有画布 / 没有数据」，可无脑全调。
+function onThemePaint() {
+  renderChart()
+  renderTwChart()
+  renderQdChart()
+  renderWbChart()
+  renderQwChart()
+  renderQwTokenChart()
+}
+
+
+// 自动刷新（P2-12）：注册后由顶栏的间隔开关驱动，卸载时自动注销
+useAutoRefresh(refresh)
 onMounted(() => {
   window.addEventListener('resize', onResize)
+  window.addEventListener('lab:theme', onThemePaint)
   refresh()
   // 连坐倒计时：只在 WorkBuddy 通道下每秒推进一格。其余通道不启定时器——
   // 一个每秒醒的 interval 在长期开着的控制台里不是零成本
@@ -2897,6 +2914,7 @@ vueWatch(() => regionStore.current, () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('lab:theme', onThemePaint)
   if (wbTick) { clearInterval(wbTick); wbTick = null }
   reqChart?.dispose()
   tokChart?.dispose()

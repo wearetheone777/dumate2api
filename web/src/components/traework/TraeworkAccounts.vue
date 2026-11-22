@@ -197,6 +197,9 @@
 
             <div class="mt-3 flex flex-wrap gap-1">
               <a-button size="small" :loading="busy[a.id]" @click="checkin(a)">签到</a-button>
+              <!-- 人工恢复（P0-3）：冷却/熔断/凭证拒绝的号，这条是唯一出口。
+                   与上面的「恢复」批量按钮不同——它总是清，不保留上游冷却 -->
+              <a-button size="small" :loading="busy[a.id]" @click="recover(a)">恢复</a-button>
               <a-popconfirm title="确定删除这个账号？" @confirm="remove(a)">
                 <a-button size="small" danger>删除</a-button>
               </a-popconfirm>
@@ -239,14 +242,14 @@
       </template>
     </a-alert>
 
-    <!-- 登录：两步。先拿授权链接（含本次的设备标识），用户浏览器登录后
-         把回调地址粘回来。不做本地 http server——手动粘贴更透明，
-         也少一个「端口被占用」的失败点。 -->
+    <!-- 登录：两条路并存（2026-11-16 P0-2a）。
+         主路是**回环自动回调**：发起时在 127.0.0.1 起临时监听，授权页自己跳回来
+         就完成入库；退路是手动粘贴（浏览器与网关不同机 / 容器部署 / 端口被占用）。 -->
     <a-modal v-model:open="loginOpen" title="添加 TRAE Work 账号" :footer="null" width="620">
       <a-steps :current="loginStep" size="small" class="mb-4">
         <a-step title="获取登录链接" />
-        <a-step title="浏览器登录" />
-        <a-step title="粘贴回调地址" />
+        <a-step title="浏览器登录（自动回调）" />
+        <a-step title="粘贴回调（退路）" />
       </a-steps>
 
       <template v-if="loginStep === 0">
@@ -272,17 +275,36 @@
           </template>
           <template #description>
             <ol class="pl-4 mb-0 mt-1 text-xs">
-              <li>在打开的页面里登录 TRAE 账号</li>
-              <li>登录后浏览器会跳到 <code>127.0.0.1:18080</code>，<b>打不开是正常的</b></li>
-              <li>复制地址栏里的<b>完整 URL</b>，粘到下一步</li>
+              <li>在打开的页面里登录 TRAE 账号并完成授权</li>
+              <li>授权完成后会跳到 <code>{{ loginRedirect }}</code>，本页会<b>自动接住并入库</b></li>
+              <li>浏览器与网关不在同一台机器？用下面的「粘贴回调」退路</li>
             </ol>
           </template>
         </a-alert>
+
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs text-slate-500">
+            <template v-if="!loginSessionId">手动粘贴模式（未启用本机回调）</template>
+            <template v-else-if="loginStatus === 'pending'">
+              <a-spin size="small" /> 等待浏览器回调…（{{ loginRemain }} 秒后过期）
+            </template>
+            <template v-else-if="loginStatus === 'exchanging'">已收到回调，正在换票…</template>
+            <template v-else-if="loginStatus === 'success'">已入库</template>
+            <template v-else-if="loginStatus === 'failed'">换票失败</template>
+            <template v-else-if="loginStatus === 'expired'">会话已过期</template>
+            <template v-else-if="loginStatus === 'cancelled'">已取消</template>
+          </span>
+          <span v-if="loginSessionId && loginTraceVerified === false" class="text-xs text-amber-600">
+            上游未回显 state（已放行，仅记录）
+          </span>
+        </div>
+
         <div class="text-xs text-slate-400 mb-2">登录链接（如按钮失效可手动复制）</div>
         <a-textarea :value="loginUrl" :rows="3" readonly class="font-mono text-xs" />
         <div class="mt-3 flex gap-2">
-          <a-button @click="loginStep = 0">上一步</a-button>
-          <a-button type="primary" @click="loginStep = 2">已登录，去粘贴回调</a-button>
+          <a-button @click="closeLogin">关闭</a-button>
+          <a-button v-if="loginSessionId" danger :loading="cancelLoading" @click="cancelLogin">取消这次登录</a-button>
+          <a-button type="primary" @click="gotoPaste">收不到回调？手动粘贴</a-button>
         </div>
       </template>
 
@@ -420,6 +442,16 @@ async function runBatch(action: 'checkin' | 'probe' | 'pause' | 'resume' | 'expo
 // 登录弹窗
 const loginOpen = ref(false)
 const loginStep = ref(0)
+// 回环登录（P0-2a）：sessionId 非空表示这次登录有本机回调在等
+const loginSessionId = ref('')
+const loginRedirect = ref('')
+const loginStatus = ref<'pending' | 'exchanging' | 'success' | 'failed' | 'expired' | 'cancelled' | 'not_found' | ''>('')
+const loginTraceVerified = ref<boolean | null>(null)
+const loginExpiresAt = ref(0)
+const loginRemain = ref(0)
+const cancelLoading = ref(false)
+let loginTimer: ReturnType<typeof setTimeout> | null = null
+let loginTick: ReturnType<typeof setInterval> | null = null
 // 账号区域跟随顶栏切换器（当前区域视图）——两个独立视图各登各区的账号
 const loginRegion = computed<'cn' | 'intl'>(() => regionStore.current)
 const loginUrl = ref('')
@@ -522,6 +554,18 @@ async function toggleModel(a: TraeworkAccount, v: boolean) {
   await load()
 }
 
+/** 单账号人工恢复：清冷却/熔断/401 计数并清掉 lastError 牌子 */
+async function recover(a: TraeworkAccount) {
+  busy[a.id] = true
+  try {
+    const { data } = await traeworkApi.recoverAccount(a.id)
+    message.success(data.revived ? '已恢复（冷却/熔断/计数已清）' : '已恢复（本来就没有冷却）')
+    await load()
+  } finally {
+    busy[a.id] = false
+  }
+}
+
 async function remove(a: TraeworkAccount) {
   await traeworkApi.removeAccount(a.id)
   message.success('已删除')
@@ -592,20 +636,118 @@ function openLogin() {
   loginError.value = ''
   deviceIds.deviceId = ''
   deviceIds.machineId = ''
+  loginSessionId.value = ''
+  loginRedirect.value = ''
+  loginStatus.value = ''
+  loginTraceVerified.value = null
   loginOpen.value = true
+}
+
+/** 停掉轮询/倒计时（任何终态与关闭都要走到这里，否则定时器会一直跑） */
+function stopLoginTimers() {
+  if (loginTimer) { clearTimeout(loginTimer); loginTimer = null }
+  if (loginTick) { clearInterval(loginTick); loginTick = null }
+}
+
+/** 关闭登录弹窗：有在等回调的会话就先取消（不留悬空监听） */
+function closeLogin() {
+  stopLoginTimers()
+  const sid = loginSessionId.value
+  loginSessionId.value = ''
+  loginOpen.value = false
+  if (sid) traeworkApi.loginCancel(sid).catch(() => { /* 关掉弹窗时取消失败不值得打扰用户 */ })
+}
+
+function gotoPaste() {
+  // 手动粘贴：会话仍然有效（后端按 sessionId 单次消费），直接进第 3 步
+  loginStep.value = 2
+}
+
+/** 轮询回环登录状态直到终态 */
+function scheduleLoginPoll() {
+  const sid = loginSessionId.value
+  if (!sid) return
+  loginTimer = setTimeout(async () => {
+    if (!loginSessionId.value) return
+    try {
+      const { data } = await traeworkApi.loginStatus(sid)
+      loginStatus.value = data.status
+      if (data.trace_verified != null) loginTraceVerified.value = data.trace_verified
+      if (data.status === 'success') {
+        stopLoginTimers()
+        message.success(`已添加账号：${data.account?.nickname || data.account?.uid || ''}`)
+        loginOpen.value = false
+        loginSessionId.value = ''
+        await load()
+        return
+      }
+      if (data.status === 'failed' || data.status === 'expired' || data.status === 'cancelled' || data.status === 'not_found') {
+        stopLoginTimers()
+        if (data.error) loginError.value = data.error
+        return
+      }
+      scheduleLoginPoll()
+    } catch (e: any) {
+      // 网络抖动不该打死整个流程：继续轮询（终态由后端给）
+      scheduleLoginPoll()
+    }
+  }, 1500)
+}
+
+/** 取消这次回环登录：停轮询 + 让后端关掉监听 */
+async function cancelLogin() {
+  const sid = loginSessionId.value
+  stopLoginTimers()
+  if (!sid) return
+  cancelLoading.value = true
+  try {
+    await traeworkApi.loginCancel(sid)
+    loginStatus.value = 'cancelled'
+  } finally {
+    cancelLoading.value = false
+  }
 }
 
 async function genLoginUrl() {
   urlLoading.value = true
   loginError.value = ''
   try {
-    const { data } = await traeworkApi.loginUrl(loginRegion.value)
+    // 先试回环自动回调（P0-2a）；端口占用/浏览器不同机等情况下退回手动粘贴，
+    // 但**把原因显示出来**——静默降级会让人以为功能没做
+    const { data } = await traeworkApi.loginStart({ region: loginRegion.value })
     loginUrl.value = data.url
+    loginRedirect.value = data.redirect
+    loginSessionId.value = data.sessionId
     deviceIds.deviceId = data.deviceId
     deviceIds.machineId = data.machineId
+    loginStatus.value = 'pending'
+    loginExpiresAt.value = data.expiresAt || 0
     loginStep.value = 1
+    loginRemain.value = Math.max(0, Math.round((loginExpiresAt.value - Date.now()) / 1000))
+    loginTick = setInterval(() => {
+      loginRemain.value = Math.max(0, Math.round((loginExpiresAt.value - Date.now()) / 1000))
+    }, 1000)
+    scheduleLoginPoll()
   } catch (e: any) {
-    loginError.value = e?.response?.data?.error || '生成登录链接失败'
+    const status = e?.response?.status
+    const msg = e?.response?.data?.error || ''
+    if (status === 503) {
+      // 回环起不来（多半是端口被占用）：退回老路径，并把原因写在弹窗里
+      try {
+        const { data } = await traeworkApi.loginUrl(loginRegion.value)
+        loginUrl.value = data.url
+        deviceIds.deviceId = data.deviceId
+        deviceIds.machineId = data.machineId
+        loginSessionId.value = ''
+        loginStep.value = 1
+        loginError.value = `本机回调不可用（${msg}），已退回手动粘贴`
+        return
+      } catch (e2: any) {
+        loginError.value = e2?.response?.data?.error || '生成登录链接失败'
+        return
+      }
+    }
+    loginError.value = msg || '生成登录链接失败'
   } finally {
     urlLoading.value = false
   }
@@ -619,18 +761,23 @@ async function submitCallback() {
   submitting.value = true
   loginError.value = ''
   try {
-    const { data } = await traeworkApi.loginCallback({
-      callback: callbackText.value.trim(),
-      deviceId: deviceIds.deviceId,
-      machineId: deviceIds.machineId,
-      region: loginRegion.value,
-    })
+    const sid = loginSessionId.value
+    const { data } = sid
+      ? await traeworkApi.loginComplete(sid, callbackText.value.trim())
+      : await traeworkApi.loginCallback({
+        callback: callbackText.value.trim(),
+        deviceId: deviceIds.deviceId,
+        machineId: deviceIds.machineId,
+        region: loginRegion.value,
+      })
     if (!data.ok) {
       loginError.value = data.error || '换票失败'
       return
     }
     message.success(`已添加账号：${data.account?.nickname || data.account?.uid || ''}`)
+    stopLoginTimers()
     loginOpen.value = false
+    loginSessionId.value = ''
     await load()
   } catch (e: any) {
     loginError.value = e?.response?.data?.error || '添加失败'
