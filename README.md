@@ -35,12 +35,17 @@ Claude Code ──── Anthropic ────────┼──→ dumate2a
 
 ```bash
 git clone <repo-url> && cd dumate2api
-npm install
-npm start                  # 网关 http://127.0.0.1:9080
-npm run admin              # 管理端 http://127.0.0.1:9081（另开终端）
+pnpm install               # 推荐：仓库锁文件是 pnpm-lock.yaml
+pnpm start                 # 网关 http://127.0.0.1:9080
+pnpm admin                 # 管理端 http://127.0.0.1:9081（另开终端）
 ```
 
 首次启动管理端会打印随机管理员口令，**只显示一次**。
+
+> **npm 也能用**：`npm install` / `npm start` / `npm run admin` 与 pnpm 等价（scripts 是通用的，没有 pnpm 专属字段）。区别只在依赖树：pnpm 用内容寻址存储 + 符号链接，npm 是扁平 `node_modules`。
+> **但不要混用**——两套锁文件并存会让「装到哪个版本」取决于谁最后跑过 install。仓库入库的是 `pnpm-lock.yaml`（`package-lock.json` 已在 `.gitignore` 里）。选定一种就一路用到底；用 npm 时把生成的 `package-lock.json` 留在本地即可，别提交。
+>
+> 没装 pnpm？`npm install -g pnpm@12`（`web/pnpm-workspace.yaml` 用的是 pnpm 12 的 `allowBuilds` 语法，pnpm 9 会报 `packages field missing or empty`）。
 
 > 端口只有一套默认值：网关 `9080` / 管理端 `9081`。`start-dev.bat` 与 `start.bat` 行为一致（同起这两个端口）。要并行跑第二个实例时，用 `DUMATE2API_PORT` / `DUMATE_ADMIN_PORT` / `DUMATE_ADMIN_GATEWAY_PORT` 显式错开。
 
@@ -55,6 +60,14 @@ curl http://127.0.0.1:9080/v1/chat/completions \
 ```
 
 **默认凭证来源是网页池**：网关启动时不探测、也不拉起桌面后端。要跑搭子通道，先在管理端「账号管理」登录一个网页账号（或粘贴 cookie）；想用桌面登录态则设 `DUMATE_DUMATE_SOURCE=auto`。千问 / TRAE / Qoder 走 OAuth；WorkBuddy 在「账号管理」页用「浏览器登录」（浏览器只是授权面，token 由上游签发），多账号每个账号各走一遍。全部无需官方客户端。
+
+**管理端界面需要先构建前端**（`web/dist` 不进仓库）：
+
+```bash
+cd web && pnpm install && pnpm build    # npm 亦可；开发时用 pnpm dev（Vite HMR，5173 端口）
+```
+
+没构建时管理端仍能启动，只是页面 404 并在日志提示 `web/dist/index.html missing`。
 
 ## Docker 部署
 
@@ -183,8 +196,8 @@ requires_openai_auth = true
 ## 测试
 
 ```bash
-npm test                                  # 离线单测（不需要任何运行中的服务）
-npm run test:smoke                        # 冒烟测试（需网关在线，默认打 9080）
+pnpm test                                 # 离线单测（不需要任何运行中的服务）
+pnpm test:smoke                           # 冒烟测试（需网关在线，默认打 9080）
 node test/verify-ccswitch.js              # Codex / Claude / 裸路径 / 模型映射四条链路
 node test/verify-checkin-detail.js        # 签到账本与按月/按年查询（离线）
 node test/verify-qoder-cosy.js            # 签名算法逐字节比对（离线）
@@ -192,6 +205,8 @@ node test/verify-workbuddy-repair.js      # WorkBuddy「播报即收尾」修复
 node --test test/unit/workbuddy-login.test.js   # WorkBuddy 浏览器授权登录（离线）
 node test/verify-fallback-stream-pipe.js  # 回落路径流式转发（离线）
 ```
+
+> `npm test` / `npm run test:smoke` 同样可用。`node test/verify-*.js` 是纯 Node 脚本，与包管理器无关。
 
 更多离线验证脚本见 `test/verify-*.js`，改完对应模块先跑它们。
 
