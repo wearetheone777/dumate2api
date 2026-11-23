@@ -857,7 +857,7 @@ per-key 限流（低价值场景）。
 | `records.js` | 统一操作记录（签到/任务/抽奖）。**纯管理端**——网关不加载它 |
 | `points-agg.js` | 额度包聚合（按来源 / 按发放日 / 临期 / 已过期未用完）。**纯管理端**。本地后端与网页账号拿到的是同一份额度包结构但字段来源不同，两份都要得出同样的派生视图——收敛在这里，否则「一边按到期日、一边按发放日判断还在不在发」这种口径漂移必然发生 |
 | `points-cursor.js` | 单请求积分成本（余额游标差）。上游账单无法归因到具体请求（同一时间窗有 1~3 条候选扣费，硬挑一条等于编数字），改用「每条请求结束后记一次余额、相邻两次差值即后一条的成本」。**每账号一条串行队列**——丢一条游标会让下一条的差值跨过两条请求，静默算错，所以宁可排队也不缺档 |
-| `login-browser.js` | 浏览器登录器（唯一依赖 playwright-core 的地方，纯管理端） |
+| `login-browser.js` | 浏览器登录器（唯一依赖 playwright-core 的地方，纯管理端）。**WSL 下走 CDP 桥接**：用 PowerShell 在 Windows 宿主拉起 Edge（独立 profile + `--remote-debugging-port`），再用 `chromium.connectOverCDP` 连上去读 cookie——playwright 的 stdio 管道跨不了 WSL/Windows 边界，CDP 走 TCP 可以。端口默认 9333（`DUMATE_WSL_CDP_PORT` 可改）。`%TEMP%` 必须用 PowerShell `Join-Path $env:TEMP` 拼，写进单引号字符串不会展开 |
 | `admin/router.js` | `/api/admin/*` 路由分发。**路径匹配锚定整串**，所以 `/models/map` 不会误吞 `/models/map/reset`；注册时 `path: ''` 与前缀拼成 `/api/admin/web-accounts`，`mount` 做了去尾斜杠 |
 | `admin/store.js` | JSON / JSONL 原子持久化（先写 `.tmp` 再 `rename`）。管理端的配置写盘都走它 |
 | `admin/iputil.js` | 客户端来源 IP。管理端只监听 127.0.0.1，所以直接取 TCP 对端；**没有 TRUST_PROXY 判定**——挂反代前必须先补，否则限流/锁定会按代理 IP 统计 |

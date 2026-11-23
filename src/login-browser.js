@@ -90,7 +90,122 @@ function playwrightChromium() {
 /** 服务端有没有图形界面——无头环境里「打开一个窗口」本质上做不到 */
 function hasDisplay() {
   if (process.platform === 'win32' || process.platform === 'darwin') return true;
+  // WSL：窗口由 Windows 宿主弹出，不依赖 WSL 自己的 DISPLAY
+  if (isWsl() && windowsBrowserPath()) return true;
   return !!(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+}
+
+// ---------------------------------------------------------------------------
+// WSL → Windows 宿主浏览器（2026-11）
+//
+// WSL 里通常没有 Linux 浏览器，但 Windows 宿主一定装了 Edge。WSL2 的
+// localhost 转发让「WSL 访问 Windows 监听端口」成为可能（实测 127.0.0.1 可达），
+// 于是可以：用 PowerShell 在 Windows 侧拉起 Edge（独立 profile + 远程调试端口），
+// 再用 playwright 的 connectOverCDP 连上去读 cookie。
+//
+// 为什么不用 playwright 直接 executablePath 指向 msedge.exe：playwright 通过
+// stdio 管道控制浏览器进程，跨 WSL/Windows 边界这条管道不通（会超时）。CDP 走
+// TCP，能跨边界。
+//
+// 全程零安装、零 sudo：只用宿主已有的 Edge + WSL 的 Windows 互通。
+// ---------------------------------------------------------------------------
+
+/** 是否运行在 WSL 里（内核版本带 microsoft 标记） */
+function isWsl() {
+  if (process.platform !== 'linux') return false;
+  try {
+    return /microsoft/i.test(fs.readFileSync('/proc/version', 'utf8'));
+  } catch (e) { return false; }
+}
+
+/** Windows 宿主上的 Edge / Chrome 可执行文件（WSL 视角的 /mnt/c 路径） */
+function windowsBrowserPath() {
+  const cands = [
+    '/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
+    '/mnt/c/Program Files/Microsoft/Edge/Application/msedge.exe',
+    '/mnt/c/Program Files/Google/Chrome/Application/chrome.exe',
+    '/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe',
+  ];
+  if (process.env.DUMATE_BROWSER_PATH && fs.existsSync(process.env.DUMATE_BROWSER_PATH)) {
+    return process.env.DUMATE_BROWSER_PATH;
+  }
+  for (const p of cands) if (fs.existsSync(p)) return p;
+  return null;
+}
+
+/** WSL 路径 → Windows 路径（C:\...），失败时回退到手工换算 */
+function toWindowsPath(p) {
+  try {
+    const out = require('child_process').execFileSync('wslpath', ['-w', p], { encoding: 'utf8' }).trim();
+    if (out) return out;
+  } catch (e) { /* 回退 */ }
+  return p.replace(/^\/mnt\/([a-z])\//i, (m, d) => `${d.toUpperCase()}:\\`).replace(/\//g, '\\');
+}
+
+/** 端口是否已经在 Windows 侧监听（CDP 的 /json/version 能回话即算就绪） */
+function waitCdpReady(port, timeoutMs) {
+  const http = require('http');
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const tick = () => {
+      const req = http.get({ host: '127.0.0.1', port, path: '/json/version', timeout: 1000 }, (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      });
+      req.on('error', () => {
+        if (Date.now() > deadline) return resolve(false);
+        setTimeout(tick, 300);
+      });
+      req.on('timeout', () => { req.destroy(); });
+    };
+    tick();
+  });
+}
+
+/** 在 Windows 侧拉起 Edge，返回 Windows PID；失败返回 { error } */
+function launchWindowsBrowser(port) {
+  const exe = windowsBrowserPath();
+  if (!exe) return { error: 'Windows 侧没找到 Edge / Chrome' };
+  const winExe = toWindowsPath(exe);
+  // user-data-dir 在 PowerShell 侧用 Join-Path 拼（**不能写 %TEMP%**：
+  // 单引号字符串里 PowerShell 不展开环境变量，Edge 会拿到字面量 %TEMP% 路径）
+  const profileLeaf = `dumate-login-${process.pid}-${Date.now()}`;
+  const args = [
+    `--remote-debugging-port=${port}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--start-maximized',
+  ];
+  // 单引号包路径，避免空格与反斜杠转义问题
+  const ps = [
+    `$ud = Join-Path $env:TEMP '${profileLeaf}'`,
+    `$p = Start-Process -FilePath '${winExe}' -ArgumentList ${[
+      `"--user-data-dir=$ud"`,
+      ...args.map((a) => `'${a}'`),
+    ].join(',')} -PassThru`,
+    'Write-Output $p.Id',
+  ].join('; ');
+  try {
+    const out = require('child_process').execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', ps],
+      { encoding: 'utf8', timeout: 20000 },
+    ).trim();
+    const pid = parseInt(out.split(/\r?\n/).pop(), 10);
+    return Number.isFinite(pid) ? { pid } : { error: `无法取得 Edge PID（输出: ${out.slice(0, 120)}）` };
+  } catch (e) {
+    return { error: `启动 Windows 浏览器失败: ${e.message}` };
+  }
+}
+
+/** 杀掉 Windows 侧进程树（不杀用户的日常 Edge：我们用的是独立 profile 的独立进程） */
+function killWindowsBrowser(pid) {
+  if (!pid) return;
+  try {
+    require('child_process').execFileSync('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', `Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue`],
+      { timeout: 10000 });
+  } catch (e) { /* 尽力而为 */ }
 }
 
 function findBrowser() {
@@ -98,6 +213,11 @@ function findBrowser() {
   if (envPath && fs.existsSync(envPath)) return envPath;
   for (const p of CANDIDATES) {
     if (fs.existsSync(p)) return p;
+  }
+  // WSL 兜底：宿主上的 Edge/Chrome（通过 CDP 驱动，见 start()）
+  if (isWsl()) {
+    const win = windowsBrowserPath();
+    if (win) return win;
   }
   return playwrightChromium();
 }
@@ -163,6 +283,10 @@ function cleanup() {
   ctx = null;
   const dir = profileDir;
   profileDir = null;
+  // WSL 分支：浏览器是 Windows 侧独立进程，CDP 断开不会杀它，需显式收尾
+  const wp = session.winPid;
+  session.winPid = 0;
+  if (wp) killWindowsBrowser(wp);
   if (c) {
     c.close()
       .catch(() => {})
@@ -235,6 +359,11 @@ async function start(opts = {}) {
     browserPath: exe,
   };
 
+  // WSL + 宿主浏览器：走 CDP 桥接（见文件中部注释），与下面的本地启动互斥
+  if (isWsl() && /^\/mnt\/[a-z]\//i.test(exe)) {
+    return startViaWindowsBrowser(exe);
+  }
+
   try {
     // 每次一个全新 profile：隔离登录态，也避免读到上次的残留
     const userDataDir = newProfileDir();
@@ -305,6 +434,101 @@ async function start(opts = {}) {
   }
 }
 
+// WSL 专用：在 Windows 宿主拉起 Edge（独立 profile），通过 CDP 连上读 cookie。
+// 与本地 start() 的区别只在「浏览器怎么起来」——轮询/收尾语义完全一致。
+async function startViaWindowsBrowser(exe) {
+  const port = parseInt(process.env.DUMATE_WSL_CDP_PORT || '9333', 10);
+  let winPid = 0;
+  try {
+    // 端口若被上一轮残留占着，先让用户知道（不盲目复用别人的调试端口）
+    if (await waitCdpReady(port, 300)) {
+      session.status = 'failed';
+      session.active = false;
+      session.message = `调试端口 ${port} 已被占用（可能是上次残留的窗口）`;
+      return { ok: false, error: session.message };
+    }
+
+    session.message = '正在 Windows 上打开登录窗口…';
+    const launched = launchWindowsBrowser(port);
+    if (launched.error) {
+      session.status = 'failed';
+      session.active = false;
+      session.message = launched.error;
+      return { ok: false, error: launched.error };
+    }
+    winPid = launched.pid;
+    session.winPid = winPid;
+
+    // 等 CDP 端点就绪（Edge 启动 + 调试端口监听约 1~3 秒）
+    const ready = await waitCdpReady(port, 20000);
+    if (!ready) {
+      throw new Error(`Windows 浏览器未在 20 秒内开放调试端口 ${port}。`
+        + '若 Edge 已开但端口不通，可能是 WSL localhost 转发被关闭（.wslconfig 的 localhostForwarding）');
+    }
+
+    ctx = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    session.message = '已打开登录窗口，请在其中完成登录';
+
+    // connectOverCDP 拿到的是既有上下文（含启动时的空白页）
+    const contexts = ctx.contexts();
+    const bctx = contexts[0] || null;
+    if (!bctx) throw new Error('CDP 连接成功但没有可用的浏览器上下文');
+
+    // 用第一个页面导航到登录页；没有就新建
+    const pages = bctx.pages();
+    const page = pages[0] || (await bctx.newPage());
+    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+
+    ctx.on('close', () => {
+      if (session.status === 'waiting') {
+        session.status = 'cancelled';
+        session.message = '登录窗口已关闭';
+      }
+      session.active = false;
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    });
+
+    let navigatedToSettle = false;
+    pollTimer = setInterval(async () => {
+      if (!ctx) return;
+      try {
+        // 读全部上下文的 cookie（BDUSS 在 .baidu.com，会话 cookie 在 console 域）
+        const cookies = await bctx.cookies();
+        const ck = extractAuthCookie(cookies);
+        if (ck) {
+          session.cookie = ck;
+          session.status = 'success';
+          session.message = '登录成功，已获取凭证';
+          cleanup();
+          return;
+        }
+        const hasBduss = cookies.some((c) => c.name === 'BDUSS' && c.value);
+        if (hasBduss && !navigatedToSettle) {
+          navigatedToSettle = true;
+          session.message = '已登录，正在建立控制台会话…';
+          const ps = bctx.pages();
+          const p = ps[ps.length - 1];
+          if (p) {
+            for (const u of SETTLE_URLS) {
+              try { await p.goto(u, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch (e) { /* 下一个 */ }
+            }
+          }
+        }
+      } catch (e) { /* 上下文已关闭，交给 close 事件 */ }
+    }, 1500);
+    if (pollTimer.unref) pollTimer.unref();
+
+    return { ok: true, ...snapshot() };
+  } catch (e) {
+    session.status = 'failed';
+    session.message = e.message;
+    session.active = false;
+    if (ctx) { try { await ctx.close(); } catch (x) { /* ignore */ } ctx = null; }
+    if (winPid) { killWindowsBrowser(winPid); session.winPid = 0; }
+    return { ok: false, error: e.message };
+  }
+}
+
 // 取走成功的 cookie。取走即清空——同一份凭证不应被重复入库两次。
 function takeCookie() {
   const c = session.cookie;
@@ -320,4 +544,8 @@ function cancel() {
   return { ok: true };
 }
 
-module.exports = { start, cancel, snapshot, takeCookie, findBrowser, hasDisplay, LOGIN_URL, extractAuthCookie };
+module.exports = {
+  start, cancel, snapshot, takeCookie, findBrowser, hasDisplay, LOGIN_URL, extractAuthCookie,
+  // 测试/排障用
+  isWsl, windowsBrowserPath, toWindowsPath,
+};

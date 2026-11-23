@@ -465,9 +465,10 @@ const routes = [
       url: LOGIN_URL,
       steps: [
         '点击链接，在打开的页面登录百度账号',
-        '登录成功后回到本页，打开浏览器开发者工具（F12）',
-        '切到 Application → Cookies → https://www.dumate.cn',
-        '全选复制所有 cookie，粘贴到下面的输入框',
+        '登录成功后，在页面按 F12 打开开发者工具',
+        '切到 Network（网络）标签，刷新页面，点任意 api/dumate 请求',
+        '在 Request Headers 里找到 Cookie 那一行，整行复制（BDUSS 是 HttpOnly，只能这样拿）',
+        '粘贴到下面的输入框',
       ],
       note: '百度登录态位于 baidu.com 域，网页无法直接读取浏览器 cookie，所以需要手动复制一次',
       // 两个条件缺一不可：有可执行文件，且服务端有图形界面。

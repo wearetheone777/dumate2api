@@ -6,6 +6,24 @@
 > [docs/LANDING-ARCHIVE-2026-11.md](docs/LANDING-ARCHIVE-2026-11.md)，
 > 按日期命名的 `CHANGES-*.md` 为当时的单次会话存档，不再逐条搬进本文件。
 
+## [Unreleased]
+
+### Added
+
+- **WSL 下搭子账号可自动登录**（`src/login-browser.js`）：WSL 里通常没有 Linux 浏览器，
+  原先只能手动粘 cookie。现在改用 **CDP 桥接**——用 PowerShell 在 Windows 宿主拉起 Edge
+  （独立 profile + 远程调试端口），Node 侧 `chromium.connectOverCDP` 连上读 cookie。
+  - playwright 的 stdio 管道跨不了 WSL/Windows 边界，CDP 走 TCP 可以（WSL2 localhost 转发实测可达）
+  - 零安装、零 sudo：只用宿主已有的 Edge/Chrome
+  - 取消/成功后自动关闭 Windows 侧浏览器进程，不碰用户的日常 Edge
+  - 端口默认 9333，`DUMATE_WSL_CDP_PORT` 可改
+  - 新增 `test/unit/login-browser-wsl.test.js`（7 项，锁路径换算与探测语义）
+
+### Changed
+
+- 手动粘贴的引导文案改准：原先写「全选复制所有 cookie」——DevTools 的 Cookie 表格
+  不支持多选，且 `BDUSS` 是 HttpOnly 拿不到。改为「Network 面板找 Request Headers 的 Cookie 行」。
+
 ## [2.0.0] - 2026-11-23
 
 > 破坏性版本：端口统一为 9080/9081、`stable/` 快照机制退役。

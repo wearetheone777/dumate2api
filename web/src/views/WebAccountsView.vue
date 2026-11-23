@@ -353,7 +353,7 @@
           </a-space>
 
           <div v-if="!browserAvailable" class="text-xs text-red-600 mt-2">
-            未检测到 Edge 或 Chrome，请改用右侧的「手动粘贴」
+            未检测到可用浏览器，请改用右侧的「手动粘贴」
           </div>
         </a-tab-pane>
 
