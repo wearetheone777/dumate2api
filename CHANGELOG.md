@@ -6,7 +6,10 @@
 > [docs/LANDING-ARCHIVE-2026-11.md](docs/LANDING-ARCHIVE-2026-11.md)，
 > 按日期命名的 `CHANGES-*.md` 为当时的单次会话存档，不再逐条搬进本文件。
 
-## [Unreleased]
+## [2.0.0] - 2026-11-23
+
+> 破坏性版本：端口统一为 9080/9081、`stable/` 快照机制退役。
+> 升级前请确认启动脚本、托盘快捷方式与任何写死 9082/9083 的客户端配置已更新。
 
 ### Added
 
@@ -51,3 +54,6 @@
 
 五通道（搭子 / 千问办公 / TRAE Work / Qoder / WorkBuddy）+ 三协议网关，逐批落地记录见
 [docs/LANDING-ARCHIVE-2026-11.md](docs/LANDING-ARCHIVE-2026-11.md)。
+
+[Unreleased]: https://github.com/wearetheone777/dumate2api/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/wearetheone777/dumate2api/releases/tag/v2.0.0
