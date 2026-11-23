@@ -406,7 +406,11 @@ test('在途帽:acquire/release 配额正确,pick 跳过满载账号', () => {
 // ---------------------------------------------------------------------------
 test('并发选号:轮询均摊、排除生效、冷却号跳过', () => {
   const clock = makeClock();
-  const p = memPool(clock);
+  // 本用例专测 rr 轮询语义，必须显式钉住两项——默认策略自 ea58378 起是加权抽签
+  // （DUMATE_POOL_PICK_MODE 未设时），且 pickGapMs 默认 100ms 防撞号窗口在本用例的
+  // 假时钟下永不冷却（时间不前进），会把刚选过的号持续踢出候选、破坏轮询序列。
+  // 不钉住则断言只在随机碰巧按序时通过（实测干净 HEAD 必失败）。
+  const p = memPool(clock, { pickMode: 'rr', pickGapMs: 0 });
 
   assert.equal(p.pick(['1', '2', '3']), '1');
   assert.equal(p.pick(['1', '2', '3']), '2');

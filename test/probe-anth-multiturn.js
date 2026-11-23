@@ -10,7 +10,7 @@
 // 用法：node test/probe-anth-multiturn.js [port] [model]
 const http = require('http');
 
-const PORT = parseInt(process.argv[2] || '9082', 10);
+const PORT = parseInt(process.argv[2] || '9080', 10);
 const MODEL = process.argv[3] || 'traework/Doubao-Seed-Evolving';
 
 const tools = [

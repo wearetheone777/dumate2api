@@ -10,14 +10,14 @@
 //   - 只有 text 块，正文里出现 <seed:tool_call> 之类文本 → 工具定义没到上游
 //
 // 用法：
-//   node test/probe-anth-tools.js                        # 打 9082，Doubao-Seed-Evolving
+//   node test/probe-anth-tools.js                        # 打 9080，Doubao-Seed-Evolving
 //   node test/probe-anth-tools.js 9080                   # 换端口
-//   node test/probe-anth-tools.js 9082 traework/DeepSeek-V4-Flash
-//   node test/probe-anth-tools.js 9082 traework/Doubao-Seed-Evolving 1   # 第三个参数=1 时不带 tools（对照组）
-//   node test/probe-anth-tools.js 9082 traework/Doubao-Seed-Evolving 0 131072  # 第四个参数=max_tokens
+//   node test/probe-anth-tools.js 9080 traework/DeepSeek-V4-Flash
+//   node test/probe-anth-tools.js 9080 traework/Doubao-Seed-Evolving 1   # 第三个参数=1 时不带 tools（对照组）
+//   node test/probe-anth-tools.js 9080 traework/Doubao-Seed-Evolving 0 131072  # 第四个参数=max_tokens
 const http = require('http');
 
-const PORT = parseInt(process.argv[2] || '9082', 10);
+const PORT = parseInt(process.argv[2] || '9080', 10);
 const MODEL = process.argv[3] || 'traework/Doubao-Seed-Evolving';
 const NO_TOOLS = process.argv[4] === '1';
 const MAX_TOKENS = parseInt(process.argv[5] || '4096', 10);

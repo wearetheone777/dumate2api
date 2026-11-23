@@ -3,7 +3,7 @@
 // 融合自 Wang-JQ77/dumate-api 的「积分为模型」思路（2026-11-07 调研 P0-1）：
 // 它把积分余额暴露成专用模型名 `dumate-points`（查积分不消耗积分）与
 // `GET /api/points/balance` 只读端点。本仓库管理端早有 Points / 余额曲线，
-// 但那都在 9083 管理端进程里——Agent（Codex / Claude Code）只看得到网关，
+// 但那都在 9081 管理端进程里——Agent（Codex / Claude Code）只看得到网关，
 // 它们想知道「还能跑多少」时没有任何入口。伪模型把读数搬进 /v1 面。
 //
 // 三条纪律：

@@ -11,7 +11,7 @@
 // 用法：node test/probe-anth-scale.js [port] [model]
 const http = require('http');
 
-const PORT = parseInt(process.argv[2] || '9082', 10);
+const PORT = parseInt(process.argv[2] || '9080', 10);
 const MODEL = process.argv[3] || 'traework/Doubao-Seed-Evolving';
 
 // 按 Claude Code 的实际工具集构造（名字与语义贴近，描述长度也贴近）

@@ -1,0 +1,29 @@
+# 构建上下文只留运行必需：src/、web/（构建输入）、package.json、pnpm-lock.yaml、docker/。
+# 其余一律不进上下文——尤其 data/（凭证敏感，绝不进镜像）与 .git。
+.git
+.claude
+node_modules
+web/node_modules
+web/dist
+data
+log
+*.log
+*.err
+
+# 文档与截图（README 引用的相对路径只在仓库里有意义，镜像不需要）
+docs
+assets
+*.md
+
+# 仓库内其它入口与产物（镜像只跑 src/server.js + src/admin/server.js）
+test
+templates
+tools
+launcher
+scripts
+skills
+plugins
+*.bat
+*.vbs
+opencode.json
+probe-*.js

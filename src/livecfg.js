@@ -2,7 +2,7 @@
 //
 // 参照 codebuddyManager workbuddy2api/internal/livecfg（快照 + 原子指针），
 // 按 Node 单进程形态落地：模块单例持一个快照对象，Store **整体替换**新对象，
-// Load 返回**私有拷贝**。跨进程（stable 网关 / dev / 管理端共用 data/）靠
+// Load 返回**私有拷贝**。跨进程（网关 / 管理端共用 data/）靠
 // mtime 失效重读同步——与 keys.js / modelmap.js 同一套纪律，任一进程 PUT
 // 后其余进程下一次 Load 即可见，不用重启。
 //

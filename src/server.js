@@ -688,7 +688,7 @@ function forwardToUpstream(portOrTarget, path, method, headers, body, callback) 
   // 两种调用形态：
   //   forwardToUpstream(8980, ...)                 ← 老签名，等价于搭子 target
   //   forwardToUpstream({host,port,basePath,...})  ← 路由后的 target
-  // 保留老签名是因为 stable/ 快照与外部调用点都按数字端口写，改签名会波及
+  // 保留老签名是因为外部调用点都按数字端口写，改签名会波及
   // 到不该动的代码。归一化放在这里，调用方不用关心。
   const t = (typeof portOrTarget === 'object' && portOrTarget !== null)
     ? portOrTarget
@@ -2670,7 +2670,7 @@ const server = http.createServer(async (req, res) => {
     // Health check
     if (url === '/health' || url === '/ping') {
       // 进程身份（2026-11-07 融合项 P1-6）：service 是品牌级判据，role 区分
-      // 入口（gateway / gateway-stable）。响应头同步带 X-Service——只看 JSON
+      // 入口（gateway / admin / web-gateway）。响应头同步带 X-Service——只看 JSON
       // 的探测方读字段，看头的负载均衡读头。强校验用带 Key 的 /v1/models，
       // 弱校验判 service 字段（与 workbuddy2api 面板同口径）。
       const identity = serviceIdentity.identity('gateway');

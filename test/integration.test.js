@@ -330,7 +330,11 @@ test('qwenwork.send 端到端（假上游）：失败账号进冷却、故障转
       } catch (e) { return null; }
     },
     unwrap: () => [],
-    aggregate: (payloads, model) => ({ object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: {} }),
+    // index.js 的修复接线（repairable = chat.hasFunctionTools(payload) > 0 && …）会真调它——
+    // 桩缺了这个方法整条用例报 TypeError（干净 HEAD 上复现过的预存失败）。
+    // 返回 0 = 无工具调用 → repairable=false，保持本用例原意（失败→冷却→换号）。
+    hasFunctionTools: () => 0,
+    aggregate: (payloads, model) => ({ object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: 'ok' } }], usage: {} }),
   };
   const fakeBridge = {
     warmup: () => {},

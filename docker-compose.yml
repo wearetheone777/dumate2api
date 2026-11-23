@@ -1,0 +1,34 @@
+# dumate2api 容器部署：单容器双进程（网关 9080 + 管理端 9081）。
+# 管理端查网关状态硬编码 127.0.0.1（src/admin/routes/*），不能拆成两个服务。
+services:
+  dumate2api:
+    build: .
+    image: dumate2api:latest
+    container_name: dumate2api
+    restart: unless-stopped
+    ports:
+      # 默认只绑宿主回环。要局域网/公网访问，改映射地址或上反向代理——
+      # 鉴权强制开启，但凭证只在本机数据卷里，暴露面越小越好。
+      - "127.0.0.1:9080:9080"   # 网关：OpenAI / Anthropic / Google
+      - "127.0.0.1:9081:9081"   # 管理端网页控制台
+      # TRAE 授权回调是回环 127.0.0.1:18080，默认不映射：宿主 18080 常被
+      # 本机其它实例占用，映射会直接让 compose up 失败。浏览器与 Docker
+      # 同机、且 18080 空闲时，取消注释即可自动回调；否则登录时手动粘贴
+      # 回调地址，不静默换端口。
+      # - "127.0.0.1:18080:18080"
+    environment:
+      TZ: Asia/Shanghai          # 签到排程按北京时间设计
+      DUMATE_AUTOSTART: "off"    # 容器内没有 Windows 桌面后端；搭子默认走网页凭证
+      # 鉴权强制开启：模型请求一律要 key。二选一：
+      #   1) 设 DUMATE2API_KEY 作 env 兜底 key；
+      #   2) 启动后在管理端「API Key」页签发（推荐，可配模型/通道/区域绑定）。
+      # DUMATE2API_KEY: change-me
+    volumes:
+      # 凭证（cookie / refresh token）与埋点全在这里。named volume 首次挂载
+      # 继承镜像内 /app/data 的属主（node:1000）。换 bind mount 时宿主目录
+      # 先 `mkdir -p data && chown -R 1000:1000 data`。
+      # **凭证敏感：不要导出、不要备份进任何镜像。**
+      - dumate2api-data:/app/data
+
+volumes:
+  dumate2api-data:

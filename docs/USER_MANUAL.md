@@ -58,8 +58,7 @@ npm run admin        # 管理端 :9081（另开终端）
 | 脚本 | 作用 |
 |---|---|
 | `start.bat` | 启动网关 + 后端 |
-| `start-dev.bat` | 启动开发网关 :9082 + 管理端 :9083（日常开发用） |
-| `start-stable.bat` | 启动稳定版快照 :9080（对外服务用，**必须经它启动**） |
+| `start-dev.bat` | 启动网关 :9080 + 管理端 :9081（单窗口，日常用） |
 | `start-web-gateway.bat` | 启动网页凭证独立网关 :9084 |
 | `stop.bat` | 停止网关进程树（不动 DuMate GUI 与 cc-switch） |
 | `restart.bat` | 重启 |
@@ -68,12 +67,12 @@ npm run admin        # 管理端 :9081（另开终端）
 
 | 端口 | 进程 | 说明 |
 |---|---|---|
-| 9080 | 稳定版网关 | 对外长期服务 |
-| 9081 | 管理端（默认） | `npm run admin` |
-| 9082 | 开发网关 | 开发调试 |
-| 9083 | 开发管理端 | 与 9082 配套，`start-dev.bat` |
-| 9084 | 网页凭证网关 | 多账号轮换跑模型 |
+| 9080 | 网关 | 对外服务（OpenAI / Anthropic / Google） |
+| 9081 | 管理端 | `npm run admin` / `start-dev.bat` |
+| 9084 | 网页凭证网关 | 多账号轮换跑模型（按需启动） |
 | 8980 | DuMate 后端 | 网关自动拉起，无需手动管理 |
+
+> 2026-11 起端口统一：不再有「稳定 9080 / 开发 9082」双轨，`stable/` 快照已删除。要并行跑第二个实例时才用 `DUMATE2API_PORT` / `DUMATE_ADMIN_PORT` 显式错开。
 
 ---
 
@@ -82,14 +81,14 @@ npm run admin        # 管理端 :9081（另开终端）
 ### 3.1 登录管理端
 
 1. 首次启动管理端时，终端会打印**随机生成的管理员口令**（只显示这一次，请立即保存）。
-2. 浏览器打开 `http://127.0.0.1:9081`（或开发实例 9083），用 `admin` + 该口令登录。
+2. 浏览器打开 `http://127.0.0.1:9081`，用 `admin` + 该口令登录。
 3. 忘记口令时可重设：
    ```bash
    node src/admin/server.js --reset-admin --password=你的新口令
    ```
    重设后其它已登录会话会被踢下线。
 
-> **开发实例注意**：启动管理端时要带 `DUMATE_ADMIN_GATEWAY_PORT=9082`，否则界面读的是 9080（可能没启动）的数据。
+> 管理端默认读 9080 网关，端口已统一，无需再设 `DUMATE_ADMIN_GATEWAY_PORT`。
 
 ### 3.2 配置各通道账号
 
@@ -290,7 +289,7 @@ Anthropic 协议接入 `http://127.0.0.1:9080`（裸路径 `/messages` 已支持
 | `DUMATE_REQUIRE_KEY` | 关闭 | 设 `1` 启用 API Key 校验。**对外暴露必须打开** |
 | `DUMATE_DUMATE_SOURCE` | `auto` | 设 `web` = 搭子只用网页凭证，不需要装客户端 |
 | `DUMATE_WEB_FALLBACK` | 开启 | 设 `0` 关闭「桌面失效回落网页池」 |
-| `DUMATE_ADMIN_PORT` / `_GATEWAY_PORT` | `9081` / `9080` | 管理端监听 / 读哪个网关（开发实例设 `9082`） |
+| `DUMATE_ADMIN_PORT` / `_GATEWAY_PORT` | `9081` / `9080` | 管理端监听 / 读哪个网关（默认即对；多实例时才需错开） |
 | `DUMATE_ADMIN_DATA` | `<repo>/data` | 数据目录，管理端与网关**必须一致** |
 | `DUMATE_QWENWORK_AUTOSTART` / `DUMATE_TRAEWORK_AUTOSTART` | `auto` | 设 `off` 关闭对应通道 |
 | `DUMATE_QWENWORK_USE_WASM` | 本地签名 | 设 `1` 切回官方 wasm 签名（退路，需装千问客户端） |
@@ -309,7 +308,8 @@ Anthropic 协议接入 `http://127.0.0.1:9080`（裸路径 `/messages` 已支持
 node test/probe-oai.js      # 只打 OpenAI 协议，原始 SSE 打到终端
 node test/probe-anth.js     # 只打 Anthropic 协议
 node test/verify-ccswitch.js  # Codex / Claude / 裸路径 / 模型映射四条链路
-npm test                    # 冒烟测试 32 项（需网关在线）
+npm test                    # 离线单测（不需要任何运行中的服务）
+npm run test:smoke          # 冒烟测试（需网关在线，打 9080）
 ```
 
 各通道离线自测（不开管理端）：

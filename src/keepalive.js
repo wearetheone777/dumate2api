@@ -481,7 +481,7 @@ function builtinAdapters() {
         // 精确值优先（整数 remain 是 floor，会把「还差一点」判成「已到线」）。
         let creditsWrote = 0;
         try {
-          const channelPool = require('../channel-pool');
+          const channelPool = require('./channel-pool');
           for (const r of okRows) {
             if (r.accountId == null) continue;
             const val = r.precise != null ? r.precise : r.remain;
