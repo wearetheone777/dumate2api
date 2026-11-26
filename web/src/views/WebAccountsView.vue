@@ -43,6 +43,7 @@
           >
             一键签到
           </a-button>
+          <AccountTransferCard @imported="load" />
           <a-button type="primary" size="small" @click="openAdd">添加账号</a-button>
         </a-space>
       </div>
@@ -252,18 +253,17 @@
             {{ pool.health?.accounts_ready ?? 0 }} / {{ pool.health?.accounts_total ?? 0 }}
           </span>
           <span v-else>
-            网关未启动（端口 {{ pool?.gateway_port ?? 9084 }}）
+            网关未启动（端口 {{ pool?.gateway_port ?? 9080 }}）
           </span>
         </template>
         <template #description>
           <div v-if="!pool?.gateway_online">
-            启动方式：双击 <code>start-web-gateway.bat</code>，或运行
-            <code>node src\web-gateway.js</code>
+            启动方式：<code>pnpm start</code>（或 <code>start.bat</code> / <code>start-dev.bat</code>）。
+            主网关默认就用这份网页凭证池跑模型，不需要额外的 9084 进程。
           </div>
           <div v-else>
             用下面的账号跑模型，多账号自动轮询。客户端把 Base URL 指向
-            <code>http://127.0.0.1:{{ pool.gateway_port }}</code> 即可，
-            协议与 9080 完全一致。
+            <code>http://127.0.0.1:{{ pool.gateway_port }}</code> 即可。
           </div>
         </template>
       </a-alert>
@@ -542,6 +542,7 @@
 
     <!-- 会话浏览器：网页端只读查询（会话/项目/connector），与账号管理同源凭证 -->
     <SessionBrowser />
+
     </template>
   </div>
 </template>
@@ -557,6 +558,7 @@ import QwenworkAccounts from '@/components/qwenwork/QwenworkAccounts.vue'
 import QoderAccounts from '@/components/qoder/QoderAccounts.vue'
 import WorkBuddyAccounts from '@/components/workbuddy/WorkBuddyAccounts.vue'
 import SessionBrowser from '@/components/SessionBrowser.vue'
+import AccountTransferCard from '@/components/AccountTransferCard.vue'
 import type { WebAccount, AccountStatus, PoolData, PoolAccount } from '@/api/webaccounts'
 
 // message 走 App.useApp() 的实例（App.vue 已包 <a-app>），静态 import 拿不到上下文

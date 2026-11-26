@@ -24,6 +24,7 @@
           {{ groupFilter ? `签到「${groupFilter}」组` : '一键签到' }}
         </a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="load">刷新</a-button>
+        <AccountTransferCard @imported="load" />
         <a-button type="primary" size="small" :loading="oauthLoading" :disabled="oauthPolling" @click="startOauthLogin">
           浏览器登录
         </a-button>
@@ -719,6 +720,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { App } from 'ant-design-vue'
 import { EditOutlined } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import AccountTransferCard from '@/components/AccountTransferCard.vue'
 import { channelStore, isWorkBuddy } from '@/stores/channel'
 import { regionStore, regionParam } from '@/stores/region'
 import { workbuddyApi } from '@/api/workbuddy'

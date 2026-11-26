@@ -30,6 +30,7 @@ const { routes: keysRoutes } = require('./routes/keys');
 const { routes: ccswitchRoutes } = require('./routes/ccswitch');
 const { routes: accountRoutes } = require('./routes/account');
 const { routes: webAccountsRoutes } = require('./routes/accounts');
+const { routes: accountTransferRoutes } = require('./routes/account-transfer');
 const { routes: checkinRoutes } = require('./routes/checkin');
 const { routes: dumateRoutes } = require('./routes/dumate');
 const autotask = require('./routes/autotask');
@@ -223,6 +224,9 @@ router.mount(PREFIX + '/agent-setup', require('./routes/agent-setup').routes);
 router.mount(PREFIX + '/channel-balance', require('./routes/channel-balance').routes);
 router.mount(PREFIX + '/account', accountRoutes);
 router.mount(PREFIX + '/web-accounts', webAccountsRoutes);
+// 账号导入/导出（跨通道搬凭证）：与 /system/backup 分工不同——那个搬配置，
+// 这个搬账号。导出是敏感 GET，路由内自己判 admin（GET 默认对 viewer 放行）。
+router.mount(PREFIX + '/account-transfer', accountTransferRoutes);
 router.mount(PREFIX + '/checkin', checkinRoutes);
 router.mount(PREFIX + '/dumate', dumateRoutes);
 router.mount(PREFIX + '/auto-checkin', autotask.routes);

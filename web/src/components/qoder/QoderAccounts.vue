@@ -6,6 +6,7 @@
           一键签到
         </a-button>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="load">刷新</a-button>
+        <AccountTransferCard @imported="load" />
         <a-button type="primary" size="small" @click="openLogin">添加账号</a-button>
       </template>
     </PageHeader>
@@ -279,6 +280,7 @@
 import { computed, onMounted, reactive, ref, watch, onUnmounted } from 'vue'
 import { App } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import AccountTransferCard from '@/components/AccountTransferCard.vue'
 import { channelStore, isQoder } from '@/stores/channel'
 import { regionStore, regionParam } from '@/stores/region'
 import { qoderApi } from '@/api/qoder'
