@@ -52,6 +52,10 @@ test('percentileOf：空直方图是 null（不是 0），分段给 lo/hi，最�
   const p90 = agg.percentileOf(h3, 0.9);
   assert.strictEqual(p90.hi, null);
   assert.strictEqual(p90.lo, 30000);
+  // P95（A6）：同一条直方图，p95 >= p90（段上界单调），空样本仍是 null
+  assert.strictEqual(agg.percentileOf([], 0.95), null);
+  const p95 = agg.percentileOf(h2, 0.95);
+  assert.deepStrictEqual(p95, { ms: 5000, lo: 2000, hi: 5000 });
 });
 
 test('hitRateOf：分母剔掉缓存写入；写入超过非缓存时钳零；全空是 null', () => {
@@ -101,6 +105,7 @@ test('桶聚合：TTFB 分母只数报了首字的请求；无样本三件套是
   assert.strictEqual(t.ttfb_max_ms, 1200);
   assert.strictEqual(t.ttfb_slow, 0, '>3s 才算慢');
   assert.strictEqual(t.ttfb_p50.ms, 1000, '800/1200 都落在 500~1000 段');
+  assert.deepStrictEqual(t.ttfb_p95, { ms: 2000, lo: 1000, hi: 2000 }, 'A6：p95 落最高样本所在段');
   p.dispose();
 
   const q = agg.create({ persist: false, flushMs: 0 });
@@ -108,6 +113,7 @@ test('桶聚合：TTFB 分母只数报了首字的请求；无样本三件套是
   const t2 = q.snapshot({ hours: 24 }).totals;
   assert.strictEqual(t2.ttfb_avg_ms, null, '无样本 → null，不是 0');
   assert.strictEqual(t2.ttfb_p90, null);
+  assert.strictEqual(t2.ttfb_p95, null, 'A6：无样本 p95 也是 null');
   assert.strictEqual(t2.ttfb_samples, 0);
   q.dispose();
 });

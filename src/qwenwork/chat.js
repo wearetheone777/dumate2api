@@ -20,6 +20,27 @@ const { contentText } = require('../images');
 
 const TIMEOUT_MS = 600000;
 
+// is_vl 的权威来源是上游模型目录（实测 2026-11-27：14 个档位全返 is_vl:true）。
+// 旧的白名单只认 3 个档位，是 1.0.4 客户端时代的保守组合——上游已全开放，
+// 但 COSY text 槽仍不传图，所以这个标志只影响发给上游的元数据，不代表本链路能传图。
+// 目录没拉到时回落白名单（不把所有模型都标成 false）。
+const LEGACY_VL_KEYS = new Set(['pro', 'flash', 'qwen3.8-max-preview']);
+let vlCatalog = null;
+
+function isVlOf(modelKey) {
+  if (vlCatalog && typeof vlCatalog[modelKey] === 'boolean') return vlCatalog[modelKey];
+  try {
+    // 只取已经缓存的目录，不触发网络（buildBody 是同步的，不能在这里发请求）
+    const idx = require('./index');
+    const sync = idx.cachedModelCapabilities && idx.cachedModelCapabilities();
+    if (sync) {
+      vlCatalog = sync;
+      if (typeof sync[modelKey] === 'boolean') return sync[modelKey];
+    }
+  } catch (e) { /* 循环依赖未就绪时用白名单 */ }
+  return LEGACY_VL_KEYS.has(modelKey);
+}
+
 /**
  * 取一次请求要用的凭证，必要时先换票。
  *
@@ -135,6 +156,17 @@ function buildBody(modelKey, payload, out = {}) {
   }
   if (parameters.max_tokens == null) parameters.max_tokens = 32000;
 
+  // reasoning_effort 透传（2026-11-27 融合 P1-1）：low/medium/high/xhigh 原样
+  // 进 parameters；'none'/'off' 视为关闭（不注入，走上游默认）；非法值忽略。
+  // 千问通道按社区实测透传——**搭子对 reasoning_effort 不敏感是搭子的结论**，
+  // 别套到千问。is_reasoning 的总开关由 DUMATE_QWENWORK_REASONING 控制（见 constants）。
+  if (payload && payload.reasoning_effort != null) {
+    const eff = String(payload.reasoning_effort).trim().toLowerCase();
+    if (eff !== 'none' && eff !== 'off' && ['low', 'medium', 'high', 'xhigh'].includes(eff)) {
+      parameters.reasoning_effort = eff;
+    }
+  }
+
   // 工具定义必须透传：硬编码空数组会让模型看不到工具，
   // 于是把工具调用当**文本**输出（Codex 里表现为 `<tool_call>` 原样打印、不执行）。
   //
@@ -168,7 +200,7 @@ function buildBody(modelKey, payload, out = {}) {
       features: [],
       extra: {
         context: [],
-        modelConfig: { key: modelKey, is_reasoning: false },
+        modelConfig: { key: modelKey, is_reasoning: constants.REASONING_ON },
         originalContent: text,
         chatPrompt: '',
       },
@@ -188,10 +220,10 @@ function buildBody(modelKey, payload, out = {}) {
       display_name: modelKey,
       model: '',
       format: 'openai',
-      // is_vl 白名单对照 Buddy2api v2.2.17（1.0.4 客户端实测组合，2026-11-06 融合）：
-      // qwen3.8-max-preview 也算多模态档，原实现漏了它（当时只实测过 pro/flash）。
-      is_vl: modelKey === 'pro' || modelKey === 'flash' || modelKey === 'qwen3.8-max-preview',
-      is_reasoning: false,
+      // is_vl 按上游目录（实测 14 个档位全 true）；目录未拉到时回落旧白名单。
+      // 注意这只是发给上游的能力声明，COSY text 槽本身仍不传图片。
+      is_vl: isVlOf(modelKey),
+      is_reasoning: constants.REASONING_ON,
       api_key: '',
       url: '',
       source: 'system',
@@ -223,24 +255,37 @@ function buildBody(modelKey, payload, out = {}) {
 }
 
 /** 剥外层信封：返回内层 OpenAI SSE payload 数组 */
+// 剥信封的最大层数（2026-11-27 融合 P2-1）。上游可能把 [DONE] 或真实 payload
+// 包在多层 body 信封里，只剥一层会漏判。
+const MAX_UNWRAP_DEPTH = 6;
+
 function unwrap(raw) {
-  const text = String(raw || '').trim();
-  if (!text || text === '[DONE]' || text === '{}') return [];
-  let outer;
-  try { outer = JSON.parse(text); } catch (e) { return [text]; }
-  if (!outer || typeof outer !== 'object') return [];
-  if (outer.choices || outer.object === 'chat.completion.chunk' || outer.object === 'chat.completion') {
-    return [text];
+  let text = String(raw || '').trim();
+  if (!text) return [];
+  // 逐层剥 body 信封。**任何一层出现字符串形态的 [DONE] 都认成结束标记并透传**：
+  // 上游把 [DONE] 包在信封里时，只认裸 [DONE] 会漏判，表现为流不结束、
+  // 上层一直等（doneSeen 永不置位）。
+  for (let depth = 0; depth < MAX_UNWRAP_DEPTH; depth++) {
+    if (text === '[DONE]') return ['[DONE]'];
+    if (text === '{}' || text === '[]' || text === 'null') return [];
+    let outer;
+    try { outer = JSON.parse(text); } catch (e) { return [text]; }
+    if (!outer || typeof outer !== 'object') return [text];
+    // 已经是内层 payload（choices / chat.completion 形状）：原样返回，不再剥
+    if (outer.choices || outer.object === 'chat.completion.chunk' || outer.object === 'chat.completion') {
+      return [text];
+    }
+    const inner = outer.body;
+    if (inner == null) return [text]; // 无 body 字段：不是信封，原样返回让上层判断
+    if (typeof inner === 'object') {
+      text = JSON.stringify(inner);
+    } else {
+      text = String(inner).trim();
+    }
+    // 循环继续剥下一层
   }
-  const inner = outer.body;
-  if (inner == null) return [];
-  if (typeof inner === 'object') {
-    const dumped = JSON.stringify(inner);
-    return dumped === '{}' || dumped === '[]' ? [] : [dumped];
-  }
-  const s = String(inner).trim();
-  if (!s || s === '[DONE]' || s === '{}' || s === 'null') return [];
-  return [s];
+  // 超过最大深度：返回最后一层（防无限循环）
+  return [text];
 }
 
 /** 发一次推理请求，返回 { status, headers, raw }。opts.agent 出站代理（E 包接线） */
@@ -402,6 +447,7 @@ module.exports = {
   buildBody,
   hasFunctionTools,
   resolveModelKey,
+  isVlOf,
   ensureAccount,
   unwrap,
   envelopeStatus,

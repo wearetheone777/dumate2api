@@ -181,9 +181,14 @@
     <a-card v-else-if="isQw" :bordered="false">
       <template #title>
         <span class="section-title">千问办公模型</span>
-        <a-tag class="ml-2" color="cyan">只读</a-tag>
+        <a-tag class="ml-2" color="blue">开关跟随本机</a-tag>
       </template>
       <template #extra>
+        <a-tooltip title="只测免费模型 minimax3.1flash，不消耗积分">
+          <a-button size="small" class="ghost-btn mr-2" :loading="qwTesting" @click="testQwModels()">
+            {{ qwTesting ? '测试中…' : '测免费模型' }}
+          </a-button>
+        </a-tooltip>
         <a-button size="small" class="ghost-btn mr-2" :loading="qwBillingChecking" @click="runQwBillingCheck">
           计费自检
         </a-button>
@@ -222,6 +227,26 @@
               <span v-if="!qwStatus.acpMode" class="cell-sub">尚无 ACP 会话</span>
             </div>
           </div>
+          <div class="qw-channel-cell" v-if="qwStatus.maas">
+            <div class="cell-label">MaaS 直连</div>
+            <div class="cell-value">
+              <a-tag :color="qwStatus.maas.available ? 'green' : 'default'">
+                {{ qwStatus.maas.available ? '可用' : (qwStatus.maas.enabled ? '凭证不可用' : '未启用') }}
+              </a-tag>
+              <span v-if="qwStatus.maas.expiresAtMs" class="cell-sub">
+                到期 {{ fmtTime(qwStatus.maas.expiresAtMs) }}
+              </span>
+            </div>
+          </div>
+          <div class="qw-channel-cell" v-if="qwStatus.langfuse">
+            <div class="cell-label">Langfuse</div>
+            <div class="cell-value">
+              <a-tag :color="qwStatus.langfuse.configured ? 'green' : 'default'">
+                {{ qwStatus.langfuse.configured ? '导出中' : '未配置' }}
+              </a-tag>
+              <span v-if="qwStatus.langfuse.queued" class="cell-sub">队列 {{ qwStatus.langfuse.queued }}</span>
+            </div>
+          </div>
         </div>
 
         <!-- 计费自检结果：千问没有标称倍率，只有实测成本（三池余额差值）。
@@ -247,6 +272,18 @@
           </template>
         </a-alert>
 
+        <!-- 测试结果：每个模型一个档位标签，失败原因 hover 可见 -->
+        <div v-if="qwTestResults.length" class="mt-3">
+          <div class="text-xs text-slate-400 mb-1">测试结果（串行 · max_tokens=8 · 首字即停）</div>
+          <div class="flex flex-wrap gap-2">
+            <a-tooltip v-for="r in qwTestResults" :key="r.model" :title="r.message || `${r.status} · ${r.latencyMs}ms`">
+              <a-tag :color="TIER_COLORS[r.tier] || 'default'">
+                {{ r.model }} · {{ r.label }} · {{ r.latencyMs }}ms
+              </a-tag>
+            </a-tooltip>
+          </div>
+        </div>
+
         <a-table
           size="small"
           :pagination="false"
@@ -256,7 +293,26 @@
           class="mt-3"
         >
           <template #bodyCell="{ column, record }">
-            <template v-if="column.key === 'name'">
+            <template v-if="column.key === 'enabled'">
+              <label class="inline-flex items-center gap-1 cursor-pointer">
+                <a-switch
+                  size="small"
+                  :checked="!record.disabled"
+                  :disabled="qwTesting"
+                  @change="(v: boolean) => toggleQwModel(record.id, !v)"
+                />
+                <span :class="record.disabled ? 'text-slate-500' : 'text-green-400'">
+                  {{ record.disabled ? '已关' : '启用' }}
+                </span>
+              </label>
+            </template>
+            <template v-else-if="column.key === 'test'">
+              <a-tooltip v-if="!record.free" title="非免费模型，测试会消耗真实积分，已禁用">
+                <a-button size="small" type="link" disabled>测试</a-button>
+              </a-tooltip>
+              <a-button v-else size="small" type="link" :disabled="qwTesting" @click="testQwModels(record.id)">测试</a-button>
+            </template>
+            <template v-else-if="column.key === 'name'">
               <div class="font-medium">{{ record.name }}</div>
               <div class="text-xs text-slate-400">中文显示名（来自上游）</div>
             </template>
@@ -286,7 +342,61 @@
 
         <div class="text-xs text-slate-500 mt-3">
           调用时用前缀名（如 <span class="font-mono">qwen/{{ qwModels[0]?.id || 'pro' }}</span>）；
-          不带前缀的名字一律走搭子。
+          不带前缀的名字一律走搭子。模型开关是本机的，刷新目录不会重置；目录删掉的模型自动清理。
+        </div>
+
+        <!-- 三项能力覆盖层：没动过跟随目录，动过标「已改」+ 可撤回 -->
+        <div class="mt-4 border-t border-slate-700 pt-3">
+          <div class="section-title mb-2">能力覆盖 <span class="text-xs text-slate-500 font-normal">（跟随上游目录 · 改后本机生效）</span></div>
+          <div v-for="o in qwOverrides" :key="o.key" class="qw-override-row">
+            <div class="qw-override-head">
+              <span class="font-mono text-xs">{{ o.key }}</span>
+              <a-tag v-if="o.dirty" color="orange" class="ml-2">已改</a-tag>
+              <a-button v-if="o.dirty" type="link" size="small" class="ml-auto" @click="clearQwOverride(o.key)">跟随目录</a-button>
+            </div>
+            <div class="qw-override-fields">
+              <label class="qw-override-field">
+                <span>上下文</span>
+                <a-select
+                  size="small"
+                  :value="String(o.effectiveContext ?? '')"
+                  :options="[
+                    { label: '跟随目录', value: '' },
+                    { label: '200K', value: '200000' },
+                    { label: '500K', value: '500000' },
+                    { label: '1M', value: '1000000' },
+                    { label: '2M', value: '2000000' },
+                  ]"
+                  style="width: 130px"
+                  @change="(v: string) => v ? saveQwOverride(o.key, 'context', v) : clearQwOverride(o.key)"
+                />
+              </label>
+              <label class="qw-override-field">
+                <span>图片输入</span>
+                <a-switch
+                  size="small"
+                  :checked="!!o.effectiveVision"
+                  @change="(v: boolean) => saveQwOverride(o.key, 'vision', v)"
+                />
+              </label>
+              <label class="qw-override-field" v-if="o.reasoning">
+                <span>思考强度</span>
+                <a-select
+                  size="small"
+                  :value="String(o.effectiveReasoning ?? 'auto')"
+                  :options="[
+                    { label: '跟随目录', value: 'auto' },
+                    { label: '关闭', value: 'none' },
+                    { label: '低', value: 'low' },
+                    { label: '中', value: 'medium' },
+                    { label: '高', value: 'high' },
+                  ]"
+                  style="width: 120px"
+                  @change="(v: string) => v === 'auto' ? clearQwOverride(o.key) : saveQwOverride(o.key, 'reasoning', v)"
+                />
+              </label>
+            </div>
+          </div>
         </div>
       </template>
     </a-card>
@@ -296,7 +406,7 @@
     <a-card v-if="isQw" :bordered="false">
       <template #title>
         <span class="section-title">模型信息</span>
-        <a-tag class="ml-2" color="cyan">只读</a-tag>
+        <a-tag class="ml-2" color="cyan">上游下发 · 可覆盖</a-tag>
       </template>
       <ModelInfoTable :channel="'qwenwork'" :preloaded="qwInfoRows" />
     </a-card>
@@ -1407,12 +1517,71 @@ async function clearTwModelCache() {
 }
 
 // 千问模型：直接问 /qwenwork/models，不再从 /models/map 的 channels 里蹭
-const qwModels = ref<Array<{ id: string; name: string; prefixed: string }>>([])
+const qwModels = ref<Array<{ id: string; name: string; prefixed: string; free?: boolean }>>([])
 const qwError = ref('')
+// 逐模型开关 + 能力覆盖层（A1）：effective* 是合并后的最终值
+const qwOverrides = ref<import('@/api/qwenwork').QwModelOverrideView[]>([])
+const qwTesting = ref(false)
+const qwTestResults = ref<import('@/api/qwenwork').QwModelTestResult[]>([])
+
+async function loadQwOverrides() {
+  try {
+    const r = await qwenworkApi.modelOverrides()
+    qwOverrides.value = r.data.entries || []
+  } catch { qwOverrides.value = [] }
+}
+
+async function toggleQwModel(model: string, disabled: boolean) {
+  try {
+    await qwenworkApi.setModelDisabled(model, disabled)
+    await Promise.all([load(), loadQwOverrides()])
+  } catch (e: any) { message.error(e?.message || '切换失败') }
+}
+
+async function saveQwOverride(model: string, field: 'context' | 'vision' | 'reasoning', value: unknown) {
+  try {
+    await qwenworkApi.setModelOverride(model, field, value)
+    await loadQwOverrides()
+    message.success('已保存（跟随目录可撤回）')
+  } catch (e: any) { message.error(e?.message || '保存失败') }
+}
+
+async function clearQwOverride(model: string) {
+  try {
+    await qwenworkApi.clearModelOverride(model)
+    await loadQwOverrides()
+    message.success('已恢复跟随目录')
+  } catch (e: any) { message.error(e?.message || '恢复失败') }
+}
+
+const TIER_COLORS: Record<string, string> = {
+  available: 'green', no_output: 'orange', unsupported: 'red', auth_failed: 'red',
+  quota: 'orange', rate_limited: 'orange', network: 'red', server: 'red',
+  forbidden: 'red', unknown: 'default',
+}
+
+async function testQwModels(model?: string) {
+  if (qwTesting.value) return
+  qwTesting.value = true
+  qwTestResults.value = []
+  try {
+    const r = await qwenworkApi.testModels(model)
+    if (!r.data.ok && r.data.error) message.error(r.data.error)
+    qwTestResults.value = r.data.results || []
+  } catch (e: any) {
+    message.error(e?.message || '测试失败')
+  } finally {
+    qwTesting.value = false
+  }
+}
 // 千问积分池：与模型表一起展示，回答「这些模型花的是哪份额度」
 const qw = ref<QwCredits | null>(null)
 // 千问通道元信息：账号、套餐、token 状态
-const qwStatus = ref<{ account: string; tier: string; planId: string; refreshExpired: boolean; tokenExpired: boolean; acpMode: string | null } | null>(null)
+const qwStatus = ref<{
+  account: string; tier: string; planId: string; refreshExpired: boolean; tokenExpired: boolean; acpMode: string | null;
+  maas?: import('@/api/qwenwork').QwStatusMaas | null;
+  langfuse?: import('@/api/qwenwork').QwStatusLangfuse | null;
+} | null>(null)
 
 // 计费自检：千问没有标称倍率（模型表无 price_factor），探针只报实测成本
 // （三池余额差值 ÷ tokens）。默认用 flash——成本量级最小
@@ -1568,9 +1737,19 @@ const fmtReset = (iso?: string | null) => {
 // 直接在前端算——数据量小（百行级），不必走后端聚合。
 const modelRows = computed(() => {
   // 只统计合计消耗：上游停发每日免费额度后，free/paid 分列恒为 0 与全额
-  const map: Record<string, { id: string; name: string; prefixed: string; requests: number; last: number | null; total: number }> = {}
+  const map: Record<string, { id: string; name: string; prefixed: string; free: boolean; requests: number; last: number | null; total: number; disabled: boolean; dirty: boolean; effectiveContext: any; effectiveVision: boolean; effectiveReasoning: any }> = {}
+  const ovMap: Record<string, import('@/api/qwenwork').QwModelOverrideView> = {}
+  for (const o of qwOverrides.value) ovMap[o.key] = o
   for (const m of qwModels.value) {
-    map[m.id] = { id: m.id, name: m.name, prefixed: m.prefixed, requests: 0, last: null, total: 0 }
+    const ov = ovMap[m.id]
+    map[m.id] = {
+      id: m.id, name: m.name, prefixed: m.prefixed, free: m.free === true, requests: 0, last: null, total: 0,
+      disabled: ov?.disabled || false,
+      dirty: ov?.dirty || false,
+      effectiveContext: ov?.effectiveContext ?? null,
+      effectiveVision: ov?.effectiveVision ?? false,
+      effectiveReasoning: ov?.effectiveReasoning ?? false,
+    }
   }
   // 调用次数与最近一次
   const since = Date.now() - 7 * 86400000
@@ -1595,11 +1774,13 @@ const modelRows = computed(() => {
 const qwUsage = ref<Array<{ model: string; ts: number; qw_total?: number }>>([])
 
 const modelColumns = [
-  { title: '显示名', key: 'name', width: '22%' },
-  { title: '模型 ID', key: 'id', width: '16%' },
-  { title: '调用前缀', key: 'prefixed', width: '18%' },
-  { title: '近 7 天', key: 'usage', width: '28%' },
-  { title: '最近调用', key: 'last', width: '16%' },
+  { title: '启用', key: 'enabled', width: '8%' },
+  { title: '显示名', key: 'name', width: '16%' },
+  { title: '模型 ID', key: 'id', width: '14%' },
+  { title: '调用前缀', key: 'prefixed', width: '14%' },
+  { title: '近 7 天', key: 'usage', width: '20%' },
+  { title: '最近调用', key: 'last', width: '14%' },
+  { title: '操作', key: 'test', width: '14%' },
 ]
 
 // 上游全量表是否包含内部模型（subagent / custom_model 占位 / summary）。
@@ -1680,6 +1861,7 @@ async function load() {
       qwStatus.value = status.data as any
       qwUsage.value = (usage.data.rows || []) as any
       qwInfoRows.value = info.data.rows || []
+      await loadQwOverrides()
       return
     }
     // 搭子：映射表 + 统一模型信息（上下文 / 输出上限）+ 通道元信息与积分。
@@ -1875,5 +2057,29 @@ watch(() => regionStore.current, async () => {
 .qw-model-usage {
   font-size: 13px;
   color: var(--lab-text);
+}
+/* 逐模型能力覆盖层（A1） */
+.qw-override-row {
+  padding: 8px 10px;
+  border: 1px solid var(--lab-border, #1e293b);
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+.qw-override-head {
+  display: flex;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.qw-override-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+.qw-override-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--lab-text-muted, #94a3b8);
 }
 </style>

@@ -219,7 +219,9 @@ const hasTool = (chunks) => chunks.some((c) => typeof c === 'object' && c.choice
     let err = null;
     try { await collect(payload()); } catch (e) { err = e; }
     ok(!!err, '错误被抛出（不吞成空回答）');
-    ok(err && Number(err.statusCode) === 402, '状态码透传：' + (err && err.statusCode));
+    // P2-2（2026-11-27）：额度类错误（402 积分耗尽）在没输出内容时转 429
+    // 带可重试语义——这是刻意分类，不是修复机制的变形。
+    ok(err && Number(err.statusCode) === 429, '额度错误转 429：' + (err && err.statusCode));
     ok(bodies.length === 1, '错误不触发修复重试');
   }
 

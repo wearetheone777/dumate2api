@@ -8,6 +8,16 @@
 // **对外响应形状保持**：前端三个页面（登录态 / 账号管理 / 仪表盘）在按现有
 // 字段渲染，这里只换取值来源，不换字段。
 const { sendJSON } = require('../router');
+
+// 千问测试纪律（2026-11-27 用户定案）：测试按钮只打免费模型，避免真实扣积分。
+// 上游模型表没有免费字段，按显式白名单判定 minimax3.1flash。
+const FREE_TEST_MODELS = new Set(['minimax-m3.1-flash', 'minimax3.1flash']);
+function isFreeTestModel(key) {
+  return FREE_TEST_MODELS.has(String(key || '').toLowerCase());
+}
+function filterTestableModels(keys) {
+  return Array.isArray(keys) ? keys.filter(isFreeTestModel) : [];
+}
 const authStore = require('../../qwenwork/auth');
 const login = require('../../qwenwork/login');
 const credits = require('../../qwenwork/credits');
@@ -667,6 +677,59 @@ const routes = [
       return sendJSON(res, 200, { ok: true, results: out });
     },
   },
+  // ---- A4（2026-11-27）：导入已有登录态 ----
+  // 社区实现：POST /admin/api/import {access, refresh?, uid?} 直接灌入从
+  // 客户端解出的 token，免去重新 device flow。与 device flow 并存。
+  {
+    method: 'POST',
+    path: '/accounts/import',
+    handler: async ({ res, body }) => {
+      const access = body && String(body.access || body.accessToken || '').trim();
+      if (!access) return sendJSON(res, 400, { error: '缺少 access token' });
+      const fields = {
+        accessToken: access,
+        refreshToken: String(body.refresh || body.refreshToken || ''),
+        uid: String(body.uid || ''),
+        machineId: authStore.genMachineId(),
+        lastError: '',
+        lastErrorAt: null,
+        enabled: body.enabled !== false,
+      };
+      // 有 uid 时拉一次用户信息补齐昵称/套餐（只读，失败不阻断导入）
+      if (fields.uid) {
+        try {
+          const info = await authStore.fetchUserInfo({
+            accessToken: fields.accessToken,
+            uid: fields.uid,
+            machineId: fields.machineId,
+          });
+          if (info) {
+            fields.nickname = info.nickname || fields.nickname || '';
+            fields.tier = info.tier || '';
+            fields.planId = info.planId || '';
+            fields.planName = info.planName || '';
+            fields.username = info.username || '';
+          }
+        } catch (e) { /* 拉不到用户信息不影响导入，账号页会显示 uid */ }
+      }
+      const rec = authStore.upsert(fields);
+      try { require('../auth').audit('admin', 'qwenwork_account_import', rec.id); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: true, account: authStore.list().find((x) => x.id === rec.id) });
+    },
+  },
+  // ---- A5（2026-11-27）：单号换指纹 ----
+  // 一号一 machineId（登录时生成），风控排查时换指纹重试，不换号、不换 token。
+  {
+    method: 'POST',
+    path: '/accounts/:id/rotate-fingerprint',
+    handler: async ({ res, params }) => {
+      const a = authStore.get(params[0]);
+      if (!a) return sendJSON(res, 404, { error: '账号不存在' });
+      authStore.patch(params[0], { machineId: authStore.genMachineId(), lastError: '', lastErrorAt: null });
+      try { require('../auth').audit('admin', 'qwenwork_fingerprint_rotate', params[0]); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: true, account: authStore.list().find((x) => x.id === a.id) });
+    },
+  },
   {
     method: 'DELETE',
     path: '/accounts/:id',
@@ -727,6 +790,10 @@ const routes = [
         loggedIn: !!st.loggedIn,
         error: st.error || '',
         accounts: st.accounts || 0,
+        maas: st.maas || null,
+        langfuse: (() => {
+          try { return require('../../langfuse-export').meta(); } catch (e) { return { enabled: false, configured: false }; }
+        })(),
         ...acct,
       });
     },
@@ -809,15 +876,138 @@ const routes = [
       let error = '';
       try {
         const qw = require('../../qwenwork');
-        const keys = await qw.listModels();
-        // 中文名来自上游 display_name（pro→高级 / flash→标准）。
-        // 硬编码一份必然过期——1.1.0 实测模型表已与旧版不同。
-        const names = { pro: '高级', flash: '标准', 'qwen3.8-max-preview': 'Qwen3.8-Max' };
-        models = keys.map((k) => ({ id: k, name: names[k] || k, prefixed: `qwen/${k}` }));
+        const entries = await qw.listModelEntries(true);
+        models = entries.map((m) => ({
+          id: m.key,
+          name: m.name || m.key,
+          prefixed: `qwen/${m.key}`,
+          free: m.free === true,
+        }));
       } catch (e) {
         error = e.message;
       }
       return sendJSON(res, 200, { models, error });
+    },
+  },
+  // ---- A2（2026-11-27）：模型测试按钮 + 判定分档 ----
+  // 见 docs/PLAN-QWENWORK-GITHUB-MERGE-ROUND2.md §A2。复用 qwen.send() 走
+  // 完整链路（签名/选号/错误分类），不重复造轮子。max_tokens=8 最小请求，
+  // 减少积分消耗；串行执行避免并发触发限流（社区实测纪律）。
+  // **测试纪律（用户定案）**：只测免费模型。上游没有免费字段，按显式白名单
+  // minimax3.1flash（上游键 minimax-m3.1-flash）判定；其它模型不给测，
+  // 避免测试按钮真实扣积分。
+  {
+    method: 'POST',
+    path: '/models/test',
+    handler: async ({ res, body }) => {
+      const qw = require('../../qwenwork');
+      const { classifyTestResult } = require('../../qwenwork/test-probe');
+      const requestedRaw = body && body.model ? String(body.model).replace(/^qwen\//, '') : '';
+      const requested = requestedRaw ? (isFreeTestModel(requestedRaw) ? requestedRaw : '') : '';
+      if (requestedRaw && !requested) {
+        return sendJSON(res, 200, {
+          ok: false,
+          error: `模型 ${requestedRaw} 非免费模型，测试只支持 minimax3.1flash（不消耗积分）`,
+          results: [],
+        });
+      }
+      let keys;
+      try {
+        keys = requested ? [requested] : filterTestableModels(await qw.listModels());
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, error: e.message });
+      }
+      if (!keys.length) return sendJSON(res, 200, {
+        ok: false,
+        error: '当前模型表没有免费模型，未发送任何测试请求（避免消耗积分）',
+        results: [],
+      });
+
+      const results = [];
+      for (const key of keys) {
+        let hasContent = false;
+        let status = 0;
+        let message = '';
+        const startedAt = Date.now();
+        try {
+          await qw.send(
+            {
+              model: key,
+              messages: [{ role: 'user', content: 'hi' }],
+              max_tokens: 8,
+              stream: true,
+            },
+            (chunk) => {
+              // 只看真实正文（choices[].delta.content），reasoning 不算内容
+              try {
+                const j = typeof chunk === 'string' && chunk.startsWith('data: ')
+                  ? JSON.parse(chunk.slice(6)) : JSON.parse(chunk);
+                if (j && j.choices && j.choices[0] && j.choices[0].delta
+                  && j.choices[0].delta.content) hasContent = true;
+              } catch (e) { /* 非 JSON 帧忽略 */ }
+            },
+          );
+          status = 200;
+        } catch (e) {
+          status = Number(e.statusCode) || 0;
+          message = e.message || '';
+        }
+        const verdict = classifyTestResult(status, message, hasContent);
+        results.push({ model: key, ...verdict, status, message: message || undefined, latencyMs: Date.now() - startedAt });
+      }
+      return sendJSON(res, 200, { ok: true, results });
+    },
+  },
+  // ---- A1（2026-11-27）：逐模型开关 + 三项能力覆盖层 ----
+  // 见 docs/PLAN-QWENWORK-GITHUB-MERGE-ROUND2.md §A1。覆盖层是本机偏好，
+  // 原子写 + mtime 热读，改完立即生效不重启。目录删模型由 fetchModelList 的
+  // prune 自动清掉，不在此重复处理。
+  {
+    method: 'GET',
+    path: '/model-overrides',
+    handler: async ({ res }) => {
+      const qw = require('../../qwenwork');
+      const ov = require('../../qwenwork/model-overrides');
+      try {
+        const entries = await qw.listModelEntries(true);
+        return sendJSON(res, 200, { entries: ov.mergedView(entries) });
+      } catch (e) {
+        return sendJSON(res, 200, { entries: [], error: e.message });
+      }
+    },
+  },
+  {
+    method: 'POST',
+    path: '/model-overrides',
+    handler: async ({ res, body }) => {
+      const ov = require('../../qwenwork/model-overrides');
+      const model = body && body.model ? String(body.model).replace(/^qwen\//, '') : '';
+      if (!model) return sendJSON(res, 400, { error: '缺少 model' });
+      try {
+        if (body.disabled != null) {
+          ov.setDisabled(model, !!body.disabled);
+        } else if (body.field) {
+          ov.setOverride(model, body.field, body.value);
+        } else {
+          return sendJSON(res, 400, { error: '缺少 disabled 或 field' });
+        }
+        try { require('../auth').audit('admin', 'qwenwork_model_override', model, JSON.stringify({ disabled: body.disabled, field: body.field })); } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, state: ov.load() });
+      } catch (e) {
+        return sendJSON(res, 400, { error: e.message });
+      }
+    },
+  },
+  {
+    method: 'DELETE',
+    path: '/model-overrides/:model',
+    handler: async ({ res, params }) => {
+      const ov = require('../../qwenwork/model-overrides');
+      const model = String((params && params[0]) || '').replace(/^qwen\//, '');
+      if (!model) return sendJSON(res, 400, { error: '缺少 model' });
+      ov.clearOverride(model);
+      try { require('../auth').audit('admin', 'qwenwork_model_override_clear', model); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: true, state: ov.load() });
     },
   },
 ];

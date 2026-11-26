@@ -26,6 +26,10 @@ const crypto = require('crypto');
 // 通道在池里的 uid 键位 = 'qwenwork:<id>'（channel-pool.js 统一裁决）。
 const channelPool = require('../channel-pool');
 const CHANNEL = 'qwenwork';
+// 「无可用账号」归因（2026-11-27 融合 P0-2）：把池的 availability() 结果
+// 压成四态文案 + 冷却概况，替代原来的笼统「没有可用账号」。
+const cooldown = require('./cooldown');
+const modelOverrides = require('./model-overrides');
 // FEFO（临期积分优先）：数据源 expiring.js（写方是管理端 /accounts）
 const expiringSnap = require('../expiring');
 
@@ -64,6 +68,8 @@ function status() {
     wasm: w ? { file: w.file, version: w.version } : null,
     loggedIn: usable.length > 0,
     accounts: usable.length,
+    // G1 MaaS 备选链路：只暴露元数据，不暴露 accessKey
+    maas: require('./maas').meta(),
     // ACP 链路上游实定档位（最近一次建会话的 extra_data.mode；无会话 null）
     acpMode: (() => {
       try { return require('./acp').lastMode(); } catch (e) { return null; }
@@ -111,6 +117,30 @@ function retryable(code, message) {
     return /not available for this user|not available|无权限|无权访问/i.test(String(message || ''));
   }
   if (n >= 500) return true; // 上游抖动，换号可能落到别的实例
+  return false;
+}
+
+/**
+ * 这条错误是不是「额度不足 / 模型不可用」类（2026-11-27 融合 P2-2）。
+ *
+ * 与 retryable 的区别：retryable 还包含 401/429/5xx/网络——那些各有自己的
+ * 处置。这里只认两类「换号/换模型可能救、但当前组合不可用」的错误：
+ *   - 402 积分耗尽（额度用尽，等重置）
+ *   - 403 + 模型不可用文案（该账号对该模型无权限，换账号/换模型即可）
+ *
+ * 用途：全部账号都栽在这类错误上、且一个内容块都没发出时，回 429 带可重试
+ * 语义（而不是 402/403），供路由层选择下一路。
+ */
+function isQuotaOrModel(code, message) {
+  const n = Number(code);
+  if (n === 402) return true;
+  if (n === 403) {
+    // 模型不可用文案（对齐 upstream-errors.js 的 MODEL_TEXT 口径）：
+    // 英文 not available/not found/not exist/unsupported，中文 不可用/不存在/不支持，
+    // 加上 无权限/无权访问（同属「换号/换模型可能救」的账号维度拒绝）。
+    return /not available for this user|not available|not found|not exist|unsupported|不可用|不存在|不支持|无权限|无权访问/i
+      .test(String(message || ''));
+  }
   return false;
 }
 
@@ -323,8 +353,22 @@ const MAX_ATTEMPTS = 3;
 async function send(payload, onChunk, opts = {}) {
   const tried = new Set();
   const errors = [];
+  // 重试耗尽时（没有更多可重试的账号）记下的归因结果，挂到最后的错误上
+  let noAccountAv = null;
   // 上游模型名（去掉通道前缀）：池的模型级负缓存与故障喂入都按它记
   const model = payload && payload.model ? String(payload.model).replace(/^qwen\//, '') : '';
+  // A1（2026-11-27）：禁用模型在选号前拦截——不消耗账号、不扣积分，回 403
+  // 明确报错（不静默兜底、不进 /v1/models）。key 用 resolveModelKey 解析后的值，
+  // 别名（如 qwenwork-advanced → pro）也拦得住。
+  if (model) {
+    const resolved = chat.resolveModelKey(model);
+    if (modelOverrides.isDisabled(resolved)) {
+      const e = new Error(`模型 ${model} 已被禁用（管理端逐模型开关），请改用其它模型`);
+      e.statusCode = 403;
+      e.code = 'model_disabled';
+      throw e;
+    }
+  }
   // 会话粘性键：同一会话尽量落到同一账号（TRAE/长上下文场景省重放），
   // channel-pool 内部判定不健康即解绑换号
   const sessionKey = channelPool.sessionKeyFor(payload, opts);
@@ -337,9 +381,12 @@ async function send(payload, onChunk, opts = {}) {
   const fefo = fefoUidSet();
   let sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring: fefo });
   if (!sel) {
-    const err = new Error('千问办公没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
-    err.statusCode = 503;
-    throw err;
+    // 归因四态 + 冷却概况（P0-2）：不压成一句「没有可用账号」，
+    // 软冷却回 429（客户端自动退避重试），其余回 503 等人处理或等额度重置。
+    throw cooldown.attributeNoAccount(
+      channelPool.availability(CHANNEL, usable, { model }),
+      usable.length,
+    );
   }
 
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
@@ -384,13 +431,20 @@ async function send(payload, onChunk, opts = {}) {
         status: code || '-',
         error: e.message,
         throttled: isThrottle(e.message),
+        quotaOrModel: isQuotaOrModel(code, e.message),
       });
       // 流式已经吐过帧，客户端收到了半截输出，再换号会输出两遍
       if (e.sent) throw e;
       if (!retryable(code, e.message)) throw e;
       // 下一个候选仍经池选：刚失败的账号若进了冷却，这里自然跳过
       sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring: fefo });
-      if (!sel) break;
+      if (!sel) {
+        // 没有更多可重试的账号：记下归因与冷却概况，挂到最后的错误上（P0-2）。
+        // 不改变 errors 的文案——已试账号的失败原因照实列，但恢复时间要让
+        // 客户端看到（限流时尤其重要，否则客户端会盲退避或直接放弃）。
+        noAccountAv = channelPool.availability(CHANNEL, usable, { model });
+        break;
+      }
     } finally {
       // 每次尝试结束必须放还在途名额（pickCandidate 命中即占用）
       channelPool.release(uid);
@@ -416,10 +470,28 @@ async function send(payload, onChunk, opts = {}) {
       const av = channelPool.availability(CHANNEL, usable, { model });
       if (av && av.softOnly && av.nextInMs > 0) err.retryAfterMs = av.nextInMs;
     } catch (e) { /* 取不到就不带头，429 语义本身仍然正确 */ }
+  } else if (errors.length && errors.every((x) => x.quotaOrModel)) {
+    // 额度不足 / 模型不可用，且一个内容块都没发出（否则早在上面的 catch 里
+    // `if (e.sent) throw e` 直接抛了，走不到这里）→ 429 带可重试语义，
+    // 供路由层选择下一路（2026-11-27 融合 P2-2）。
+    // 不回 402/403：客户端对这两个码按「硬失败」处理（只报一次、不退避），
+    // 而额度/模型条件是「换号/换模型/等重置」能解的，429 才让客户端退避重试。
+    err.statusCode = 429;
+    err.quotaOrModel = true;
+    try {
+      const av = channelPool.availability(CHANNEL, usable, { model });
+      if (av && av.nextInMs > 0) err.retryAfterMs = av.nextInMs;
+    } catch (e) { /* 取不到就不带头，429 语义本身仍然正确 */ }
   } else {
     // 状态码 0 = 网络层失败（连接被拒/中断/超时）。映射成 502 让客户端知道是
     // 上游不可用，而不是把 0 原样回出去（0 会被某些客户端当成「无错误」）。
     err.statusCode = Number(errors[errors.length - 1].status) || 502;
+  }
+  // 重试耗尽且无更多可重试账号时，把归因与冷却概况补上（P0-2）。
+  // 限流分支可能已设了 retryAfterMs，这里不覆盖它。
+  if (noAccountAv) {
+    if (!err.retryAfterMs && noAccountAv.nextInMs > 0) err.retryAfterMs = noAccountAv.nextInMs;
+    if (noAccountAv.details && noAccountAv.details.length) err.noAccountDetails = noAccountAv.details;
   }
   throw err;
 }
@@ -443,6 +515,13 @@ function numOrNull(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+/** 协议解析（G3）：显式 protocol 优先，否则按 provider 查映射表，兜底 chat */
+function resolveProtocol(provider, explicit) {
+  if (explicit) return String(explicit);
+  if (provider && constants.PROTOCOL_BY_PROVIDER[provider]) return constants.PROTOCOL_BY_PROVIDER[provider];
+  return constants.PROTOCOL_DEFAULT;
+}
+
 /** 归一化一条上游模型行（纯函数，便于离线验证） */
 function normalizeModelRow(m) {
   if (!m || typeof m !== 'object') return null;
@@ -458,6 +537,12 @@ function normalizeModelRow(m) {
   }
   tiers.sort((a, b) => a - b);
   const ctxMax = tiers.length ? tiers[tiers.length - 1] : numOrNull(m.max_input_tokens);
+  // 能力位（2026-11-27 融合 G3，见 docs/PLAN-QWENWORK-GITHUB-MERGE-ROUND2.md §G3）：
+  // provider/protocol 决定 MaaS 链路的协议端点（anthropic→messages / openai→responses）；
+  // maxOutputTokens 给预算钳制参考；modalities 从 is_vl 推导；reasoning/tool_call
+  // 给管理端能力覆盖层作默认值。上游不返的字段一律给中性默认，不编数字。
+  const provider = String(m.provider || m.provider_key || '');
+  const isVl = m.is_vl === true;
   return {
     key: String(key),
     name: String(m.display_name || m.displayName || m.name || key),
@@ -465,8 +550,19 @@ function normalizeModelRow(m) {
     rateOriginal: numOrNull(m.original_price_factor),
     contextWindow: ctxMax,
     contextTiers: tiers,
-    multimodal: m.is_vl === true,
+    multimodal: isVl,
     enabled: m.enable !== false,
+    // 免费档位：上游模型表没有 free 字段，按已知事实标记 minimax3.1flash
+    // （2026-11-27 用户定案：测试只用这一档，不消耗积分）。
+    free: /minimax/i.test(String(m.key || '')) || /minimax/i.test(String(m.display_name || m.displayName || m.name || '')),
+    provider,
+    protocol: resolveProtocol(provider, m.protocol),
+    maxOutputTokens: numOrNull(m.max_output_tokens ?? m.maxOutputTokens),
+    modalities: isVl ? ['text', 'image'] : ['text'],
+    reasoning: m.is_reasoning === true || m.reasoning === true,
+    // 上游没有 tool_call 字段：给 null（未知），不编造 false——
+    // CLAUDE.md 定案四个协议入口全部支持原生 function calling。
+    toolCall: m.tool_call === true || m.support_tool === true ? true : null,
   };
 }
 
@@ -512,6 +608,8 @@ async function fetchModelList(force = false) {
       const entries = parseModelsResponse(JSON.parse(res.raw));
       if (entries.length) {
         modelsCache = { at: Date.now(), entries, keys: entries.map((e) => e.key) };
+        // A1：目录刷新后清理——目录里没有的模型，禁用与覆盖都清掉（不残留）
+        try { modelOverrides.prune(entries.map((e) => e.key)); } catch (e) { /* 清理失败不影响拉取 */ }
         // 成功拉到就告诉 model-info：界面据此把倍率/上下文标成「上游下发」
         try { require('../model-info').setQwenModels(entries); } catch (e) { /* 不影响返回 */ }
         return modelsCache;
@@ -521,25 +619,40 @@ async function fetchModelList(force = false) {
   return modelsCache.entries.length ? modelsCache : { at: 0, entries: [], keys: [] };
 }
 
-/** 模型 key 列表：优先问服务端，失败回落静态表 */
-async function listModels(force = false) {
-  const r = await fetchModelList(force);
-  return r.keys.length ? r.keys : constants.FALLBACK_MODELS.slice();
+/** 模型 key → is_vl Map（只取已缓存的目录，不触发网络）。chat.js 用它填 body 的 is_vl */
+function cachedModelCapabilities() {
+  if (!modelsCache.entries.length) return null;
+  const m = {};
+  for (const e of modelsCache.entries) m[e.key] = e.multimodal;
+  return m;
 }
 
-/** 带元数据的模型表（倍率/上下文/多模态）。接口不可用时给静态条目 */
+/** 模型 key 列表：优先问服务端，失败回落静态表。过滤禁用模型（A1） */
+async function listModels(force = false) {
+  const r = await fetchModelList(force);
+  const keys = r.keys.length ? r.keys : constants.FALLBACK_MODELS.slice();
+  // A1：/v1/models 出口过滤禁用模型——客户端看不到，发出前还会再拦一次
+  return keys.filter((k) => !modelOverrides.isDisabled(k));
+}
+
+/** 带元数据的模型表（倍率/上下文/多模态/能力位）。接口不可用时给静态条目 */
 async function listModelEntries(force = false) {
   const r = await fetchModelList(force);
   if (r.entries.length) return r.entries;
   return constants.FALLBACK_MODELS.map((key) => ({
     key, name: key, rate: null, rateOriginal: null,
     contextWindow: null, contextTiers: [], multimodal: false, enabled: true,
+    // 静态兜底的能力位：上游没返，给中性默认（reasoning 用全局开关、toolCall 默认开）
+    provider: '', protocol: constants.PROTOCOL_DEFAULT, maxOutputTokens: null,
+    modalities: ['text'], reasoning: constants.REASONING_ON, toolCall: true,
   }));
 }
 
 module.exports = {
   warmup, status, send, listModels, listModelEntries, pickAccount,
-  normalizeModelRow, parseModelsResponse,
+  normalizeModelRow, parseModelsResponse, resolveProtocol, cachedModelCapabilities,
+  // 额度/模型类错误判定（P2-2）：导出供单测锁分类口径
+  isQuotaOrModel,
   // FEFO 集合推导导出：端到端回归用（verify-expiring-fefo.js）。
   // Qoder 3f 的教训——没导出的内部推导就是没测到的内部推导
   fefoUidSet,

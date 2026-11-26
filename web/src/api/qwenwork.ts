@@ -95,6 +95,39 @@ export interface QwModel {
   id: string
   name: string
   prefixed: string
+  free?: boolean
+}
+
+/** 逐模型能力覆盖层（A1）：effective* 是合并后的最终值，dirty 标「已改」 */
+export interface QwModelOverrideView {
+  key: string
+  name: string
+  rate: number | null
+  contextWindow: number | null
+  multimodal: boolean
+  enabled: boolean
+  provider: string
+  protocol: string
+  reasoning: boolean
+  toolCall: boolean
+  disabled: boolean
+  contextOverride: string | null
+  visionOverride: boolean | null
+  reasoningOverride: string | null
+  effectiveContext: number | string | null
+  effectiveVision: boolean
+  effectiveReasoning: boolean | string
+  dirty: boolean
+}
+
+/** 模型测试结果（A2）：tier 是机器档位，label 是中文显示 */
+export interface QwModelTestResult {
+  model: string
+  tier: string
+  label: string
+  status: number
+  message?: string
+  latencyMs: number
 }
 
 /** 归因里附带的账号信息（千问是单账号直连，但字段留着方便以后扩展） */
@@ -106,6 +139,22 @@ export interface QwAccountInfo {
 }
 
 /** 千问登录态（只读）。来自官方客户端的 auth-v2.dat */
+export interface QwStatusMaas {
+  enabled: boolean
+  available: boolean
+  keyPrefix?: string
+  keyLength?: number
+  expiresAtMs?: number
+  baseUrl?: string
+}
+
+export interface QwStatusLangfuse {
+  enabled: boolean
+  configured: boolean
+  qwenworkOnly?: boolean
+  queued?: number
+}
+
 export interface QwLogin {
   ok: boolean
   error: string
@@ -277,6 +326,20 @@ export const qwenworkApi = {
   credits: () => client.get<QwCredits>('/qwenwork/credits'),
   daily: (days = 14) => client.get<{ days: number; rows: QwDailyRow[] }>(`/qwenwork/credits/daily?days=${days}`),
   models: () => client.get<{ models: QwModel[]; error: string }>('/qwenwork/models'),
+  // ---- 逐模型开关 + 能力覆盖层（A1）----
+  modelOverrides: () => client.get<{ entries: QwModelOverrideView[]; error?: string }>('/qwenwork/model-overrides'),
+  setModelDisabled: (model: string, disabled: boolean) =>
+    client.post<{ ok: boolean }>('/qwenwork/model-overrides', { model, disabled }),
+  setModelOverride: (model: string, field: 'context' | 'vision' | 'reasoning', value: unknown) =>
+    client.post<{ ok: boolean }>('/qwenwork/model-overrides', { model, field, value }),
+  clearModelOverride: (model: string) =>
+    client.delete<{ ok: boolean }>(`/qwenwork/model-overrides/${encodeURIComponent(model)}`),
+  // 模型测试（A2）：不带 model = 测全部（串行），带 model = 测单个
+  testModels: (model?: string) =>
+    client.post<{ ok: boolean; results: QwModelTestResult[]; error?: string }>(
+      '/qwenwork/models/test', model ? { model } : {},
+      { timeout: 300000 },
+    ),
   status: () => client.get<{
     ready: boolean; loggedIn: boolean; error: string;
     wasm: string | null;
@@ -312,6 +375,12 @@ export const qwenworkApi = {
   }>('/qwenwork/accounts'),
   // ---- 以下为多账号后的写接口 ----
   loginStart: () => client.post<QwLoginSession>('/qwenwork/login/start'),
+  // A4：导入已有登录态（access/refresh/uid 三字段，refresh/uid 可选）
+  importAccount: (data: { access: string; refresh?: string; uid?: string }) =>
+    client.post<{ ok: boolean; account?: QwAccount }>('/qwenwork/accounts/import', data),
+  // A5：单号换指纹（不换号、不换 token）
+  rotateFingerprint: (id: string | number) =>
+    client.post<{ ok: boolean; account?: QwAccount }>(`/qwenwork/accounts/${id}/rotate-fingerprint`),
   loginPoll: (nonce: string) =>
     client.post<QwLoginPoll>('/qwenwork/login/poll', { nonce }),
   loginCancel: (nonce: string) =>

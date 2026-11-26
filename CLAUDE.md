@@ -792,6 +792,13 @@ per-key 限流（低价值场景）。
 | `DUMATE_QWENWORK_COSY_VERSION` | `1.1.71` | 千问的 cosy 版本（进 payload 与请求头，2026-10-31 对齐官方 1.4.0）。上游做版本门时可覆盖回退 |
 | `DUMATE_QWENWORK_IDE_VERSION` / `_RELEASE_VERSION` / `_BUILD` | `1.4.0` / `1.4.0-26102705` / `26102705` | 千问客户端身份（进 `X-QwenWork-*` 头）。release 与 build **必须成对改**（build 由 release 派生） |
 | `DUMATE_QWENWORK_OS_HEADERS` | 未设（发送） | 设 `0` 关闭 `X-QwenWork-*` 六个身份头（排障对照用） |
+| `DUMATE_QWENWORK_MAAS` | 未设（关闭） | 设 `1` 启用千问 MaaS 直连备选链路。默认走应用链路；凭证不可用时如实回落。Windows/WSL 凭证来自 `%USERPROFILE%\.qwenworkcn\engine-maas-key.dat` + `%APPDATA%\QwenWorkCN\Local State`（DPAPI + AES-256-GCM），只读取不修改 |
+| `DUMATE_QWENWORK_MAAS_BASE` | `https://api9.qwenwork.cn/v1` | MaaS 基址覆盖（缓存文件里的 `baseUrl` 优先） |
+| `DUMATE_QWENWORK_MAAS_CRED` / `_CRED_WIN` | `%USERPROFILE%\.qwenworkcn\engine-maas-key.dat` | PowerShell 侧缓存文件路径覆盖（两个变量都认；`_CRED_WIN` 优先）。WSL 下要写 Windows 可见路径 |
+| `DUMATE_QWENWORK_LANGFUSE` / `DUMATE_LANGFUSE` | 未设（关闭） | 设 `1` 开启请求埋点导出到 Langfuse。需同时设 URL 与 KEY；失败吞掉，不影响网关 |
+| `DUMATE_LANGFUSE_URL` / `_KEY` | 未设 | Langfuse 基址与 API key。POST `{URL}/api/public/ingestion`，不导出正文/token/IP/UA |
+| `DUMATE_LANGFUSE_QWENWORK_ONLY` | `1` | 默认只导 qwenwork 通道；设 `0` 导出全部通道 |
+| `DUMATE_LANGFUSE_LOCAL_LOG` | `<data>/langfuse-local.jsonl` | Langfuse 投递失败时的本地日志（只记事件 id 与时间，不记正文/凭证）；1MB 轮转留最近 500 条 |
 
 ## 数据文件（`data/`，已 gitignore）
 

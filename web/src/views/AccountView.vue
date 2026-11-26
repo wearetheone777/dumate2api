@@ -4,7 +4,7 @@
       title="登录态"
       :sub="isTw ? 'TRAE Work 登录态（凭证自持）'
         : isQd ? 'Qoder 登录态（凭证自持，无需客户端）'
-        : isQw ? '千问办公客户端登录态（只读）'
+        : isQw ? '千问办公账号池（自持凭证）'
         : isWb ? 'WorkBuddy 登录态（凭证自持，双区域）' : '客户端当前状态（只读）'"
     />
 
@@ -19,13 +19,36 @@
 
     <!-- ============ 千问办公：单账号直连，登录态在官方客户端的 auth-v2.dat ============ -->
     <template v-else-if="isQw">
-      <a-alert type="info" show-icon message="只读页面">
+      <a-alert type="info" show-icon message="自持凭证账号池">
         <template #description>
-          千问办公的登录态由官方客户端维护（Electron safeStorage 加密的 auth-v2.dat）。
-          管理端只读取，不做写入——两边各写一次会互相把对方的登录态刷掉。
-          需要换账号请在千问办公客户端里操作。
+          千问办公已改为自持凭证（data/qwenwork-accounts.json），不再读官方客户端的 auth-v2.dat。
+          可通过设备授权添加账号，也可导入从客户端解出的登录态；单号可换指纹排查风控。
         </template>
       </a-alert>
+
+      <div class="mt-3 flex gap-2">
+        <a-button type="primary" size="small" @click="qwImportOpen = true">导入登录态</a-button>
+        <a-popconfirm title="对第一个账号换指纹？不换号、不换 token。" @confirm="rotateQwFingerprint(qwAccounts[0]?.id)">
+          <a-button size="small" :disabled="!qwAccounts.length">换指纹（首个账号）</a-button>
+        </a-popconfirm>
+      </div>
+
+      <a-modal v-model:open="qwImportOpen" title="导入千问办公登录态" :footer="null" width="520">
+        <a-alert type="info" show-icon class="mb-3"
+          message="access token 必填；refresh token 与 uid 可选（填 uid 会拉取昵称与套餐）" />
+        <a-form layout="vertical" @finish="submitQwImport">
+          <a-form-item label="Access Token" name="access" :rules="[{ required: true, message: '请填 access token' }]">
+            <a-textarea v-model:value="qwImportForm.access" :rows="3" placeholder="eyJ..." />
+          </a-form-item>
+          <a-form-item label="Refresh Token（可选）">
+            <a-textarea v-model:value="qwImportForm.refresh" :rows="2" />
+          </a-form-item>
+          <a-form-item label="UID（可选）">
+            <a-input v-model:value="qwImportForm.uid" placeholder="从客户端解出的 uid" />
+          </a-form-item>
+          <a-button type="primary" html-type="submit" :loading="qwImporting">导入</a-button>
+        </a-form>
+      </a-modal>
 
       <a-alert
         v-if="qw && !qw.ok"
@@ -362,7 +385,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { message } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import client from '@/api/client'
 import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
@@ -376,6 +400,39 @@ import type { AccountData } from '@/api/account'
 const data = ref<AccountData | null>(null)
 // 千问办公的登录态：来自官方客户端 auth-v2.dat，只读
 const qw = ref<QwLogin | null>(null)
+// A4/A5：导入登录态 + 单号换指纹
+const qwImportOpen = ref(false)
+const qwImporting = ref(false)
+const qwImportForm = reactive({ access: '', refresh: '', uid: '' })
+const qwAccounts = computed(() => (qw.value as any)?.accounts || [])
+
+async function submitQwImport() {
+  if (qwImporting.value) return
+  qwImporting.value = true
+  try {
+    await qwenworkApi.importAccount({
+      access: qwImportForm.access,
+      refresh: qwImportForm.refresh || undefined,
+      uid: qwImportForm.uid || undefined,
+    })
+    message.success('导入成功')
+    qwImportOpen.value = false
+    qwImportForm.access = ''
+    qwImportForm.refresh = ''
+    qwImportForm.uid = ''
+    await load()
+  } catch (e: any) { message.error(e?.message || '导入失败') }
+  finally { qwImporting.value = false }
+}
+
+async function rotateQwFingerprint(id: string | number | undefined) {
+  if (!id) return
+  try {
+    await qwenworkApi.rotateFingerprint(id)
+    message.success('指纹已更换')
+    await load()
+  } catch (e: any) { message.error(e?.message || '换指纹失败') }
+}
 
 // 四条通道四种形态：搭子（有后端进程）、千问（单账号只读）、TRAE/Qoder（多账号自持）、
 // WorkBuddy（多账号自持，双区域）。isDirectChannel 只分「搭子 vs 直连」，直连内部

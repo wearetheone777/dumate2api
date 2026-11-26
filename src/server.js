@@ -210,6 +210,10 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   //   qwenwork → 官方 wasm 封装请求体（依赖客户端安装的 wasm）
   //   traework → 自持凭证，直接调上游
   //   qoder    → 纯本地签名（cosy.js），连 wasm 都不需要
+  // G1（2026-11-27）：千问办公可选 MaaS 直连。默认关；开启且凭证可用时才
+  // 切 provider，否则仍用应用链路（同一份 send/onChunk 接口，不动三套翻译器）。
+  const maas = route.channel === 'qwenwork' ? require('./qwenwork/maas') : null;
+  const useMaas = maas && maas.enabled() && maas.available();
   const provider = route.target.provider
     ? require(route.target.provider)
     : route.channel === 'traework'
@@ -218,7 +222,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
         ? require('./qoder')
         : route.channel === 'workbuddy'
           ? require('./workbuddy')
-          : require('./qwenwork');
+          : (useMaas ? maas : require('./qwenwork'));
   const wantStream = !!payload.stream;
 
   // 请求 id 在这里就定下来：埋点与积分归因两边都要用同一个值才能配对。
@@ -462,11 +466,14 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
 
     (async () => {
       try {
+        let doneSeen = false;
         await provider.send(payload, (inner) => {
           if (inner === '[DONE]') {
-            // 按 OpenAI 规范补发结束标记再关流。千问上游本身不发
-            // `data: [DONE]`（它用 event:finish 收尾），但客户端按规范等这个
-            // 标记；只靠流关闭会让部分客户端（如 Codex）认为响应未完成。
+            // 按 OpenAI 规范补发结束标记再关流。千问应用链路本身不发
+            // `data: [DONE]`（它用 event:finish 收尾），但 MaaS 会发。
+            // 用 doneSeen 去重：重复结束标记会被部分客户端当成两段响应。
+            if (doneSeen) return;
+            doneSeen = true;
             if (pingTimer) clearInterval(pingTimer);
             writeSSEHead && writeSSEHead();
             shim.write('data: [DONE]\n\n');
@@ -490,7 +497,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
         // 已在 readStream 里吃掉），所以这里补一个再关流。
         // **顺序关键**：先补 [DONE]、再 end——直接 end 会让翻译器在
         // 没有收到任何帧的情况下看到流结束，报 upstream stream error。
-        if (route.channel === 'traework') {
+        if (route.channel === 'traework' || !doneSeen) {
           writeSSEHead && writeSSEHead();
           shim.write('data: [DONE]\n\n');
         }

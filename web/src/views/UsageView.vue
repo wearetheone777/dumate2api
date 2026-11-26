@@ -145,6 +145,11 @@
             <div class="text-xs text-slate-400">{{ ttfbRange(agg.totals.ttfb_p90) }}</div>
           </div>
           <div>
+            <div class="block-label">首字 p95</div>
+            <div class="num text-lg">{{ ttfbText(agg.totals.ttfb_p95) }}</div>
+            <div class="text-xs text-slate-400">{{ ttfbRange(agg.totals.ttfb_p95) }}</div>
+          </div>
+          <div>
             <div class="block-label">首字均值 / 最慢</div>
             <div class="num text-lg">{{ ttfbText(agg.totals.ttfb_avg_ms) }}</div>
             <div class="text-xs text-slate-400">
@@ -185,7 +190,7 @@
           </div>
         </div>
         <div class="text-xs text-slate-400 mt-2">
-          首字延迟用 8 段直方图（250/500/1s/2s/5s/10s/30s），p50/p90 是**段上界的近似值**，
+          首字延迟用 8 段直方图（250/500/1s/2s/5s/10s/30s），p50/p90/p95 是**段上界的近似值**，
           括号里给出真实区间；无样本时显示「—」，不按 0ms 报。
         </div>
       </template>
@@ -682,6 +687,7 @@ interface AggTotals {
   ttfb_slow?: number
   ttfb_p50?: TtfbPoint | null
   ttfb_p90?: TtfbPoint | null
+  ttfb_p95?: TtfbPoint | null
   /** 命中率：分子分母都摊出来，页面直显、复核也直显 */
   cache_hit?: {
     numerator: number

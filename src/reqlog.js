@@ -25,6 +25,11 @@ let disabled = false;
 let aggHook = null;
 let aggHookBroken = false;
 
+// A7（2026-11-27）：Langfuse 可选导出。关闭时零开销；开启后只异步 POST 增量
+// ingestion 事件，任何失败都吞掉，绝不阻塞/影响埋点主路径。
+let langfuseHook = null;
+let langfuseHookBroken = false;
+
 function ensureDir() {
   try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (e) { /* 已存在 */ }
 }
@@ -50,6 +55,12 @@ function record(entry) {
   }
   if (aggHook) {
     try { aggHook.feed(entry); } catch (e) { /* 计量失败不影响埋点 */ }
+  }
+  if (!langfuseHook && !langfuseHookBroken) {
+    try { langfuseHook = require('./langfuse-export'); } catch (e) { langfuseHookBroken = true; }
+  }
+  if (langfuseHook) {
+    try { langfuseHook.exportEntry(entry); } catch (e) { /* 外部导出失败不影响埋点 */ }
   }
   // 单 Key 每日配额的 token 计数（2026-11-07）：entry.key_id 由各网关的
   // logRequest 传入。请求数在 keys.validate 里即时计数，token 只能等响应

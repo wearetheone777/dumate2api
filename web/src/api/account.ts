@@ -44,7 +44,7 @@ export interface ProcInfo {
 }
 
 export interface AccountData {
-  install: { dir: string; checks: InstallCheck[] }
+  install: { dir: string; checks: InstallCheck[]; platform_note?: string }
   version: ClientVersion | null
   login: LoginState
   processes: ProcInfo[]

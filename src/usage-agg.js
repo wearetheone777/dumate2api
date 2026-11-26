@@ -429,6 +429,9 @@ function create(opts = {}) {
 
   function histogramP50(h) { return percentileOf(h, 0.5); }
   function histogramP90(h) { return percentileOf(h, 0.9); }
+  // P95（社区看板同款）：复用同一条直方图，8 段上界对 p95 仍够用——
+  // 分位数是段上界近似值，前端展示必须自带区间（与 p50/p90 同口径）。
+  function histogramP95(h) { return percentileOf(h, 0.95); }
 
   // 把一组桶累加成一行统计。均值必须带样本数加权，不能对每桶均值再平均。
   function finish(a) {
@@ -458,6 +461,7 @@ function create(opts = {}) {
       ttfb_slow: a.fslow || 0,
       ttfb_p50: histogramP50(a.fh),
       ttfb_p90: histogramP90(a.fh),
+      ttfb_p95: histogramP95(a.fh),
     };
   }
 
