@@ -3,8 +3,11 @@ const { currentUser, audit } = require('./auth');
 
 const routes = [];
 
+// opts 必须整体带上：router 除了 `public` 还读 `write`（viewer 写白名单）与
+// `maxBody`（单路由的请求体上限）。只挑 `public` 会让这两项静默失效——
+// 路由声明了 16MB 上限却仍按 1MB 拒，症状是「导入大文件报 body too large」。
 function register(method, pattern, handler, opts = {}) {
-  routes.push({ method, pattern, handler, public: !!opts.public });
+  routes.push({ method, pattern, handler, ...opts, public: !!opts.public });
 }
 
 function mount(prefix, table) {
@@ -63,15 +66,19 @@ function sendJSON(res, status, data) {
 
 // 请求体上限。管理接口的载荷都很小（配置、key、探测列表），
 // 不设限等于让任何调用者用一次请求把内存吃满。
+//
+// 例外：账号导入（account-transfer）搬的是整包账号，一个账号记录含 token
+// 约 1KB，几百个账号就过 MB。那条路由在自己的 route 上声明 `maxBody`，
+// 默认值不动——放宽全局上限等于把所有接口一起放宽。
 const MAX_BODY = 1024 * 1024;
 
-function readBody(req) {
+function readBody(req, limit = MAX_BODY) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on('data', (c) => {
       size += c.length;
-      if (size > MAX_BODY) {
+      if (size > limit) {
         // 不再累积，但要把剩余数据读掉，否则连接不会正常结束
         reject(new Error('body too large'));
         req.resume();
@@ -106,7 +113,7 @@ async function handle(req, res, pathname) {
 
   let body = null;
   if (req.method !== 'GET') {
-    const raw = await readBody(req);
+    const raw = await readBody(req, Number(hit.route.maxBody) || MAX_BODY);
     if (raw) {
       try {
         body = JSON.parse(raw);
