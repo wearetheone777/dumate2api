@@ -50,10 +50,13 @@
             <span>账号管理</span>
           </a-badge>
         </a-menu-item>
-        <!-- TRAE 运行策略：写运行期配置，admin 专属、与通道无关 -->
-        <a-menu-item v-if="isAdmin" key="trae-runtime">
+        <!-- TRAE 运行策略：写的是 data/traework-runtime.json（降级 / Max 档 /
+             选号策略 / 护栏），只对 TRAE 通道生效。与下面的 Qoder 运行策略
+             同一规则——通道级配置套到别的通道上是误导（在搭子页点进去改
+             TRAE 的降级开关，会以为改的是搭子）。 -->
+        <a-menu-item v-if="isAdmin && channelStore.current === 'traework'" key="trae-runtime">
           <template #icon><ControlOutlined /></template>
-          <span>运行策略</span>
+          <span>TRAE 运行策略</span>
         </a-menu-item>
         <!-- 通道风控（P1-9）：并发/间隔/重试/限流上限 + 通道级复位，admin 专属 -->
         <a-menu-item v-if="isAdmin" key="channel-policy">

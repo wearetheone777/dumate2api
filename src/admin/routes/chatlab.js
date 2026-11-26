@@ -49,6 +49,10 @@ function budgetFor(kind, requested) {
 function availableModels() {
   const cfg = modelmap.load();
   const exposed = (cfg.exposed || []).map((id) => ({ id, kind: 'upstream', mapped: cfg.aliases?.[id] || id }));
+  // aliases 是给旧客户端兼容用的（gpt-4o / claude-3-5-sonnet 等硬编码名），
+  // **全部指向同一个 fallback 后端**。它们混进下拉框会让人以为「有 20 个模型」，
+  // 实际只有一个。这里保留在响应里（有客户端按名字查表），但标 kind='alias'，
+  // 前端默认不渲染——试调台只列真实模型。
   const aliases = Object.keys(cfg.aliases || {})
     .filter((id) => !(cfg.exposed || []).includes(id))
     .map((id) => ({ id, kind: 'alias', mapped: cfg.aliases[id] }));

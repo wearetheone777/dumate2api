@@ -369,7 +369,7 @@ async function applyChannel(id: string) {
     model.value = free?.prefixed || cheapest?.prefixed || wbModels.value[0]?.prefixed || ''
   } else {
     if (!models.value) await loadModels()
-    model.value = models.value?.exposed?.[0]?.id || models.value?.aliases?.[0]?.id || ''
+    model.value = models.value?.exposed?.[0]?.id || ''
   }
 }
 
@@ -414,11 +414,12 @@ const modelOptions = computed(() => {
     }
     return out
   }
+  // 只列真实模型。aliases 是 17 个全部指向同一后端的兼容名
+  // （gpt-4o / claude-3-5-sonnet / o1 / gpt-5 …），混进来会让人以为
+  // 「有 20 个模型可选」，实际只有这几个真后端。它们仍可手填使用，
+  // 但不在下拉框里占位。
   for (const m of models.value?.exposed ?? []) {
-    out.push({ label: `${m.id}（上游）`, value: m.id })
-  }
-  for (const m of models.value?.aliases ?? []) {
-    out.push({ label: `${m.id} → ${m.mapped}`, value: m.id })
+    out.push({ label: m.mapped && m.mapped !== m.id ? `${m.id}（${m.mapped}）` : m.id, value: m.id })
   }
   return out
 })
@@ -436,7 +437,7 @@ async function loadModels() {
     // 用 isDirectChannel() 而不是逐个比对 id：Qoder 接入时这里漏过一次
     // （判定只写了 qwenwork / traework），漏了会把 Qoder 当搭子补默认值。
     if (!model.value && !isDirectChannel(labChannel.value)) {
-      model.value = data.exposed?.[0]?.id || data.aliases?.[0]?.id || ''
+      model.value = data.exposed?.[0]?.id || ''
     }
   } finally {
     modelsLoading.value = false

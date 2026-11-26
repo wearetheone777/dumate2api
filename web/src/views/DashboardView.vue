@@ -1537,7 +1537,7 @@
               <a-tag :color="dash?.upstream.gateway_online ? 'green' : 'red'">
                 {{ dash?.upstream.gateway_online ? '正常' : '未启动' }}
               </a-tag>
-              <span class="text-xs text-slate-400 ml-1">:{{ dash?.upstream.gateway_port ?? 9084 }}</span>
+              <span class="text-xs text-slate-400 ml-1">:{{ dash?.upstream.gateway_port ?? 9080 }}</span>
             </a-descriptions-item>
             <a-descriptions-item label="可用账号">
               <template v-if="dash?.upstream.accounts_ready !== null && dash?.upstream.accounts_ready !== undefined">

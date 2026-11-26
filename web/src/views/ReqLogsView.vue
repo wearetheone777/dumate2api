@@ -460,7 +460,7 @@
           <div class="detail-value">
             <template v-if="detail.upstream === 'web'">
               <a-tag color="geekblue">网页凭证</a-tag>
-              <span class="text-xs text-slate-400 ml-1">（9084 / 测试台，多账号轮询）</span>
+              <span class="text-xs text-slate-400 ml-1">（主网关按池轮询）</span>
             </template>
             <template v-else-if="detail.upstream">
               <a-tag>{{ detail.upstream }}</a-tag>

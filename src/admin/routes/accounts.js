@@ -66,6 +66,24 @@ function withTimeout(promise, ms) {
   ]);
 }
 
+/**
+ * 给 /health 补上 accounts_ready / accounts_total。
+ *
+ * 主网关（9080）的 /health 只报通道级 ready，不报账号数——那是已废弃的
+ * 9084（web-gateway.js）专有字段。但界面要显示「可用 N / 共 M」，所以这里
+ * 用本地池状态补齐。网关没响应（health 为 null）时也要给，否则界面会显示
+ * 「0 / 0」而不是「网关未启动」。
+ */
+function withPoolCounts(health, poolState) {
+  const entries = (poolState && poolState.entries) || [];
+  const counts = {
+    accounts_total: entries.length,
+    // 「可用」= 参与轮询且不在冷却（与 web-gateway.js 的 /health 同口径）
+    accounts_ready: entries.filter((a) => a.enabled !== false && !a.cooling && a.state !== 'disabled' && a.state !== 'paused').length,
+  };
+  return Object.assign({}, health || {}, counts);
+}
+
 async function backfillNickname(account) {
   if (!account) return '';
   if (account.nickname) return account.nickname;
@@ -1055,7 +1073,10 @@ const routes = [
     path: '/dashboard',
     handler: async ({ res }) => {
       const list = accounts.load().accounts;
-      const gatewayPort = parseInt(process.env.DUMATE_WEB_GATEWAY_PORT || '9084', 10);
+      // 与 /pool 同口径：探主网关（默认 9080），不是已废弃的 9084
+      const gatewayPort = parseInt(
+        process.env.DUMATE_ADMIN_GATEWAY_PORT || process.env.DUMATE2API_PORT || '9080', 10,
+      );
 
       // 先补昵称再算指标：下面各处（健康快照、即将过期明细）都要用显示名，
       // 补完这一轮后续全部拿到真实昵称。**只对启用且昵称为空的账号**打上游，
@@ -1216,14 +1237,19 @@ const routes = [
         // 即将过期的积分明细（账号 × 到期日）。空数组 = 30 天内无损失
         expiring_points_rows: expiringPoints,
         // 上游/池状态
-        upstream: {
-          gateway_online: !!gw,
-          gateway_port: gatewayPort,
-          accounts_total: gw ? gw.accounts_total : null,
-          accounts_ready: gw ? gw.accounts_ready : null,
-          cooling: gw ? (gw.accounts || []).filter((x) => x.cooling).length : null,
-          // 网关未启动时这些数字没有意义，如实标 null 而不是填 0
-        },
+        upstream: (() => {
+          // 主网关（9080）的 /health 不报账号数，用本地池状态补；
+          // 网关未启动时这些数字没有意义，如实标 null 而不是填 0。
+          const ps = (() => { try { accountPool.reloadIfChanged(); return { entries: list.map((a) => ({ id: a.id, enabled: a.enabled, ...accountPool.status(a.id) })) }; } catch (e) { return { entries: [] }; } })();
+          const h = withPoolCounts(gw, ps);
+          return {
+            gateway_online: !!gw,
+            gateway_port: gatewayPort,
+            accounts_total: gw ? h.accounts_total : null,
+            accounts_ready: gw ? h.accounts_ready : null,
+            cooling: gw ? (ps.entries || []).filter((x) => x.cooling).length : null,
+          };
+        })(),
         accounts: enriched,
       });
     },
@@ -1328,7 +1354,14 @@ const routes = [
       //
       // 惩罚态（冷却/熔断/禁用/余额快照）已随施工包 A 落盘到 pool-state.json,
       // 管理端能直接读——先吸纳网关 5s 防抖内新写的内容再出视图。
-      const gatewayPort = parseInt(process.env.DUMATE_WEB_GATEWAY_PORT || '9084', 10);
+      //
+      // 探活对象是**主网关**（DUMATE_ADMIN_GATEWAY_PORT，默认 9080），不是 9084：
+      // 9080 的 DUMATE_DUMATE_SOURCE=web（默认）就直接用这份网页凭证池跑模型，
+      // 而 9084（web-gateway.js）是已废弃的独立入口。原先探 9084 会让界面恒显示
+      // 「网关未启动」，与实际可用状态相反。
+      const gatewayPort = parseInt(
+        process.env.DUMATE_ADMIN_GATEWAY_PORT || process.env.DUMATE2API_PORT || '9080', 10,
+      );
       accountPool.reloadIfChanged();
       const poolState = {
         counts: accountPool.counts(),
@@ -1358,12 +1391,24 @@ const routes = [
           r.on('end', () => {
             let health = null;
             try { health = JSON.parse(d); } catch (e) { health = null; }
-            sendJSON(res, 200, { gateway_port: gatewayPort, gateway_online: true, health, accounts: list, pool_state: poolState });
+            sendJSON(res, 200, {
+              gateway_port: gatewayPort,
+              gateway_online: true,
+              // 主网关（9080）的 /health 不报账号数（那是已废弃 9084 的字段），
+              // 用本地池状态补齐，前端就能照旧显示「可用 N / 共 M」
+              health: withPoolCounts(health, poolState),
+              accounts: list,
+              pool_state: poolState,
+            });
           });
         },
       );
       req.on('error', () => sendJSON(res, 200, {
-        gateway_port: gatewayPort, gateway_online: false, health: null, accounts: list, pool_state: poolState,
+        gateway_port: gatewayPort,
+        gateway_online: false,
+        health: withPoolCounts(null, poolState),
+        accounts: list,
+        pool_state: poolState,
       }));
       req.on('timeout', () => { req.destroy(); });
       req.end();

@@ -107,12 +107,65 @@ async function fetchPoints(opts = {}) {
   }
 
   const port = await discovery.discoverPort();
-  if (!port) return { ok: false, error: 'upstream not found' };
 
-  const [overview, remaining] = await Promise.all([
-    upstreamJSON(port, '/api/dumate/points/quota_overview'),
-    upstreamJSON(port, '/api/dumate/points/remaining'),
-  ]);
+  // 桌面后端（8980）不可用时回落到网页凭证池。
+  //
+  // 为什么必须有这条：DUMATE_DUMATE_SOURCE=web（默认）的部署根本不跑桌面后端，
+  // 但积分数据照样能从网页账号拿到——仪表盘的「积分余额」卡走的就是这条路。
+  // 原先这里只认桌面链路，于是在纯网页部署下模型页恒显示「取不到搭子积分」，
+  // 而同一份数据在仪表盘上却是好的。
+  let overview;
+  let remaining = { ok: false, data: null };
+  let viaWeb = false;
+  let webAccount = null;
+  if (port) {
+    [overview, remaining] = await Promise.all([
+      upstreamJSON(port, '/api/dumate/points/quota_overview'),
+      upstreamJSON(port, '/api/dumate/points/remaining'),
+    ]);
+  } else {
+    const web = require('../../dumate-web');
+    const accounts = require('../../accounts');
+    const list = (accounts.load().accounts || []).filter((a) => a.enabled !== false && a.cookie);
+    // 优先用有余额快照的那个；否则第一个。单账号即可代表「这份额度」——
+    // 多账号的合计口径在 /web-accounts/dashboard 的 summary 里，那是另一回事。
+    webAccount = list.slice().sort((a, b) => ((b.points && b.points.left) || 0) - ((a.points && a.points.left) || 0))[0] || null;
+    if (!webAccount) return { ok: false, error: 'upstream not found（无桌面后端，也没有网页账号）' };
+    let agent;
+    try { agent = web.agentFor(webAccount); } catch (e) { agent = undefined; }
+    const r = await web.api.quotaOverview(webAccount.cookie, agent ? { agent } : {});
+    if (!r.ok) return { ok: false, error: r.error || 'web upstream error' };
+    // **网页接口返回的是已解析好的结构**（total / used / left / packages 直接
+    // 在顶层，字段名与桌面链路的 totalPoints/usedPoints 不同），不是
+    // {success, result} 信封。所以这里直接构造最终形状，不走下面的
+    // 「信封 → packages 解析」分支。
+    const { packages: pkgs, expiring: exp, sources: srcs, daily_grant: daily, expired_unused: expUnused } =
+      pointsAgg.aggregate((r.packages || []).map((p) => ({ ...p, kind: p.kind || 'incremental' })));
+    const webResult = {
+      ok: true,
+      data: {
+        subscribed: !!r.subscribed,
+        total: r.total,
+        used: r.used,
+        left: r.left,
+        has_remaining: r.left > 0,
+        throttled: !!r.throttled,
+        throttle_reason: '',
+        packages: pkgs,
+        expiring: exp,
+        sources: srcs,
+        daily_grant: daily,
+        expired_unused: expUnused,
+        upstream_port: null,
+        account_id: String(webAccount.id),
+        account_name: `${require('../../accounts').displayName(webAccount)}（网页凭证）`,
+        via: 'web',
+        fetched_at: Date.now(),
+      },
+    };
+    cache = { at: Date.now(), data: webResult.data };
+    return webResult;
+  }
 
   if (!overview.ok || !overview.data || !overview.data.success) {
     return { ok: false, error: (overview.data && overview.data.message) || overview.error || 'upstream error' };
@@ -166,8 +219,13 @@ async function fetchPoints(opts = {}) {
       expired_unused: expUnused,
       upstream_port: port,
       // 前端用账号 ID 做切换，网页账号用数字 id，这里给个不会撞的字符串
-      account_id: 'local',
-      account_name: '本地后端（桌面凭证）',
+      account_id: viaWeb ? String(webAccount.id) : 'local',
+      account_name: viaWeb
+        ? `${require('../../accounts').displayName(webAccount)}（网页凭证）`
+        : '本地后端（桌面凭证）',
+      // 数据来源：桌面后端 / 网页凭证。界面据此显示，避免把网页数据
+      // 误认为桌面链路的读数
+      via: viaWeb ? 'web' : 'desktop',
       fetched_at: Date.now(),
     },
   };

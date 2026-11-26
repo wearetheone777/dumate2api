@@ -742,6 +742,17 @@
     <a-card title="搭子积分" :bordered="false">
       <a-empty v-if="!dumatePoints" description="取不到搭子积分" />
       <template v-else>
+        <!-- 数据来源与账号：网页凭证链路下这是**单个账号**的额度，与仪表盘
+             「积分余额」卡（多账号合计）口径不同，必须说清否则会被当成合计 -->
+        <div class="text-xs text-slate-500 mb-3">
+          <template v-if="dumatePoints.via === 'web'">
+            来源：网页凭证 · 账号「{{ dumatePoints.account_name }}」（单账号口径；
+            多账号合计见仪表盘「积分余额」卡）
+          </template>
+          <template v-else>
+            来源：本地后端（桌面凭证）{{ dumatePoints.account_name ? '· ' + dumatePoints.account_name : '' }}
+          </template>
+        </div>
         <a-row :gutter="[16, 16]">
           <a-col :xs="24" :sm="12" :lg="8">
             <div class="qw-pool">

@@ -69,6 +69,13 @@
           <span v-else class="text-xs text-slate-500">—</span>
         </template>
 
+        <template v-else-if="column.key === 'realModel'">
+          <div class="font-mono text-xs">{{ record.backend || '—' }}</div>
+          <!-- 同后端的其他调用名：让人一眼看出「这几个其实是同一个模型」 -->
+          <div v-if="record.alsoKnownAs?.length" class="text-xs text-slate-500 mt-0.5">
+            亦称 {{ record.alsoKnownAs.join(' / ') }}
+          </div>
+        </template>
         <template v-else-if="column.key === 'name'">
           <div class="font-medium">
             {{ record.name }}
@@ -287,19 +294,24 @@ const sortOptions = [
   { label: '名称', value: 'name' },
 ]
 
-const columns = [
+const columns = computed(() => [
   { title: '#', key: 'rank', width: '5%' },
-  { title: '模型', key: 'name', width: '22%' },
+  { title: '模型', key: 'name', width: '20%' },
+  // 搭子专用：多个模型名常指向同一个后端（model-text / deepseek-v41-flash /
+  // dm-auto-model/*.L0 全是 deepseek-v4.1-flash）。不标出来会让人以为
+  // 「有 20 个不同模型」，实际只有几个真后端。其他通道上游直接给模型表，
+  // 模型名即后端，不需要这一列。
+  ...(props.channel === 'dumate' ? [{ title: '真实后端', key: 'realModel', width: '18%' }] : []),
   // 搭子的数字是**实测积分成本**（积分/千 output token），不是标称倍率；
   // 表头带「（实测）」避免被当成官方价目表。排序下拉见左上角。
-  { title: props.channel === 'dumate' ? '消耗倍率（实测）' : '消耗倍率', key: 'rate', width: '16%' },
+  { title: props.channel === 'dumate' ? '消耗倍率（实测）' : '消耗倍率', key: 'rate', width: '15%' },
   // TRAE 有会员折扣，Qoder 没有——同一列按通道换标题，换成两套组件会各自漂移
-  { title: props.channel === 'qoder' ? '档位属性' : '会员折扣', key: 'discount', width: '14%' },
-  { title: '上下文', key: 'ctx', width: '13%' },
-  { title: '输出上限', key: 'maxtok', width: '11%' },
-  { title: '类型', key: 'cap', width: '9%' },
-  { title: '调用前缀', key: 'prefixed', width: '10%' },
-]
+  { title: props.channel === 'qoder' ? '档位属性' : '会员折扣', key: 'discount', width: '13%' },
+  { title: '上下文', key: 'ctx', width: '12%' },
+  { title: '输出上限', key: 'maxtok', width: '10%' },
+  { title: '类型', key: 'cap', width: '8%' },
+  { title: '调用前缀', key: 'prefixed', width: '9%' },
+])
 
 const rateHint = computed(() =>
   props.channel === 'dumate'

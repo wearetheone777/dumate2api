@@ -46,6 +46,9 @@ export interface PointsData {
   // 账号身份。本地后端固定为 'local'，用来区分于网页账号的数字 id。
   account_id?: string
   account_name?: string
+  // 数据来源：desktop=本地后端（桌面凭证），web=网页凭证。
+  // 网页链路下这是**单账号**口径，多账号合计在 /web-accounts/dashboard 的 summary。
+  via?: 'desktop' | 'web'
   fetched_at: number
   cached?: boolean
 }
