@@ -11,6 +11,9 @@ const KNOWN_PORTS = [8980, 52890];
 const MANAGED_PORT = parseInt(process.env.DUMATE_UPSTREAM_PORT || '8980', 10);
 
 function runPS(script, timeout = 15000) {
+  // 非 Windows（macOS / Linux）没有 PowerShell。显式短路而不是让它去
+  // ENOENT——调用点拿到空串自然走降级链，也避免每次探测都付一次失败调用。
+  if (process.platform !== 'win32') return '';
   try {
     return execFileSync(
       'powershell',
@@ -27,6 +30,7 @@ function runPS(script, timeout = 15000) {
 // 所有请求（包括别的页面）都无响应。凡是「顺手看一眼进程状态」这类
 // 非关键路径，一律走异步。
 function runPSAsync(script, timeout = 15000) {
+  if (process.platform !== 'win32') return Promise.resolve('');
   return new Promise((resolve) => {
     execFile(
       'powershell',
@@ -37,22 +41,49 @@ function runPSAsync(script, timeout = 15000) {
   });
 }
 
+// 非 Windows 的进程/端口探测：ps + lsof 是 macOS / Linux 系统自带命令，
+// 零依赖，语义与 PowerShell 版等价（命令行找 --port、按 pid 找监听端口）。
+function runPosix(args, timeout = 15000) {
+  return new Promise((resolve) => {
+    execFile(args[0], args.slice(1), { encoding: 'utf8', timeout, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout) => resolve(err ? '' : String(stdout || '')));
+  });
+}
+
 // 进程查询缓存。进程状态变化不频繁，而每次查询要付 PowerShell 启动成本，
 // 缓存能把仪表盘重复刷新从「每次 15 秒」降到「每 10 秒最多一次」。
 const PS_CACHE_TTL = 10000;
 let cliCache = { at: 0, value: null };
 let sockCache = { at: 0, value: null };
 
+// POSIX 命令行过滤：ps 行格式「pid 命令…」，命令字段必须以目标进程名
+// 开头（可带路径前缀）。命令行文本里出现该字符串的无关进程不会误匹配。
+const cmdFieldRe = () => new RegExp('^(?:\\/[^\\s]*)?' + PROCESS_MATCH + '(?=\\s|$)');
+
 async function discoverViaCommandLineAsync() {
   if (Date.now() - cliCache.at < PS_CACHE_TTL) return cliCache.value;
-  const out = await runPSAsync(
-    `(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '${PROCESS_MATCH}' }).CommandLine`
-  );
   let value = null;
-  const m = out.match(/--port[=\s]+(\d+)/);
-  if (m) {
-    const port = parseInt(m[1], 10);
-    if (port > 0 && port < 65536) value = port;
+  if (process.platform === 'win32') {
+    const out = await runPSAsync(
+      `(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '${PROCESS_MATCH}' }).CommandLine`
+    );
+    const m = out.match(/--port[=\s]+(\d+)/);
+    if (m) {
+      const port = parseInt(m[1], 10);
+      if (port > 0 && port < 65536) value = port;
+    }
+  } else {
+    const psOut = await runPosix(['ps', '-eo', 'pid=,command=']);
+    const re = cmdFieldRe();
+    for (const line of psOut.split('\n')) {
+      const m = line.match(/^\s*(\d+)\s+(.*)$/);
+      if (!m || !re.test(m[2])) continue;
+      const pm = m[2].match(/--port[=\s]+(\d+)/);
+      if (pm) {
+        const port = parseInt(pm[1], 10);
+        if (port > 0 && port < 65536) { value = port; break; }
+      }
+    }
   }
   cliCache = { at: Date.now(), value };
   return value;
@@ -60,23 +91,60 @@ async function discoverViaCommandLineAsync() {
 
 async function discoverViaListeningSocketsAsync() {
   if (Date.now() - sockCache.at < PS_CACHE_TTL) return sockCache.value;
-  const out = await runPSAsync(
-    `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -match '${PROCESS_MATCH}' } | Select-Object -ExpandProperty ProcessId; ` +
-    `if ($p) { (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $p -contains $_.OwningProcess } | ` +
-    `Select-Object -ExpandProperty LocalPort -Unique) -join ',' }`
-  );
+  let out;
+  let pids = [];
+  if (process.platform === 'win32') {
+    out = await runPSAsync(
+      `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -match '${PROCESS_MATCH}' } | Select-Object -ExpandProperty ProcessId; ` +
+      `if ($p) { (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $p -contains $_.OwningProcess } | ` +
+      `Select-Object -ExpandProperty LocalPort -Unique) -join ',' }`
+    );
+  } else {
+    // POSIX：先按命令行找出 dumate-main-server 的 pid，再查这些 pid 的
+    // 监听端口。ps 输出形如「  1234 /path/dumate-main-server --port 8980」。
+    //
+    // 两个实测坑：
+    // 1. 匹配必须锚定「命令行的第一个字段」——ps 行有前导空格，且命令行
+    //    文本里出现该字符串的无关进程（grep、测试脚本）会被误匹配；
+    // 2. lsof 的 -p 在部分环境过滤失效（实测输出了不在 -p 列表里的进程的
+    //    监听行），改为全量 LISTEN 输出后按 PID 列在内存里过滤。
+    const psOut = await runPosix(['ps', '-eo', 'pid=,command=']);
+    const re = cmdFieldRe();
+    for (const line of psOut.split('\n')) {
+      const m = line.match(/^\s*(\d+)\s+(.*)$/);
+      if (!m) continue;
+      if (!re.test(m[2])) continue;
+      const pid = parseInt(m[1], 10);
+      if (pid > 0) pids.push(pid);
+    }
+    out = pids.length ? await runPosix(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN']) : '';
+  }
   const value = out
-    .split(',')
-    .map((s) => parseInt(s.trim(), 10))
+    .split('\n')
+    .map((l) => {
+      if (process.platform === 'win32') {
+        // PowerShell 版是逗号分隔纯数字
+        const m = l.match(/:(\d+)\s/);
+        return m ? parseInt(m[1], 10) : parseInt(l.trim(), 10);
+      }
+      // lsof 行格式：COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+      const cols = l.trim().split(/\s+/);
+      const pid = parseInt(cols[1], 10);
+      if (!pids.includes(pid)) return null;
+      const m = l.match(/:(\d+)\s/);
+      return m ? parseInt(m[1], 10) : null;
+    })
     .filter((p) => Number.isInteger(p) && p > 0 && p < 65536);
   sockCache = { at: Date.now(), value };
   return value;
 }
 
 function discoverViaCommandLine() {
-  const out = runPS(
-    `(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '${PROCESS_MATCH}' }).CommandLine`
-  );
+  const out = process.platform === 'win32'
+    ? runPS(
+      `(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '${PROCESS_MATCH}' }).CommandLine`
+    )
+    : '';
   const m = out.match(/--port[=\s]+(\d+)/);
   if (m) {
     const port = parseInt(m[1], 10);
@@ -86,11 +154,13 @@ function discoverViaCommandLine() {
 }
 
 function discoverViaListeningSockets() {
-  const out = runPS(
-    `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -match '${PROCESS_MATCH}' } | Select-Object -ExpandProperty ProcessId; ` +
-    `if ($p) { (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $p -contains $_.OwningProcess } | ` +
-    `Select-Object -ExpandProperty LocalPort -Unique) -join ',' }`
-  );
+  const out = process.platform === 'win32'
+    ? runPS(
+      `$p = Get-CimInstance Win32_Process | Where-Object { $_.Name -match '${PROCESS_MATCH}' } | Select-Object -ExpandProperty ProcessId; ` +
+      `if ($p) { (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $p -contains $_.OwningProcess } | ` +
+      `Select-Object -ExpandProperty LocalPort -Unique) -join ',' }`
+    )
+    : '';
   return out
     .split(',')
     .map((s) => parseInt(s.trim(), 10))

@@ -31,7 +31,11 @@ test('prepareInfer: 补发 x-request-id / cosy-machinetype / cosy-machineos / tr
     uid: 'u1', token: 't1', bodyJson: '{}', modelKey: 'pro', machineId: 'm1',
   });
   assert.strictEqual(headers['cosy-machinetype'], '5');
-  assert.strictEqual(headers['cosy-machineos'], 'x86_64_win32');
+  // cosy-machineos 按本机平台生成（macOS / Linux 不再伪装 Windows）
+  const expectedMachineOs = process.platform === 'win32' ? 'x86_64_win32'
+    : process.platform === 'darwin' ? 'x86_64_darwin'
+    : 'x86_64_linux';
+  assert.strictEqual(headers['cosy-machineos'], expectedMachineOs);
   assert.ok(/^[0-9a-f-]{36}$/.test(headers['x-request-id']), 'x-request-id 应是 UUID');
   assert.strictEqual(headers['x-internal-model-key'], 'pro');
   assert.strictEqual(headers['x-model-key'], 'pro');

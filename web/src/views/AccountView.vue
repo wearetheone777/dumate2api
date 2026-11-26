@@ -338,7 +338,10 @@
           </template>
         </a-table>
         <div class="text-xs text-slate-400 mt-2">
-          安装目录：<span class="break-all">{{ data?.install.dir }}</span>
+          安装目录：<span class="break-all">{{ data?.install.dir ?? '不适用（桌面客户端仅支持 Windows）' }}</span>
+        </div>
+        <div v-if="data?.install.platform_note" class="text-xs text-amber-400 mt-1">
+          {{ data.install.platform_note }}
         </div>
       </a-card>
 

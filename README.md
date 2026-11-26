@@ -49,6 +49,17 @@ pnpm admin                 # 管理端 http://127.0.0.1:9081（另开终端）
 
 > 端口只有一套默认值：网关 `9080` / 管理端 `9081`。`start-dev.bat` 与 `start.bat` 行为一致（同起这两个端口）。要并行跑第二个实例时，用 `DUMATE2API_PORT` / `DUMATE_ADMIN_PORT` / `DUMATE_ADMIN_GATEWAY_PORT` 显式错开。
 
+**macOS / Linux 启动脚本**：仓库自带 `start.sh` / `stop.sh` / `restart.sh`，与 Windows 的 `.bat` 同语义（起网关 + 管理端、按端口停、不动其它进程）：
+
+```bash
+./start.sh              # 后台起网关 + 管理端（幂等：端口已在监听则跳过；日志与 PID 落 data/）
+./start.sh --foreground # 前台跑网关，日志直接打终端，Ctrl+C 停止
+./stop.sh               # 停网关 + 管理端（先按 PID 文件，再按端口兜底）
+./restart.sh            # 先停后起
+```
+
+**平台边界**：网关本体与四条直连通道（千问 / TRAE / Qoder / WorkBuddy）是纯 Node，macOS / Linux **全功能可用**，默认走**网页凭证链路**（不依赖任何桌面客户端）。唯一跑不了的是**桌面后端链路**（`DUMATE_DUMATE_SOURCE=auto/desktop`）——它要拉起 `dumate-main-server.exe`（DuMate 桌面客户端的 Windows 后端），macOS / Linux 没有这个安装包；管理端「登录态」页在该平台会明确标注「桌面客户端仅支持 Windows」，不会给出 `D:\` 假路径让你排查。
+
 自检：
 
 ```bash

@@ -40,16 +40,18 @@ DuMate2API 是运行在本机的**模型网关 + 进程管理器**，它把五�
 
 ### 2.1 前置条件
 
-- **Windows 10+**（依赖 PowerShell 进程查询、`%APPDATA%` 路径）
+- **Windows 10+** 或 **macOS / Linux**——网关本体与四条直连通道（千问 / TRAE / Qoder / WorkBuddy）是纯 Node，全平台可用
 - **Node.js >= 18**（网关零第三方依赖；前端构建与管理端登录器另有依赖）
 - 至少配置**一条通道**的凭证（任一通道不可用不会阻断网关启动）
+
+**平台边界**：唯一 Windows 专属的是「桌面后端链路」（`DUMATE_DUMATE_SOURCE=auto/desktop`，拉起 `dumate-main-server.exe`）。macOS / Linux 没有该客户端安装包，默认走**网页凭证链路**不受影响；管理端「登录态」页在该平台会明确标注「桌面客户端仅支持 Windows」，不会给出 `D:\` 假路径。进程探测（`src/discovery.js`）在 macOS / Linux 走 `ps` + `lsof`，不依赖 PowerShell。
 
 ### 2.2 启动
 
 ```bash
 git clone <repo-url> && cd dumate2api
 npm install          # 安装依赖（playwright-core 等管理端所需）
-npm start            # 网关 :9080，自动拉起 DuMate 后端 :8980
+npm start            # 网关 :9080（默认网页凭证链路，不拉起桌面后端；设 DUMATE_DUMATE_SOURCE=auto 才启用桌面链路）
 npm run admin        # 管理端 :9081（另开终端）
 ```
 
@@ -62,6 +64,15 @@ npm run admin        # 管理端 :9081（另开终端）
 | `start-web-gateway.bat` | 启动网页凭证独立网关 :9084 |
 | `stop.bat` | 停止网关进程树（不动 DuMate GUI 与 cc-switch） |
 | `restart.bat` | 重启 |
+
+一键脚本（macOS / Linux）：
+
+| 脚本 | 作用 |
+|---|---|
+| `./start.sh` | 后台启动网关 :9080 + 管理端 :9081（幂等：端口已在监听则跳过；日志与 PID 落 `data/`） |
+| `./start.sh --foreground` | 前台启动网关，日志直接打终端，Ctrl+C 停止 |
+| `./stop.sh` | 停止网关 + 管理端（先按 PID 文件，再按端口兜底；不动其它进程） |
+| `./restart.sh` | 先停后起 |
 
 ### 2.3 端口一览
 
@@ -150,6 +161,16 @@ TRAE / Qoder / WorkBuddy 还有**区域视图**（顶栏「国内版 / 国际版
 
 ### 登录态 / 各通道账号
 千问、TRAE、Qoder 的账号管理：查看 token 有效期、添加/删除账号、指定主账号（千问）、多账号切换。**refresh token 已过期的账号会标橙提示**——access token 到期后无法自动续期，需要重新登录。
+
+### 账号导入导出（换机 / 多实例迁移）
+**在「账号管理」页底部的「导入 / 导出」卡**（admin 专属，五条通道都有）。默认只处理当前通道，卡上另有「导出全部通道」按钮用于一次带走所有号。
+
+- **导出**：单通道或全部通道；文件含 cookie / refresh token **明文**，按密码级保管（不要进仓库）。导出动作落管理审计（只记通道与条数）。
+- **导入**：按业务键 upsert——搭子按 BDUSS 尾号，直连通道按 `uid` + 区域。`id` 一律重新分配，所以**不要**直接拷 `data/*-accounts.json`（会撞号，改一个号会改到别人身上）。
+- **冲突策略**：`跳过`（默认，只补新号）/ `覆盖`（源机换过 token 时才用）。
+- **已过期凭证**：导入结果里单列「N 个凭证已过期」，需重新登录该账号才能用——迁移本身没错，是号老了。
+- **不搬的字段**：`id`、`lastError`、`lastErrorAt`。错误状态属于源机此刻，搬过来会把早已自愈的故障当成当前的。
+- 与「账户管理 → 导出配置备份」分工不同：那个搬**配置**（模型映射 / key / 用户表），这个搬**账号凭证**。
 
 ### API Key
 密钥的创建、白名单/通道绑定配置、用量统计（按通道分开计数）。

@@ -15,7 +15,11 @@ const APPDATA_DIR = () => path.join(process.env.APPDATA || '', 'qianfan-desktop-
 // 异步执行 PowerShell。同步版（execFileSync）在本机实测冷启动要 5 秒以上，
 // 而它阻塞的是整个事件循环——一个「看一眼进程状态」的请求就能让管理端
 // 所有页面一起卡死，这是实测过的故障。
+//
+// 非 Windows（macOS / Linux）：没有 PowerShell，直接短路返回空串。调用点
+// 拿到空串自然降级（版本查不到、进程列表为空），不付一次 ENOENT 失败调用。
 function runPS(script, timeout = 12000) {
+  if (process.platform !== 'win32') return Promise.resolve('');
   return new Promise((resolve) => {
     execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', script],
       { encoding: 'utf8', timeout, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
@@ -127,8 +131,18 @@ function loginState() {
   };
 }
 
-// 安装完整性：可执行文件、配置、登录态目录逐项检查
+// 安装完整性：可执行文件、配置、登录态目录逐项检查。
+//
+// 桌面客户端（DuMate.exe + 桌面后端链路）是 Windows 专属：macOS / Linux
+// 上没有安装包，逐项检查只会给出一串 D:\ 假路径的「缺失」行，用户会对着
+// 不存在的路径排查。非 Windows 整体返回说明，界面明确「当前平台不适用」。
 function installCheck() {
+  if (process.platform !== 'win32') {
+    return {
+      platform_note: '桌面客户端（DuMate.exe / 桌面后端链路）仅支持 Windows；macOS / Linux 请使用网页凭证链路',
+      checks: [],
+    };
+  }
   const root = launcher.installRoot();
   const items = [
     { key: 'install_dir', label: '安装目录', path: root, kind: 'dir' },
@@ -159,10 +173,13 @@ const routes = [
       let upstreamPort = null;
       try { upstreamPort = await discovery.discoverPort(); } catch (e) { upstreamPort = null; }
 
+      const ic = installCheck();
       return sendJSON(res, 200, {
         install: {
-          dir: launcher.installRoot(),
-          checks: installCheck(),
+          // 非 Windows 没有桌面客户端，安装目录无从谈起，如实给 null
+          dir: process.platform === 'win32' ? launcher.installRoot() : null,
+          platform_note: ic.platform_note,
+          checks: ic.checks,
         },
         version: await clientVersion(),
         login: loginState(),

@@ -74,7 +74,14 @@ const CLIENT_TYPE = '6';
 const BUSINESS_PRODUCT = 'qoder_work';
 const BUSINESS_TYPE = 'agent';
 const SCENE = 'qwork';
-const MACHINE_OS = 'x86_64_win32';
+// cosy-machineos：官方形态 {arch}_{platform}。按本机平台生成（macOS / Linux
+// 上跑千问通道时不再伪装 Windows），可覆盖 `DUMATE_QWENWORK_MACHINE_OS`
+// （与 Qoder 的 DUMATE_QODER_MACHINE_OS 同形）。架构统一取 x86_64——上游
+// 只认这个形态，arm64 机器同样发 x86_64_darwin，不自作主张换 arch。
+const MACHINE_OS = process.env.DUMATE_QWENWORK_MACHINE_OS
+  || (process.platform === 'win32' ? 'x86_64_win32'
+    : process.platform === 'darwin' ? 'x86_64_darwin'
+    : 'x86_64_linux');
 const LOGIN_VERSION = 'v2';
 const USER_AGENT = 'qoderwork/1.1.0';
 
