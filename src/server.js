@@ -85,6 +85,23 @@ if (process.env.DUMATE_REQUIRE_KEY === '0') {
   console.warn('[dumate2api] DUMATE_REQUIRE_KEY=0 无效：鉴权已强制，无法通过环境变量关闭');
 }
 
+// 搭子桌面链路的 target 端口：**发现端口优先于 router 的 defaultPort**。
+// router 的 defaultPort 是 8980（且 portOf() 保证恒有值），但 DuMate GUI
+// 启动的 Go 后端会用随机端口；启动时 discoverPort() 探测到的真实端口以前
+// 只写进 upstreamPort 供 /health 显示，四个协议入口转发时仍拿着 target.port=8980，
+// 于是 ECONNREFUSED → 502 DuMate upstream unavailable（issue #8）。
+// 这里按与 ensureUpstream() 相同的 30 秒窗口决定端口新鲜度：窗口内用发现值，
+// 过期后不再用陈旧端口（让它走 8980 → 回落网页池，而不是把请求钉死在旧端口）。
+// `DUMATE_UPSTREAM_PORT` 显式指定时以它为准（target.port 已是该值，不覆盖）。
+function dumateTargetPort(t) {
+  const envPort = parseInt(process.env.DUMATE_UPSTREAM_PORT, 10);
+  const explicit = Number.isInteger(envPort) && envPort > 0 && envPort < 65536;
+  if (explicit || !upstreamPort || Date.now() - lastDiscoveryTime >= DISCOVERY_INTERVAL) {
+    return t.port;
+  }
+  return upstreamPort;
+}
+
 let upstreamPort = null;
 let upstreamManaged = false;
 let qwenworkUp = null; // 千问办公通道端口；null = 本次启动未就绪
@@ -803,28 +820,20 @@ function forwardWithFallback(portOrTarget, path, method, headers, body, clientRe
     return null;
   }
 
-  // 端口解析也要纳入回落范围。桌面凭证失效时 dumate-main-server.exe 会拒绝
-  // 启动或直接退出，ensureUpstream() 于是抛错——这条分支让那种情况也能走到
-  // 回落，而不是在调用点先抛错。
-  //
-  // **注意：这条分支走不到。** 网页来源在上面已经直接返回；桌面来源
-  // （DUMATE_DUMATE_SOURCE=auto）下，upstream-router 给 dumate 的 defaultPort
-  // 是 8980 且 portOf() 保证返回有效数字，所以 t.port 恒有值。
-  // 真实的失败路径是下面的 startForward(t)：连一次本地 8980 →
-  // ECONNREFUSED（回环连接，毫秒级）→ 回调里 tryWebFallback()。
-  // 也就是说「客户端没装」**不会**给每个请求带来探测开销，不必给失败结果加
-  // 缓存——2026-10-14 实测确认（打桩 discovery 计数：客户端缺失时连发 5 个
-  // 请求，discoverPort 一次都没被调用）。真正的探测开销只在**启动时**那一次
-  // discoverPort（要跑 PowerShell 查询，实测约 3 秒），而它只在 auto 模式下跑。
-  if (isDumate && t && !t.port) {
-    ensureUpstream().then(
-      (port) => { t.port = port; startForward(t); },
-      () => { if (!tryWebFallback()) callback({ fakeResponse: true, statusCode: 502, headers: {}, write() {}, end() {} }); },
-    );
-    return null;
+  // 发现端口覆盖 / 回落。
+  // 原 `!t.port` 分支走不到（router 的 defaultPort=8980 恒有值），真正的
+  // 修复是转发前用启动时 discoverPort() 得到的 upstreamPort 覆盖 target.port
+  // ——只在 desktop(auto) 来源、且没有显式 DUMATE_UPSTREAM_PORT 时覆盖。
+  // 覆盖后仍走 startForward 的单一回落路径：连不上/4xx 时回落网页池，
+  // 不会像 issue 评论里的补丁那样「回落成功却把请求挂住 / 硬回 502」。
+  // 每次请求零额外探测；端口变化由 30 秒缓存窗口失效后的 ECONNREFUSED →
+  // 回落兜底，下一次请求再重新发现。
+  let forwardTarget = portOrTarget;
+  if (isDumate && t && t.id === 'dumate' && router.dumateSource() !== 'web') {
+    forwardTarget = { ...t, port: dumateTargetPort(t) };
   }
 
-  return startForward(portOrTarget);
+  return startForward(forwardTarget);
 
   function startForward(targetOrPort) {
     return forwardToUpstream(targetOrPort, path, method, headers, body, (upstreamRes) => {
