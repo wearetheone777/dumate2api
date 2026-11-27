@@ -6,6 +6,14 @@ export interface ReqLogRow {
   path: string
   model: string
   mapped_model?: string
+  /**
+   * 上游真实模型的**指纹**（P1-3，Qoder 的 system_fingerprint）。
+   * 响应 model 恒为 auto，只有它能区分真实后端。是哈希不是名字，
+   * 界面写「指纹」。上游没给就缺省（旧行都没有）。
+   */
+  upstream_fingerprint?: string
+  /** 上游真实执行的模型（搭子云端 X-Dumate-Gw-Realmodel 回显；桌面链路为空） */
+  real_model?: string
   // 上游通道。**历史记录没有这个字段**（分通道之前产生的），
   // 所以是可选的——界面遇到 undefined 显示「—」而不是默认成搭子。
   channel?: 'dumate' | 'qwenwork' | 'traework' | 'qoder' | 'workbuddy'
@@ -37,6 +45,12 @@ export interface ReqLogRow {
     reason: string
     at: number
     ms?: number
+    /** 失败阶段（P1-3）：auth / throttle / quota / network / model / http */
+    stage?: string
+    /** 上游业务码（字符串，可能 > 10000，如 Qoder 10605） */
+    upstreamCode?: string
+    /** 上游请求 ID（上游没给就缺省——不拿本地 id 冒充） */
+    upstreamRequestId?: string
   }>
   attempts_truncated?: boolean
   /**

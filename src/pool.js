@@ -226,8 +226,8 @@ function createPool(opts = {}) {
 
   /** 积分保底判据（纯函数）:余额有快照、低于保底线时拦收费模型。
    *  credits 为 null（从未查过余额）不拦——没有数据源不做猜测性拦截。 */
-  function floorBlockedFor(e) {
-    return o.creditFloor > 0 && Number.isFinite(e.credits) && e.credits < o.creditFloor;
+  function floorBlockedFor(e, floor = o.creditFloor) {
+    return floor > 0 && Number.isFinite(e.credits) && e.credits < floor;
   }
 
   // ---------------------------------------------------------------------------
@@ -453,7 +453,7 @@ function createPool(opts = {}) {
       if (!isHealthy(e, now)) continue;
       if (e.in_flight >= (Number(optsPick.inFlightMax) > 0 ? optsPick.inFlightMax : o.inFlightMax)) continue;
       if (optsPick.model && modelCooled(e, now, optsPick.model)) continue;
-      if (optsPick.paid && floorBlockedFor(e)) continue;
+      if (optsPick.paid && floorBlockedFor(e, optsPick.creditFloor)) continue;
       ok.push(id);
     }
     if (!ok.length) return null;
@@ -958,6 +958,8 @@ function createPool(opts = {}) {
     acquire, release,
     // 选号与查询
     pick, status, snapshot, counts, isHealthy: isHealthyId,
+    // P1-2：纯判据导出供离线验证（floor 缺省时用本实例的 creditFloor）。
+    internals: { floorBlockedFor },
     // 持久化
     flush, close, reloadIfChanged,
     msUntilNext4AM,
@@ -968,5 +970,4 @@ function createPool(opts = {}) {
 // flusher 周期 5s,进程退出由调用方调 close()（unref 过,不阻塞退出）。
 // hotSoftCooldown:软冷却基数热读 livecfg（仅生产单例,测试池保持对机器配置不敏感）。
 const pool = createPool({ file: STATE_FILE, hotSoftCooldown: true });
-
 module.exports = { createPool, pool, DEFAULTS, STATE_FILE, msUntilNext4AM };

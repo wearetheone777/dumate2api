@@ -308,3 +308,47 @@ test('配置落盘并在新进程读回（重启不丢开关）', () => {
   assert.strictEqual(disk.jitter_minutes, 5);
   autock.configure({ enabled: false, hour: 10, minute: 15, jitter_minutes: 10 });
 });
+
+test('P1-4：同人拒绝 6h 窗口跳过，其余按最久没真正领到轮转', () => {
+  const now = Date.UTC(2026, 10, 27, 12, 0, 0);
+  const accounts = [CN(81), CN(82), CN(83)];
+  const rows = [
+    { accountId: 81, verification: 'same_person', ts: now - 2 * 3600000, grantedAt: now - 2 * 3600000 },
+    { accountId: 82, verification: 'claimed', ts: now - 3600000, grantedAt: now - 3600000 },
+    { accountId: 83, verification: 'unverified', ts: now - 7200000, grantedAt: now - 7200000 },
+  ];
+  const out = autock.orderCheckinCandidates(accounts, { now, rows });
+  assert.deepStrictEqual(out.list.map((a) => a.id), [83, 82]);
+  assert.deepStrictEqual(out.skipped.map((a) => a.id), [81]);
+  // 窗口边界：满 6h 后解除
+  const after = autock.orderCheckinCandidates(accounts, { now: now + 6 * 3600000, rows });
+  assert.ok(after.list.some((a) => a.id === 81));
+  assert.equal(after.skipped.length, 0);
+});
+
+test('P1-4：核验失败（unverified）不动签到结论，也不误跳', () => {
+  const now = Date.UTC(2026, 10, 27, 12, 0, 0);
+  const rows = [{ accountId: 91, verification: 'unverified', ts: now - 1000 }];
+  assert.equal(autock.lastSamePersonRejected(91, rows), null);
+  const out = autock.orderCheckinCandidates([CN(91)], { now, rows });
+  assert.equal(out.list.length, 1);
+  assert.equal(out.skipped.length, 0);
+});
+
+test('P1-4：runOnce 把同人拒绝账号记为 skipped，不调用 claimOf', async () => {
+  autock.state.failures = {};
+  const now = Date.UTC(2026, 10, 27, 12, 0, 0);
+  const rows = [{ accountId: 101, verification: 'same_person', ts: now - 1800000 }];
+  let claimed = 0;
+  const r = await autock.runOnce('manual', {
+    accounts: [CN(101)], rows, now,
+    authStore: fakeStore(), perAccountDelayMs: 0,
+    refreshOf: async (a) => a,
+    statusOf: async () => ({ ok: true, checkedIn: false, pending: 100 }),
+    claimOf: async () => { claimed++; return { ok: true, gained: 100, claimed: [{ ok: true }] }; },
+  });
+  assert.equal(claimed, 0);
+  assert.equal(r.skipped, 1);
+  assert.equal(r.results[0].action, 'skipped');
+  assert.match(r.results[0].note, /同人拒绝/);
+});

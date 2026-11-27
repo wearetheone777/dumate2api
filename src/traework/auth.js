@@ -102,6 +102,14 @@ function get(id) {
   return load().accounts.find((a) => a.id === Number(id) || a.id === id) || null;
 }
 
+/**
+ * 可用账号（**总闸**：签到/额度/保活都用它，所以要触达冷却账号）。
+ *
+ * `refreshRetiredAt` 的号**不排除**：它只是「换不了票」，access token 若还没过期
+ * 照样能跑（实测存在这种状态）。真正拦在选号处由池状态决定——换票真失败时
+ * `index.js` 会把它排除出本轮候选并换号。这里排除会误伤「access 还有效」的号，
+ * 那正是签到等辅助路径还需要它的原因。
+ */
 function findUsable() {
   return load().accounts.filter((a) => a.enabled !== false && a.accessToken && a.refreshToken);
 }
@@ -120,13 +128,17 @@ function upsert(acc) {
     cache = { mtime: -1, data: null };
     const data = load();
     const i = data.accounts.findIndex((a) => (acc.uid && a.uid === acc.uid) || (acc.id && a.id === acc.id));
+    // 重新登录（新 refreshToken）必须清掉「凭证已退场」标记，否则
+    // needsRefresh 会一直返回 false，新凭证被判成不用刷新也进不了池——
+    // 表现为「重新登录了还是用不了」，且没有任何报错。
+    const fresh = acc.refreshToken ? { ...acc, refreshRetiredAt: null } : acc;
     if (i >= 0) {
-      data.accounts[i] = { ...data.accounts[i], ...acc };
+      data.accounts[i] = { ...data.accounts[i], ...fresh };
       save(data);
       return data.accounts[i];
     }
     const id = data.accounts.reduce((m, a) => Math.max(m, Number(a.id) || 0), 0) + 1;
-    const rec = { id, enabled: true, createdAt: Date.now(), ...acc };
+    const rec = { id, enabled: true, createdAt: Date.now(), ...fresh };
     data.accounts.push(rec);
     save(data);
     return rec;
@@ -182,8 +194,20 @@ const REFRESH_STAGGER_MS = Number(process.env.DUMATE_TRAEWORK_REFRESH_STAGGER_MS
  * 错峰加在**提前量**上而不是"延迟刷新"：让不同账号在不同时刻进入刷新窗口，
  * 而不是让它们一起到点、再排队错开——后者在窗口内仍是同一秒的请求尖峰。
  */
+/**
+ * 该账号的 access token 是否需要换票。
+ *
+ * `refreshRetiredAt`（2026-11-28）：凭证被上游**明确拒绝**过的标记（`index.js`
+ * 的换票失败路径写入）。它的作用是别让废号每次请求都白撞一次换票端点——
+ * 上游已经说过 `refresh token is not matched`，再问也是同一个答案。
+ * 返回 false 意味着「不刷新」，账号仍可能因 access 未过期而可用；真正决定
+ * 它还能不能被选中由 access token 是否过期 + 池状态共同判断。
+ * 用户重新登录（`upsert` 带新 refreshToken）时必须清掉该标记，否则新凭证
+ * 也会被这条挡住——清除逻辑在 `upsert`。
+ */
 function needsRefresh(a, skewMs = 24 * 3600 * 1000) {
   if (!a || !a.expiresAt) return true;
+  if (a.refreshRetiredAt) return false;
   const margin = skewMs + jitter.staggerMs(`traework:${a.id}`, REFRESH_STAGGER_MS);
   return Date.now() + margin >= a.expiresAt;
 }

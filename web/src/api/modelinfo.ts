@@ -63,6 +63,17 @@ export interface ModelInfoRow {
   /** 免费档（Qoder 的 is_free）。与 TRAE 的会员折扣不是一回事 */
   isFree?: boolean
   note?: string
+  /**
+   * 模型状态（P0-2）：
+   * - `disabled`：上游模型表声明 enable=false，客户端列表不给，管理端灰显
+   * - `retired_candidate`：第三方清单称已下线、本项目未真机复核。
+   *   **条目保留**，只是默认不在 /v1/models 列出；显式调用仍透传。
+   */
+  status?: 'active' | 'disabled' | 'retired_candidate'
+  disabledReason?: string
+  retiredCandidate?: boolean
+  /** 模型表来源：upstream / disk-cache / client-cache / snapshot（Qoder） */
+  catalogSource?: string
 }
 
 export const modelInfoApi = {

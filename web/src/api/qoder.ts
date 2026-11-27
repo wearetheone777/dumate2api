@@ -22,6 +22,8 @@ export interface QoderAccount {
   preferred: boolean
   expiresAt: number | null
   refreshExpiresAt: number | null
+  /** P1-1：后台提前续期状态（默认关闭，DUMATE_QODER_TOKEN_PREREFRESH=1 才写） */
+  tokenRefresh: { at: number; ok: boolean; error: string } | null
   machineId: string
   lastError: string
   /** lastError 的写入时刻，界面显示「N 分钟前」用 */
@@ -30,6 +32,8 @@ export interface QoderAccount {
   daysAlive: number | null
   hasRefresh: boolean
   hasAccess: boolean
+  /** P2-1：凭证族 device / job / pat（只读展示，不带 token） */
+  tokenFamily: 'device' | 'job' | 'pat' | 'unknown'
   refreshTail: string
 }
 
@@ -191,6 +195,12 @@ export interface QoderModel {
    */
   rateOriginal: number | null
   contextWindow: number | null
+  /** P0-2：上游声明 enable=false 时 'disabled'；快照候选下线 'retired_candidate' */
+  status?: 'active' | 'disabled' | 'retired_candidate'
+  disabledReason?: string
+  retiredCandidate?: boolean
+  /** 模型表来源：upstream / disk-cache / client-cache / snapshot */
+  catalogSource?: string
   isDefault: boolean
   isFree: boolean
   isNew: boolean
@@ -387,7 +397,7 @@ export const qoderApi = {
 
   // ---- 运行期配置（P0-3，热生效：保存后网关下一次判定就读到新值） ----
   runtime: () => client.get<QoderRuntime>('/qoder-runtime'),
-  saveRuntime: (patch: Partial<Pick<QoderRuntimeConfig, 'timeouts' | 'queue' | 'limits' | 'repair' | 'concurrency'>>) =>
+  saveRuntime: (patch: Partial<QoderRuntimeConfig>) =>
     client.put<{ ok: boolean; config?: QoderRuntimeConfig; changed?: Record<string, object>; restartFields?: string[]; error?: string }>(
       '/qoder-runtime', patch,
     ),
@@ -521,6 +531,14 @@ export interface QoderModelLock {
   reasons: Array<{ text: string; count: number }>
   /** 粗分：queue（等就好）/ quota / model / other。**不给处置建议** */
   kind: 'queue' | 'quota' | 'model' | 'other'
+  /**
+   * 排队的子类别（2026-11-28 真机实测，只在 kind==='queue' 时给）：
+   * - `real` 真排队（p4 / queueCount>0 / serviceAvailable:true）→ 等着会放行
+   * - `hard` 伪装成排队的身份拒绝（p1 / queueCount:0 / serviceAvailable:false）
+   *   → **等也不会放行**，要改 system 文本（见 identity-guard）
+   * - `''` 认不出（不猜，按未知处理）
+   */
+  queueKind?: 'real' | 'hard' | ''
 }
 
 /** 探测任务状态（触发式编排的轮询目标） */
@@ -621,7 +639,11 @@ export interface QoderRuntimeConfig {
     minIntervalMs: number
     /** `''` = 池默认加权抽签；`least-inflight` = 最少在途优先 */
     pickStrategy: '' | 'least-inflight'
+    /** Qoder 积分保底（0 = 关）。低于此值的账号不进候选；全部低于时按余额最高者继续 */
+    creditFloor: number
   }
+  /** 出站身份句守卫（11-23 受控 A/B：品牌身份句触发 10605/p1 硬拒绝）。默认关 */
+  identityGuard: { enabled: boolean }
 }
 
 export interface QoderRuntime {

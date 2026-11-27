@@ -109,6 +109,38 @@ test('kindOf：只做粗分（排队 / 配额 / 模型 / 其它），不给处�
   assert.strictEqual(locks.kindOf([]), 'other');
 });
 
+test('queueKindOf：真排队(p4) 与伪装硬拒绝(p1) 分开（2026-11-28 真机实测）', () => {
+  // 真排队：服务在、队列里有人 → 等着会放行
+  const real = '{"code":"10605","isQueued":true,"queueCount":1,"queueType":"p4",'
+    + '"serviceAvailable":true,"subCode":"RESOURCE_LIMIT","waitTime":60}';
+  assert.strictEqual(locks.queueKindOf(real), 'real');
+  // 伪装硬拒绝：服务不在、队列空 → 等也不会放行（identity-guard 中和的那种）
+  const hard = '{"code":"10605","isQueued":true,"queueCount":0,"queueType":"p1",'
+    + '"serviceAvailable":false,"subCode":"RESOURCE_LIMIT"}';
+  assert.strictEqual(locks.queueKindOf(hard), 'hard');
+  // 只有 code 10605、形态字段都没给 → 不猜
+  assert.strictEqual(locks.queueKindOf('{"code":"10605","isQueued":true}'), '');
+  // 根本不是排队的文本 → 恒空（不臆造排队形态）
+  assert.strictEqual(locks.queueKindOf('quota exhausted'), '');
+  assert.strictEqual(locks.queueKindOf(''), '');
+});
+
+test('queueKind：只对排队类锁给形态，其它锁恒空', () => {
+  const snap = [
+    row('qoder:1', [['gfmodel', 60_000, 1,
+      '{"code":"10605","isQueued":true,"queueCount":1,"queueType":"p4","serviceAvailable":true}']]),
+    row('qoder:2', [['dfmodel', 60_000, 1, 'quota exhausted (112)']]),
+  ];
+  const out = locks.aggregateLocks(snap, { prefix: 'qoder:' });
+  const gf = out.models.find((m) => m.model === 'gfmodel');
+  const df = out.models.find((m) => m.model === 'dfmodel');
+  assert.strictEqual(gf.kind, 'queue');
+  assert.strictEqual(gf.queueKind, 'real');
+  // 额度锁不是排队，不该带排队形态
+  assert.strictEqual(df.kind, 'quota');
+  assert.strictEqual(df.queueKind, '');
+});
+
 test('同模型的多种原因按次数排序，主因取最多的那条', () => {
   const snap = [
     row('qoder:1', [['dfmodel', 60_000, 1, 'RESOURCE_LIMIT']]),

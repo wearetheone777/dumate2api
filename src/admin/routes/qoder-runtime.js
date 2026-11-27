@@ -42,7 +42,9 @@ function effective() {
       inflightMax: cp.inflightMaxOf('qoder'),
       minIntervalMs: cp.minIntervalMsOf('qoder'),
       pickStrategy: cp.pickStrategyOf('qoder'),
+      creditFloor: cp.creditFloorOf('qoder'),
     } : null,
+    identityGuard: { enabled: require('../../qoder/identity-guard').enabled() },
   };
 }
 

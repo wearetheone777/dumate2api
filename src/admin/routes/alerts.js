@@ -51,6 +51,12 @@ function facts(cfg, now = Date.now()) {
     // 启用且有凭证的账号数；没有登录态字段的通道按 enabled 计
     channels[channel] = accounts.filter((a) => a.channel === channel && a.enabled !== false).length;
   }
+  // Qoder 遥测是**只读进程内计数**：告警读取它不触发上游、不喂池，
+  // 与「探针不惩罚健康账号」同一纪律（P1-6）。
+  try {
+    const qtel = require('../../qoder/telemetry').snapshot();
+    channels.qoder = { ...(channels.qoder || {}), telemetry: qtel };
+  } catch (e) { /* 遥测不可用时不新增规则判定 */ }
   const last = taskScheduler.state.last_result;
   // 连续失败轮数：任务轮结果只有最近一轮，按「本轮有失败」记 1；
   // 真正的连续 N 轮由 alerts.assess 的迟滞状态跨轮累计（阈值默认 2）。

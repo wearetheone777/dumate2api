@@ -279,6 +279,10 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   // provider 解析出**实际发给上游的模型 key** 后回调（目前只有 Qoder 报）。
   // `route.model` 只是去掉前缀的调用方写法，显示名有没有解析成功看不出来。
   const onModel = (name) => { if (name) req._mappedModel = String(name); };
+  // 上游真实模型的**指纹**（P1-3，目前只有 Qoder 报）：响应里的 model 恒为
+  // "auto"，只有 system_fingerprint 能区分后端。它是哈希，不是模型名——
+  // 单独一个字段，界面写「指纹」而不是冒充 resolved_model。
+  const onFingerprint = (fp) => { if (fp && !req._upstreamFingerprint) req._upstreamFingerprint = String(fp); };
   // 链路上报（2026-11-06）：traework 的三条链路（utils_chat / remote / solo）
   // 实际走哪条只有通道知道——req 上存一下，logRequest 落 link 字段。
   // 没有「链路」概念的通道不上报，字段留空，前端不显示。
@@ -347,7 +351,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
     // TRAE 宝身份标记（2026-11-03）：resolve() 把 `traebao/` 前缀剥掉后才到
     // provider 手里，send() 靠 payload.model 认不出身份——显式经 opts 传。
     if (route.personalAssistant) req._personalAssistant = true;
-    const providerOpts = { reqId, onAccount, onModel, onLink, onDegraded, onFailover, onReasoning, onSessionKey, attempts: attemptLog, startedAt, region: ctx.region || '', personalAssistant: !!route.personalAssistant, key: req._apiKey || null };
+    const providerOpts = { reqId, onAccount, onModel, onFingerprint, onLink, onDegraded, onFailover, onReasoning, onSessionKey, attempts: attemptLog, startedAt, region: ctx.region || '', personalAssistant: !!route.personalAssistant, key: req._apiKey || null };
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
       const result = await provider.send(payload, undefined, providerOpts);
@@ -979,6 +983,10 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 上游会按请求模型静默改路由（glm-5 预置展示 GLM-5.2），不记这个
     // 就只能靠猜。桌面链路拿不到这个头，如实留空。
     real_model: req._realModel || '',
+    // 上游真实模型的指纹（P1-3，Qoder 的 system_fingerprint）。与 real_model
+    // 是两个来源：后者是 HTTP 头回显（只有搭子云端有），前者是响应帧。
+    // 拿不到如实留空——不拿请求的模型名冒充「上游确认了」。
+    upstream_fingerprint: req._upstreamFingerprint || '',
     stream: !!info.stream,
     messages: info.messages || 0,
     status: status || 0,
@@ -1431,6 +1439,17 @@ async function handleOpenAIModels(req, res) {
             owned_by: 'qoder',
             name: m.name,
             ...(m.contextWindow ? { contextWindow: m.contextWindow, maxContextWindow: m.maxContextWindow } : {}),
+            // P0-3：能力元数据「一致才返回」由 qoder 出口判定；这里只透传。
+            // 缺失字段不填 false/null——cc-switch / 客户端应当成「未知」。
+            ...(m.supports_reasoning !== undefined ? { supports_reasoning: m.supports_reasoning } : {}),
+            ...(m.reasoning_effort_options ? { reasoning_effort_options: m.reasoning_effort_options } : {}),
+            ...(m.default_reasoning_effort ? { default_reasoning_effort: m.default_reasoning_effort } : {}),
+            ...(m.multimodal !== undefined ? { multimodal: m.multimodal } : {}),
+            ...(m.maxOutputTokens ? { maxOutputTokens: m.maxOutputTokens } : {}),
+            // P0-2：模型表来源（upstream / disk-cache / client-cache / snapshot）。
+            // **不能省**——兜底时条目明显变少，不标来源会被当成网关故障排查。
+            ...(m.catalogSource ? { catalogSource: m.catalogSource } : {}),
+            ...(m.status && m.status !== 'active' ? { status: m.status } : {}),
           });
         }
       }
@@ -2766,12 +2785,15 @@ const server = http.createServer(async (req, res) => {
               const reg = regionParamOf(req);
               const st = require('./qoder').status();
               let telemetry = null;
+              let observations = null;
               try { telemetry = require('./qoder/telemetry').snapshot(); }
               catch (e2) { telemetry = null; }
+              try { observations = require('./qoder/telemetry').observationSnapshot(); }
+              catch (e2) { observations = null; }
               if (!reg) {
                 return {
                   direct: true, ready: st.ready, needsClient: false,
-                  accounts: st.accounts, error: st.error || '', telemetry,
+                  accounts: st.accounts, error: st.error || '', telemetry, observations,
                 };
               }
               const rows = require('./qoder/auth').list()
@@ -2779,7 +2801,7 @@ const server = http.createServer(async (req, res) => {
               const ready = rows.some((a) => a.enabled);
               return {
                 direct: true, ready, needsClient: false,
-                accounts: rows.length, region: reg, telemetry,
+                accounts: rows.length, region: reg, telemetry, observations,
                 error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
               };
             } catch (e) {

@@ -46,6 +46,19 @@ function create(opts = {}) {
       at,
     };
     if (entry.ms != null && Number.isFinite(Number(entry.ms))) item.ms = Math.max(0, Number(entry.ms));
+    // P1-3：上游诊断码/请求 ID（只记标识，不记报文正文与凭证）
+    if (entry.upstreamCode != null && String(entry.upstreamCode).trim()) {
+      item.upstreamCode = String(entry.upstreamCode).slice(0, 40);
+    }
+    if (entry.upstreamRequestId != null && String(entry.upstreamRequestId).trim()) {
+      item.upstreamRequestId = String(entry.upstreamRequestId).slice(0, 120);
+    }
+    // P1-3：失败阶段（auth / upstream / http / throttle / network）。
+    // 与 upstreamCode 是两回事：码是上游给的，阶段是**我们**判定的
+    // 「这一步错在哪」——排障先看阶段，再看码。
+    if (entry.stage != null && String(entry.stage).trim()) {
+      item.stage = String(entry.stage).slice(0, 20);
+    }
     list.push(item);
     return item;
   }

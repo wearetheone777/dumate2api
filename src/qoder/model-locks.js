@@ -101,6 +101,11 @@ function aggregateLocks(snap, opts = {}) {
         ? cell.reasons.sort((a, b) => b.count - a.count)[0].text : '',
       reasons: cell.reasons.sort((a, b) => b.count - a.count),
       kind: kindOf(cell.reasons),
+      // 排队的子类别（real / hard / ''）。kind 不等于 queue 时恒 ''——
+      // 「不是排队」的锁不该带排队形态，否则界面会给出错的处置提示。
+      queueKind: kindOf(cell.reasons) === 'queue'
+        ? queueKindOf(cell.reasons.map((r) => r.text).join(' '))
+        : '',
     }))
     // 先按「全池解锁最快」排，再看锁了几个号——快通的排前面（那是用户该换的模型）
     .sort((a, b) => (a.allClearUntil - b.allClearUntil) || (a.accountCount - b.accountCount));
@@ -141,4 +146,30 @@ function kindOf(reasons) {
   return 'other';
 }
 
-module.exports = { aggregateLocks, kindOf, clampReason };
+/**
+ * 排队的**子类别**：真排队 vs 伪装成排队的硬拒绝（2026-11-28 真机实测）。
+ *
+ * 两个形态都是 HTTP 403 + code 10605 + subCode RESOURCE_LIMIT，只看错误码分不开，
+ * 但处置完全相反：
+ *
+ *   - `real`（真排队）：`queueType:"p4"` + `queueCount:1` + `serviceAvailable:true`
+ *     ——服务在，只是排在队里，等着（或走官方排队轮询）会放行。
+ *   - `hard`（硬拒绝）：`queueType:"p1"` + `queueCount:0` + `serviceAvailable:false`
+ *     ——qoder2api-hub v1.10.3 §7 的受控实验结论：这是**伪装成排队的身份拒绝**，
+ *     等待永远不会放行（触发条件是 system 文本里的 `You are Codex,` 这类身份句，
+ *     由 `identity-guard.js` 中和）。
+ *
+ * 判据优先级：`serviceAvailable === false` 最硬（服务都没了，等不来）；
+ * 其次是 `queueCount === 0`（队列里一个都没有，说明不是拥堵）。
+ * 两个字段都认不出时不猜，返回 ''——让调用方按「未知」处理而不是给错建议。
+ */
+function queueKindOf(blob) {
+  const s = String(blob || '');
+  if (!/10605|isQueued|RESOURCE_LIMIT|CALL_COUNT_LIMIT|排队/i.test(s)) return '';
+  if (/"serviceAvailable"\s*:\s*false/i.test(s)) return 'hard';
+  if (/"queueCount"\s*:\s*0(?![\d])/.test(s)) return 'hard';
+  if (/"serviceAvailable"\s*:\s*true/i.test(s) || /"queueCount"\s*:\s*[1-9]/i.test(s)) return 'real';
+  return '';
+}
+
+module.exports = { aggregateLocks, kindOf, queueKindOf, clampReason };

@@ -100,6 +100,8 @@ function list() {
     preferred: !!a.preferred,
     expiresAt: a.expiresAt || null,
     refreshExpiresAt: a.refreshExpiresAt || null,
+    // P1-1：后台提前续期的状态（由 balance-refresh 探针写；失败不写 lastError）
+    tokenRefresh: a.tokenRefresh || null,
     machineId: a.machineId || '',
     // 读取时翻译：`aborted` 这类原生错误名对「账号怎么了」没有信息量。
     // 存量记录（本功能上线前写的）靠这一层也能看懂——lastError 只在成功时
@@ -108,6 +110,8 @@ function list() {
     lastErrorAt: a.lastErrorAt || null,
     createdAt: a.createdAt || null,
     daysAlive: a.createdAt ? Math.floor((Date.now() - a.createdAt) / 86400000) : null,
+    // P2-1：凭证族（device/job/pat）供凭证健康卡只读展示，不带 token
+    tokenFamily: (() => { try { return require('./session').tokenFamilyOf(a); } catch (e) { return 'unknown'; } })(),
     // 「凭证是否完整」以布尔形式带出——token 本身不外传，调用方需要知道有没有
     hasRefresh: !!a.refreshToken,
     hasAccess: !!a.accessToken,
@@ -153,13 +157,17 @@ function upsert(acc) {
     if (acc && acc.preferred === true) {
       for (const x of data.accounts) x.preferred = false;
     }
+    // 重新登录（带新 refreshToken）必须清掉「凭证已退场」标记，否则
+    // needsRefresh 一直返回 false，新凭证被判成不用刷新——表现为
+    // 「重新登录了还是用不了」，且没有任何报错（TRAE/WorkBuddy 同款坑）。
+    const fresh = acc.refreshToken ? { ...acc, refreshRetiredAt: null } : acc;
     if (i >= 0) {
-      data.accounts[i] = { ...data.accounts[i], ...acc };
+      data.accounts[i] = { ...data.accounts[i], ...fresh };
       save(data);
       return data.accounts[i];
     }
     const id = data.accounts.reduce((m, a) => Math.max(m, Number(a.id) || 0), 0) + 1;
-    const rec = { id, enabled: true, createdAt: Date.now(), ...acc };
+    const rec = { id, enabled: true, createdAt: Date.now(), ...fresh };
     if (rec.preferred === undefined) rec.preferred = data.accounts.length === 0;
     data.accounts.push(rec);
     save(data);
@@ -240,6 +248,10 @@ function remove(id) {
 /** token 是否在 skewMs 内过期。无 expiresAt 视为需要刷新 */
 function needsRefresh(a, skewMs = 300000) {
   if (!a || !a.expiresAt) return true;
+  // 凭证退场标记（2026-11-28，与 TRAE/WorkBuddy 同源）：换票被上游
+  // 明确判死过（`exchange` 返回 `expired: true`），再问也是同一个答案。
+  // 返回 false 表示「不刷新」，账号仍可能因 access 未过期而可用。
+  if (a.refreshRetiredAt) return false;
   return Date.now() + skewMs >= a.expiresAt;
 }
 

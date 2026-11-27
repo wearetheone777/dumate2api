@@ -41,7 +41,7 @@ const filelock = require('./filelock');
 
 const FILE = 'livecfg.json';
 
-const FIELDS = ['recordClientInfo', 'hiddenModels', 'softCooldownMs', 'throttle', 'throttleMaxMs', 'imageBudget'];
+const FIELDS = ['recordClientInfo', 'hiddenModels', 'softCooldownMs', 'throttle', 'throttleMaxMs', 'imageBudget', 'reqlogRetention'];
 
 /**
  * 通道风控旋钮的**存储形状**（只存，不解释语义——解释在 src/throttle.js）。
@@ -69,6 +69,12 @@ function defaults() {
     throttle: {},
     throttleMaxMs: 0,
     imageBudget: { maxBytes: 0, maxTotalBytes: 0, maxEdge: 0 },
+    // P2-3：请求日志保留策略。0 = 不按天清理（env DUMATE_REQLOG_RETENTION_DAYS 仍生效）；
+    // maxLines 只裁剪归档 `.1`，在写主文件绝不碰。
+    reqlogRetention: {
+      days: parseInt(process.env.DUMATE_REQLOG_RETENTION_DAYS || '0', 10) || 0,
+      maxLines: parseInt(process.env.DUMATE_REQLOG_MAX_LINES || '0', 10) || 0,
+    },
   };
 }
 
@@ -174,6 +180,23 @@ function sanitize(patch, { strict = false } = {}) {
         table[ch] = cell;
       }
       out.throttle = table;
+    } else if (key === 'reqlogRetention') {
+      if (v == null) continue;
+      if (typeof v !== 'object' || Array.isArray(v)) {
+        if (strict) throw new Error('reqlogRetention 必须是 `{days, maxLines}` 对象');
+        continue;
+      }
+      const cell = {};
+      for (const k of ['days', 'maxLines']) {
+        if (v[k] === undefined || v[k] === null) continue;
+        const n = Number(v[k]);
+        if (!Number.isFinite(n) || n < 0) {
+          if (strict) throw new Error(`reqlogRetention.${k} 必须是非负数字（0 = 不限）`);
+          continue;
+        }
+        cell[k] = Math.round(n);
+      }
+      out.reqlogRetention = cell;
     } else if (key === 'imageBudget') {
       if (v == null) continue;
       if (typeof v !== 'object' || Array.isArray(v)) {
@@ -233,6 +256,7 @@ function Load() {
     hiddenModels: [...snap.hiddenModels],
     throttle: materializeThrottle(snap.throttle),
     imageBudget: { ...(snap.imageBudget || {}) },
+    reqlogRetention: { ...(snap.reqlogRetention || {}) },
   };
 }
 
@@ -253,6 +277,7 @@ function mergeInto(base, patch) {
     // 两个键是同一件事的两面，逐键合并才符合 patch 语义
     out.imageBudget = { ...(base.imageBudget || {}), ...patch.imageBudget };
   }
+  if (patch.reqlogRetention) out.reqlogRetention = { ...(base.reqlogRetention || {}), ...patch.reqlogRetention };
   if (patch.throttle) {
     const table = { ...(base.throttle || {}) };
     for (const [ch, row] of Object.entries(patch.throttle)) {

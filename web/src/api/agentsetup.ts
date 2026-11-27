@@ -93,6 +93,20 @@ export const agentSetupApi = {
     return client.get<SetupClientsData>('/agent-setup/clients')
   },
 
+  /** P2-2：只读接入片段（token 占位符，不写文件），与一键配置同一份生成器 */
+  snippets(channel = 'qoder') {
+    return client.get<{
+      ok: boolean
+      channel: string
+      gateway: string
+      claude: string
+      codex: string
+      accountNote?: string
+      note: string
+      error?: string
+    }>(`/agent-setup/snippets?channel=${encodeURIComponent(channel)}`)
+  },
+
   /** 写入配置。token 留空时后端写 'nokey' 占位（鉴权已强制，实际请求会被 401） */
   apply(params: { client: string; channel: string; token?: string }) {
     return client.post<SetupApplyResult>('/agent-setup/apply', params)

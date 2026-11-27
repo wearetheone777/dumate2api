@@ -126,6 +126,55 @@
       </template>
     </a-card>
 
+    <!-- ========= 凭证健康（P2-1，只读本地状态，不打上游） ========= -->
+    <a-card :bordered="false" title="Qoder 凭证健康" class="mb-4">
+      <div class="text-xs text-slate-400 mb-3">
+        只读展示 <code>/qoder/status</code> 的本地凭证信息：<b>null 显示「未知」，不显示 0</b>。
+        续期状态由后台轮转探针写；没记录就标「未观测」，不猜成正常。
+      </div>
+      <a-table size="small" :pagination="false" row-key="id" :data-source="credentialRows"
+        :columns="[
+          { title: '账号', dataIndex: 'nickname', key: 'nickname' },
+          { title: '区域', key: 'region', width: 90 },
+          { title: '凭证族', key: 'family', width: 100 },
+          { title: '凭证完整', key: 'cred', width: 160 },
+          { title: 'refresh 到期', key: 'exp', width: 180 },
+          { title: '最近续期', key: 'refresh', width: 200 },
+        ]">
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'nickname'">
+            <span>{{ record.nickname || '未命名' }}</span>
+            <span class="text-xs text-slate-400 ml-1">#{{ record.id }}</span>
+          </template>
+          <template v-else-if="column.key === 'region'">
+            <a-tag size="small" :color="record.region === 'cn' ? 'blue' : 'purple'">
+              {{ record.region === 'cn' ? '国内' : '国际' }}
+            </a-tag>
+          </template>
+          <template v-else-if="column.key === 'family'">
+            <span>{{ record.tokenFamily || 'unknown' }}</span>
+          </template>
+          <template v-else-if="column.key === 'cred'">
+            <a-tag size="small" :color="record.hasRefresh && record.hasAccess ? 'green' : 'orange'">
+              {{ record.hasRefresh && record.hasAccess ? '完整' : '缺失' }}
+            </a-tag>
+          </template>
+          <template v-else-if="column.key === 'exp'">
+            <span :class="record.refreshExpiresAt && record.refreshExpiresAt <= Date.now() ? 'text-red-500' : ''">
+              {{ refreshText(record) }}
+            </span>
+          </template>
+          <template v-else-if="column.key === 'refresh'">
+            <span :class="record.tokenRefresh && !record.tokenRefresh.ok ? 'text-orange-500' : ''">
+              {{ tokenRefreshText(record) }}
+            </span>
+            <span v-if="record.tokenRefresh?.error" class="text-xs text-slate-400 ml-1">{{ record.tokenRefresh.error }}</span>
+          </template>
+        </template>
+      </a-table>
+      <div v-if="!credentialRows.length" class="text-xs text-slate-400 mt-2">当前区域没有 Qoder 账号。</div>
+    </a-card>
+
     <!-- ========= 计时器 ========= -->
     <a-card :bordered="false" title="超时与体积（P0-3）" class="mb-4">
       <div class="text-xs text-slate-400 mb-3">
@@ -270,7 +319,24 @@
             <div v-if="effConcurrency" class="text-xs text-slate-500 mt-1">
               生效：在途上限 {{ effConcurrency.inflightMax || '池默认 4' }} ·
               间隔 {{ effConcurrency.minIntervalMs || '关' }} ·
-              {{ effConcurrency.pickStrategy || '池默认' }}
+              {{ effConcurrency.pickStrategy || '池默认' }} ·
+              保底 {{ effConcurrency.creditFloor || '关' }}
+            </div>
+          </div>
+        </a-col>
+        <a-col :xs="24" :sm="12" :md="8">
+          <div class="cfg-cell">
+            <div class="text-xs text-slate-400">积分保底</div>
+            <div class="flex items-center gap-2 mt-1">
+              <a-input-number
+                v-model:value="rt.concurrency.creditFloor"
+                :min="0" :max="1000000" :step="1" :disabled="!isAdmin"
+                style="width: 100%"
+              />
+              <span class="text-xs text-slate-400 shrink-0">分</span>
+            </div>
+            <div class="text-xs text-slate-400 mt-1">
+              0 = 关。低于此值的账号不进候选；全部低于时按余额最高者继续
             </div>
           </div>
         </a-col>
@@ -278,6 +344,25 @@
       <div class="text-xs text-slate-400 mt-3">
         <b>粘性优先于 least-inflight</b>：前缀缓存命中率直接影响实付 token，而在途均衡只影响排队概率。
         两者冲突时选前者；least-inflight 只在暖列表全不可用时接管分配。
+      </div>
+    </a-card>
+
+    <!-- ========= 出站身份句守卫（P0-1） ========= -->
+    <a-card :bordered="false" title="出站身份句守卫（P0-1）" class="mb-4">
+      <div class="flex items-start justify-between gap-4">
+        <div class="text-xs text-slate-400">
+          <p class="mb-1">
+            上游实测（受控 A/B，2026-11-23）：<code>You are Codex,</code> /
+            <code>powered by DeepSeekRuntime.</code> 这类身份句会触发
+            <b>10605 / p1 硬拒绝</b>（伪装成排队，等待不会放行）。
+          </p>
+          <p class="mb-0">
+            开启后只在品牌名后的标点前插一个空格（<code>You are Codex ,</code>），
+            不改语义、不动自家品牌 Qoder，幂等；前缀缓存字节稳定。
+            <b>默认关闭</b>，与 env <code>DUMATE_QODER_IDENTITY_GUARD=1</code> 等价。
+          </p>
+        </div>
+        <a-switch v-model:checked="rt.identityGuard.enabled" :disabled="!isAdmin" />
       </div>
     </a-card>
 
@@ -312,6 +397,12 @@
             <template v-if="column.key === 'model'">
               <span class="font-mono text-xs">{{ record.model }}</span>
               <a-tag :color="lockKindColor(record.kind)" class="ml-1">{{ lockKindText(record.kind) }}</a-tag>
+              <a-tag v-if="record.queueKind" :color="record.queueKind === 'hard' ? 'red' : 'blue'" class="ml-1"
+                     :title="record.queueKind === 'hard'
+                       ? '伪装成排队的身份拒绝（p1/serviceAvailable:false）——等待不会放行，需中和 system 身份句'
+                       : '真排队（p4/queueCount>0）——等着会放行'">
+                {{ lockQueueKindText(record.queueKind) }}
+              </a-tag>
             </template>
             <template v-else-if="column.key === 'accounts'">
               <span class="text-xs">{{ record.accountCount }} 个号</span>
@@ -354,7 +445,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { App } from 'ant-design-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { qoderApi } from '@/api/qoder'
-import type { QoderAutoCheckin, QoderRuntime, QoderRuntimeConfig, QoderModelLocks } from '@/api/qoder'
+import type { QoderAccount, QoderAutoCheckin, QoderRuntime, QoderRuntimeConfig, QoderModelLocks } from '@/api/qoder'
 import { regionParam } from '@/stores/region'
 import { isAdmin } from '@/stores/auth'
 
@@ -362,6 +453,7 @@ const { message } = App.useApp()
 const loading = ref(false)
 const saving = ref(false)
 const autoBusy = ref(false)
+const credentialRows = ref<QoderAccount[]>([])
 const err = ref('')
 const file = ref('')
 const runtime = ref<QoderRuntime>({
@@ -377,7 +469,8 @@ function emptyConfig(): QoderRuntimeConfig {
     queue: { pollEnabled: true, pollBudgetMs: 60000, patienceMs: 6000, stepMs: 1500, pollIntervalMs: 0, cooldownMs: 5000 },
     limits: { throttleMaxMs: 600000, fefoDays: 3 },
     repair: { retry: 1, holdCap: 600 },
-    concurrency: { inflightMax: 0, minIntervalMs: 0, pickStrategy: '' },
+    concurrency: { inflightMax: 0, minIntervalMs: 0, pickStrategy: '', creditFloor: 0 },
+    identityGuard: { enabled: false },
   }
 }
 
@@ -444,6 +537,10 @@ function lockKindText(k: string) {
 function lockKindColor(k: string) {
   return ({ queue: 'blue', quota: 'orange', model: 'purple', other: 'default' } as Record<string, string>)[k] || 'default'
 }
+/** 排队形态：真排队 vs 伪装硬拒绝（2026-11-28 真机实测的字段差异） */
+function lockQueueKindText(k: string) {
+  return ({ real: '真排队', hard: '硬拒绝' } as Record<string, string>)[k] || k
+}
 /** 毫秒 → 「N 分」/「N 秒」/「N 小时 M 分」。0 显示「现在」 */
 function msText(ms: number) {
   if (!(ms > 0)) return '现在'
@@ -503,6 +600,7 @@ function copyConfig(c: QoderRuntimeConfig) {
   Object.assign(rt.limits, c.limits)
   Object.assign(rt.repair, c.repair)
   Object.assign(rt.concurrency, c.concurrency)
+  if (c.identityGuard) Object.assign(rt.identityGuard, c.identityGuard)
 }
 
 function copyAuto(a: QoderAutoCheckin) {
@@ -542,9 +640,30 @@ async function loadAuto() {
   }
 }
 
+async function loadCredentials() {
+  try {
+    const { data } = await qoderApi.status(regionParam() as 'cn' | 'intl' | undefined)
+    credentialRows.value = data.rows || []
+  } catch (e: any) {
+    err.value = e?.response?.data?.error || '读取凭证健康状态失败'
+  }
+}
+
 async function loadAll() {
   loading.value = true
-  try { await Promise.all([loadRuntime(), loadAuto(), loadLocks()]) } finally { loading.value = false }
+  try { await Promise.all([loadRuntime(), loadAuto(), loadLocks(), loadCredentials()]) } finally { loading.value = false }
+}
+
+function refreshText(a: QoderAccount) {
+  if (!a.refreshExpiresAt) return '未知'
+  const ms = a.refreshExpiresAt - Date.now()
+  if (ms <= 0) return `已过期 ${dateText(a.refreshExpiresAt)}`
+  return dateText(a.refreshExpiresAt)
+}
+
+function tokenRefreshText(a: QoderAccount) {
+  if (!a.tokenRefresh) return '未观测'
+  return a.tokenRefresh.ok ? `已续期 ${dateText(a.tokenRefresh.at)}` : `失败 ${dateText(a.tokenRefresh.at)}`
 }
 
 async function saveRuntime() {
@@ -556,6 +675,7 @@ async function saveRuntime() {
       limits: { ...rt.limits },
       repair: { ...rt.repair },
       concurrency: { ...rt.concurrency },
+      identityGuard: { ...rt.identityGuard },
     })
     if (data.ok === false) { message.error(data.error || '保存失败'); return }
     await loadRuntime()

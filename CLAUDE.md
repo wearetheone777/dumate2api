@@ -93,6 +93,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 7. **搭子思考档位只对同后端白名单生效**（`src/dumate-reasoning.js`）：只认 `none/low/high/max`，
    只对 `deepseek-v41-flash` / `model-text` / `dm-auto-model/{text,mm}.L0` 等同一后端生效；
    `minimal`/`medium`（翻译层五档词表里的）刻意不映射。改之前先读该文件头三个边界。
+8. **四通道共用「凭证退场」口径，判废只有一处**（2026-11-28）：换票被上游**明确拒绝**
+   才标 `refreshRetiredAt`（判据各通道一份：TRAE/WorkBuddy 认原文措辞、Qoder 认
+   `exchange` 的 `expired:true`、千问认 401/403 或 `INVALID_REFRESH_TOKEN`/`invalid_grant`；
+   **认不出不猜**——网络抖误标要人工重新登录才能解）。标记的语义是「换不了票」**不是**
+   「号不能用」：access 未过期时照样能跑，所以判废是**双条件**（标记 + access 已过期）
+   且只在 `channel-pool.pickCandidate` 入口做一次（`credentialDead()`）。别在通道里各写
+   一遍——TRAE 与 WorkBuddy 曾各自实现，第三第四份必然漂移。`upsert` 带新 refreshToken
+   时必须清标记，否则重新登录了也用不了。
 
 ## 命令
 

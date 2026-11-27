@@ -62,6 +62,8 @@ const state = {
   // Qoder 轮转探活游标（P1-8）。进程内即弃：重启后从 0 号开始重扫一遍，
   // 一轮之后自然恢复覆盖（N 个账号 N 轮全覆盖，不依赖持久化）
   qoderCursor: 0,
+  // Qoder token 提前续期游标（P1-1）：只轮转扫，不整池同时打 refresh。
+  qoderRefreshCursor: 0,
 };
 
 let timer = null;
@@ -228,6 +230,66 @@ async function collectWorkbuddy(opts = {}) {
  * @param {object} opts 测试注入：list / quota / delay / cursor
  * @returns {object|null} null = 通道未启用或无可用账号
  */
+/**
+ * Qoder token 提前续期（P1-1）。
+ *
+ * 挂在余额轮转探针上，不新开定时器。每轮只扫一个账号；满足条件才换票：
+ *   - 开关 `DUMATE_QODER_TOKEN_PREREFRESH=1`
+ *   - 距 accessToken 到期 < 24h（沿用 auth.needsRefresh 的 skew，不另编 12/15 天）
+ *   - refreshToken 存在
+ *
+ * 失败**不写 lastError、不惩罚账号**——续期是后台观测，不是用户请求失败。
+ * 只把原因记在本轮回执里给面板/日志看。
+ */
+async function prerefreshQoderToken(opts = {}) {
+  if (process.env.DUMATE_QODER_TOKEN_PREREFRESH !== '1') return { enabled: false, skipped: 'disabled' };
+  let authStore;
+  let session;
+  try {
+    authStore = require('./qoder/auth');
+    session = require('./qoder/session');
+  } catch (e) { return { enabled: true, error: e.message }; }
+  let list;
+  try { list = opts.list ? opts.list() : authStore.findUsable(); } catch (e) { return { enabled: true, error: e.message }; }
+  list = (list || []).filter((a) => a && a.enabled !== false && a.refreshToken);
+  if (!list.length) return { enabled: true, skipped: 'no_accounts' };
+  const sorted = [...list].sort((a, b) => Number(a.id) - Number(b.id));
+  const idx = Number.isInteger(opts.cursor) ? (opts.cursor % sorted.length + sorted.length) % sorted.length
+    : (state.qoderRefreshCursor % sorted.length);
+  const a = sorted[idx];
+  state.qoderRefreshCursor = (idx + 1) % sorted.length;
+  if (!authStore.needsRefresh(a, 24 * 3600 * 1000)) {
+    return { enabled: true, scanned: a.id, refreshed: false, reason: 'not_due' };
+  }
+  let r;
+  try { r = opts.exchange
+    ? await opts.exchange(a)
+    : await session.exchange(a);
+  } catch (e) { r = { ok: false, error: e.message }; }
+  if (!r || !r.ok || !r.patch) {
+    const error = (r && r.error) || '换票失败';
+    // 失败不写 lastError、不惩罚账号，但要在账号表里留一行状态供面板查看。
+    try {
+      const mark = { tokenRefresh: { at: Date.now(), ok: false, error } };
+      if (opts.patch) await opts.patch(a.id, mark);
+      else authStore.patch(a.id, mark);
+    } catch (e) { /* 状态写不进去不影响主流程 */ }
+    return { enabled: true, scanned: a.id, refreshed: false, reason: 'failed', error };
+  }
+  try {
+    const patch = { ...r.patch, tokenRefresh: { at: Date.now(), ok: true, error: '' } };
+    if (opts.patch) await opts.patch(a.id, patch);
+    else authStore.patch(a.id, patch);
+  } catch (e) {
+    return { enabled: true, scanned: a.id, refreshed: false, reason: 'write_failed', error: e.message };
+  }
+  return {
+    enabled: true, scanned: a.id, refreshed: true,
+    expiresAt: r.patch.expiresAt || null,
+    refreshExpiresAt: r.patch.refreshExpiresAt || null,
+  };
+}
+
 async function collectQoder(opts = {}) {
   let authStore;
   let session;
@@ -324,6 +386,10 @@ async function runOnce(trigger = 'manual', opts = {}) {
       try { qd = await collectQoder({ ...opts.qoder, delay: opts.delay }); } catch (e) {
         qd = { error: e.message };
       }
+      // P1-1：提前续期挂同一轮探针，失败不影响 qd 的余额回执。
+      try { qd = { ...(qd || {}), token: await prerefreshQoderToken(opts.qoderToken || {}) }; } catch (e) {
+        qd = { ...(qd || {}), token: { enabled: true, error: e.message } };
+      }
     }
 
     // 冷却解冻（keepalive.internals.reconcile：余额 > 阈值 ∩ 冷却中 → 只解硬冷却）
@@ -409,5 +475,5 @@ module.exports = {
   schedule, stop, runOnce, snapshot, configure, state,
   // collectWorkbuddy / collectQoder 一并导出：直连通道段的行为（串行、一次落盘、
   // 轮转游标、失败计数）必须有单测能直接打，否则只能靠「跑一天看看快照新不新」验证
-  internals: { collect, collectWorkbuddy, collectQoder, loadConfig, PER_ACCOUNT_DELAY_MS, FIRST_RUN_DELAY_MS },
+  internals: { collect, collectWorkbuddy, collectQoder, prerefreshQoderToken, loadConfig, PER_ACCOUNT_DELAY_MS, FIRST_RUN_DELAY_MS },
 };

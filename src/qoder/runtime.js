@@ -38,12 +38,14 @@
 //   concurrency.inflightMax DUMATE_QODER_INFLIGHT_MAX      单号并发闸门（0 = 用池默认 4）
 //   concurrency.minIntervalMs DUMATE_QODER_MIN_INTERVAL_MS 单号最小请求间隔（0 = 关）
 //   concurrency.pickStrategy DUMATE_QODER_PICK_STRATEGY    选号策略（'' = 池默认）
+//   concurrency.creditFloor  DUMATE_QODER_CREDIT_FLOOR     账号积分保底线（0 = 关）
+//   identityGuard.enabled   DUMATE_QODER_IDENTITY_GUARD    出站身份句守卫（false = 关）
 const fs = require('fs');
 const path = require('path');
 const filelock = require('../filelock');
 
 const FILE = 'qoder-runtime.json';
-const FIELDS = ['timeouts', 'queue', 'limits', 'repair', 'concurrency'];
+const FIELDS = ['timeouts', 'queue', 'limits', 'repair', 'concurrency', 'identityGuard'];
 
 function dataDir() {
   return process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', '..', 'data');
@@ -105,11 +107,16 @@ function defaults() {
     concurrency: {
       inflightMax: envInt('DUMATE_QODER_INFLIGHT_MAX', 0, 0, 64),
       minIntervalMs: envInt('DUMATE_QODER_MIN_INTERVAL_MS', 0, 0, 600000),
+      creditFloor: envInt('DUMATE_QODER_CREDIT_FLOOR', 0, 0, 1000000),
       // 'least-inflight' | ''（= 池默认加权抽签/轮询）
       pickStrategy: (() => {
         const raw = String(process.env.DUMATE_QODER_PICK_STRATEGY || '').trim().toLowerCase();
         return raw === 'least-inflight' || raw === 'least_inflight' ? 'least-inflight' : '';
       })(),
+    },
+    // 出站身份句守卫（P0-1）。默认关闭——改动出站文本必须有显式决定。
+    identityGuard: {
+      enabled: process.env.DUMATE_QODER_IDENTITY_GUARD === '1',
     },
   };
 }
@@ -143,7 +150,10 @@ const RANGES = {
   concurrency: {
     inflightMax: [0, 64, 'concurrency.inflightMax 需为 0-64 的整数（0 = 用池默认 4）'],
     minIntervalMs: [0, 600000, 'concurrency.minIntervalMs 需为 0-600000 的整数（ms，0 = 关）'],
+    creditFloor: [0, 1000000, 'concurrency.creditFloor 需为 0-1000000 的数字（0 = 关）'],
   },
+  // 布尔字段，由 sanitize 的专用分支处理；RANGES 要有这个键才不会被整组跳过
+  identityGuard: {},
 };
 
 const SUBFIELDS = {
@@ -152,6 +162,7 @@ const SUBFIELDS = {
   limits: Object.keys(RANGES.limits),
   repair: Object.keys(RANGES.repair),
   concurrency: ['pickStrategy', ...Object.keys(RANGES.concurrency)],
+  identityGuard: ['enabled'],
 };
 
 const PICK_STRATEGIES = ['', 'least-inflight'];
@@ -190,7 +201,9 @@ function sanitize(patch, { strict = false } = {}) {
     for (const [k, [min, max, msg]] of Object.entries(RANGES[key])) {
       if (v[k] === undefined) continue;
       const n = Number(v[k]);
-      if (!Number.isInteger(n) || n < min || n > max) {
+      // creditFloor 允许小数（积分余额可以是 0.3），其余字段仍是整数
+      const valid = k === 'creditFloor' ? Number.isFinite(n) : Number.isInteger(n);
+      if (!valid || n < min || n > max) {
         // 0 的语义各不相同（0 = 关闭 / 0 = 按上游 retryAfter / 0 = 关闭 FEFO），
         // 范围表已经把它们包进去了，这里只拒绝越界与小数
         if (strict) throw new Error(msg);
@@ -200,6 +213,10 @@ function sanitize(patch, { strict = false } = {}) {
     }
     if (key === 'queue' && v.pollEnabled !== undefined) {
       cell.pollEnabled = v.pollEnabled === true;
+    }
+    if (key === 'identityGuard' && v.enabled !== undefined) {
+      if (strict && typeof v.enabled !== 'boolean') throw new Error('identityGuard.enabled 必须是 boolean');
+      cell.enabled = v.enabled === true;
     }
     if (key === 'concurrency' && v.pickStrategy !== undefined) {
       const s = String(v.pickStrategy == null ? '' : v.pickStrategy).trim().toLowerCase();

@@ -1,7 +1,7 @@
 // src/admin/alerts.js - 运维告警评估器（调研 P1-6 的规则层）
 //
 // 已有闭环：`notify.js`（五种 webhook）+ `keepalive` 轮末 crit 推送。
-// 这里补的是**规则层**：七类规则、静默窗、迟滞、恢复 resolved_at。
+// 这里补的是**规则层**：八类规则、静默窗、迟滞、恢复 resolved_at。
 // 保持只读评估：不打上游、不改账号池；投递由调用方（admin/routes/alerts.js）
 // 走 notify.sendNotify，测试可注入假 sender。
 //
@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 
 const FILE = 'alerts-state.json';
-const RULES = ['pool_empty', 'task_failed', 'token_expiring', 'error_rate', 'key_burst', 'off_hours', 'budget'];
+const RULES = ['pool_empty', 'task_failed', 'token_expiring', 'error_rate', 'key_burst', 'off_hours', 'budget', 'qoder_rejected'];
 /** 仅提示、不计入「待处理」与推送的规则（info 级） */
 const HINT_RULES = ['off_hours'];
 
@@ -31,6 +31,7 @@ function defaults() {
     offHoursStart: 1,        // off_hours：本地 [start, end) 时段
     offHoursEnd: 6,
     budget: 1000000,         // budget：窗口 token 预算（0 = 关）
+    qoderRejectedMin: 3,     // qoder_rejected：回看窗内 rejected 次数阈值
     windowMs: 3600000,       // 指标回看窗口
     silenceMs: 3600000,      // 同一规则+对象静默窗
     hysteresis: 2,           // 连续 N 轮触发才告警，M 轮正常才恢复
@@ -106,6 +107,19 @@ function evaluate(facts, cfg = {}, now = Date.now()) {
   if (c.budget > 0) {
     const tokens = rows.reduce((s, r) => s + (Number(r.total_tokens) || 0), 0);
     if (tokens >= c.budget) push('budget', 'gateway', 'warn', `近一小时 ${tokens} tokens，达到预算 ${c.budget}`);
+  }
+  // Qoder 专属风控告警（P1-6）：只观测、不联动。Qoder 的 10605 可能是排队，
+  // 也可能是伪装成排队的硬拒绝（身份句命中）；项目里没有连坐证据，禁止照搬
+  // WorkBuddy 11140 的换号/熔断/暂停整区。窗口内只要有 1 条成功就说明通道
+  // 是通的，不告警；rejected 不足阈值也不告警（样本不足不猜）。
+  const qtel = channels.qoder && channels.qoder.telemetry;
+  if (qtel && Number.isFinite(Number(qtel.rejected))) {
+    const rejected = Number(qtel.rejected);
+    const ok = Number(qtel.ok) || 0;
+    if (rejected >= c.qoderRejectedMin && ok === 0) {
+      push('qoder_rejected', 'qoder', 'warn',
+        `Qoder 近 ${Math.round(c.windowMs / 60000)} 分钟 ${rejected} 次上游拒绝且无成功（仅观测，不换号/熔断）`);
+    }
   }
   return out;
 }

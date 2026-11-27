@@ -1,4 +1,4 @@
-// src/qoder/telemetry.js - Qoder 风控信号遥测（P1-11）
+// src/qoder/telemetry.js - Qoder 风控信号遥测（P1-11 + P1-5 排队观察）
 //
 // 出处：docs/QODER-GATEWAY-FEATURE-MERGE.md P1-11「`/health` 风控信号遥测 +
 // 健康端点身份标识」。
@@ -22,6 +22,13 @@
 // 直接变成路由决策（本项目在「探针不喂池」上已经踩过一次）。
 const BUCKETS = 12;
 const WINDOW_MS = 10 * 60 * 1000;
+// P1-5：按 (area, account, model) 的排队观察，24h TTL、进程内、上限 200 条。
+// 只读聚合——不主动探测、不打上游（主动探针烧额度且只代表一次请求）。
+const OBSERVE_TTL_MS = 24 * 3600 * 1000;
+const OBSERVE_MAX = 200;
+const QUEUE_TYPES = /^p[0-9]$/;
+const OBSERVE_KINDS = new Set(['queued', 'throttled', 'rejected', 'ok']);
+const observations = new Map();
 
 /** 每桶 { at, queued, throttled, rejected, ok, total, lastQueueType } */
 let ring = [];
@@ -58,7 +65,91 @@ function note(kind, info = {}) {
       if (info.queueType) b.lastQueueType = String(info.queueType);
     } else if (kind === 'throttled') b.throttled++;
     else if (kind === 'rejected') b.rejected++;
+    // P1-5：按作用域记观察；缺字段不编，不记录任何正文/凭证。
+    if (info.area != null || info.accountId != null || info.model) noteObservation(kind, info, now);
   } catch (e) { /* 埋点失败绝不影响请求 */ }
+}
+
+/**
+ * 记一条带作用域的观察（P1-5）。`queueType` 只接受 p0~p9，其余记 `unknown`；
+ * `reason` 恒为 unknown——排队原因（风控/并发/额度）不是我们能从信封里证明的，
+ * 不冒充根因。
+ */
+function noteObservation(kind, info = {}, now = Date.now()) {
+  const k = OBSERVE_KINDS.has(kind) ? kind : null;
+  if (!k) return;
+  const area = String(info.area || '').slice(0, 24) || 'unknown';
+  const rawAccount = info.accountId == null ? '' : info.accountId;
+  const account = Number.isFinite(Number(rawAccount)) && String(rawAccount).trim() !== ''
+    ? Number(rawAccount)
+    : (String(rawAccount).slice(0, 40) || 'unknown');
+  const model = String(info.model || '').slice(0, 80) || 'unknown';
+  const key = `${area}\u0000${account}\u0000${model}`;
+  // ok 只用于**清掉同作用域的排队观察**：成功请求不该凭空造出一条观察行，
+  // 否则每次成功都会写一行，200 条上限很快被正常流量挤满，真正排队的号反而
+  // 被丢掉。没有旧观察时直接返回。
+  if (k === 'ok') {
+    const hit = observations.get(key);
+    if (!hit) return;
+    hit.queued = 0;
+    hit.throttled = 0;
+    hit.rejected = 0;
+    hit.queueType = 'unknown';
+    hit.ok++;
+    hit.clearedAt = now;
+    hit.lastAt = now;
+    return;
+  }
+  const qtRaw = String(info.queueType || '').trim().toLowerCase();
+  const queueType = QUEUE_TYPES.test(qtRaw) ? qtRaw : 'unknown';
+  let row = observations.get(key);
+  if (!row) {
+    // 有界：满了先清过期，仍满就丢最老的一条（观测宁可少，不能无限长）
+    if (observations.size >= OBSERVE_MAX) pruneObservations(now);
+    if (observations.size >= OBSERVE_MAX) {
+      const oldest = [...observations.entries()].sort((a, b) => a[1].lastAt - b[1].lastAt)[0];
+      if (oldest) observations.delete(oldest[0]);
+    }
+    row = { area, account, model, queued: 0, throttled: 0, rejected: 0, ok: 0, queueType: 'unknown', clearedAt: 0, lastAt: now };
+    observations.set(key, row);
+  }
+  row[k]++;
+  row.lastAt = now;
+  if (k === 'queued') row.queueType = queueType;
+}
+
+function pruneObservations(now) {
+  for (const [key, row] of observations) {
+    if (now - row.lastAt > OBSERVE_TTL_MS) observations.delete(key);
+  }
+}
+
+/** 只读聚合：按作用域给出 24h 内的排队观察，不触发任何上游请求。 */
+function observationSnapshot(now = Date.now()) {
+  try {
+    pruneObservations(now);
+    const rows = [...observations.values()].map((r) => ({
+      area: r.area,
+      account: r.account,
+      model: r.model,
+      queued: r.queued,
+      throttled: r.throttled,
+      rejected: r.rejected,
+      ok: r.ok,
+      queueType: r.queueType,
+      reason: 'unknown', // 恒 unknown：排队原因无法从信封证明
+      clearedAt: r.clearedAt || null, // 最近一次成功清除同作用域观察的时刻
+      lastAt: r.lastAt || null,
+    }));
+    rows.sort((a, b) => b.lastAt - a.lastAt);
+    return {
+      windowMs: OBSERVE_TTL_MS,
+      total: rows.length,
+      rows: rows.slice(0, OBSERVE_MAX),
+      note: '只读聚合（进程内 24h）。queueType 只认 p0~p9，其余记 unknown；'
+        + 'reason 恒 unknown，不冒充根因。不做主动探测——那会烧额度且只代表一次请求。',
+    };
+  } catch (e) { return null; }
 }
 
 /**
@@ -143,7 +234,11 @@ function waitOnly({ minSamples = 5 } = {}) {
 /** 仅供测试：清空环形桶 */
 function _resetForTest() {
   ring = [];
+  observations.clear();
   startedAt = Date.now();
 }
 
-module.exports = { WINDOW_MS, BUCKETS, note, kindOf, snapshot, waitOnly, _resetForTest };
+module.exports = {
+  WINDOW_MS, BUCKETS, OBSERVE_TTL_MS, OBSERVE_MAX,
+  note, noteObservation, kindOf, snapshot, observationSnapshot, waitOnly, _resetForTest,
+};

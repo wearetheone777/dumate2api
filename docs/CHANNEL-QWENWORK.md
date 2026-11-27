@@ -166,3 +166,23 @@ sanguo 项目的 `novel-creator` 技能把写作拆成分阶段门控（「起�
 for this user`（账号维度，网关会据此换号）。**这不是配置错误、不是额度、不是 token
 问题**——遇到就重试。真正需要处理的是 **402**（额度真耗尽）和 **`换票失败`**
 （refresh token 失效，要重新登录），这两种才会持续失败。
+
+## 凭证退场标记（2026-11-28，四通道统一口径）
+
+`chat.ensureAccount` 换票失败时原本只抛 401（调用方换号），但没有「这份凭证
+已经废了」的记忆：死号每次被选中都白撞一次换票端点。
+
+现在与 TRAE / WorkBuddy / Qoder 共用一套口径：
+
+| 环节 | 千问的实现 |
+|---|---|
+| 判据 | `auth.isRefreshRejected(r)`：401 / 403 或 `INVALID_REFRESH_TOKEN` / `invalid_grant`。**与 `exchange()` 里收编官方客户端那条路径同源**（同一个函数，两处写两套正则必然漂移） |
+| 写标记 | `chat.ensureAccount` 失败分支写 `refreshRetiredAt` + `lastError='凭证失效（需重新登录）…'` |
+| 生效 | `auth.needsRefresh` 见标记返回 false |
+| 判废 | `channel-pool` 的 `credentialDead()`（四通道共用）：标记 + access 已过期 → 不进候选 |
+| 清除 | 刷新成功分支 + `auth.upsert` 带新 refreshToken 时 |
+
+**语义边界**：`refreshRetiredAt` 只表示「换不了票」，不是「号不能用」——access
+未过期时照样能跑，所以只在**双条件**下判废。
+
+离线验证：`test/unit/credential-retired.test.js`（8 项）。

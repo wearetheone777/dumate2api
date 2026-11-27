@@ -149,11 +149,77 @@ function withAgentDiscipline(system, hasTools) {
  * @param {string} name 调用方传的名字（可带 qoder/ 前缀）
  * @param {Array} [models] 模型表（session.cachedModels 的结果）；不传则只走别名
  */
+// 运行时别名表（P0-2）：每次成功拉模型表就注册 `display_name → key`。
+// 只在内存，进程重启即丢。**歧义不猜**：同一个显示名指向两个 key 时标记
+// ambiguous 并拒绝解析，让上游按原样名字裁决（比按插入顺序随便选一个安全）。
+const runtimeAliases = new Map();
+const runtimeAliasesNorm = new Map();
+const runtimeAliasAmbiguous = new Set();
+
+function normAlias(x) {
+  return String(x || '').toLowerCase().replace(/[\s._\-]+/g, '');
+}
+
+/** 注册一批模型行的显示名 → key。幂等；歧义显示名进入 ambiguous 集合 */
+function registerAliases(models) {
+  for (const m of Array.isArray(models) ? models : []) {
+    if (!m || !m.key) continue;
+    const key = String(m.key);
+    const names = new Set([String(m.name || ''), String(m.aliasOf || '')].filter(Boolean));
+    for (const n of names) {
+      const nk = normAlias(n);
+      const cur = runtimeAliases.get(n);
+      if (cur && cur !== key) {
+        // 歧义：**精确名与归一化名都要拉黑**。只拉黑精确名的话，
+        // `glm53flash` 这条归一化路径仍会返回先注册的那个 key——
+        // 实测踩过：显示名冲突后归一化名照样猜中，等于没守住歧义。
+        runtimeAliasAmbiguous.add(n);
+        runtimeAliasAmbiguous.add(nk);
+        runtimeAliases.delete(n);
+        runtimeAliasesNorm.delete(nk);
+        continue;
+      }
+      runtimeAliases.set(n, key);
+      const curN = runtimeAliasesNorm.get(nk);
+      if (curN && curN !== key) {
+        runtimeAliasAmbiguous.add(n);
+        runtimeAliasAmbiguous.add(nk);
+        runtimeAliases.delete(n);
+        runtimeAliasesNorm.delete(nk);
+      } else {
+        runtimeAliasesNorm.set(nk, key);
+      }
+    }
+  }
+}
+
+/** 仅供测试：清空运行时别名 */
+function _resetAliasesForTest() {
+  runtimeAliases.clear();
+  runtimeAliasesNorm.clear();
+  runtimeAliasAmbiguous.clear();
+}
+
 function resolveModelKey(name, models) {
   const raw = String(name || '').trim();
   const bare = raw.toLowerCase().startsWith('qoder/') ? raw.slice('qoder/'.length).trim() : raw;
   if (!bare) return c.DEFAULT_MODEL;
   if (c.MODEL_ALIASES[bare]) return c.MODEL_ALIASES[bare];
+  // 运行时别名（P0-2）：上游下发的 display_name 注册进来的名字。
+  // 顺序是**静态表先行**（上面那行）——静态别名是手写的用户约定
+  // （qwen-flash 这类），上游哪天出现同名显示名也不该静默改掉老配置指向的模型。
+  // 歧义（多个 key 共用一个显示名）**不猜**——原样透传让上游裁决。
+  if (!runtimeAliasAmbiguous.has(bare)) {
+    const hit = runtimeAliases.get(bare);
+    if (hit) return hit;
+  }
+  {
+    const nk = normAlias(bare);
+    if (!runtimeAliasAmbiguous.has(nk)) {
+      const hit = runtimeAliasesNorm.get(nk);
+      if (hit) return hit;
+    }
+  }
 
   const list = Array.isArray(models) ? models.filter((m) => m && m.key) : [];
   if (!list.length) return bare;
@@ -822,12 +888,17 @@ function aggregate(payloads, model, opts = {}) {
   let finish = 'stop';
   let usage = {};
   let id = 'qoder';
+  // 上游实际模型的**指纹**（不是名字）：响应里的 `model` 恒为 "auto"，
+  // 唯一能区分真实后端的就是 system_fingerprint（实测 dmodel → a307abda…）。
+  // 它是哈希，**不冒充模型名**——埋点里单独一个字段，界面上写「指纹」。
+  let fingerprint = '';
   const created = Math.floor(Date.now() / 1000);
   const calls = new Map();
   for (const p of payloads) {
     try {
       const o = JSON.parse(p);
       if (o.id) id = o.id;
+      if (!fingerprint && typeof o.system_fingerprint === 'string') fingerprint = o.system_fingerprint;
       if (o.usage) usage = o.usage;
       const ch = (o.choices || [{}])[0];
       if (ch.finish_reason) finish = ch.finish_reason;
@@ -873,11 +944,14 @@ function aggregate(payloads, model, opts = {}) {
     if (!content) message.content = null;
   }
   normalizeUsageCache(usage);
-  return {
+  const out = {
     id, object: 'chat.completion', created, model,
     choices: [{ index: 0, message, finish_reason: finish }],
     usage: usage || {},
   };
+  // 指纹只在**上游真的给了**时出现（不造字段：没给就是不知道）
+  if (fingerprint) out.system_fingerprint = fingerprint;
+  return out;
 }
 
 /**
@@ -973,7 +1047,8 @@ function backfillToolCallIds(parsed, ids) {
 }
 
 module.exports = {
-  buildBody, hasFunctionTools, resolveModelKey, unwrap, envelopeStatus, payloadError,
+  buildBody, hasFunctionTools, resolveModelKey, registerAliases, _resetAliasesForTest,
+  unwrap, envelopeStatus, payloadError,
   post, postStream, aggregate, withAgentDiscipline, resolveReasoningEffort,
   getQueueStatus, parseQueueStatus, normalizeUsageCache,
   assertBodySize, rememberReasoning, backfillToolCallIds,

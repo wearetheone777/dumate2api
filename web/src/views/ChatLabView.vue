@@ -17,6 +17,9 @@
       </template>
     </PageHeader>
 
+    <!-- P2-2：接入片段 Tab（只读展示，与一键配置同一份生成器） -->
+    <a-tabs v-model:activeKey="labTab" class="lab-tabs" size="small">
+      <a-tab-pane key="chat" tab="对话试调">
     <!-- 对话主体 -->
     <div class="lab-body">
       <div ref="scrollEl" class="chat-scroll">
@@ -160,6 +163,25 @@
       测试台仅用于调试（走管理端登录态，不经密钥与 IP 管控）· 正式接入请用「API 密钥」页签发的密钥<br>
       不支持的推理档位上游会自动降级
     </footer>
+      </a-tab-pane>
+      <a-tab-pane key="snippets" tab="接入片段（Qoder）">
+        <div class="snippet-pane">
+          <a-alert type="info" show-icon class="mb-3"
+            message="只读展示，不写文件；token 用占位符"
+            description="片段由「智能体一键配置」的同一份生成器产出——这里展示什么，写进去就是什么。真正写入请到智能体配置页。" />
+          <a-spin :spinning="snippetLoading">
+            <div v-if="snippetError" class="text-xs text-red-500 mb-2">{{ snippetError }}</div>
+            <template v-if="snippet">
+              <div class="snippet-title">Claude Code（~/.claude/settings.json 的 env）</div>
+              <pre class="snippet-code">{{ snippet.claude }}</pre>
+              <div class="snippet-title">Codex CLI（~/.codex/config.toml 的托管块）</div>
+              <pre class="snippet-code">{{ snippet.codex }}</pre>
+              <div v-if="snippet.accountNote" class="text-xs text-slate-400 mt-2">{{ snippet.accountNote }}</div>
+            </template>
+          </a-spin>
+        </div>
+      </a-tab-pane>
+    </a-tabs>
   </div>
 </template>
 
@@ -171,12 +193,35 @@ import {
   ExclamationCircleOutlined, CommentOutlined,
 } from '@ant-design/icons-vue'
 import client from '@/api/client'
+import { agentSetupApi } from '@/api/agentsetup'
 import PageHeader from '@/components/PageHeader.vue'
 import { channelStore, CHANNELS, isDirectChannel } from '@/stores/channel'
 import { qwenworkApi as qwenApi } from '@/api/qwenwork'
 import { traeworkApi } from '@/api/traework'
 import { qoderApi } from '@/api/qoder'
 import type { ChatLabModels } from '@/api/chatlab'
+
+const labTab = ref('chat')
+const snippet = ref<{ claude: string; codex: string; accountNote?: string } | null>(null)
+const snippetLoading = ref(false)
+const snippetError = ref('')
+
+async function loadSnippets() {
+  if (snippet.value) return
+  snippetLoading.value = true
+  snippetError.value = ''
+  try {
+    const { data } = await agentSetupApi.snippets('qoder')
+    if (!data.ok) { snippetError.value = data.error || '读取片段失败'; return }
+    snippet.value = data
+  } catch (e: any) {
+    snippetError.value = e?.response?.data?.error || '读取片段失败'
+  } finally {
+    snippetLoading.value = false
+  }
+}
+
+vueWatch(labTab, (v) => { if (v === 'snippets') loadSnippets() })
 
 interface ChatMessage {
   role: 'user' | 'assistant'
@@ -579,6 +624,51 @@ onMounted(async () => {
    纵向布局与间距由全局 .page（flex + gap）负责，这里只补高度 */
 .chatlab {
   height: calc(100vh - 96px);
+}
+
+.lab-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.lab-tabs :deep(.ant-tabs-content-holder) {
+  flex: 1;
+  min-height: 0;
+}
+.lab-tabs :deep(.ant-tabs-content),
+.lab-tabs :deep(.ant-tabs-tabpane) {
+  height: 100%;
+  min-height: 0;
+}
+.lab-tabs :deep(.ant-tabs-tabpane) {
+  display: flex;
+  flex-direction: column;
+}
+.snippet-pane {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--lab-surface);
+  border: 1px solid var(--lab-border);
+  border-radius: var(--lab-radius);
+  padding: 16px;
+}
+.snippet-title {
+  font-size: 12px;
+  color: #94a3b8;
+  margin: 10px 0 4px;
+}
+.snippet-code {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--lab-border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 /* ---------- 主体 ---------- */

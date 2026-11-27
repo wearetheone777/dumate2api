@@ -48,8 +48,47 @@ function rotateIfNeeded(file) {
   } catch (e) { /* 文件还不存在 */ }
 }
 
+/**
+ * P2-3：日志保留策略。只在**归档文件**上动手——主文件正在被多进程追加，
+ * 裁剪它等于和写者抢同一个 inode，丢行且可能把半行留给读侧。
+ * days / maxLines 都按「面板 > env > 不限」解析；0 一律表示不限。
+ * 失败吞掉：清理绝不能影响埋点主路径。
+ */
+function retentionOf() {
+  let days = parseInt(process.env.DUMATE_REQLOG_RETENTION_DAYS || '0', 10) || 0;
+  let maxLines = parseInt(process.env.DUMATE_REQLOG_MAX_LINES || '0', 10) || 0;
+  try {
+    const cfg = require('./livecfg').Load().reqlogRetention || {};
+    if (Number.isFinite(Number(cfg.days)) && Number(cfg.days) >= 0) days = Math.round(Number(cfg.days));
+    if (Number.isFinite(Number(cfg.maxLines)) && Number(cfg.maxLines) >= 0) maxLines = Math.round(Number(cfg.maxLines));
+  } catch (e) { /* 配置读不到按 env */ }
+  return { days, maxLines };
+}
+
+function pruneArchive(now = Date.now()) {
+  const { days, maxLines } = retentionOf();
+  if (!days && !maxLines) return;
+  const archive = path.join(LOG_DIR, `${FILE}.1`);
+  try {
+    const st = fs.statSync(archive);
+    const stale = days > 0 && (now - st.mtimeMs) > days * 86400000;
+    if (stale) { fs.unlinkSync(archive); return; }
+    if (maxLines > 0 && st.size > 0) {
+      const lines = fs.readFileSync(archive, 'utf8').split('\n').filter(Boolean);
+      if (lines.length > maxLines) {
+        const tmp = `${archive}.tmp`;
+        fs.writeFileSync(tmp, `${lines.slice(-maxLines).join('\n')}\n`, 'utf8');
+        filelock.renameAtomic(tmp, archive);
+      }
+    }
+  } catch (e) { /* 归档不存在或清理失败都不影响主路径 */ }
+}
+
 function record(entry) {
   if (disabled) return;
+  // 保留策略挂在轮转后的下一次记录：高频路径上只在归档存在时多一次 stat，
+  // 而且清理失败被吞，不影响正在转发的响应。
+  try { pruneArchive(); } catch (e) { /* 忽略 */ }
   if (!aggHook && !aggHookBroken) {
     try { aggHook = require('./reqlog-hook'); } catch (e) { aggHookBroken = true; }
   }
@@ -225,5 +264,5 @@ function markFirstToken(res) {
 
 module.exports = {
   record, read, pickUsage, usageFromSSE, describeRequest, clientIP, newReqId,
-  markFirstToken, LOG_DIR,
+  markFirstToken, retentionOf, pruneArchive, LOG_DIR,
 };

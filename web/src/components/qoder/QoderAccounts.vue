@@ -66,6 +66,19 @@
                   </a-tag>
                   {{ a.planName || '—' }}
                 </div>
+                <!-- P1-1：Token 续期状态。后台轮转探针写，失败不写 lastError。
+                     没有记录时显示「—」，不猜成「正常」。 -->
+                <div class="text-xs text-slate-500 mt-1">
+                  Token 续期
+                  <a-tag v-if="a.tokenRefresh" :color="a.tokenRefresh.ok ? 'green' : 'orange'" size="small">
+                    {{ a.tokenRefresh.ok ? '已续期' : '续期失败' }}
+                  </a-tag>
+                  <span v-else>—</span>
+                  <span v-if="a.tokenRefresh?.error" class="ml-1">{{ a.tokenRefresh.error }}</span>
+                  <span v-else-if="a.expiresAt" class="ml-1">
+                    到期 {{ new Date(a.expiresAt).toLocaleString('zh-CN') }}
+                  </span>
+                </div>
                 <!-- 脱敏手机号：认号用（多个账号昵称可能相近）。
                      只显示脱敏形式——完整号码不进界面，账号文件里也没有。 -->
                 <div v-if="a.phoneMasked" class="text-xs text-slate-500 mt-1">
@@ -523,15 +536,25 @@ async function checkinOne(a: QoderAccount) {
     const { data } = await qoderApi.checkin(a.id)
     const r = (data.results || [])[0] || {}
     const name = a.nickname || a.id
-    // 只有 ok === true 才算签到完成。早先不看 ok，token 过期的 401 也被
-    // 报成「签到完成」——用户因此完全无法判断到底成没成。
-    if (r.ok === false) {
-      message.error(`${name} 签到失败：${r.error || '未知错误'}`)
-    } else if (r.gained != null) {
+    // P0-5：领取响应成功 ≠ 积分到账；outcome 由后端按「响应 + 实测差值」判定。
+    // 没有 outcome 的旧后端仍走 ok/gained 兜底，升级期间界面不会报错。
+    if (r.outcome === 'claimed') {
       // 报**实际到账差值**，不是总额——上游从不直接告诉发了多少
       message.success(r.gained > 0
         ? `${name} 签到到账 ${r.gained} credits`
-        : `${name} 今日已签到（到账 0）`)
+        : `${name} 签到完成（上游未回报到账数量）`)
+    } else if (r.outcome === 'already') {
+      message.info(`${name} 今日已签到`)
+    } else if (r.outcome === 'none_available') {
+      message.warning(`${name} 领取响应成功但到账 0，未记为签到成功`)
+    } else if (r.outcome === 'same_person') {
+      message.warning(`${name} 额度已被同一人的另一账号领取`)
+    } else if (r.outcome === 'exhausted' || r.outcome === 'blocked') {
+      message.warning(`${name} 今日无可领积分或上游拦截，未记为成功`)
+    } else if (r.ok === false) {
+      message.error(`${name} 签到失败：${r.error || '未知错误'}`)
+    } else if (r.gained != null && r.gained > 0) {
+      message.success(`${name} 签到到账 ${r.gained} credits`)
     } else if (r.alreadyChecked) {
       message.info(`${name} 今日已签到`)
     } else {
@@ -569,17 +592,23 @@ async function checkinAll() {
   checkinLoading.value = true
   try {
     const { data } = await qoderApi.checkin()
-    const results = (data.results || []) as Array<{ nickname: string; ok?: boolean; gained?: number; error?: string }>
-    const failed = results.filter((r) => r.ok === false)
-    const total = results.reduce((s, r) => s + (r.gained || 0), 0)
+    const results = (data.results || []) as Array<{ nickname: string; ok?: boolean; outcome?: string; gained?: number; error?: string }>
+    // P0-5：claimed 才算真签成；already 单列；none_available 等「响应成功但没到账」
+    // 既不算成功也不混入失败——它们要明确可见，否则零到账会被读成成功。
+    const succeeded = results.filter((r) => r.outcome ? r.outcome === 'claimed' : r.ok === true && (r.gained || 0) > 0)
+    const already = results.filter((r) => r.outcome === 'already')
+    const failed = results.filter((r) => r.ok === false || (r.outcome && !['claimed', 'already'].includes(r.outcome)))
+    const vacant = results.filter((r) => !r.ok && !r.outcome)
+    const total = succeeded.reduce((s, r) => s + (r.gained || 0), 0)
     // 部分失败也必须说出来：一律报 success 会把失败账号藏在成功里
-    if (failed.length) {
+    if (failed.length || vacant.length) {
+      const first = failed[0] || vacant[0]
       message.warning(
-        `签到完成：成功 ${results.length - failed.length}/${results.length}，合计到账 ${total.toFixed(4)} credits；` +
-        `${failed[0].nickname || ''} ${failed[0].error || '失败'}`,
+        `签到完成：到账 ${succeeded.length}/${results.length}（已签 ${already.length}），合计 ${total.toFixed(4)} credits；` +
+        `${first.nickname || ''} ${first.error || first.outcome || '未回报'}`,
       )
     } else {
-      message.success(`签到完成：${results.length} 个账号，合计到账 ${total.toFixed(4)} credits`)
+      message.success(`签到完成：到账 ${succeeded.length} 个账号（已签 ${already.length}），合计 ${total.toFixed(4)} credits`)
     }
     await load()
   } catch (e: any) {

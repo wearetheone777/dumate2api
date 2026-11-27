@@ -189,6 +189,15 @@ function inflightMaxOf(channel) {
   return v == null ? 0 : v;
 }
 
+/** 通道级积分保底线（面板 > env > 0）。Qoder 专属；0 = 用池默认/关。 */
+function creditFloorOf(channel) {
+  if (channel !== 'qoder') return 0;
+  const rt = qoderRuntime();
+  const v = rt ? rt.pick('concurrency.creditFloor', null) : null;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 /**
  * 通道级选号策略（'' = 用池默认）。
  * `DUMATE_QODER_PICK_STRATEGY=least-inflight` 或面板 concurrency.pickStrategy
@@ -243,6 +252,27 @@ function sessionKeyFor(payload, opts) {
 }
 
 /**
+ * 凭证已彻底不可用：换票被上游明确拒绝过（`refreshRetiredAt`）**且** access
+ * 也已过期。这种号带出去只会吃一个注定失败的 401（TRAE 实测：`needsRefresh`
+ * 因退场标记返回 false，于是带着过期 token 出网，每次白撞一个上游请求）。
+ *
+ * **只在这个双条件下判废**：退场标记单独存在时账号仍可能可用（access 未过期，
+ * 实测存在），`findUsable` 也刻意不排除它们（签到等辅助路径需要）。
+ *
+ * 放在 `pickCandidate` 而不是各通道的选号循环里：四个通道的选号逻辑各异，
+ * 而这是**与通道无关**的凭证事实——写四遍必然漂移（TRAE 与 WorkBuddy 已经
+ * 各自实现过一次，Qoder/千问再抄就是第三、第四份）。
+ */
+function credentialDead(a) {
+  if (!a || !a.refreshRetiredAt) return false;
+  const exp = Number(a.expiresAt);
+  // 没有 expiresAt 时不敢判死：那说明这个通道不跟踪到期时间，
+  // 我们无法证明 access 已经失效（宁可放它试一次，错误如实上报）。
+  if (!Number.isFinite(exp) || exp <= 0) return false;
+  return Date.now() >= exp;
+}
+
+/**
  * 选一个候选账号：粘性命中优先，否则池轮询（冷却/熔断/禁用/暂停/在途满/
  * 模型负缓存/保底拦截全部跳过）。命中即占用一个在途名额。
  *
@@ -255,7 +285,7 @@ function sessionKeyFor(payload, opts) {
  * @returns {{account:object, uid:string, sessionKey:string}|null} null = 没有可用账号
  */
 function pickCandidate(channel, candidates, opts = {}) {
-  const list = (candidates || []).filter((a) => a && a.id !== undefined);
+  const list = (candidates || []).filter((a) => a && a.id !== undefined && !credentialDead(a));
   if (!list.length) return null;
   const byUid = new Map(list.map((a) => [uidOf(channel, a.id), a]));
   const uids = [...byUid.keys()];
@@ -264,6 +294,7 @@ function pickCandidate(channel, candidates, opts = {}) {
   const busy = new Set();
   const minMs = minIntervalMsOf(channel);
   const inFlightMax = inflightMaxOf(channel);
+  const creditFloor = creditFloorOf(channel);
   const now = Date.now();
 
   for (;;) {
@@ -307,7 +338,10 @@ function pickCandidate(channel, candidates, opts = {}) {
       uid = pool.pick(ordered, {
         exclude: [...exclude, ...busy],
         model: opts.model,
-        paid: opts.paid,
+        paid: opts.paid !== false, // 默认按真实收费请求处理（false 仅供只读探针豁免）
+        // Qoder 通道级积分保底（面板 > env > 0）。池创建时的 creditFloor 是
+        // 全通道共享、要重启才生效；这里按次覆盖，面板热改下一次选号即生效。
+        ...(creditFloor ? { creditFloor } : {}),
         // FEFO（最早到期优先）：调用方算好的「有临期积分批次」uid 集合，
         // 非空时池把候选限制在集合内（pool.pick 的 expiring 语义），把临期
         // 额度先烧掉。集合为空/null 时无感。
@@ -318,7 +352,23 @@ function pickCandidate(channel, candidates, opts = {}) {
         // （'first'），而不是在排好的队列上再抽签/轮询——那样顺序就白排了。
         ...(ordered !== uids ? { pickMode: 'first' } : {}),
       });
-      if (uid == null) return null;
+      if (uid == null) {
+        // P1-2 第三条不变量：**全部余额低于保底**时如实按余额最高者继续，
+        // 不报「没有账号」。`fallbackLowestFloor` 只在「保底是唯一拦截原因」
+        // 时返回账号，并自带 WARN——冷却/熔断/在途满一律返回 null，
+        // 那时 null 仍然是正确答案（客户端 429/503 后重试）。
+        const rest = uids.map((u) => byUid.get(u)).filter((a) => a && !exclude.has(uidOf(channel, a.id)));
+        const fb = fallbackLowestFloor(channel, rest, { model: opts.model, inFlightMax });
+        if (fb) {
+          const fbUid = uidOf(channel, fb.id);
+          if (pool.acquire(fbUid, inFlightMax ? { inFlightMax } : undefined)) {
+            markPicked(fbUid, now);
+            if (sessionKey) sticky.bind(sessionKey, fbUid);
+            return { account: fb, uid: fbUid, sessionKey };
+          }
+        }
+        return null;
+      }
       // 闸门放在池选择之后（池还不知道间隔这回事）：选中的账号若在最小
       // 间隔内，本轮跳过它继续找——不是账号的错，与 busy 同语义
       if (withinInterval(uid, minMs, now)) {
@@ -524,10 +574,48 @@ function creditsOf(channel, id) {
   }
 }
 
+/**
+ * 全部候选都低于积分保底时，返回余额最高的那个并打 WARN；否则返回 null。
+ *
+ * **只在「保底是唯一拦截原因」时兜底**（P1-2 第三条不变量）：
+ *   - 有冷却/熔断/禁用/暂停/模型冷却/在途满 → 返回 null（等一等就好，
+ *     拿一个余额低还排着队的号去撞上游只会更糟）
+ *   - 还有余额 ≥ 保底的健康号 → 返回 null（那说明不是「全部低」，
+ *     池选不到它是别的原因，兜底会掩盖真问题）
+ *   - 余额未知（null）不参与比较，也不阻止兜底（null ≠ 0）
+ */
+function fallbackLowestFloor(channel, candidates, opts = {}) {
+  const floor = creditFloorOf(channel);
+  if (!(floor > 0)) return null;
+  const list = (candidates || []).filter((a) => a && a.id !== undefined);
+  const maxInFlight = Number(opts.inFlightMax) > 0 ? Number(opts.inFlightMax)
+    : (inflightMaxOf(channel) || DEFAULTS.inFlightMax);
+  let best = null;
+  let bestCredits = -Infinity;
+  let sawBelow = false;
+  for (const a of list) {
+    const st = pool.status(uidOf(channel, a.id));
+    if (!st) continue;
+    if (st.cooling || st.state === 'disabled' || st.state === 'paused') return null;
+    if (opts.model && (st.model_cooldowns || []).some((m) => m && m.model === opts.model)) return null;
+    if ((st.in_flight || 0) >= maxInFlight) return null;
+    // pool.status 的 floor_blocked 是池创建时的全局阈值；这里必须按**通道级**
+    // 面板值现算，否则面板改了阈值、兜底却还按旧值判。
+    const c = Number(st.credits);
+    if (!Number.isFinite(c)) continue;                // 余额未知：不参与、不阻止
+    if (c >= floor) return null;                      // 还有没被拦的号：不该兜底
+    sawBelow = true;
+    if (c > bestCredits) { bestCredits = c; best = a; }
+  }
+  if (!sawBelow || !best) return null;
+  console.warn(`[${channel}] 所有账号积分都低于保底线 ${floor}，按余额最高者 ${best.nickname || best.uid || best.id}（${bestCredits}）继续派发；这不是「没有账号」。`);
+  return best;
+}
+
 module.exports = {
   uidOf, sessionKeyOf, sessionKeyFor, systemTextOf, pickCandidate, availability, release, noteSuccess, noteError,
   noteCredits, creditsOf,
   // 策略读取器（离线验证与 /config 端点报当前生效策略用）
-  pickStrategyOf, inflightMaxOf, minIntervalMsOf, leastInflightOrder,
+  pickStrategyOf, inflightMaxOf, minIntervalMsOf, creditFloorOf, leastInflightOrder, fallbackLowestFloor,
   _stickySize, _stickyClear,
 };

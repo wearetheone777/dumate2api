@@ -485,6 +485,13 @@ async function qoderRows({ region = '' } = {}) {
     ? list.map((m) => ({
       key: m.key,
       name: m.name || m.display_name || m.key,
+      // P0-2：状态原样透出。上游 enable=false 的模型**管理端照样列出**
+      // （灰显 + 原因），只是 /v1/models 不给客户端——两张表口径不同是故意的：
+      // 运维要看到「这个模型为什么没了」，客户端只该看到能用的。
+      status: m.status || (m.enable === false ? 'disabled' : 'active'),
+      disabledReason: m.disabledReason || '',
+      retiredCandidate: false,
+      aliasOf: m.aliasOf || '',
       rate: typeof m.rate === 'number' ? m.rate : (typeof m.price_factor === 'number' ? m.price_factor : null),
       // 原价倍率：免费/错峰模型的 price_factor 会是 0（实测 qfmodel=0、
       // original_price_factor=0.1），只显示 rate 会被读成「不扣费」
@@ -515,10 +522,27 @@ async function qoderRows({ region = '' } = {}) {
       // 错峰优惠（上游 promotion，session.fetchModels 已归一化）
       promotion: m.promotion && typeof m.promotion === 'object' ? m.promotion : null,
     }))
-    : constants.FALLBACK_MODELS.map((k) => ({
-      key: k, name: k, rate: null, rateOriginal: null, ctx: null,
-      reasoning: false, multimodal: false, isFree: false, promotion: null,
-    }));
+    // P0-2：兜底行从 catalog 快照派生（带 retiredCandidate 状态与原因）。
+    // **不删条目**——第三方清单不是真机证据，只标候选，管理端灰显提示。
+    : (() => {
+      let rows = [];
+      try { rows = require('./qoder/catalog').loadSnapshot(); } catch (e) { rows = []; }
+      if (!rows.length) {
+        return constants.FALLBACK_MODELS.map((k) => ({
+          key: k, name: k, rate: null, rateOriginal: null, ctx: null,
+          reasoning: false, multimodal: false, isFree: false, promotion: null,
+          status: 'active', disabledReason: '', retiredCandidate: false, aliasOf: '',
+        }));
+      }
+      return rows.map((r) => ({
+        key: r.key, name: r.key, rate: null, rateOriginal: null, ctx: null,
+        reasoning: false, multimodal: false, isFree: false, promotion: null,
+        status: r.retiredCandidate ? 'retired_candidate' : 'active',
+        disabledReason: r.reason || '',
+        retiredCandidate: !!r.retiredCandidate,
+        aliasOf: '',
+      }));
+    })();
   return items.map((m) => ({
     id: m.key,
     name: m.name || m.key,
@@ -528,6 +552,13 @@ async function qoderRows({ region = '' } = {}) {
     channel: 'qoder',
     native: true,
     target: m.key,
+    // P0-2：状态（active / disabled / retired_candidate）与目录来源。
+    // 界面据此灰显 + 给原因；调用方据此决定要不要在复制片段里出现。
+    status: m.status || 'active',
+    disabledReason: m.disabledReason || '',
+    retiredCandidate: !!m.retiredCandidate,
+    aliasOf: m.aliasOf || '',
+    catalogSource: fromUpstream ? 'upstream' : 'snapshot',
     // 倍率是相对值（price_factor），不是积分绝对值——与 TRAE 同理
     rate: typeof m.rate === 'number' ? m.rate : null,
     rateSource: typeof m.rate === 'number' ? 'upstream' : null,

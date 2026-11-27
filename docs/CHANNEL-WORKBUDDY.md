@@ -640,3 +640,34 @@ if (!Number.isFinite(c)) return false;
 
 **判据**：`/api/admin/workbuddy/busy` 是「事前探」，这条是「事后说清楚」——
 两者互补，都不能省。前者要人工点，后者自动生效。
+
+#### 11.13 凭证退场标记（2026-11-28，与 TRAE 同源的一处缺口）
+
+`auth.ensureFresh` 刷新失败时**静默带旧 token 继续**（`return a`，错误只在请求
+真正失败时才浮出来）。这带来两个白白消耗的上游请求：
+
+1. 死号的换票被上游明确拒（`12153` / `invalid_grant`）之后，下一次轮到它
+   又白撞一次换票端点——上游答案不会变。
+2. 那个 401 走池的 `session_dead` 防误杀计数（**连续 3 次才禁用**，见
+   `pool.DEFAULTS.sessionDeadThreshold`），中间两次全是白打的。
+
+修法与 TRAE 完全同构：
+
+| 环节 | 位置 | 行为 |
+|---|---|---|
+| 判据 | `auth.isRefreshRejected(msg)` | 只认上游原文：`12153` / `Offline user session not found` / `invalid_grant` / `refresh token …invalid/expired/not found`。**认不出不猜**——网络抖/5xx 误标要人工重新登录才能解 |
+| 写标记 | `auth.ensureFresh` 失败分支 + `index.js` 的 401 刷新分支 | 标 `refreshRetiredAt`，`lastError` 写成「凭证失效（需重新登录）」 |
+| 生效 | `auth.needsRefresh` | 有标记 → 返回 false，不再反复打换票端点 |
+| 判废 | `index.js` 选号层 | 标记 + access 也过期 → 直接换号，不带过期 token 吃注定失败的 401 |
+| 清除 | `auth.ensureFresh` 成功分支 + `auth.upsert`（带新 refreshToken 时） | 刷新成功 / 重新导入客户端凭证都清标记 |
+
+**`refreshRetiredAt` 的语义边界**：它表示「换不了票」，**不是**「这个号不能用」
+——access 若还没过期照样能跑。真正拦它是 `pool` 的冷却/禁用与本层的
+「标记 + access 已过期」双条件。
+
+**`invalid_grant` 为什么算终态**：`exchange` 的 guard 2 已经在失败后重读过存储
+（别人可能抢先换好了、采纳对方新值）——走到标记这一步说明存储里也没有可用
+新值，确属终态。
+
+离线验证：`test/unit/workbuddy-refresh-retired.test.js`（6 项：判据正反、
+被拒打标、抖动不打标、成功清标、upsert 清标/保留）。

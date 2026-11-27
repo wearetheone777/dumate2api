@@ -636,6 +636,18 @@ async function send(payload, onChunk, opts = {}) {
             channelPool.noteError(CHANNEL, auth.id, { status: 401, message: e.message, model });
             try { authStore.patch(auth.id, { lastError: e.message }); } catch (err) { /* 记不下不影响 */ }
           }
+          // 上游**明确拒绝**换票（12153 / invalid_grant / refresh token invalid）
+          // 才标退场：后续请求不再每次白撞换票端点。认不出措辞就不标
+          // （网络抖/5xx 下次可能就好了，误标要人工重新登录才能解）。
+          const refreshErr = rr && rr.error ? String(rr.error) : '';
+          if (authStore.isRefreshRejected(refreshErr)) {
+            try {
+              authStore.patch(auth.id, {
+                lastError: `凭证失效（需重新登录）: ${refreshErr}`.slice(0, 300),
+                refreshRetiredAt: Date.now(),
+              });
+            } catch (err) { /* 标记失败不影响换号 */ }
+          }
           continue;
         }
         throw e;

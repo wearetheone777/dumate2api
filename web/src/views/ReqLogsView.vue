@@ -255,6 +255,11 @@
               <span class="font-mono text-slate-500">+{{ a.at }}ms</span>
               <span class="text-slate-300">{{ a.account || '—' }}</span>
               <span class="text-slate-400 break-all">{{ a.reason || '' }}</span>
+              <!-- P1-3：失败阶段（我们判定的「错在哪一步」）与上游码分开显示。
+                   阶段先看，再看码——码是上游给的，阶段是我们定的。 -->
+              <a-tag v-if="a.stage" color="red" class="shrink-0">{{ stageLabel(a.stage) }}</a-tag>
+              <span v-if="a.upstreamCode" class="text-slate-500">码 {{ a.upstreamCode }}</span>
+              <span v-if="a.upstreamRequestId" class="text-slate-500 font-mono">req {{ a.upstreamRequestId }}</span>
               <span v-if="a.ms != null" class="text-slate-500">耗时 {{ a.ms }}ms</span>
             </div>
           </div>
@@ -288,6 +293,13 @@
 
           <div class="detail-label">映射模型</div>
           <div class="detail-value font-mono text-xs">{{ detail.mapped_model || '—' }}</div>
+
+          <!-- 上游指纹（P1-3）：Qoder 的响应 model 恒为 auto，只有
+               system_fingerprint 能区分真实后端。它是哈希不是名字，如实标「指纹」。 -->
+          <template v-if="detail.upstream_fingerprint">
+            <div class="detail-label">上游指纹</div>
+            <div class="detail-value font-mono text-xs">{{ detail.upstream_fingerprint }}</div>
+          </template>
 
           <!-- 会话粘性键（P2-11）：回答「这条会话是不是一直用同一个号」。
                放在通道/账号上方——它解释的是账号那一列为什么会变。 -->
@@ -527,6 +539,12 @@ function attemptLabel(outcome: string) {
   return ({
     picked: '选中', ok: '成功', error: '失败', skip: '跳过', failover: '跨区',
   } as Record<string, string>)[outcome] || outcome
+}
+/** 失败阶段（P1-3）：我们判定的「错在哪一步」，与上游给的码分开展示 */
+function stageLabel(stage: string) {
+  return ({
+    auth: '凭证', throttle: '限流', quota: '额度', network: '网络', model: '模型', http: '上游',
+  } as Record<string, string>)[stage] || stage
 }
 const detailOpen = ref(false)
 

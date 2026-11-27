@@ -87,10 +87,10 @@ const routes = [
       }
       if (!pref) return sendJSON(res, 200, { models: [], total: 0, region: region || undefined, error: '没有可用账号', fetchedAt: 0 });
       const fr = await fresh(pref);
-      if (fr.error) return sendJSON(res, 200, { models: [], total: 0, region: region || constants.normalizeRegion(pref.region), error: fr.error, fetchedAt: 0 });
+      if (fr.error) return sendJSON(res, 200, { models: [], total: 0, region: region || constants.normalizeRegion(pref.region), error: fr.error, fetchedAt: 0, catalogSource: 'none' });
       try {
         const raw = await session.fetchModels(fr.account, { force });
-        if (!raw.ok) return sendJSON(res, 200, { models: [], total: 0, region: constants.normalizeRegion(pref.region), error: raw.error || '', fetchedAt: 0 });
+        if (!raw.ok) return sendJSON(res, 200, { models: [], total: 0, region: constants.normalizeRegion(pref.region), error: raw.error || '', fetchedAt: 0, catalogSource: 'none' });
         const reg = constants.normalizeRegion(pref.region);
         // 叠加**主动探测**结论（P2-20）：模型表声称的输出上限普遍虚高，
         // 实测过的才有数字。没测过的 probe=null，界面不标注（没测 ≠ 没钳制）。
@@ -103,6 +103,8 @@ const routes = [
           region: reg,
           error: '',
           fetchedAt: Date.now(),
+          // P0-2：目录来源如实标注（upstream / disk-cache / client-cache / snapshot）
+          catalogSource: 'upstream',
           // 倍率语义写清楚：相对值，不是积分绝对值
           rateNote: '倍率是相对值（上游字段 price_factor），实际扣费 = 倍率 × 用量。0.1 档最省，适合调试。',
           probeNote: 'probe 字段是**实测**输出上限（主动探测落盘）：clamped=被静默钳制（标「32K ⚠ 钳制 4×」）、'
