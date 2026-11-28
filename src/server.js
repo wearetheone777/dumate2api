@@ -868,6 +868,45 @@ function readBody(req) {
   return bodyLimit.readBody(req, { maxBytes: MAX_BODY_BYTES });
 }
 
+// Buffer 版请求体读取（批次九）：ASR 的 multipart 是**二进制**，readBody 的
+// utf8 字符串路径会把跨 chunk 的多字节序列打碎（音频字节损坏）。语义复刻
+// body-limit：超限当场 resolve(null) + 后台限时排空，读与写分离。
+function readBodyBuffer(req, maxBytes) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    let drainTimer = null;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      if (drainTimer) clearTimeout(drainTimer);
+      resolve(v);
+    };
+    req.on('data', (c) => {
+      if (settled) return;
+      size += c.length;
+      if (size > maxBytes) {
+        req._bodyTooLarge = true;
+        chunks.length = 0;
+        finish(null);
+        try { req.resume(); } catch (e) { /* 已结束 */ }
+        const drainFor = bodyLimit.drainMs();
+        if (drainFor > 0) {
+          drainTimer = setTimeout(() => { try { req.destroy(); } catch (e) { /* 已销毁 */ } }, drainFor);
+          if (drainTimer.unref) drainTimer.unref();
+        } else {
+          try { req.destroy(); } catch (e) { /* 已销毁 */ }
+        }
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => finish(Buffer.concat(chunks)));
+    req.on('error', () => finish(Buffer.concat(chunks)));
+  });
+}
+
 // 请求体超限的统一出口。各端点正常错误形状不同，但 413 极少触发，
 // 统一 OpenAI 形状即可（客户端只看状态码）。
 // **多带 `Connection: close`**：超限时我们并不保证把上传读完（只排空很短一段），
@@ -1601,6 +1640,13 @@ async function handleSpeech(req, res) {
     return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
   body = pb.value;
+  // /v1/audio/speech 双通道分派（批次九）：hunyuan-tts / wb: 前缀 → WorkBuddy
+  // TTS（上游写死模型），其余（tts-1 占位名、搭子模型、空）仍走搭子 media.js。
+  const wbAudio = require('./workbuddy/audio');
+  const ttsDispatch = wbAudio.resolveTTSDispatch(body.model);
+  if (ttsDispatch.workbuddy) {
+    return handleWorkbuddySpeech(req, res, body, startedAt, ttsDispatch.region);
+  }
   const model = body.model || media.DEFAULT_TTS_MODEL;
   const r = await media.synthesizeSpeech({
     input: body.input,
@@ -1621,6 +1667,90 @@ async function handleSpeech(req, res) {
     ...(res._cors || {}),
   });
   return res.end(r.buffer);
+}
+
+// WorkBuddy 音频端点（批次九，misakano speech.go 协议 + 真机探针定案）。
+// 错误面与 media 同款：4xx → invalid_request_error，5xx → api_error。
+async function handleWorkbuddySpeech(req, res, body, startedAt, regionOverride) {
+  req._logPath = '/v1/audio/speech';
+  req._channel = 'workbuddy';
+  const region = regionOverride || (req._apiKeyRegion === 'intl' ? 'global' : 'cn');
+  const format = String(body.response_format || 'wav').toLowerCase();
+  if (!(format === '' || format === 'wav' || format === 'pcm')) {
+    return sendJSON(res, 400, {
+      error: { message: `response_format "${body.response_format}" 不支持：上游只产出 PCM，可选 wav / pcm`, type: 'invalid_request_error' },
+    });
+  }
+  try {
+    const r = await require('./workbuddy/audio').speechTTS({ input: body.input, voice: body.voice, region });
+    const out = format === 'pcm' ? r.pcm : r.wav;
+    logRequest(req, res, startedAt, { model: `workbuddy/tts`, stream: false, messages: 0 }, 200, null,
+      { media: 'wb_tts', bytes: out.length, ms: r.ms });
+    res.writeHead(200, {
+      'Content-Type': format === 'pcm' ? 'audio/pcm' : 'audio/wav',
+      'Content-Length': out.length,
+      ...(res._cors || {}),
+    });
+    return res.end(out);
+  } catch (e) {
+    const status = e.statusCode || 502;
+    logRequest(req, res, startedAt, { model: 'workbuddy/tts', stream: false, messages: 0 }, status, null,
+      { media: 'wb_tts', error: e.message });
+    return sendJSON(res, status, {
+      error: { message: e.message, type: status < 500 ? 'invalid_request_error' : 'api_error' },
+    });
+  }
+}
+
+// 语音转文本（OpenAI /v1/audio/transcriptions 形状）。本项目此前完全没有 ASR
+// 能力——这条是第一条。multipart 解析与上游转发都在 workbuddy/audio.js。
+async function handleWorkbuddyTranscriptions(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/audio/transcriptions';
+  req._channel = 'workbuddy';
+  const wbAudio = require('./workbuddy/audio');
+  // 3MB 上限在入口钳（读盘/转发之前）；Buffer 读——multipart 是二进制，
+  // utf8 字符串路径会打碎音频字节
+  const raw = await readBodyBuffer(req, wbAudio.MAX_AUDIO_BYTES + wbAudio.ASR_BODY_SLACK);
+  if (raw == null) {
+    return sendJSON(res, 413, {
+      error: { message: '音频超过 3MB 上游上限（请求体含 multipart 分帧余量 64KiB）', type: 'invalid_request_error', code: 'audio_too_large' },
+    }, { Connection: 'close' });
+  }
+  let part;
+  try {
+    part = wbAudio.parseMultipartAudio(raw, req.headers['content-type']);
+  } catch (e) {
+    return sendJSON(res, e.statusCode || 400, { error: { message: e.message, type: 'invalid_request_error' } });
+  }
+  // OpenAI 的 response_format：json（默认）/ text；srt/vtt/verbose_json 要时间戳，
+  // 上游不返回，明确拒掉而不是静默回 json（panel 同口径）
+  const fmt = String((part.fields && part.fields.response_format) || 'json').toLowerCase();
+  if (!(fmt === '' || fmt === 'json' || fmt === 'text')) {
+    return sendJSON(res, 400, {
+      error: { message: `response_format "${part.fields.response_format}" 不支持：上游不返回时间戳，可选 json / text`, type: 'invalid_request_error' },
+    });
+  }
+  const region = (part.fields && part.fields.realm === 'global') || req._apiKeyRegion === 'intl' ? 'global' : 'cn';
+  try {
+    const r = await wbAudio.transcribe({
+      audio: part.bytes, filename: part.filename, contentType: part.contentType, region,
+    });
+    logRequest(req, res, startedAt, { model: 'workbuddy/asr', stream: false, messages: 0 }, 200, null,
+      { media: 'wb_asr', chars: r.text.length, ms: r.ms });
+    if (fmt === 'text') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', ...(res._cors || {}) });
+      return res.end(r.text);
+    }
+    return sendJSON(res, 200, { text: r.text });
+  } catch (e) {
+    const status = e.statusCode || 502;
+    logRequest(req, res, startedAt, { model: 'workbuddy/asr', stream: false, messages: 0 }, status, null,
+      { media: 'wb_asr', error: e.message });
+    return sendJSON(res, status, {
+      error: { message: e.message, type: status < 500 ? 'invalid_request_error' : 'api_error' },
+    });
+  }
 }
 
 // 千问搜索端点（2026-10-31）。两条都是**只读检索**，不消耗对话额度里的
@@ -3005,14 +3135,25 @@ const server = http.createServer(async (req, res) => {
           const r = require('./upstream-router').resolve(model);
           reqChannel = r.channel || '';
         } catch (e) { reqChannel = ''; }
+      } else if (req.method === 'POST' && /^\/(v1\/)?audio\/transcriptions/.test(url)) {
+        // WorkBuddy ASR（批次九）：本项目唯一的 ASR 实现，路径归通道即可——
+        // multipart 的 model/realm 字段在鉴权段不可得（form-data 不按 JSON 解析）。
+        reqChannel = 'workbuddy';
+      } else if (req.method === 'POST' && /^\/(v1\/)?audio\/speech/.test(url)) {
+        // TTS 双通道分派（批次九）：hunyuan-tts / wb: 前缀 → workbuddy；其余
+        // （tts-1 占位名、搭子模型、无 model）仍归搭子。与 handleSpeech 的
+        // handler 分派同一判据（resolveTTSDispatch 单一来源）。
+        reqChannel = (model && require('./workbuddy/audio').resolveTTSDispatch(model).workbuddy)
+          ? 'workbuddy' : 'dumate';
       } else if (req.method === 'POST') {
         // 无 model 字段的工具端点按路径归通道：搜索/语音润色/文件上传是千问
-        // （纯国内），生图/视频/TTS 是搭子。不映射的话，区域绑定的 key 打
+        // （纯国内），生图/视频是搭子。不映射的话，区域绑定的 key 打
         // 这些端点会绕过 validate 的区域判定（channel 未知即跳过）。
         // search 必须写全 web|images：search/agenttool 是 workbuddy 的，
-        // 宽匹配会把它吞进千问。
+        // 宽匹配会把它吞进千问。audio/speech 与 audio/transcriptions 已在
+        // 上两个分支按模型/实现归通道，不再出现在这张路径表里。
         if (/^\/(v1\/)?(search\/(web|images)|voice\/polish|files\/upload)/.test(url)) reqChannel = 'qwenwork';
-        else if (/^\/(v1\/)?(images\/generations|videos\/generations|audio\/speech)/.test(url)) reqChannel = 'dumate';
+        else if (/^\/(v1\/)?(images\/generations|videos\/generations)/.test(url)) reqChannel = 'dumate';
       }
 
       const verdict = keysvc.validate(key, reqlog.clientIP(req), model, reqChannel);
@@ -3106,6 +3247,9 @@ const server = http.createServer(async (req, res) => {
     }
     if ((url === '/v1/embeddings' || url === '/embeddings') && req.method === 'POST') {
       return await handleWorkbuddyEmbeddings(req, res);
+    }
+    if ((url === '/v1/audio/transcriptions' || url === '/audio/transcriptions') && req.method === 'POST') {
+      return await handleWorkbuddyTranscriptions(req, res);
     }
 
     // Responses API (Codex CLI 0.155+ 只认 wire_api="responses")

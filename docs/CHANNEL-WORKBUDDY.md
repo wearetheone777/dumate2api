@@ -776,3 +776,26 @@ if (!Number.isFinite(c)) return false;
 **验证**：`test/unit/workbuddy-agenttool.test.js` 17 项（buildQuery `-site:` 幂等 / 信封归一化 / 缺字段不炸 / url·query 校验 / 3xx 禁跟随 / 信封错误 / 非 JSON / normalizeInput 全形状 / 11351 双路径 / 11353 / 413 / 条数不符 / 其它错误透传 / 接线自证）；`npm test` 1792/1792、`npm run verify` 52/52；隔离实例冒烟六项（9085 scratch 实例，不动 9080）全过。**测试基建两个坑**：① stub `module.exports.postTool` 的**恢复必须写在测试体内**——顶层代码文件加载时执行，随后用例会把桩换回去（「Missing expected rejection」的根因）；② 接线自证 grep 正则字面量时源码里 `/` 写作 `\/`，按转义后文本比对。
 
 **待办**：server.js 已改，**9080 重启后三条端点才生效**（当前网关进程还是旧代码）。嵌入注册表暂只有 bge-m3 实测——上游若有新嵌入模型，先探针再放行，别把对话模型名透传进 embeddings（必 11351）。
+
+### 11.11 批次九：音频 TTS + ASR（2026-11-28，misakano speech.go 协议 + 真机探针闭环定案）
+
+**协议**（探针 `test/probe-workbuddy-audio.js` 闭环验证：TTS 合成 → 现场套 WAV → ASR 转写回原文）：
+
+| 端点 | 请求 | 实测形状 |
+|---|---|---|
+| `POST {chatBase}/v2/audio/speech` | `{model:'hunyuan-tts-2.5', stream:true, speech:{input, voice, response_format:'pcm', sample_rate:24000}}` | SSE：`speech.audio.delta`（audio.data = base64 PCM，24kHz 单声道 s16le）→ `speech.audio.done` → `[DONE]`。模型写死 hunyuan-tts-2.5，默认音色 `f191_female_cn_tts2.5_flash` |
+| `POST {chatBase}/agenttool/v1/asr` | multipart 字段 `audio`（带 filename/mime），≤3MB | `{code?, msg?, text}`——**code 字段可能不存在**（探针实测 undefined），成功判据 `code==null||0`；text 是唯一可靠产物 |
+
+**两个 11101 实测（探针踩出来的，别再试）**：① UA 不在 `chatHeaders` 里（chat 的 postStream 单独补）——漏了即 400 11101 missing required header；② **X-Conversation-ID 空串即 400 11101**——会话三件套是渠道校验的一部分，官方客户端 chat/**speech** 都带（panel injectConversationHeaders 空 meta 现造 v7 的注释原文）。音频无会话概念，现造一个 v7 即过。两条负证据同批落袋：**baggage 不需要**、**x-device-token 不需要**（都没发也 200）。
+
+**网关端点**：`POST /v1/audio/speech`（与搭子 TTS 共用路径，`resolveTTSDispatch` 单一来源分派——hunyuan-tts*/wb: 前缀 → workbuddy，tts-1 占位名/搭子模型/空 → 搭子 media.js；`cn:`/`global:` 模型前缀是区域覆写）与 `POST /v1/audio/transcriptions`（本项目**第一条 ASR**；multipart 字段 file|audio 都认，response_format json/text，srt/vtt/verbose_json 明确 400——上游不返回时间戳）。响应：wav（默认，44 字节 RIFF 头）/pcm（audio/pcm）二进制；转写 `{text}` 或 text/plain。
+
+**三个关键闸**：
+
+1. **TTS 无 `speech.audio.done` 帧不能当成功**：上游分块流偶发中途 close，半段音频回 200 = 客户端拿到残缺录音（panel issue #277 实测 132480 vs 136320 字节识别成乱码）。截断 → 502 `truncated`，可换号重试。SSE 流内 error 帧必须认——不认就掉到 truncated，把上游原因咽掉。
+2. **错误处置**：请求级（HTTP 4xx 信封、11101/15052/15053、413 预检）fail-fast 不换号；上游侧（SSE error/截断/空 PCM/5xx/未知业务码）换号重试上限 3；**不喂池**（与 agenttool 同口径）。15052→413、15053→400。
+3. **二进制请求体必须 Buffer 读**：`readBody` 是 utf8 字符串路径，跨 chunk 会打碎音频字节（与 SSE 的 StringDecoder 同一条铁律）。`readBodyBuffer`（server.js）语义复刻 body-limit；ASR 入口预检 3MiB+64KiB，超限当场 413 `audio_too_large`。零依赖 multipart 解析 `parseMultipartAudio`（boundary quoted/裸、file|audio 双字段、文本字段一并取出）。
+
+**冒烟假象教训**：4MB 用例首测 502 空体——是本机 `http_proxy=7897` 在「413 提前断连」场景的产物，`--noproxy '*'` 直连 413 正确。**凡「预期短响应 + 大上传」的冒烟用例都要绕代理**，否则测的是代理不是网关。
+
+**验证**：workbuddy-audio 19 项；npm test 1811/1811、verify 52/52；隔离实例（9085）六项冒烟全过。**9080 重启后生效**。上游语音模型不在 /v1/models 目录（独立端点），/v1/models 不列。
