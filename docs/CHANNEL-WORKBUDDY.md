@@ -841,3 +841,32 @@ if (!Number.isFinite(c)) return false;
 **「桌面腿与网页腿共用候选序列」未做**：hub 的桌面腿是桌面身份 chat/completions 对话；本项目每日活跃是 activity 上报 + 网页 ACP 双通道，没有桌面对话腿，共用无从谈起——真要做时按 `dailyChatCandidates` 直接取用即可，函数已按 region 参数化。
 
 **验证**：workbuddy-webmodel 12 项（序列三层/退避/换候选判据/端到端回退/11140 终止/预算结论/接线自证）；npm test 1847/1847、verify 53/53；真机端到端 `dailyActivity` hy4flash-free 一次过（attempts 1，零回退，3.5s）。**只挂管理端进程**（autocheckin + admin 路由），网关 9080 不受本批影响，重启范围仅 9081。
+
+### 11.14 批次十二：模型规则（按账号 deny/allow）（2026-11-28，misakano modelrules.go 移植）
+
+需求背景：昂贵模型只对少数账号开放，其余账号只用便宜常用的——否则一个账号把额度打穿，整个池子连便宜模型都跟着没得用。规则是**命名的一组模型 + 黑/白模式**，挂到账号上即刻生效，改规则内容时所有挂了它的账号一起变（不用逐账号重设）。
+
+**语义（modelrules.go 原文口径，`src/workbuddy/rules.js`）**：
+
+- deny 黑名单 = 规则里的模型不可用；allow 白名单 = 只有规则里的模型可用，列表外全部不可用。一个账号可挂多条：多条 deny 取并集、多条 allow 取并集、同时存在时 **deny 优先**（显式禁用比允许列表更明确——进了白名单也拦）；
+- 域前缀：模型名可带 `cn:`/`global:`（两域两拨账号，剥掉就分不开），**裸名 = 两个域都命中**；`global:hy4std` 与裸名 `hy4std` 是不同条目（去重按整串）；
+- **allow 在账号所属域零命中 → 这条规则视作没挂**（防跨域误挂封死：global 号挂纯 `cn:` 白名单若照直展开，会被白名单封死所有模型而面板毫无异常；跨域写错的意图几乎必然是「这个号只用这几个模型」，不是「这个号什么都不能用」）；
+- `'auto'` 档位不做模型级判断（实际模型由账号决定，规则无从比对）。
+
+**发送链集成（`src/workbuddy/index.js` send 选号处）**：候选构造后按 `filterAccounts` 过滤，部分被拦照常跑（被拦的账号不进候选，与冷却/白名单/护栏叠加判定）；**全部被拦 → 400 `model_not_allowed`**（`e.modelNotAllowed=true`）——**不是 503**：503 会被客户端当上游抖动重试，而规则不会自愈，重试只是白打。
+
+**存储**：`data/workbuddy-model-rules.json`（`{rules: {id: rule}, assignments: {accountId: [ids]}}`，原子写 + mtime 热读——与 modelmap/keys 同款，管理端改完网关零重启生效）。规则与挂载关系进这一个文件，**凭证（workbuddy-accounts.json）不掺配置**。带 id 更新必须已存在（404，拼错 id 悄悄建出一条没人挂的新规则最难排查）；assignRules 未知规则 id 拒绝（野 id 不静默进账）；deleteRule 摘掉全部引用并删空 assignment 行。
+
+**管理端 5 条路由**（`/api/admin/workbuddy/model-rules`，全部带审计 `workbuddy_rule_*`）：
+
+| 方法 / 路径 | 作用 |
+|---|---|
+| `GET /model-rules` | 规则列表 + 每条挂载数 + 全量挂载映射；`?account_id=` 附账号视角（可再带 `?model=` 看该账号对该模型被哪条规则拦） |
+| `POST /model-rules` | 新建 / 更新（body.rule 或 body；name ≤40 字，mode 支持 deny/blacklist/black、allow/whitelist/white 别名） |
+| `DELETE /model-rules/:id` | 删除并摘全部引用 |
+| `POST /model-rules/assign` | 设置某账号的规则集合（**整体替换**，空数组 = 全摘） |
+| `POST /model-rules/apply` | 一条规则批量挂/摘到多账号（只增删这一条，返回真实变化账号数，幂等） |
+
+**前端页（批次十三，2026-11-28）**：`web/src/views/ModelRulesView.vue` + 路由 `#/model-rules`（adminOnly）+ 侧栏菜单「模型规则」（只在 WorkBuddy 通道 + admin 可见，与 TRAE/Qoder 运行策略同一规则）。页面 = 语义说明卡 + 规则表（模式 tag / 模型 tag / 挂载数 / 编辑·应用到账号·删除）+ 账号挂载表（每账号挂的规则，配置=整体替换）+ 三个弹窗（规则编辑：目录选项 cn+global 合并去重、mode="tags" 可手输前缀；账号挂载；单规则批量应用带「挂到勾选账号 / 从勾选账号摘除」两个动作）。真机截图验证过列表与编辑弹窗（tools/ui-shot.js，隔离数据目录 + 9085 临时管理端，不碰 9080/9081）。
+
+**验证**：workbuddy-modelrules 11 项（校验与别名归一 / 域前缀命中 / allow 零命中不挂 / deny 优先 / filterAccounts 全拦-部分拦-auto / mtime 热读 / 接线自证）+ verify-workbuddy-rules-api.js 9 项（HTTP 层直调 5 条路由：形状/校验错误/404/整体替换/幂等/账号诊断视图）；npm test 1858/1858、verify 54/54；vue-tsc 构建过、真机截图双张。**双进程都读同一份规则文件**（mtime 热读），重启非必须；管理端（9081）需重启才有新路由与新前端。

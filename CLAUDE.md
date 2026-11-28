@@ -661,6 +661,26 @@ ETag 用内容哈希而不是 `statSync` 的 mtime：后者在异步回调里阻
 <a-switch/></label>`），并给关闭态一个不同颜色的标签。同理：改完前端别只看接口
 返回，要用真实浏览器截图核对可见性（本次两处问题都是接口 200、界面无感）。
 
+**`tools/ui-shot.js` 在 WSL 里要经 Windows node 跑（2026-11-28 实测）。** 本机
+WSL 没有 Linux 浏览器，工具默认起的是 Windows Edge——而 WSL node 会把
+`os.tmpdir()`（`/tmp/...`）当 `--user-data-dir` 传给 Edge，**Windows 程序读不了
+Linux 路径，Edge 起不来、devtools 端口永远无响应**（WSL networkMode=mirrored
+不是问题，路径才是）。正确姿势：
+
+```bash
+"/mnt/c/Users/zhou/AppData/Local/Author Software/nvm/.nodejs/node.exe" \
+  '\\wsl.localhost\Ubuntu-24.04\home\zhou\code\claude\demo\dumate2api\tools\ui-shot.js' \
+  --url "http://127.0.0.1:9085/#/页面" --user admin --pass "$PW" \
+  --channel workbuddy --out 'C:\Users\zhou\AppData\Local\Temp\x.png' ...
+```
+
+脚本经 UNC 访问、profile/输出全落 Windows 侧，Windows→WSL 的 localhost 在
+mirrored 模式下可达。要截图的页面若需要登录，用**隔离数据目录** +
+`DUMATE_ADMIN_PORT=9085 ... node src/admin/server.js --reset-admin` 起临时管理端，
+别在真 9081 上试密码。另：`--click` 匹配按钮 innerText，**AntD 两字按钮自动插
+空格**（渲染成「编 辑」「配 置」），--click 传带空格的形态；断言文本避开会自动
+换行的长句（innerText 换行会断开 includes 匹配）。
+
 **新增运行态配置字段要改三处，不是一处（2026-11-16 踩过）。**
 `src/trae-runtime.js` 里 `defaults()`、`FIELDS`、以及 **`Load()` 的返回体**是三份
 独立的字段清单——只加前两个，`Store()` 写盘成功、接口读出来却恒 `undefined`

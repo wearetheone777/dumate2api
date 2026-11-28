@@ -69,6 +69,12 @@
           <template #icon><ControlOutlined /></template>
           <span>Qoder 运行策略</span>
         </a-menu-item>
+        <!-- WorkBuddy 模型规则：按账号 deny/allow（批次十三）。只在 WorkBuddy
+             通道下出现，理由同上——规则挂在 workbuddy 账号上，别的通道没有这回事 -->
+        <a-menu-item v-if="isAdmin && channelStore.current === 'workbuddy'" key="model-rules">
+          <template #icon><BlockOutlined /></template>
+          <span>模型规则</span>
+        </a-menu-item>
         <!-- 运行日志：进程 console，admin 专属 -->
         <a-menu-item v-if="isAdmin" key="logs">
           <template #icon><CodeOutlined /></template>
@@ -212,7 +218,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined } from '@ant-design/icons-vue'
+import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined, BlockOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import client from '@/api/client'
 import { auth, isAdmin } from '@/stores/auth'
