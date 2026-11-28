@@ -165,3 +165,19 @@ test('缓冲门: 非 JSON 帧原样转发；result().pending/held 记账', () =>
   assert.strictEqual(gate.result().pending, 1);
   assert.strictEqual(gate.result().held, 0);
 });
+
+test('缓冲门: finishReason / reasoningSeen 记账（零输出守卫判定字段，批次六）', () => {
+  // 零输出形状：role/空帧直发（pass），finish(length)/usage 暂扣，无 reasoning/正文/工具
+  const { gate } = drive([roleFrame(), finish('length'), usageF(), '[DONE]'], true);
+  const r = gate.result();
+  assert.strictEqual(r.finishReason, 'length', 'finish_reason 在暂扣时顺手记下');
+  assert.strictEqual(r.reasoningSeen, false, '没见过 reasoning 帧');
+  assert.strictEqual(r.text, '');
+  assert.strictEqual(r.toolCalls, 0);
+  // reasoning 直发 → reasoningSeen（半空轮不是零输出，客户端已看见思考）
+  const { gate: g2 } = drive([rsn('想'), finish('length')], true);
+  assert.strictEqual(g2.result().reasoningSeen, true);
+  // finish=stop 也如实记；usage 帧不带 finish_reason，不覆盖
+  const { gate: g3 } = drive([usageF(), finish('stop')], true);
+  assert.strictEqual(g3.result().finishReason, 'stop');
+});

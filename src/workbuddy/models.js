@@ -12,6 +12,9 @@
 // credits 字符串 "x0.00 credits" 判免费（issue #65：后缀不影响取数）。
 const c = require('./constants');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
 // 目录基本不变，缓存 10 分钟（按区域分——两区目录不同）
 const CACHE_MS = parseInt(process.env.DUMATE_WORKBUDDY_MODELS_CACHE_MS || '600000', 10);
@@ -222,6 +225,24 @@ function maxOutputOf(region = 'cn', modelId = '', rows = null) {
 }
 
 /**
+ * 同步取某模型的目录 reasoning 元数据（2026-11-28 融合批 P0-4）：
+ * { efforts:[], defaultEffort, canDisableThinking }，供 thinking.js 做档位
+ * 钳制与默认档。未预热 / 模型不在表 / 无 reasoning 数据返回 null（调用方不钳）。
+ * rows 参数仅供测试注入，生产读缓存——与 maxOutputOf 同一形状。
+ */
+function reasoningOf(region = 'cn', modelId = '', rows = null) {
+  const reg = c.normalizeRegion(region);
+  let list = rows;
+  if (!list) {
+    const hit = caches.get(reg);
+    list = hit && hit.data ? hit.data.models : null;
+  }
+  if (!Array.isArray(list)) return null;
+  const m = list.find((x) => x && x.id === modelId);
+  return m && m.reasoning && typeof m.reasoning === 'object' ? m.reasoning : null;
+}
+
+/**
  * 按模型名推断它属于哪个区域（2026-11-08 融合批，真机事故驱动）。
  *
  * **要解决的真实问题**：`accountsForRegion()` 只在调用方显式传 `opts.region`
@@ -262,11 +283,104 @@ function regionOfModel(model) {
 function _setCatalog(region, ids) {
   const reg = c.normalizeRegion(region);
   if (ids == null) { caches.delete(reg); return; }
-  const list = (Array.isArray(ids) ? ids : []).map((id) => ({ id: String(id) }));
+  // 字符串 → {id}；对象 → 原样保留（reasoningOf 的测试也要能注入 reasoning 元数据）
+  const list = (Array.isArray(ids) ? ids : []).map((x) => (
+    typeof x === 'string' ? { id: x } : { ...x, id: String(x && x.id) }
+  ));
   caches.set(reg, { at: Date.now(), data: { models: list, ok: true, fetchedAt: Date.now() } });
 }
 
+/**
+ * 该模型是否「确认免费」（批次五：免费模型豁免额度护栏，hub v2.2.2）。
+ *
+ * 两层数据源，**实测是终审**：
+ *   ① 实测账本（rate-ledger，billing-check 探针的 EMA）：有样本就按它——
+ *      EMA=0 免费、>0 不豁免（上游改口径/目录元数据过期时当场暴露，这正是
+ *      台账存在的意义；EMA 淡忘机制让口径改回后 5~10 次探测内恢复豁免）；
+ *   ② 目录缓存（fetchModels 的解析结果带 free 字段，rate===0）——只在
+ *      实测无样本时生效。
+ * 计划里的「内置快照」层刻意缺席：本仓没有 workbuddy 的内置目录快照，
+ * 也没有经核实的免费模型名单——编一个名单比缺一层更糟（无证据不预编）。
+ *
+ * 判不出来返回 false（不豁免）——错放一个付费模型只会让请求照旧打上游
+ * （等同今日行为）；错豁免一个付费模型才会真的绕过护栏。'auto' 档位永远
+ * 不豁免（auto 的实际模型由账号决定，免费性不可知）。
+ * rows 参数仅供测试注入，生产读缓存——与 maxOutputOf/reasoningOf 同一形状。
+ */
+function isFreeModel(region = 'cn', modelId = '', rows = null) {
+  const reg = c.normalizeRegion(region);
+  const m = String(modelId || '').trim().replace(/^workbuddy\//, '');
+  if (!m || m === 'auto') return false;
+  try {
+    const led = require('./rate-ledger').getRate(m, reg);
+    if (led) return Number(led.ema) === 0; // 有实测样本：实测终审
+  } catch (e) { /* 账本异常不豁免（继续走目录层） */ }
+  let list = rows;
+  if (!list) {
+    const hit = caches.get(reg);
+    list = hit && hit.data ? hit.data.models : null;
+  }
+  if (!Array.isArray(list)) return false;
+  const row = list.find((x) => x && x.id === m);
+  return !!(row && row.free === true);
+}
+
+// ---- 目录改版监控（批次七，misakano watchdog.go）----
+//
+// 上游改目录（加/删/改名/调倍率/调上下文）是静默的：本地映射不跟着改，
+// 请求就会 404 或计错费，而界面上看不到任何征兆。周期取一次目录指纹
+// （sha256），变了就交告警层报。**复用已有模型拉取**——指纹走 fetchModels
+// 的缓存（CACHE_MS），不新增端点与调用节奏。
+//
+// 哈希的是 parseCatalog 的归一化行（固定键序构造，同一份上游数据哈希稳定；
+// fetchedAt 在包装层不进行内）。首次建档只存基线不告警——没有基线谈不上
+// 「改版」。落盘跨重启，`DUMATE_ADMIN_DATA` 与告警状态同目录。
+const FP_FILE = 'workbuddy-catalog-fp.json';
+function fpPath() {
+  const dir = process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', '..', 'data');
+  return path.join(dir, FP_FILE);
+}
+function loadFp() {
+  try { return JSON.parse(fs.readFileSync(fpPath(), 'utf8')); } catch (e) { return {}; }
+}
+function saveFp(d) {
+  const p = fpPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = `${p}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(d, null, 2), 'utf8');
+  fs.renameSync(tmp, p);
+}
+
+/**
+ * 取一次目录指纹并与上一份比对。返回 {ok, region, sha, models, prevSha,
+ * prevModels, changed, first}；拉取失败返回 {ok:false, error}（评估层没有
+ * 事实就不判，绝不把「拉不到」当成「改版了」）。
+ */
+async function catalogWatch(region = 'cn') {
+  const reg = c.normalizeRegion(region);
+  let m;
+  try { m = await fetchModels({ region: reg }); } catch (e) {
+    return { ok: false, region: reg, error: e.message || String(e) };
+  }
+  if (!m || !m.ok) return { ok: false, region: reg, error: (m && m.error) || '目录不可用' };
+  const models = Array.isArray(m.models) ? m.models : [];
+  const sha = crypto.createHash('sha256').update(JSON.stringify(models)).digest('hex');
+  const store = loadFp();
+  const prev = store[reg];
+  const changed = !!(prev && prev.sha !== sha);
+  const out = {
+    ok: true, region: reg, sha, models: models.length,
+    prevSha: prev ? prev.sha : null, prevModels: prev ? prev.models : null,
+    changed, first: !prev,
+  };
+  if (!prev || changed) {
+    store[reg] = { sha, models: models.length, at: Date.now() };
+    try { saveFp(store); } catch (e) { /* 存不上就本轮告警重发一次，不影响请求 */ }
+  }
+  return out;
+}
+
 module.exports = {
-  fetchModels, parseCatalog, parseCreditsRate, cachedModelIds, maxOutputOf,
-  regionOfModel, _setCatalog, CACHE_MS,
+  fetchModels, parseCatalog, parseCreditsRate, cachedModelIds, maxOutputOf, reasoningOf,
+  regionOfModel, isFreeModel, _setCatalog, catalogWatch, CACHE_MS,
 };

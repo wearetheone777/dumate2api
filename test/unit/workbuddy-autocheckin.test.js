@@ -318,3 +318,72 @@ test('配置落盘并在新进程读回（重启不丢开关）', () => {
   assert.strictEqual(disk.jitter_minutes, 5);
   autock.configure({ enabled: false, hour: 0, minute: 0, jitter_minutes: 10 });
 });
+
+// ---- 第四腿（成长任务清扫，P0-6；taskSweeper 注入接管，开关不陪 env 玩）----
+
+test('runOnce：第四腿默认关——taskSweeper 不注入且 env 未开时不产生 tasks 行', async () => {
+  const r = await autock.runOnce('manual', {
+    accounts: [CN(51)],
+    authStore: fakeStore(),
+    perAccountDelayMs: 0,
+    webAgent: null,
+    activityReporter: null,
+    statusOf: async () => ({ ok: true, todayCheckedIn: true }),
+    claimOf: async () => ({ ok: true }),
+    // taskSweeper 缺省 → env 开关判定（测试环境未设 DUMATE_WORKBUDDY_TASKS_SWEEP → 关）
+  });
+  assert.strictEqual(r.results.filter((x) => x.action === 'tasks').length, 0, '开关没开就没有第四腿');
+  assert.strictEqual(r.tasksClaimed, 0);
+});
+
+test('runOnce：第四腿注入即跑——计数进汇总、企业号跳过不调清扫器', async () => {
+  const swept = [];
+  const sweeper = async (a) => {
+    swept.push(a.id);
+    if (a.id === 31) {
+      return {
+        sweep: { ok: true, accepted: ['t1'], claimed: [{ code: 't1', credit: 20, energy: 1, verified: true }], unverified: [], skipped: [], error: '' },
+        redeem: { ok: true, redeemed: [{ tier: '14d', granted: { credit: 300, energy: 10, cards: 1, chances: 0 } }], skipped: [] },
+      };
+    }
+    return { sweep: { ok: true, accepted: [], claimed: [], unverified: [], skipped: [], error: '' }, redeem: { ok: true, redeemed: [], skipped: [] } };
+  };
+  const r = await autock.runOnce('manual', {
+    accounts: [CN(31), { ...CN(32), enterpriseId: 'corp-x' }],
+    authStore: fakeStore(),
+    perAccountDelayMs: 0,
+    webAgent: null,
+    activityReporter: null,
+    statusOf: async () => ({ ok: true, todayCheckedIn: true }),
+    claimOf: async () => ({ ok: true }),
+    taskSweeper: sweeper,
+  });
+  assert.deepStrictEqual(swept, [31], '企业号（enterpriseId 非空）不调清扫器');
+  const taskRows = r.results.filter((x) => x.action === 'tasks');
+  assert.strictEqual(taskRows.length, 2);
+  const byId = Object.fromEntries(taskRows.map((x) => [x.id, x]));
+  assert.strictEqual(byId[31].claimed, 1);
+  assert.strictEqual(byId[31].redeemed, 1);
+  assert.strictEqual(byId[32].skipped, true, '企业号行如实标注，不冒充清扫成功');
+  assert.strictEqual(r.tasksAccepted, 1);
+  assert.strictEqual(r.tasksClaimed, 1);
+  assert.strictEqual(r.tasksRedeemed, 1);
+  assert.strictEqual(r.tasksUnverified, 0);
+});
+
+test('runOnce：第四腿失败如实计数（清扫器抛错 → tasksFailed）', async () => {
+  const r = await autock.runOnce('manual', {
+    accounts: [CN(41)],
+    authStore: fakeStore(),
+    perAccountDelayMs: 0,
+    webAgent: null,
+    activityReporter: null,
+    statusOf: async () => ({ ok: true, todayCheckedIn: true }),
+    claimOf: async () => ({ ok: true }),
+    taskSweeper: async () => { throw new Error('网络炸了'); },
+  });
+  const row = r.results.find((x) => x.action === 'tasks');
+  assert.strictEqual(row.ok, false);
+  assert.match(row.error, /清扫无结果/);
+  assert.strictEqual(r.tasksFailed, 1);
+});

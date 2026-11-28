@@ -31,6 +31,66 @@ let requestImpl = require('https').request;
 function _setRequestImpl(f) { requestImpl = f || require('https').request; }
 
 /** GET 一个成长端点，返回 { ok, status, doc, error }。永不抛 */
+/** POST 版 getJson（同头族同传输，P1-6 官方用量账本用）。bodyObj 序列化成 JSON。 */
+function postJson(region, account, path, bodyObj) {
+  return new Promise((resolve) => {
+    const spec = c.specOf(region);
+    let agent = null;
+    try { agent = require('../proxy-agent').getAgentFor(account); } catch (e) {
+      return resolve({ ok: false, status: 0, doc: null, error: `出站代理配置错误: ${e.message}` });
+    }
+    const payload = Buffer.from(JSON.stringify(bodyObj || {}), 'utf8');
+    const u = new URL(spec.chatBase + path);
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      'Accept-Language': region === 'global' ? 'en-US' : 'zh-CN',
+      'X-CodeBuddy-Request': '1',
+      'X-Requested-With': 'XMLHttpRequest',
+      'X-Product': 'SaaS',
+      Origin: spec.billingBase,
+      Referer: `${spec.billingBase}/`,
+      'User-Agent': c.CLIENT_UA,
+      Authorization: `Bearer ${(account && account.accessToken) || ''}`,
+      'Content-Type': 'application/json',
+      'Content-Length': String(payload.length),
+    };
+    if (account && account.uid) headers['X-User-Id'] = account.uid;
+    if (account && account.domain) headers['X-Domain'] = account.domain;
+    if (account && account.enterpriseId) headers['X-Enterprise-Id'] = account.enterpriseId;
+
+    let req;
+    try {
+      req = requestImpl({
+        hostname: u.hostname, path: u.pathname + u.search, method: 'POST', headers,
+        ...(agent ? { agent } : {}), timeout: 15000,
+      }, (res) => {
+        let b = '';
+        const { StringDecoder } = require('string_decoder');
+        const dec = new StringDecoder('utf8');
+        res.on('data', (x) => { b += dec.write(x); });
+        res.on('end', () => {
+          b += dec.end();
+          let doc = null;
+          try { doc = JSON.parse(b); } catch (e) { /* 非 JSON */ }
+          const code = doc ? Number(doc.code) : NaN;
+          const ok = res.statusCode >= 200 && res.statusCode < 300
+            && Number.isFinite(code) && code === 0;
+          resolve({
+            ok, status: res.statusCode, doc,
+            error: ok ? '' : `HTTP ${res.statusCode}${doc && doc.msg ? `: ${doc.msg}` : ''}`,
+          });
+        });
+      });
+    } catch (e) {
+      return resolve({ ok: false, status: 0, doc: null, error: e.message });
+    }
+    req.on('error', (e) => resolve({ ok: false, status: 0, doc: null, error: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, doc: null, error: 'timeout' }); });
+    req.write(payload);
+    req.end();
+  });
+}
+
 function getJson(region, account, path) {
   return new Promise((resolve) => {
     const spec = c.specOf(region);
@@ -259,7 +319,68 @@ async function fetchGrowth(region, account, now = Date.now()) {
   };
 }
 
+/**
+ * 任务中心三桶扫描（P1-7，2026-11-28 融合批；只读，不碰写路径）。
+ *
+ * 每账号未完成任务分三桶，不变量 `incomplete_total == 三桶之和` 保证不漏项：
+ *   auto        可自动化——补领清扫（tasks.sweepTasks）能接的行（accept+claim）
+ *   locked_auto 上游锁定（locked:true，等前置/等档位）——看得见动不了
+ *   manual      需手动——mp/客户端口径任务（Sequential_Tasks_* 等，须 X-Client-Platform:
+ *               miniprogram 头族），本批只显示指引不执行；国际版 manual 桶同理只指引
+ * 已领（accept_status==='claimed'）/已过期/无奖励位的不进桶。
+ *
+ * scan_state 五态——**401/空 body/非 JSON 一律 error，绝不渲染成「没有待办」**：
+ *   ok / empty / error / skipped_enterprise / skipped_disabled
+ *
+ * @param {{disabled?:boolean, execution_enabled?:boolean}} opts
+ *   disabled=true 直接报 skipped_disabled（自动化腿在开关关闭时用）；
+ *   execution_enabled 由调用方传（tasks.sweepEnabled()），这里不读 env——扫描是
+ *   只读的，执行开关是执行路径的事，两件事不能搅在一起。
+ */
+async function scanGrowthTasks(region, account, opts = {}) {
+  const region2 = c.normalizeRegion(region);
+  const out = {
+    scan_state: 'error', buckets: null, incomplete_total: null,
+    claimable_total: 0, execution_enabled: opts.execution_enabled === true,
+    invariant_ok: null, error: '',
+  };
+  const tasksMod = require('./tasks'); // 纯解析与企业号判据单一出处（无循环依赖）
+  if (tasksMod.enterpriseBlocked(account)) {
+    out.scan_state = 'skipped_enterprise';
+    return out;
+  }
+  if (opts.disabled) {
+    out.scan_state = 'skipped_disabled';
+    return out;
+  }
+  const r = await getJson(region2, account, '/v2/activity/growth/tasks');
+  if (!r.ok) {
+    // 401 / 空 body / 非业务信封 → error。把「读不到」渲染成「没有待办」会让
+    // 运维以为任务都领完了——这比漏领更难发现。
+    out.error = r.error || `HTTP ${r.status}`;
+    return out;
+  }
+  const rows = tasksMod.parseTasksList(r.doc);
+  const buckets = { auto: [], locked_auto: [], manual: [] };
+  for (const t of rows) {
+    if (t.acceptStatus === 'claimed' || t.expired || !t.hasReward) continue;
+    if (t.locked) buckets.locked_auto.push(t);
+    else if (t.type === 'mp' || /^Sequential_Tasks_/.test(t.code)) buckets.manual.push(t);
+    else buckets.auto.push(t);
+  }
+  const incomplete = buckets.auto.length + buckets.locked_auto.length + buckets.manual.length;
+  out.scan_state = incomplete === 0 ? 'empty' : 'ok';
+  out.buckets = buckets;
+  out.incomplete_total = incomplete;
+  out.invariant_ok = incomplete === buckets.auto.length + buckets.locked_auto.length + buckets.manual.length;
+  out.claimable_total = rows.filter((t) => t.claimable).length;
+  if (region2 === 'global' && buckets.manual.length) {
+    out.manualNote = '国际版手动桶只显示指引（客户端/小程序口径），本网关不代执行';
+  }
+  return out;
+}
+
 module.exports = {
   parseStreak, parseHeatmap, parseTasks, parseEnergy, parseBuddyQuota,
-  fetchGrowth, getJson, _setRequestImpl,
+  fetchGrowth, getJson, postJson, _setRequestImpl, scanGrowthTasks,
 };

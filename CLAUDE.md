@@ -735,6 +735,7 @@ per-key 限流（低价值场景）。
 | `DUMATE_QWENWORK_REPAIR_RETRY` / `DUMATE_QODER_REPAIR_RETRY` | `1` | 同上，千问与 Qoder 各一套（`src/repair.js` 的 `envCaps`）。互不影响。**可被管理端「通道风控」面板覆盖** |
 | `DUMATE_QWENWORK_HOLD_CAP` / `DUMATE_QODER_HOLD_CAP` | `600` | 同上，千问与 Qoder 各一套 |
 | `DUMATE_WORKBUDDY_REPAIR_RETRY` / `_HOLD_CAP` | `1` / `600` | 同上，WorkBuddy 一套（2026-11-04 接入共享修复） |
+| `DUMATE_WORKBUDDY_TASKS_SWEEP` | 未设（关闭） | 成长任务补领清扫的**自动化**开关（autocheckin 第四腿：accept 幂等报名 + claim 完成未领 + 连登兑换）。默认关——写操作独立开关纪律；管理端 `/tasks/*` 手动按钮不受它管。端点定案与安全形状见 `docs/CHANNEL-WORKBUDDY.md` 11.5 |
 | `DUMATE_WORKBUDDY_MIN_MAX_TOKENS` | `16384` | WorkBuddy 输出预算下限（`budget.js` 的 `WB_FLOOR`，reasoning 与正文抢预算） |
 | `DUMATE_WORKBUDDY_MODELS_CACHE_MS` | `600000` | WorkBuddy 模型表缓存时长（10 分钟，按区域分缓存） |
 | `DUMATE_WORKBUDDY_APP_VERSION` | 未设（按区域兜底 5.5.6 / 5.5.2） | 覆盖客户端版本号（进 `X-IDE-Version` 与 chat UA） |

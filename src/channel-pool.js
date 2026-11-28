@@ -69,6 +69,14 @@ function systemTextOf(payload) {
  * 「继续」就共用一个粘性账号，前一秒还在 A 项目上下文里，后一秒被塞进 B 项目
  * 的前缀缓存，命中率与上下文恢复成本双双恶化。
  *
+ * **为什么还要含首条 assistant（P1-8，hub v2.0.7 #839）**：只看 system+首条
+ * user 时，**同一开场白的多个并发会话**（同一个 harness 反复开新会话，开场
+ * 消息逐字节相同）从第 2 轮起仍撞同一个键——它们会被钉死在同一个账号上，
+ * 前缀缓存互相踩踏。加入首条 assistant 后，分叉发生在第 2 轮：各会话拿到
+ * 各自的键、各走各号。第 1 轮（还没有 assistant）的键与旧口径**逐字节一致**
+ * ——旧键的既有绑定不受影响；第 2 轮的键变更由 `sessionKeyFor` 的 prebind
+ * 迁移兜住（把第 1 轮绑定的账号迁给第 2 轮的新键，会话不换号）。
+ *
  * 三个已确认的前提（不成立时这条改动就该回退）：
  *   1. 两个协议都把 system **每轮重发**（Claude Code 顶层 `system`；Codex/OpenAI
  *      在 messages 里）——所以同一会话的 system 在轮次之间是稳定的，键也稳定；
@@ -76,28 +84,46 @@ function systemTextOf(payload) {
  *   3. 键只在本地用（选号 + 粘性表），不进上游、不进日志原文。
  *
  * system 用**全文**哈希而不截断：system 的差异常在尾部（追加的项目约定），
- * 截断会把「改过的 system」认成同一个；user 侧仍截 2048（那是既有的稳定锚点）。
+ * 截断会把「改过的 system」认成同一个；user 与 assistant 侧仍截 2048
+ * （assistant 是本轮新增的锚点，沿用同一条稳定口径，不引入第二套数字）。
  */
-function sessionKeyOf(payload, opts) {
+
+/**
+ * 键的完整推导（sessionKeyOf 的实现体，sessionKeyFor 需要 prevKey 做迁移）。
+ * @returns {{key:string, prevKey:string|null}} prevKey = 还没有 assistant 时
+ *   的旧键（P1-8 迁移用）；本请求没有 assistant 时为 null（key 就是旧键）。
+ */
+function sessionKeyPartsOf(payload, opts) {
   if (opts && opts.sessionKey != null && String(opts.sessionKey).trim()) {
-    return `k:${String(opts.sessionKey).trim()}`;
+    // 显式键由调用方全权管理（自带迁移语义），这里不掺和
+    return { key: `k:${String(opts.sessionKey).trim()}`, prevKey: null };
   }
   try {
     const msgs = payload && Array.isArray(payload.messages) ? payload.messages : [];
     const first = msgs.find((m) => m && m.role === 'user');
     const text = first ? textOf(first.content) : '';
-    if (!text.trim()) return '';
+    if (!text.trim()) return { key: '', prevKey: null };
     const sys = systemTextOf(payload);
-    const digest = crypto.createHash('sha1')
+    const digestOf = (asst) => crypto.createHash('sha1')
       .update(sys)
       .update('\u0000')                       // 分隔符：防「system 尾部 + user 头部」拼出同一串
       .update(text.slice(0, 2048))
+      .update(asst ? '\u0000' : '')           // assistant 分隔符：有才加（旧键形状不变）
+      .update(asst ? String(asst).slice(0, 2048) : '')
       .digest('hex')
       .slice(0, 20);
-    return `m:${digest}`;
+    const asstMsg = msgs.find((m) => m && m.role === 'assistant');
+    const asstText = asstMsg ? textOf(asstMsg.content) : '';
+    const hasAssistant = !!String(asstText || '').trim();
+    const key = `m:${digestOf(hasAssistant ? asstText : '')}`;
+    return { key, prevKey: hasAssistant ? `m:${digestOf('')}` : null };
   } catch (e) {
-    return '';
+    return { key: '', prevKey: null };
   }
+}
+
+function sessionKeyOf(payload, opts) {
+  return sessionKeyPartsOf(payload, opts).key;
 }
 
 // 粘性命中也要过与 pool.pick 同一套判据：模型负缓存与保底不在
@@ -244,11 +270,21 @@ function withinInterval(uid, minMs, now) {
  * 回调失败一律吞掉：埋点绝不能影响选号。
  */
 function sessionKeyFor(payload, opts) {
-  const key = sessionKeyOf(payload, opts);
-  if (key && opts && typeof opts.onSessionKey === 'function') {
-    try { opts.onSessionKey(key); } catch (e) { /* 埋点失败不影响请求 */ }
+  const parts = sessionKeyPartsOf(payload, opts);
+  // P1-8 prebind（hub v2.0.7 #839）：带 assistant 的新键从第 2 轮才出现，
+  // 此时还没有自己的绑定；第 1 轮的旧键（不含 assistant）已经绑定了账号。
+  // 把旧键的绑定迁给新键——会话跨键变更不换号，前缀缓存不断（否则第 2 轮
+  // 粘性丢失，整段前缀重付）。幂等：新键已绑定时不动。
+  if (parts.prevKey && parts.key) {
+    const bound = sticky.lookup(parts.prevKey);
+    if (bound && !sticky.lookup(parts.key)) {
+      try { sticky.bind(parts.key, bound); } catch (e) { /* 迁移失败不影响选号 */ }
+    }
   }
-  return key;
+  if (parts.key && opts && typeof opts.onSessionKey === 'function') {
+    try { opts.onSessionKey(parts.key); } catch (e) { /* 埋点失败不影响请求 */ }
+  }
+  return parts.key;
 }
 
 /**

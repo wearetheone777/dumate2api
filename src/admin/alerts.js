@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 
 const FILE = 'alerts-state.json';
-const RULES = ['pool_empty', 'task_failed', 'token_expiring', 'error_rate', 'key_burst', 'off_hours', 'budget', 'qoder_rejected'];
+const RULES = ['pool_empty', 'task_failed', 'token_expiring', 'error_rate', 'key_burst', 'off_hours', 'budget', 'qoder_rejected', 'upstream_degraded', 'catalog_changed'];
 /** 仅提示、不计入「待处理」与推送的规则（info 级） */
 const HINT_RULES = ['off_hours'];
 
@@ -32,6 +32,12 @@ function defaults() {
     offHoursEnd: 6,
     budget: 1000000,         // budget：窗口 token 预算（0 = 关）
     qoderRejectedMin: 3,     // qoder_rejected：回看窗内 rejected 次数阈值
+    // 上游劣化（批次七，misakano upstreamhealth.go）：短窗观测「全 200 但慢」
+    upstreamWindowMs: 300000, // 上游劣化回看窗（5 分钟——劣化是短时停摆，1h 窗会被均值淹没）
+    upstreamTtfbMs: 8000,     // TTFB 阈值；思考重的智能体流量请调高（首字含思考时间）
+    upstreamTtfbRatio: 0.3,   // TTFB≥阈值的请求占比
+    upstream5xxRatio: 0.1,    // 5xx（含 502 上游不可达）占比
+    upstreamMinRequests: 3,   // 样本不足不判（同 error_rate 的 errorMinRequests 纪律）
     windowMs: 3600000,       // 指标回看窗口
     silenceMs: 3600000,      // 同一规则+对象静默窗
     hysteresis: 2,           // 连续 N 轮触发才告警，M 轮正常才恢复
@@ -119,6 +125,32 @@ function evaluate(facts, cfg = {}, now = Date.now()) {
     if (rejected >= c.qoderRejectedMin && ok === 0) {
       push('qoder_rejected', 'qoder', 'warn',
         `Qoder 近 ${Math.round(c.windowMs / 60000)} 分钟 ${rejected} 次上游拒绝且无成功（仅观测，不换号/熔断）`);
+    }
+  }
+  // 上游劣化（批次七，misakano upstreamhealth.go）：「全 200 但每个请求 20 秒」
+  // 的停摆 error_rate 看不见——它只数失败。两个维度任一越界就聚合报**一条**
+  //（不按通道拆，拆了就是 N 条告警的「狼来了」）。TTFB 分母只数报了首字的
+  // 请求——非流式/未标记的行没有首字时刻，拿 0 当 TTFB 会把占比算假。
+  const uRows = within(facts.requests, now, c.upstreamWindowMs);
+  if (uRows.length >= c.upstreamMinRequests) {
+    const ttfbRows = uRows.filter((r) => Number.isFinite(Number(r.first_token_ms)) && r.first_token_ms != null);
+    const slow = ttfbRows.filter((r) => Number(r.first_token_ms) >= c.upstreamTtfbMs).length;
+    const fiveXX = uRows.filter((r) => Number(r.status) >= 500).length;
+    const slowRatio = ttfbRows.length ? slow / ttfbRows.length : 0;
+    const xxRatio = fiveXX / uRows.length;
+    if (slowRatio >= c.upstreamTtfbRatio || xxRatio >= c.upstream5xxRatio) {
+      push('upstream_degraded', 'upstream', 'warn',
+        `近 ${Math.round(c.upstreamWindowMs / 60000)} 分钟上游疑似劣化：TTFB≥${Math.round(c.upstreamTtfbMs / 1000)}s 占 ${Math.round(slowRatio * 100)}%（${slow}/${ttfbRows.length}）；5xx 占 ${Math.round(xxRatio * 100)}%（${fiveXX}/${uRows.length}）——只观测，不联动`);
+    }
+  }
+  // 模型目录改版（批次七，misakano watchdog.go）：目录指纹变化 → 告警。
+  // 指纹在 facts 采集时由 models.catalogWatch 算好（复用已有目录拉取），
+  // 评估器只看结论；首次建档（first）不告警——没有基线谈不上「改版」，
+  // 拉取失败（ok:false）根本不进 facts，绝不把「拉不到」当成「改版了」。
+  for (const cat of facts.workbuddyCatalog || []) {
+    if (cat && cat.changed) {
+      push('catalog_changed', `workbuddy:${cat.region}`, 'warn',
+        `WorkBuddy ${cat.region === 'global' ? '国际' : '国内'}目录改版：${cat.prevModels == null ? '?' : cat.prevModels} → ${cat.models} 个模型（指纹已更新，建议核对模型映射与倍率）`);
     }
   }
   return out;

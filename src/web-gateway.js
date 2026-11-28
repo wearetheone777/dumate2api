@@ -17,6 +17,8 @@ const pointsCursor = require('./points-cursor');
 const modelmap = require('./modelmap');
 const { anthropicToOpenAI, openAIToAnthropic, mapFinishReason } = require('./anthropic');
 const { resolveMaxTokens } = require('./budget');
+// 入站 JSON 统一解析（P1-2）：与 9080 同一份实现（src/inbound-json.js）。
+const { parseJsonBody, invalidJsonMessage } = require('./inbound-json');
 
 const PORT = parseInt(process.env.DUMATE_WEB_GATEWAY_PORT || '9084', 10);
 const HOST = process.env.DUMATE_WEB_GATEWAY_HOST || '127.0.0.1';
@@ -137,11 +139,11 @@ async function handleOpenAIChat(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let reqBody;
-  try {
-    reqBody = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pj = parseJsonBody(bodyStr);
+  if (pj.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pj), type: 'invalid_request_error' } });
   }
+  reqBody = pj.value;
 
   const info = reqlog.describeRequest(reqBody);
   req._logPath = '/v1/chat/completions';
@@ -217,11 +219,11 @@ async function handleAnthropicMessages(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let anthropicReq;
-  try {
-    anthropicReq = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body' } });
+  const pan = parseJsonBody(bodyStr);
+  if (pan.err) {
+    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: invalidJsonMessage(pan) } });
   }
+  anthropicReq = pan.value;
 
   const info = reqlog.describeRequest(anthropicReq);
   req._logPath = '/v1/messages';
@@ -400,11 +402,11 @@ async function handleGoogleGenerate(req, res, pathModel, isStream) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let googleReq;
-  try {
-    googleReq = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { error: { code: 400, message: 'Invalid JSON body', status: 'INVALID_ARGUMENT' } });
+  const pgg = parseJsonBody(bodyStr);
+  if (pgg.err) {
+    return sendJSON(res, 400, { error: { code: 400, message: invalidJsonMessage(pgg), status: 'INVALID_ARGUMENT' } });
   }
+  googleReq = pgg.value;
   googleReq.model = pathModel;
 
   const info = reqlog.describeRequest(googleReq, pathModel);

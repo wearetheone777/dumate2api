@@ -43,7 +43,7 @@ function accountFacts() {
   return out;
 }
 
-function facts(cfg, now = Date.now()) {
+async function facts(cfg, now = Date.now()) {
   const requests = reqlog.read({ limit: 0, filter: (r) => Number(r.ts) >= now - cfg.windowMs }).rows;
   const accounts = accountFacts();
   const channels = {};
@@ -61,7 +61,20 @@ function facts(cfg, now = Date.now()) {
   // 连续失败轮数：任务轮结果只有最近一轮，按「本轮有失败」记 1；
   // 真正的连续 N 轮由 alerts.assess 的迟滞状态跨轮累计（阈值默认 2）。
   const streak = last && Array.isArray(last.results) && last.results.some((r) => r && r.ok === false) ? 1 : 0;
-  return { channels, accounts, requests, taskFailStreak: streak };
+  const out = { channels, accounts, requests, taskFailStreak: streak };
+  // 模型目录改版监控（批次七，misakano watchdog.go）：复用 fetchModels 的
+  // 目录拉取与缓存（零新增上游调用节奏）；拉取失败如实不进 facts——
+  // 评估层没有事实就不判，绝不把「拉不到」当成「改版了」。
+  try {
+    const models = require('../../workbuddy/models');
+    const watches = [];
+    for (const reg of ['cn', 'global']) {
+      const w = await models.catalogWatch(reg);
+      if (w && w.ok) watches.push(w);
+    }
+    if (watches.length) out.workbuddyCatalog = watches;
+  } catch (e) { /* 目录监控不可用不拖挂其它规则 */ }
+  return out;
 }
 
 async function deliver(list) {
@@ -79,9 +92,9 @@ async function deliver(list) {
 const SCHEDULE_MINUTES = Math.max(0, parseInt(process.env.DUMATE_ALERTS_SCHEDULE_MINUTES || '0', 10) || 0);
 let timer = null;
 
-function tick() {
+async function tick() {
   const cfg = config();
-  const out = alerts.assess(facts(cfg), { config: cfg });
+  const out = alerts.assess(await facts(cfg), { config: cfg });
   if (out.notify.length && notify.loadConfig().enabled) {
     deliver(out.notify).catch(() => { /* 推送失败不拖挂下一轮 */ });
   }
@@ -92,7 +105,7 @@ function schedule() {
   stop();
   if (!(SCHEDULE_MINUTES > 0)) return;
   timer = setInterval(() => {
-    try { tick(); } catch (e) { console.warn('[alerts] 规则评估失败:', e.message); }
+    tick().catch((e) => console.warn('[alerts] 规则评估失败:', e.message));
   }, SCHEDULE_MINUTES * 60000);
   if (timer.unref) timer.unref();
 }
@@ -147,7 +160,7 @@ const routes = [
     path: '/evaluate',
     handler: async ({ res, body }) => {
       const cfg = config();
-      const out = body && body.auto === true ? tick() : alerts.assess(facts(cfg), { config: cfg });
+      const out = body && body.auto === true ? await tick() : alerts.assess(await facts(cfg), { config: cfg });
       // 手动评估且显式要求推送时才打 webhook；后台 tick 自己按 notify 配置决定
       const delivered = body && body.auto !== true && body.notify === true ? await deliver(out.notify) : (out.delivered || []);
       try { require('../auth').audit('admin', 'alerts_evaluate', '', `notify=${delivered.length}`); } catch (e) { /* 忽略 */ }

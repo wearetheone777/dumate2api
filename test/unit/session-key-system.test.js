@@ -42,12 +42,16 @@ test('不同 system + 同一句「继续」→ 不同键（本项要修的症状
   assert.notStrictEqual(a, b, '两个项目的「继续」不能共用一个粘性键');
 });
 
-test('同一会话稳定：同 system 同首条 user，追加多少轮都不换键', () => {
-  const k1 = channelPool.sessionKeyOf(convo('共同 system', 1));
+test('同一会话稳定：同 system 同首条 user，第 2 轮起键恒定（P1-8 修订口径）', () => {
+  // P1-8（hub #839）修订了 P2-11 的旧不变量「追加多少轮都不换键」：
+  // 第 2 轮起键含首条 assistant——同开场白的并发会话从第 2 轮分叉各走各号。
+  // 会话连续性改由 prebind 保障（旧键绑定迁给新键，sticky-key-assistant.test.js
+  // 的端到端用例锁）；本测试锁的是**第 2 轮起键稳定**（同首条 assistant）。
+  const k1 = channelPool.sessionKeyOf(convo('共同 system', 1));   // 第 1 轮：无 assistant
   const k5 = channelPool.sessionKeyOf(convo('共同 system', 5));
   const k20 = channelPool.sessionKeyOf(convo('共同 system', 20));
-  assert.strictEqual(k1, k5);
-  assert.strictEqual(k1, k20);
+  assert.strictEqual(k5, k20, '第 2 轮起（首条 assistant 相同）键恒定');
+  assert.notStrictEqual(k1, k5, '第 1 轮与第 2 轮键不同（P1-8 的分叉点）——连续性由 prebind 兜住');
 });
 
 test('system 三种形状等价：顶层字符串 / parts 数组 / messages 里的 role=system', () => {

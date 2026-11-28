@@ -877,6 +877,9 @@ function sendBodyTooLarge(res) {
     { Connection: 'close' });
 }
 
+// 入站 JSON 统一解析（P1-2）：实现在 src/inbound-json.js（9080/9084 共用）。
+const { parseJsonBody, invalidJsonMessage } = require('./inbound-json');
+
 // 非流式上游响应的累积上限（审计 P1-1b）：上游半信任，流量不可控，
 // 无限 `data += c` 等于把上游（或中间人）的输出全部吃进内存。
 // 默认 64MB，DUMATE_MAX_UPSTREAM_MB 可调。超限后停止累积、继续读干净，
@@ -1001,6 +1004,11 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 缓存写入（P2-13）：Anthropic 系的第三段。命中率分母要由它剔掉写入。
     cache_creation_tokens: u.creation || 0,
     cache_creation_reported: !!u.creationReported,
+    // 官方逐请求积分（P1-6，R2 两本账）：上游 usage 帧带了 credit 就记。
+    // **credit_reported=false 或 credit=0 是「这条记录没带」= 不知道，不是免费**——
+    // 官方账本侧只累加有值的行，绝不拿 0 补。
+    credit: u.credit != null ? u.credit : null,
+    credit_reported: !!u.creditReported,
     // 计量口径（2026-11-06）：qwen-acp 的会话帧不带 token 计量（tokens 恒 0），
     // 扣费真实发生（三池差值实证）但逐笔金额网关侧拿不到——差值法每请求要
     // 多 2 次上游调用，不值得。标 wallet-delta 让界面显示「无计量」，
@@ -1525,9 +1533,11 @@ async function handleImageGenerations(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const model = body.model || media.DEFAULT_IMAGE_MODEL;
   const r = await media.generateImage({
     prompt: body.prompt,
@@ -1558,9 +1568,11 @@ async function handleVideo(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const model = body.model || media.DEFAULT_VIDEO_MODEL;
   const r = await media.generateVideo({
     prompt: body.prompt,
@@ -1584,9 +1596,11 @@ async function handleSpeech(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const model = body.model || media.DEFAULT_TTS_MODEL;
   const r = await media.synthesizeSpeech({
     input: body.input,
@@ -1622,9 +1636,11 @@ async function handleWebSearch(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const search = require('./qwenwork/search');
   try {
     const r = await search.webSearch({
@@ -1650,9 +1666,11 @@ async function handleVoicePolish(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const voice = require('./qwenwork/voice');
   try {
     const r = await voice.polishVoiceText(body.text, { accountId: body.account_id });
@@ -1676,9 +1694,11 @@ async function handleImageSearch(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const search = require('./qwenwork/search');
   try {
     const r = await search.imageSearch({ query: body.query || body.q, count: body.count });
@@ -1698,9 +1718,11 @@ async function handleFileUpload(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   // 请求体形状：{ name, content_base64, mime_type? }。用 base64 而不是
   // multipart，是因为网关没有 multipart 解析器（零第三方依赖），而文件
   // 上传是低频动作，客户端做一次 base64 编码完全可以接受。
@@ -1787,11 +1809,11 @@ async function handleOpenAIChat(req, res) {
   const startedAt = Date.now();  const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let reqBody;
-  try {
-    reqBody = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const p = parseJsonBody(bodyStr);
+  if (p.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(p), type: 'invalid_request_error' } });
   }
+  reqBody = p.value;
 
   // 客户端 token 字段归一（实机原因见 src/budget.js:normalizeTokenFields）：
   // 上游只认 max_tokens——两个都发会被明文拒绝（400），只发
@@ -2008,11 +2030,11 @@ async function handleAnthropicCountTokens(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try {
-    body = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body' } });
+  const pc = parseJsonBody(bodyStr);
+  if (pc.err) {
+    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: invalidJsonMessage(pc) } });
   }
+  body = pc.value;
   let total = estimateTokens(body.system);
   for (const m of (body.messages || [])) total += estimateTokens(m.content) + 4;
   for (const t of (body.tools || [])) total += estimateTokens(t.description || '') + estimateTokens(JSON.stringify(t.input_schema || {}));
@@ -2038,11 +2060,11 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let googleReq;
-  try {
-    googleReq = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { error: { code: 400, message: 'Invalid JSON body', status: 'INVALID_ARGUMENT' } });
+  const pg = parseJsonBody(bodyStr);
+  if (pg.err) {
+    return sendJSON(res, 400, { error: { code: 400, message: invalidJsonMessage(pg), status: 'INVALID_ARGUMENT' } });
   }
+  googleReq = pg.value;
 
   googleReq.stream = isStream;
   // Google 的模型名在 URL 路径上，body 里没有，埋点要显式带上
@@ -2177,11 +2199,11 @@ async function handleOpenAIResponses(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let reqBody;
-  try {
-    reqBody = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pr = parseJsonBody(bodyStr);
+  if (pr.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pr), type: 'invalid_request_error' } });
   }
+  reqBody = pr.value;
 
   const isStream = reqBody.stream !== false; // Codex 默认流式
   const info = reqlog.describeRequest(reqBody);
@@ -2289,11 +2311,11 @@ async function handleAnthropicMessages(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let anthropicReq;
-  try {
-    anthropicReq = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body' } });
+  const pa = parseJsonBody(bodyStr);
+  if (pa.err) {
+    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: invalidJsonMessage(pa) } });
   }
+  anthropicReq = pa.value;
 
   const info = reqlog.describeRequest(anthropicReq);
   req._logPath = '/v1/messages';

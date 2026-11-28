@@ -325,7 +325,52 @@ async function runOnce(trigger = 'manual', opts = {}) {
       }
     }
 
-    const allResults = results.concat(activityResults, intlResults);
+    // ---- 成长任务补领清扫（第四腿，P0-6；独立开关 DUMATE_WORKBUDDY_TASKS_SWEEP 默认关）----
+    //
+    // 与签到并列的第四条腿：accept（幂等报名）+ claim（完成未领）+ 连登兑换，
+    // 全部真实动作流的低风险层。企业号（enterpriseId 非空）跳过——组织账号的
+    // 行为自动化不碰。`opts.taskSweeper === null` 可关（测试用），注入函数接管时
+    // 开关不参与判定（测试不想陪 env 玩）。
+    const taskSweeper = opts.taskSweeper === undefined
+      ? (() => { try { const t = require('./tasks'); return t.sweepEnabled() ? t.sweepDaily : null; } catch (e) { return null; } })()
+      : opts.taskSweeper;
+    const taskResults = [];
+    if (taskSweeper) {
+      const { enterpriseBlocked } = require('./tasks');
+      for (const raw of list) {
+        if (abortFlag) break;
+        if (taskResults.length > 0) await sleep(delayMs);
+        const name = raw.nickname || raw.uid || `账号 ${raw.id}`;
+        const region = c.normalizeRegion(raw.region);
+        if (enterpriseBlocked(raw)) {
+          taskResults.push({ id: raw.id, name, region, ok: true, action: 'tasks', skipped: true, error: '', msg: '企业号跳过成长写腿' });
+          continue;
+        }
+        // 与签到腿同款：先 ensureFresh 再打上游（清扫是 2~5 次写，AT 必须新鲜）
+        let a = raw;
+        try { a = await authStoreRef.ensureFresh(raw); } catch (e) { a = raw; }
+        let r;
+        try { r = await taskSweeper(a); } catch (e) { r = null; }
+        const sweep = (r && r.sweep) || { ok: false, error: (r && r.error) || '清扫无结果' };
+        const redeem = (r && r.redeem) || { ok: false, redeemed: [], skipped: [] };
+        taskResults.push({
+          id: raw.id, name, region,
+          ok: !!(r && r.sweep && r.sweep.ok),
+          action: 'tasks',
+          // 明细按腿语义摊平：accepted/claimed/unverified 是清扫三态，redeemed 是兑换
+          accepted: (sweep.accepted || []).length,
+          claimed: (sweep.claimed || []).length,
+          unverified: (sweep.unverified || []).length,
+          redeemed: (redeem.redeemed || []).length,
+          skipped: !!(sweep.ok && !(sweep.accepted || []).length && !(sweep.claimed || []).length
+            && !(sweep.unverified || []).length && !(redeem.redeemed || []).length),
+          error: sweep.error || '',
+          msg: `${(sweep.claimed || []).length} 领 / ${(redeem.redeemed || []).length} 兑`,
+        });
+      }
+    }
+
+    const allResults = results.concat(activityResults, intlResults, taskResults);
     const claimed = results.filter((r) => r.ok && r.action === 'claim' && !r.already).length;
     const webDaily = intlResults.filter((r) => r.ok && !r.already).length;
     // 活跃**只把「回读到连登天数」算进 activity**：送达但未验证的数量单列。
@@ -352,11 +397,18 @@ async function runOnce(trigger = 'manual', opts = {}) {
       activityFailed: activityResults.filter((r) => !r.ok).length,
       webDaily,
       webDailyFailed: intlResults.filter((r) => !r.ok).length,
+      // 第四腿（成长任务）：领/兑分开计，未验证单列——没回读证据不算到手
+      tasksAccepted: taskResults.reduce((s, r) => s + (r.accepted || 0), 0),
+      tasksClaimed: taskResults.reduce((s, r) => s + (r.claimed || 0), 0),
+      tasksUnverified: taskResults.reduce((s, r) => s + (r.unverified || 0), 0),
+      tasksRedeemed: taskResults.reduce((s, r) => s + (r.redeemed || 0), 0),
+      tasksFailed: taskResults.filter((r) => !r.ok).length,
       results: allResults,
     };
     try {
       require('../admin/auth').audit('system', 'workbuddy_autocheckin', '',
-        `${trigger}: 国内签成 ${claimed} / 活跃 ${activity}${activityUnverified ? `（未验证 ${activityUnverified}）` : ''} / 网页打卡 ${webDaily}`);
+        `${trigger}: 国内签成 ${claimed} / 活跃 ${activity}${activityUnverified ? `（未验证 ${activityUnverified}）` : ''} / 网页打卡 ${webDaily}`
+        + (taskSweeper ? ` / 任务领 ${taskResults.reduce((s, r) => s + (r.claimed || 0), 0)} 兑 ${taskResults.reduce((s, r) => s + (r.redeemed || 0), 0)}` : ''));
     } catch (e) { /* 审计不可用不阻塞结果 */ }
     return state.last_result;
   } finally {

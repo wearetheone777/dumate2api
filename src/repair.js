@@ -429,6 +429,10 @@ function createChunkGate(emit, hold, cap, opts = {}) {
   let toolCalls = 0;           // 带名字的工具调用个数
   let emitted = 0;             // 实际转发给下游的帧数（错误时判「客户端是否已收到输出」）
   let doneSeen = false;        // [DONE] 哨兵
+  // 零输出守卫（批次六）判定字段：finish_reason 在 hold 帧里，暂扣时顺手记下；
+  // reasoning 是直发的（客户端已看见思考），出现过就不算零输出
+  let finishReason = null;
+  let reasoningSeen = false;
 
   const held = [];             // 暂扣的 usage / finish_reason 帧（原串）
   const fwd = (s) => { emitted++; emit(s); };
@@ -556,11 +560,18 @@ function createChunkGate(emit, hold, cap, opts = {}) {
         if (pendingLen > cap) { live = true; flush(); }
         return;
       }
-      if (kind === 'hold') { held.push(inner); return; }
+      if (kind === 'hold') {
+        held.push(inner);
+        const hch = (o.choices || [])[0];
+        if (hch && hch.finish_reason) finishReason = hch.finish_reason;
+        return;
+      }
+      if (kind === 'reasoning') reasoningSeen = true;
       fwd(inner);   // reasoning / pass
     },
-    /** 判定所需的中间状态（与 TRAE gate.result() 同形，多一个 emitted） */
-    result() { return { toolCalls, text, live, emitted, pending: pendingFrames.length, held: held.length }; },
+    /** 判定所需的中间状态（与 TRAE gate.result() 同形，多一个 emitted；
+     *  批次六再加 finishReason / reasoningSeen 供零输出守卫判定） */
+    result() { return { toolCalls, text, live, emitted, pending: pendingFrames.length, held: held.length, finishReason, reasoningSeen }; },
     /** 收尾：把还没下发的正文与暂扣的帧补发出去 */
     finish() {
       dsmlFixup();

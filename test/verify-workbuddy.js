@@ -79,17 +79,19 @@ test('buildChatBody：prompt_cache_key 按账号硬隔离', () => {
   assert.ok(!('prompt_cache_key' in JSON.parse(n.body)));
 });
 
-test('chatHeaders：X-Conversation 三头必带且与 body 同源；身份缺省 X-No-* 占位', () => {
+test('chatHeaders：X-Conversation 三头必带且与 body 同源；官方不发的不带（P0-1）', () => {
   const h = chat.chatHeaders('global', { accessToken: 't' }, 10, 'conv-1');
   assert.equal(h['X-Conversation-ID'], 'conv-1');
   assert.ok(h['X-Conversation-Request-ID']);
   assert.ok(h['X-Conversation-Message-ID']);
-  assert.equal(h['X-No-User-Id'], '1');
-  assert.equal(h['X-No-Enterprise-Id'], '1');
-  assert.equal(h['X-No-Department-Info'], '1');
+  // P0-1（2026-11-28）：官方对话不发 X-No-*（那是登录前 auth/state 的约定）——
+  // 缺字段就是不带，不再是占位
+  assert.equal(h['X-No-User-Id'], undefined);
+  assert.equal(h['X-No-Enterprise-Id'], undefined);
+  assert.equal(h['X-No-Department-Info'], undefined);
   assert.equal(h['X-Product'], 'SaaS');
-  assert.equal(h['X-IDE-Type'], 'CLI');
-  assert.equal(h.Origin, 'https://www.workbuddy.ai');
+  assert.equal(h['X-IDE-Type'], 'WorkBuddy');
+  assert.equal(h.Origin, undefined, 'Origin/Referer/Accept-Language 已按官方形态移除');
   // 红线：chat 请求绝不携带 X-Refresh-Token
   assert.ok(!Object.keys(h).some((k) => k.toLowerCase() === 'x-refresh-token'));
   // 完整账号走实名头

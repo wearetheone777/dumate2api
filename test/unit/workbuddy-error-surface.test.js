@@ -156,3 +156,39 @@ test('readStream：[DONE] 即终态——resolve + 销毁连接，不再白等�
     delete process.env.DUMATE_WORKBUDDY_STOP_AT_DONE;
   }
 });
+
+// —— P2 三件（2026-11-28 批）：reset 解析放宽 + 11151 快速失败判据 ——
+
+test('parseRateLimitReset：单数字小时 / 裸墙钟兜底（无时区按北京时间）/ UTC 负偏移', () => {
+  // 上游写过不补零的墙钟（旧 \d{2} 解析不出 → 冷却只能落默认）
+  const bare1 = Math.floor(Date.parse('2026-10-02T01:05:03Z') / 1000);
+  assert.equal(c.parseRateLimitReset('usage will reset at 2026-10-02 9:05:03 UTC+8 .'), bare1);
+  assert.equal(c.parseRateLimitReset('将在 2026-10-02 9:05:03 UTC+8 重置'), bare1);
+  // 裸墙钟（无措辞、无 UTC 标记）：按**北京时间墙钟**解读——上游文案面向
+  // +08:00 用户；旧实现按 UTC 会让重置时刻提早 8 小时（冷却缩水 8h）
+  const wall = Math.floor(Date.parse('2026-10-02T08:00:00Z') / 1000);
+  assert.equal(c.parseRateLimitReset('{"code":6004,"msg":"2026-10-02 16:00:00"}'), wall);
+  assert.equal(
+    c.parseRateLimitReset('{"code":6004,"msg":"2026-10-02 9:00:00"}'),
+    Math.floor(Date.parse('2026-10-02T01:00:00Z') / 1000),
+  );
+  // UTC 负偏移与小数分偏移仍正确换算
+  assert.equal(
+    c.parseRateLimitReset('reset at 2026-10-02 03:00:00 UTC-5'),
+    Math.floor(Date.parse('2026-10-02T08:00:00Z') / 1000),
+  );
+  assert.equal(
+    c.parseRateLimitReset('reset at 2026-10-02 05:30:00 UTC+5:30'),
+    Math.floor(Date.parse('2026-10-02T00:00:00Z') / 1000),
+  );
+});
+
+test('PARAM_ERROR_TEXT_RE：11151 空 text 段快速失败判据（码值负向断言）', () => {
+  assert.ok(c.PARAM_ERROR_TEXT_RE.test('{"code":11151,"msg":"a message has empty content"}'));
+  assert.ok(c.PARAM_ERROR_TEXT_RE.test('{"code": 11151,"msg":"x"}'));
+  // 负向：码值子串不误吃（11151 是 111510 的前缀，正则必须带 (?!\d) 边界）
+  assert.ok(!c.PARAM_ERROR_TEXT_RE.test('{"code":111510,"msg":"x"}'));
+  assert.ok(!c.PARAM_ERROR_TEXT_RE.test('{"code":1511,"msg":"x"}'));
+  // 原有参数错判据不回归
+  assert.ok(c.PARAM_ERROR_TEXT_RE.test('request param is invalid'));
+});

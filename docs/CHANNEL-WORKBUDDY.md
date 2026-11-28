@@ -671,3 +671,80 @@ if (!Number.isFinite(c)) return false;
 
 离线验证：`test/unit/workbuddy-refresh-retired.test.js`（6 项：判据正反、
 被拒打标、抖动不打标、成功清标、upsert 清标/保留）。
+
+### 11.5 成长任务写路径探针定案（P0-6，2026-11-28，账号 1 cn）
+
+探针脚本 `test/probe-workbuddy-tasks.js`（可重跑：`node test/probe-workbuddy-tasks.js <账号id>`），
+全部安全形状（空 accept 数组 / 已领码 claim / 未断签日期 / locked 档）——**零副作用**：
+
+| 端点 | 探针结论 | 实现 |
+|---|---|---|
+| accept | `POST /v2/activity/growth/tasks/accept`（chatBase）与**无 /v2 前缀双路由都存在**——空数组双双回 `400 task_codes is empty`（参数校验先于前缀分流，本形状区分不了前缀）。字段名 `task_codes`（复数数组）确认 | 取 /v2（misakano 口径） |
+| claim | **必须走 web 域** `POST https://www.workbuddy.cn/activity/growth/tasks/<task_code>/claim`：任务码在**路径**、无 body、头族带 `x-client-platform: web` + Origin/Referer workbuddy.cn；已领码回 `200 code=0`（幂等）。CLI 域的 `/v2/activity/growth/tasks/reward/claim` 回 `400 task not completed`——**路径不存在**（misakano 同结论复现）：400 不是「任务没完成」的意思，别误读成该重试 | `tasks.js` webClaimHeaders |
+| redeem | `POST {chatBase}/activity/growth/redeem`（无 /v2），body `{tier, client_token:"u-<uuid4>"}`；locked 档误发回 `409 该档位本月已兑换`（月度业务态）。实发字段带 `_granted` 后缀（`credit_granted` 等；`credit` 恒 null，读它必漏计） | `tasks.redeemUnlocked` |
+| makeup | `POST {chatBase}/activity/growth/makeup-cards/use`，字段名定案 **`target_date`**——`date` 变体被上游拒 `invalid target_date format`；未断签日回 `400 date is not broken, no makeup needed`（正常竞争，不耗卡） | `tasks.makeupBrokenDay` |
+
+补签候选判据（misakano 移植）：heatmap score==0、≥ 当月月首、< **响应的 `today.date`**（不用宿主机时钟——UTC 机器北京 08:00 前会算错天）、不在 `streak.makeup_dates`（已补过的日期上游会记账）、≥ 2026-06-17（成长体系上线前无意义）；最近断点优先，每轮 ≤1 张。
+
+企业号闸：`enterpriseId` 非空的账号跳过全部成长写腿（组织账号行为自动化不碰）。判据单一出处 `tasks.enterpriseBlocked()`，autocheckin 第四腿与管理端共用。
+
+**行为链红线（重申）**：聊天任务/专家/模板/旅行/盲盒/抽奖不接——计数型任务上游校验真实会话 messageId，伪造不计数还增暴露面；抽奖含实物收件、盲盒覆盖旅行记录，不可逆。
+
+落地：`src/workbuddy/tasks.js`（三动作 + 执行队列骨架 runExclusive）＋ autocheckin 第四腿（`DUMATE_WORKBUDDY_TASKS_SWEEP` 默认关）＋ 管理端 `POST /api/admin/workbuddy/tasks/{sweep,redeem,makeup}`（手动按钮，账号间并发 + 账号内 TryLock）＋ `GET /tasks/scan`（三桶扫描，P1-7）。任务列表 accept 双形状（progress 对象 / 平铺字段）与 streak 双形状（`tiers[]` 描述数组 + 平铺 `tier_Nd_status` 键）都已实测并用单测锁（`test/unit/workbuddy-tasks.test.js` 11 项、`test/unit/workbuddy-growth-scan.test.js` 8 项）。
+
+### 11.6 批次四：failover / 官方用量账本 / P2 三件（2026-11-28）
+
+**P1-4 failover 一期（`src/workbuddy/failover.js`）**。基础设施三态 408/502/503 计入熔断（504 刻意排除——网关超时重放无意义还拉长尾延迟）；60 秒窗口 ≥3 次打开，退避 15→30→60→120s 封顶，任一成功全重置。cn 链 `[copilot.tencent.com, www.workbuddy.cn, wb.tencentbuddy.com]`，**两备用都开着才插静态 IP `162.14.3.241` 影子候选**（Host/SNI 仍原域名，只换连接目标）；每请求最多一跳；body 带 `retry_policy.retry===false` 时既不切换也不记熔断（上游明说别重试）。global 单元素链——没有备用入口的证据就不编。chat 层两跳全败如实 status 0，`bufferStream` 用 PassThrough 与 readAll/readStream 消费端兼容。
+
+**P1-6 官方逐请求用量账本（`src/workbuddy/usage.js`）**。`POST {chatBase}/billing/meter/get-user-request-usage`（xu20060420 usage_official.go 取证）：RFC3339(+08:00) 字符串 + pageNum/pageSize，CN/global 同路径无 /v2。分页终止判据「本页条数 < pageSize」为主（部分域 Total 恒 0，只看 Total 会首页即断）；**第 2 页起失败记 error + truncated**——统计了前半段必须可见，绝不静默少算。口径两条钉死：`credit` 显式 null ≠ 0（`Number(null)===0` 会把「不知道」洗成「免费」）；官方账本（含客户端直连）与网关 reqlog（只覆盖经本网关）是**覆盖面不同的两本账**，不是「一个总量的两部分」。管理端 `GET /api/admin/workbuddy/usage-official` + 积分明细页「官方账本（逐请求）」卡。
+
+**P2 reset 解析放宽（constants.js `parseRateLimitReset`）**。三种形状：措辞前缀（reset at/将在）→ UTC 后缀 → 裸墙钟兜底；小时位一律 `\d{1,2}`（上游写过 9:00:00 不补零，`\d{2}` 会漏）；**无时区标记按北京时间墙钟**——旧实现按 UTC 会让重置时刻提早 8 小时，冷却缩水 8h、账号提前解冻反复撞墙。6004 解析不出墙钟时默认 300s（模型窗口用满的量级：比瞬时抖动长、比次日重置短）。
+
+**P2 11151 空 text 段补位（chat.js `guardEmptyTextParts`）**。形状表（misakano empty_text_part.go，kimi-k3.1-pro + cn 号池逐形态实测）：`text` 空串/null/缺失 → 400/11151「a message has empty content」**不可自愈**（重试重放同一段历史，多号池只会把坏请求撞满一轮）；`"   "` 放行（只判零长度不 trim）；textarea 等未知 type 不校验；对象形态不嗅探。**字符串 content 跳过空白后以 `[` 开头会被当 parts 数组解析**——工具结果里的表单/按钮抓取恰好是这个形状。修法只补值不删段（补一个空格对模型无语义影响）；字符串形态**字节级**补位（扫描器定位 + 每段切片与整体解析 stringify 自证），大整数精度/HTML 实体/键序/前后空白零改动——整体 JSON 往返会把工具输出改得不是客户端发来的那份；**不能用加前缀空格规避嗅探**（上游先跳过空白再解析）。漏网形状兜底：PARAM_ERROR_TEXT_RE 扩 `a message has empty content` + `"code":11151(?!\d)`（负向边界：11151 是 111510 的前缀，必须 `(?!\d)`）→ 400 快速失败不喂池不换号。接线点在 convId/traceId 派生**之前**。
+
+**P2 b3 链路随会话延续（chat.js `sessionTraceId`）**。TraceId 从首条 user 指纹种子派生（与 stableConversationId 同锚 + `|trace` 盐）——比计划里的 LRU 好：无状态、无淘汰失忆、天然「同会话稳定跨会话不同」。span 每请求随机；postStream 接线后 failover 两跳共用同一 TraceId（同一条 trace 的两个 span）；chatHeaders 第五参做 32-hex 形状校验，脏值回落新 uuidv7 绝不外发。
+
+### 11.7 批次五：指纹清洗加固 / 免费模型豁免 / Kimi $ref（2026-11-28）
+
+**指纹清洗三件加固（sanitize.js + 新共享模块 jsonscan.js）**。
+① **TraeCode 自述句**：hub 2026-11-24 CN 号池逐条二分实测——上游按「interactive agent in TraeCode」连续短语判非官方渠道（单独 TraeCode / in Trae IDE / in Cursor 均 200，只删 in TraeCode 后真实 23KB system 整体 200），故只删这一段、行为指令原样保留，幂等。
+② **注入身份滚雪球**（panel issue #187）：上游服务端注入的身份指令不出现在出站 body，但模型会在 reasoning_content 里复述原文，客户端带回历史下一轮原样进出站——「声明→进历史→再看到→再声明」。正则刻意收紧到整句（单独 `identify yourself as` 会误伤 "Do not identify yourself as an AI." 这类合法指令）；句尾「不接字母数字的句号」收口（身份名可带点，GPT-4.1 不能留半句），句号后字符用捕获组原样接回；`<model_identity>` 标签剥除、内部文本保留。**作用域只洗 assistant 正文与 reasoning_content / reasoning**——system/user 里同形句是用户自己写的人设，字节不动（scope 测试锁）。
+③ **工具参数清洗改字节级**：参考实现把 arguments 整串跑文本替换，`{"code":11128}` 会被 11128→11-128 规则改成非法 JSON（上游 11129 bad params——比指纹本身更糟）。现用 jsonscan 扫描器只重写**发生了变化的字符串值**的字面量：数字/键序/转义形态/大整数精度零改动（工具参数里的 64 位 id 很常见，JSON.parse 往返会丢精度）；非法 JSON 原文回落——arguments 会被客户端执行，文本改写 inside 命令/路径会改变行为，宁可漏一条指纹。jsonscan.js 同时服务 chat.js 的 11151 补位（共享扫描器，避免 sanitize↔chat 循环 require）。
+
+**免费模型豁免额度护栏（models.isFreeModel）**。两层判据、**实测终审**：rate-ledger 有样本就按它（EMA=0 免费 / >0 不豁免——上游改口径当场暴露，EMA 淡忘让口径改回后 5~10 次探测内恢复豁免），没有样本才看目录 free 字段。计划的「内置快照」层刻意缺席：没有经核实的免费模型名单，编一个比缺一层更糟（无证据不预编）。'auto' 永不豁免（实际模型由账号决定）。接线两处：send 的 guard.threshold 快照过滤跳过免费模型；pickCandidate 传 `paid: !freeModel`（pool 层 floorBlockedFor 天然跳过）。判不出来不豁免——错放付费模型等同今日行为，错豁免才真绕护栏。顺带修 `rate-ledger.recordRate` 的 mkdir 缺口（全新数据目录首次探针 ENOENT：锁文件先于 saveLedger 的 mkdir 被打开）。
+
+**CN Kimi $ref 内联展开（sanitize.kimiInlineTools）**。CN Kimi 不接受 parameters 里的 $ref/#/$defs（实测 400 11129）。展开语义（kimi_tools.go 忠实移植）：JSON Pointer 转义还原（~1→/、~0→~）、循环引用落空 schema `{}`、缺目标退 `{type:'object'}`、展开后 $defs/$schema 剥除、depth 64 + budget 10000 双保护、预算耗尽整体回落原 tools、**无改动返回原数组引用**（零分配路径）；只展开不裁剪工具（按名裁剪是把某个部署的绕行手段写进共享路径，其它用户的 MCP 工具会静默消失）；非 function 工具保形。门控在 buildChatBody：cn 区域 + /^kimi/i（剥 `cn:` 前缀），非 kimi 零解析零改动，global 不启用。
+
+### 11.8 批次六：零输出守卫（2026-11-28，hub sse.go HeadVetoError 移植）
+
+**病状**：上游 200、流正常收尾（`finish_reason=length`），但正文/思考/工具全空——客户端拿到一个空回答，无从判断是上游故障还是模型真的没话说。panel 的做法是首帧否决（HeadVetoError）：第一个字节写出前发现「上游 error 帧或零有效帧」→ 不写任何字节返回，调用方换号重试，客户端无痕。
+
+**我们的三处判定点**（`runConversation`）：
+
+1. **非流式**：聚合完成后判（`fin0==='length' && !hasCalls && !msg.content && !msg.reasoning_content`）。此时客户端什么都没收到，窗口天然完整。**必须放在修复判定之前**——空正文对 `looksUnfinished` 是「收尾正常」，不先判守卫就原样回空回答。
+2. **流式带门**（有工具、修复启用）：`gate.result()` 判 `finishReason==='length' && !text && !toolCalls && !reasoningSeen`。finish/usage/[DONE] 全部还在门里暂扣，否决 = 一轮缓冲整批丢弃，连透传帧都不用补。
+3. **流式无门**（纯对话/修复关闭）：回调里跟踪 `sawOut`/`lastFinish`，**尾部暂扣** finish/usage 帧到 [DONE] 前；[DONE] 时刻判定，否决则 [DONE] 不写出。裸关闭（上游没发 [DONE]）同判；**非否决轮的裸关闭要把暂扣帧补发**，别让尾部帧凭空消失。
+
+**无痕口径是「无可见输出帧」而非字节级**（与 panel 的差异，架构约束）：role/空 delta 帧照旧透传——chunkKind 'pass' 的既有语义就是「下游翻译层要它们保持顺序」，四个翻译器对它们零可见事件（逐行核对过 `translateStreamToAnthropic`：空 delta 不开 content_block_start；`message_start` 在翻译器初始化就发，本来就无法避免）。真正的可见帧（正文/思考/工具/finish/usage/[DONE]）被否决轮**零下发**，测试逐帧断言。
+
+**`reasoningSeen` 是半空轮的闸**：思考帧是直发的，客户端已看见——reasoning 非空就不算零输出（计划原文「正文/思考/工具全空」三条件），如实交付不换号（换号会让思考内容出现两段）。缓冲门为此新增 `finishReason`/`reasoningSeen` 两个记账字段（hold 帧暂扣时顺手记 finish_reason；reasoning 直发时置位）。
+
+**处置（`errorActionOf`）**：`zeroOutput → {feed:'none', action:'rotate'}`——不罚账号、不写 lastError、不喂池（空输出与账号健康无关，多半是上游侧临时故障，喂池只会让健康号背锅）。`tried` 集合保证换号不重复，轮转天然以池大小封顶。全池耗尽且死因是零输出时改写 message：连续次数 + 可行动 hint（稍后重试/换一个模型/看管理端通道页），`statusCode 502` + `code zero_output_length`。
+
+**两个实现陷阱**：
+- `chat.readStream` 会吞回调异常（`try { onData(...) } catch` 包住了 onData 本身）——回调里只能置标记不能抛；判定点③用 `vetoHit` 标记在 readStream 返回后抛。
+- 判定点③的否决条件**不含 `emitted===0`**：emitted 计 role/空 delta 的透传（pass 帧也计数），按它判会把最常见的「role 帧 + finish 帧」零输出形状放过去。
+
+**验证**：`node test/verify-workbuddy-zero-output.js`（43 项：换号无痕端到端 ×3 路径、裸关闭两向、四种不否决形状、耗尽 hint、池不罚、接线自证）+ `node --test test/unit/repair-gate.test.js`（+1 门记账项）。**接线自证必须锁**——零输出守卫是典型的「模块写好、无调用方」温床（qoder-telemetry 教训）。
+
+**明确不做**：finish_reason=stop + 全空**不拦**（「说完了但什么都没说」不是 length 语义，守卫只认 length）；length + 有正文/思考/工具**不拦**（内容已可见，换号会重复）；上游流内 error 帧（200 + error JSON 帧）的否决不在本批（计划只写了 length 形状，error 帧形状没有独立证据，不预编）。
+
+### 11.9 批次七：上游劣化告警 / 目录改版监控 / RT 续期核对 / x-device-token 负知识（2026-11-28）
+
+**上游劣化滑窗告警（alerts 规则 `upstream_degraded`，misakano upstreamhealth.go）**。「全 200 但每个请求 20 秒」的停摆 `error_rate` 看不见——它只数失败。新规则在**5 分钟短窗**内观测两个维度，任一越界聚合报**一条** warn（不按通道拆，拆了就是 N 条告警的「狼来了」）：TTFB≥8s 占比≥30%、5xx（含 502 上游不可达）占比≥10%。三个口径：① TTFB 分母只数报了首字的请求（与 usage TTFB 分桶同一纪律，未标记行不稀释占比）；② 样本不足（默认 <3 条）不判；③ 5 分钟窗刻意短于默认的 1h 指标窗——劣化是短时停摆，长窗会被均值淹没。阈值全部可配（`upstreamWindowMs/upstreamTtfbMs/upstreamTtfbRatio/upstream5xxRatio/upstreamMinRequests`，PUT /api/admin/alerts/config）。**思考重的智能体流量请调高 TTFB 阈值**——首字含思考时间，Claude Code 这种流量 8s 是常态。只观测不联动：劣化不喂池不冷却，账号健康与上游慢是两回事。
+
+**模型目录改版监控（models.catalogWatch + 规则 `catalog_changed`，misakano watchdog.go）**。上游改目录（加/删/改名/调倍率/调上下文）是静默的：本地映射不跟着改，请求就会 404 或计错费。指纹 = sha256(parseCatalog 归一化行)，**复用已有目录拉取**（走 fetchModels 的 10 分钟缓存，零新增上游调用节奏）；首次建档只存基线不告警（没有基线谈不上「改版」），变了就告警并即时更新基线（不判方向——变回去也是改版）。落盘 `data/workbuddy-catalog-fp.json` 跨重启。**「拉不到」≠「改版了」**：fetchModels 失败（无账号/上游 5xx）返回 `ok:false`，根本不进 facts，绝不告警。采集点在 `routes/alerts.js` 的 `facts()`（改 async），评估器只看结论。
+
+**RT >10 天强制续期（L0NE-6）——经核对已被既有行为覆盖，不新做**。keepalive 的 workbuddy 刷新腿自 P1-3（misakano #296 早死观测）起就是**每轮必刷**（720h 窗口恒真等价无条件，带 1h 最小间隔 + `lastRefreshAt` 落盘 + 退场跳过）——「距上次刷新 >10 天强制刷」这个条件在每轮必刷面前恒不触发，加上去只会是死代码。L0NE-6 关心的事（离线 30 天 RT 链断）真正的防线是「keepalive 开着」：keepalive 默认关（新排程不悄悄自启纪律），关着期间本来就没有任何续期路径，这是排程开关的显式选择，不是判据缺口；只要开着，RT 链永远 <1 天新鲜。唯一残值场景（keepalive 关 10~30 天后重开）首轮必刷照样救回来——不需要新判据。
+
+**x-device-token 负知识（Zhengyuuuui，写进「别再试」清单）**：**国际版官方客户端不产 `x-device-token`**（三轮抓包 + 二进制验证）；国内版才有，且一设备一账号。给国际版请求补这个头不是「更像官方」而是**更像非官方**——官方根本没有。别再试。

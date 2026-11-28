@@ -103,6 +103,9 @@ test('告警规则：判据、样本不足不报、未知余额不猜 0', () => 
   // P1-6：新增的 qoder_rejected 需要专门的 rejected 遥测样本，
   // 本用例的通用事实不含它；规则覆盖在 test/unit/admin-alerts.test.js 验证。
   facts.channels.qoder = { telemetry: { rejected: 3, ok: 0 } };
+  // 批次七：catalog_changed 需要专门的目录指纹事实（facts() 采集时只收
+  // ok 的 watch）；上游劣化由上面的 4×500 样本自然触发（80% ≥ 10%）。
+  facts.workbuddyCatalog = [{ ok: true, region: 'cn', changed: true, first: false, prevModels: 17, models: 16 }];
   const cfg = { ...alerts.defaults(), keyBurst: 5, budget: 40, errorRate: 0.5, errorMinRequests: 5 };
   const rules = new Set(alerts.evaluate(facts, cfg, now).map((a) => a.rule));
   for (const r of alerts.RULES) assert.ok(rules.has(r), `缺少规则 ${r}`);

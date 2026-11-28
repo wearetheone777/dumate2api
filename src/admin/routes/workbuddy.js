@@ -40,6 +40,28 @@ function uidsOf(url) {
   return ids.size ? ids : null;
 }
 
+/** 成长任务写路径（/tasks/* 三个端点共用）的账号选择：body.id 单号、body.group
+ *  分组、缺省全量可用；企业号在这里统一闸掉（判据单一出处 tasks.enterpriseBlocked）。 */
+function taskAccountsOf(body) {
+  const tasks = require('../../workbuddy/tasks');
+  const id = body && body.id;
+  const group = body && body.group ? String(body.group).trim() : '';
+  let list;
+  if (id) {
+    list = [authStore.get(id)].filter(Boolean);
+    if (!list.length) return { err: `账号 ${id} 不存在` };
+  } else if (group) {
+    list = authStore.findUsable().filter((a) => (a.group || '') === group);
+    if (!list.length) return { err: `分组「${group}」下没有可用账号` };
+  } else {
+    list = authStore.findUsable();
+  }
+  if (!list.length) return { err: '没有可用账号' };
+  const blocked = list.filter((a) => tasks.enterpriseBlocked(a));
+  if (blocked.length === list.length) return { err: '选中的全是企业号——组织账号不做成长写腿' };
+  return { list: list.filter((a) => !tasks.enterpriseBlocked(a)), skippedEnterprise: blocked.length };
+}
+
 const routes = [
   {
     // 通道状态 + 账号列表（脱敏）。?region= 区域视图
@@ -98,9 +120,11 @@ const routes = [
       return sendJSON(res, 200, {
         ok: true,
         config: config.restriction,
+        thinking: config.thinking,
         envDefaults: runtime.defaults().restriction,
+        thinkingDefaults: runtime.defaults().thinking,
         file: runtime.FILE,
-        note: 'holdSeconds=0 彻底关闭连坐暂停（仍记「哪些号被限制」供观测）；改短时长会立即截断现有倒计时。',
+        note: 'holdSeconds=0 彻底关闭连坐暂停（仍记「哪些号被限制」供观测）；改短时长会立即截断现有倒计时。thinking.defaultEffort 留空 = 用模型目录的 defaultEffort。',
       });
     },
   },
@@ -111,7 +135,15 @@ const routes = [
       const runtime = require('../../workbuddy/runtime');
       let out;
       try {
-        out = runtime.Store({ restriction: body || {} });
+        // 兼容两种提交形状：{restriction:{...}, thinking:{...}}（新面板一次提交两组）
+        // 与裸 restriction 字段对象（旧面板）。thinking 不在 body 里时不下发
+        // （patch 语义：不传 = 不改动）。
+        const hasThinking = body && body.thinking && typeof body.thinking === 'object'
+          && !Array.isArray(body.thinking);
+        const patch = hasThinking
+          ? { restriction: body.restriction || {}, thinking: body.thinking }
+          : { restriction: body || {} };
+        out = runtime.Store(patch);
       } catch (e) {
         return sendJSON(res, 400, { ok: false, error: e.message });
       }
@@ -128,7 +160,9 @@ const routes = [
       return sendJSON(res, 200, {
         ok: true,
         config: out.config.restriction,
+        thinking: out.config.thinking,
         changed: out.changed.restriction || {},
+        thinkingChanged: out.changed.thinking || {},
         state: wb.restrictionState(),
       });
     },
@@ -503,6 +537,106 @@ const routes = [
       const okCount = out.filter((r) => r.ok).length;
       try { require('../auth').audit('admin', 'workbuddy_checkin', id || (group ? `group:${group}` : 'all'), `${okCount}/${out.length}`); } catch (e) { /* 审计失败不影响结果 */ }
       return sendJSON(res, 200, { ok: true, results: out });
+    },
+  },
+  {
+    // ── 成长任务写路径（P0-6，2026-11-28 融合批；手动触发，端点本身就是独立开关）──
+    //
+    // 三个动作各自幂等/低风险（探针定案见 docs/CHANNEL-WORKBUDDY.md 11.x）：
+    //   sweep  补领清扫：accept（幂等报名）+ claim（完成未领）+ 回读确认
+    //   redeem 连登兑换：只兑 unlocked 档，403/409 是业务态如实报
+    //   makeup 断登补签：每轮 ≤1 张补签卡，最近断点优先，无卡早退
+    // 企业号（enterpriseId 非空）一律跳过——组织账号的行为自动化不碰。
+    // 自动化入口在 autocheckin 第四腿，受 DUMATE_WORKBUDDY_TASKS_SWEEP（默认关）管；
+    // 这里是手动按钮，操作人点了就是明确授权。
+    method: 'POST',
+    path: '/tasks/sweep',
+    handler: async ({ res, body }) => {
+      const tasks = require('../../workbuddy/tasks');
+      const { list, err, skippedEnterprise } = taskAccountsOf(body);
+      if (err) return sendJSON(res, 200, { ok: false, error: err });
+      // 账号间并发、账号内互斥（runExclusive；同账号重复点击报 busy）
+      const results = await Promise.all(list.map((a) => tasks.runExclusive(a, async () => ({
+        id: a.id, nickname: a.nickname || a.uid || '', region: constants.normalizeRegion(a.region),
+        ...(await tasks.sweepTasks(constants.normalizeRegion(a.region), a)),
+      }))));
+      try { require('../auth').audit('admin', 'workbuddy_tasks_sweep', (body && body.id) || 'all', results.map((r) => `#${r.id} 领${(r.claimed || []).length}/未验${(r.unverified || []).length}`).join(' ')); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: results.some((r) => r.ok), skippedEnterprise: skippedEnterprise || 0, results });
+    },
+  },
+  {
+    method: 'POST',
+    path: '/tasks/redeem',
+    handler: async ({ res, body }) => {
+      const tasks = require('../../workbuddy/tasks');
+      const { list, err, skippedEnterprise } = taskAccountsOf(body);
+      if (err) return sendJSON(res, 200, { ok: false, error: err });
+      const results = await Promise.all(list.map((a) => tasks.runExclusive(a, async () => ({
+        id: a.id, nickname: a.nickname || a.uid || '', region: constants.normalizeRegion(a.region),
+        ...(await tasks.redeemUnlocked(constants.normalizeRegion(a.region), a)),
+      }))));
+      try { require('../auth').audit('admin', 'workbuddy_tasks_redeem', (body && body.id) || 'all', results.map((r) => `#${r.id} 兑${(r.redeemed || []).length}`).join(' ')); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: results.some((r) => r.ok), skippedEnterprise: skippedEnterprise || 0, results });
+    },
+  },
+  {
+    method: 'POST',
+    path: '/tasks/makeup',
+    handler: async ({ res, body }) => {
+      const tasks = require('../../workbuddy/tasks');
+      const { list, err, skippedEnterprise } = taskAccountsOf(body);
+      if (err) return sendJSON(res, 200, { ok: false, error: err });
+      const results = await Promise.all(list.map((a) => tasks.runExclusive(a, async () => ({
+        id: a.id, nickname: a.nickname || a.uid || '', region: constants.normalizeRegion(a.region),
+        ...(await tasks.makeupBrokenDay(constants.normalizeRegion(a.region), a)),
+      }))));
+      try { require('../auth').audit('admin', 'workbuddy_tasks_makeup', (body && body.id) || 'all', results.map((r) => `#${r.id} ${r.used || '未用卡'}`).join(' ')); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: results.some((r) => r.ok), skippedEnterprise: skippedEnterprise || 0, results });
+    },
+  },
+  {
+    // ── 官方逐请求用量账本（P1-6，只读）──
+    //
+    // R2 两本账：这里是**官方账本**（含官方客户端直连的消耗，reqlog 看不到的那
+    // 一半）；网关侧账本在用量页。两者不是「一个总量的两部分」——覆盖范围不同，
+    // 前端并排呈现时各自标来源。企业号跳过（成长/账本域对组织号 403，问了也是白问）。
+    method: 'GET',
+    path: '/usage-official',
+    handler: async ({ res, req }) => {
+      const usageMod = require('../../workbuddy/usage');
+      const hoursRaw = Number(((req.url.match(/[?&]hours=(\d+)/) || [])[1]) || 0) || undefined;
+      const regionQ = regionOf(req.url || '');
+      const all = authStore.findUsable();
+      const skipped = all.filter((a) => require('../../workbuddy/tasks').enterpriseBlocked(a)).length;
+      let targets = all
+        .filter((a) => !require('../../workbuddy/tasks').enterpriseBlocked(a))
+        .map((a) => ({ account: a, region: constants.normalizeRegion(a.region), name: a.nickname || a.uid || `账号 ${a.id}`, id: a.id }));
+      if (regionQ) targets = targets.filter((t) => t.region === regionQ);
+      if (!targets.length) return sendJSON(res, 200, { ok: false, error: '没有可拉取账号' });
+      const data = await usageMod.fetchOfficialUsage(targets, { hours: hoursRaw });
+      data.skipped_enterprise = skipped;
+      return sendJSON(res, 200, data);
+    },
+  },
+  {
+    method: 'GET',
+    path: '/tasks/scan',
+    handler: async ({ res, req }) => {
+      const growth = require('../../workbuddy/growth');
+      const tasks = require('../../workbuddy/tasks');
+      const regionQ = regionOf(req.url || '');
+      const idQ = Number(((req.url.match(/[?&]id=(\d+)/) || [])[1]) || 0);
+      let list = idQ ? [authStore.get(idQ)].filter(Boolean) : authStore.findUsable();
+      if (regionQ) list = list.filter((a) => constants.normalizeRegion(a.region) === regionQ);
+      if (!list.length) return sendJSON(res, 200, { ok: false, error: '没有可扫描账号' });
+      const executionEnabled = tasks.sweepEnabled();
+      // 扫描是只读的，账号间并发（每账号 1 个 GET，低频手动触发）
+      const results = await Promise.all(list.map((a) => growth.scanGrowthTasks(constants.normalizeRegion(a.region), a, { execution_enabled: executionEnabled })));
+      return sendJSON(res, 200, {
+        ok: results.some((r) => r.scan_state === 'ok' || r.scan_state === 'empty'),
+        execution_enabled: executionEnabled,
+        results: results.map((r, i) => ({ id: list[i].id, nickname: list[i].nickname || list[i].uid || '', region: constants.normalizeRegion(list[i].region), ...r })),
+      });
     },
   },
   {

@@ -128,6 +128,43 @@ export interface WorkBuddyBusy {
  * 逐项记明。界面必须区分「查到了是 0」与「没查到（null）」——这是本项目
  * 反复强调的一条（null ≠ 0）。
  */
+/**
+ * 官方逐请求用量账本（`GET /workbuddy/usage-official`，P1-6）——**只读**。
+ *
+ * R2 两本账：这是**官方账本**（含官方客户端直连的消耗，网关 reqlog 看不到的
+ * 那一半）；与用量页的网关侧账本并列呈现，不是「一个总量的两部分」。
+ * credit 缺失/0 = 「这条记录没带」= 不知道，不是免费——creditsUnknown 如实单列。
+ */
+export interface WorkBuddyUsageOfficial {
+  ok: boolean
+  window_hours: number
+  start: string
+  end: string
+  totals: {
+    requests: number
+    credits: number
+    creditsUnknown: number
+    accounts: number
+    active: number
+    truncated: boolean
+  }
+  by_account: Array<{
+    id: number
+    name: string
+    region: string
+    requests: number
+    creditsKnown: number
+    creditsUnknown: number
+    truncated: boolean
+    error?: string
+  }>
+  by_model: Array<{ model: string; requests: number; credits: number; creditsUnknown: number }>
+  series: Array<{ day: string; requests: number; credits: number }>
+  errors: Array<{ id: number; name: string; error: string }>
+  skipped_enterprise?: number
+  note?: string
+}
+
 export interface WorkBuddyGrowth {
   ok: boolean
   region: 'cn' | 'global'
@@ -445,6 +482,13 @@ export const workbuddyApi = {
     if (opts.id) q.push(`id=${opts.id}`)
     const qs = q.length ? '?' + q.join('&') : ''
     return client.get<WorkBuddyGrowth>(`/workbuddy/growth${qs}`)
+  },
+  usageOfficial: (opts: { hours?: number; region?: 'cn' | 'intl' } = {}) => {
+    const q: string[] = []
+    if (opts.hours) q.push(`hours=${opts.hours}`)
+    if (opts.region) q.push(`region=${opts.region}`)
+    const qs = q.length ? '?' + q.join('&') : ''
+    return client.get<WorkBuddyUsageOfficial>(`/workbuddy/usage-official${qs}`)
   },
   credits: (region?: 'cn' | 'intl', uids?: number[]) =>
     client.get<{

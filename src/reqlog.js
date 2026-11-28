@@ -158,7 +158,7 @@ function newReqId() {
 // 是两回事：前者是「确认零缓存」（全价请求），后者是「未知」（不能当 0 算）。
 function pickUsage(u) {
   if (!u || typeof u !== 'object') {
-    return { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false };
+    return { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false, credit: null, creditReported: false };
   }
   const input = Number(u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0) || 0;
   const output = Number(u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0) || 0;
@@ -179,16 +179,21 @@ function pickUsage(u) {
   // 后者不能当 0 写入去算分母（会虚高命中率）。
   const creationCands = [num(u.cache_creation_input_tokens)].filter((v) => v != null);
   const creation = creationCands.length ? Math.max(...creationCands) : 0;
+  // 官方逐请求积分（P1-6，R2 两本账口径）：上游 usage 帧带了 credit 就记。
+  // **credit 缺失/0 = 「这条记录没带」= 不知道，不是免费**——聚合侧只累加
+  // 有值的行，绝不拿 0 补。
+  const credit = num(u.credit);
   return {
     input, output, total, cached, cachedReported: cands.length > 0,
     creation, creationReported: creationCands.length > 0,
+    credit, creditReported: credit != null,
   };
 }
 
 // 从 SSE 文本里扫出 usage。流式响应没有单一的 usage 字段，
 // 必须逐行解析 data: 负载，取最后一个带 usage 的块。
 function usageFromSSE(text) {
-  let best = { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false };
+  let best = { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false, credit: null, creditReported: false };
   for (const line of text.split('\n')) {
     if (!line.startsWith('data:')) continue;
     const payload = line.slice(5).trim();

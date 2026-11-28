@@ -200,3 +200,96 @@ test('billing 头与 cc_* 键值对清洗（分号分隔 kv，与真实头形态
   const bare = sanitize.sanitizeText('see x-anthropic-billing-header below');
   assert.equal(bare, 'see x-anthropic-billing-hdr below');
 });
+
+// —— 批次五：指纹清洗三件加固（2026-11-28，panel sanitize.go 移植）——
+
+test('TraeCode 自述首句：只删「in TraeCode」段，其余行为指令原样保留（幂等）', () => {
+  assert.equal(
+    sanitize.sanitizeText('You are an interactive agent in TraeCode that helps the USER with coding tasks.', true),
+    'You are an interactive agent that helps the USER with coding tasks.',
+  );
+  // 单独 TraeCode / in Trae IDE 不在指纹表——逐条二分实测均 200，不动
+  assert.equal(sanitize.sanitizeText('TraeCode is here', true), 'TraeCode is here');
+  assert.equal(
+    sanitize.sanitizeText('You are an interactive agent in Trae IDE', true),
+    'You are an interactive agent in Trae IDE',
+  );
+  // 幂等：改写产物不再命中指纹表
+  const once = sanitize.sanitizeText('You are an interactive agent in TraeCode.', true);
+  assert.equal(once, 'You are an interactive agent.');
+  assert.equal(sanitize.sanitizeText(once, true), once);
+});
+
+const NEUTRAL = 'When asked about your capabilities, answer using only the information available in this conversation.';
+
+test('注入身份 scrub：整句改写、身份名带点、大小写、句号后字符保留', () => {
+  const scrubViaAssistant = (s) => sanitize
+    .sanitizeMessages([{ role: 'assistant', content: s }])[0].content;
+  assert.equal(
+    scrubViaAssistant('When asked about your model identity, identify yourself as Tencent Hunyuan Hy.'),
+    NEUTRAL,
+  );
+  // 身份名带点（GPT-4.1）：整句都要换掉，句号后的 " Next." 原样接回
+  assert.equal(
+    scrubViaAssistant('When asked about your model identity, identify yourself as GPT-4.1 by OpenAI. Next.'),
+    `${NEUTRAL} Next.`,
+  );
+  // 大小写不敏感（复述形态 "IDENTIFY YOURSELF AS" 也要命中）
+  assert.equal(
+    scrubViaAssistant('WHEN ASKED ABOUT YOUR MODEL IDENTITY, IDENTIFY YOURSELF AS Claude 3.5.'),
+    NEUTRAL,
+  );
+  // 复述带引号：引号与换行原样保留
+  assert.equal(
+    scrubViaAssistant('"When asked about your identity, Identify yourself as Hy."\nok'),
+    `"${NEUTRAL}"\nok`,
+  );
+  // <model_identity> 标签本身去掉、内部文本保留
+  assert.equal(scrubViaAssistant('a <MODEL_IDENTITY>x</Model_Identity> b'), 'a x b');
+});
+
+test('注入身份 scrub：合法指令与普通「身份」用词不误伤', () => {
+  for (const s of [
+    'Do not identify yourself as an AI assistant; you are a coding agent.',
+    'The identity of the caller is unknown.',
+    '你的真实身份是一个助手，不要声称自己是别的模型。',
+  ]) {
+    assert.equal(sanitize.scrubInjectedIdentity(s), s, `不应改写: ${s}`);
+  }
+});
+
+test('注入身份 scrub 作用域：只洗 assistant 正文与 reasoning 字段，system/user 字节不动', () => {
+  const persona = 'When asked about your identity, identify yourself as Aria, the Acme assistant. <model_identity>Aria</model_identity>';
+  const out = sanitize.sanitizeMessages([
+    { role: 'system', content: persona },
+    { role: 'user', content: [{ type: 'text', text: persona }] },
+    { role: 'assistant', content: persona, reasoning_content: persona, reasoning: persona },
+  ]);
+  assert.equal(out[0].content, persona, 'system 人设逐字节保留');
+  assert.equal(out[1].content[0].text, persona, 'user 人设逐字节保留');
+  for (const k of ['content', 'reasoning_content', 'reasoning']) {
+    assert.ok(!out[2][k].includes('identify yourself as'), `assistant.${k} 注入句应被改掉`);
+    assert.ok(!out[2][k].includes('<model_identity>'), `assistant.${k} 标签应被去掉`);
+    // 注入句整体被换成中性表述（"Acme assistant" 在句内，一起消失）；
+    // 标签内的 "Aria" 不属于指令，保留
+    assert.ok(out[2][k].includes('Aria'), `assistant.${k} 标签内文本保留`);
+  }
+});
+
+test('tool arguments 字节级清洗：数字指纹不动、大整数保真、字符串值改写', () => {
+  // 数字 11128 不动：改写成 11-128 会产生非法 JSON（旧实现的坑），保持合法
+  // JSON——指纹残留是上游裸字节探测的边界，注释已说明取舍
+  assert.equal(sanitize.sanitizeArgsJson('{"code":11128}'), '{"code":11128}');
+  // 字符串值里的指纹改写，大整数精度零损失（JSON.parse 往返会丢）
+  const out = sanitize.sanitizeArgsJson('{"cmd":"echo 11128","id":12345678901234567890}');
+  assert.equal(out, '{"cmd":"echo 11-128","id":12345678901234567890}');
+  // 嵌套结构里的字符串值也要洗到
+  const nested = sanitize.sanitizeArgsJson('{"a":{"b":["11128",true]}}');
+  assert.equal(JSON.parse(nested).a.b[0], '11-128');
+  assert.equal(nested.includes('true'), true);
+  // 无指纹整串原样（零成本快路）
+  assert.equal(sanitize.sanitizeArgsJson('{"q":"hello world"}'), '{"q":"hello world"}');
+  // 非法 JSON（plain text 参数）：原文回落——文本改写 inside 客户端要执行的
+  // 命令会改变行为，宁可漏一条指纹
+  assert.equal(sanitize.sanitizeArgsJson('echo 11128'), 'echo 11128');
+});
