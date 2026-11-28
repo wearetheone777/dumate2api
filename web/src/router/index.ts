@@ -18,6 +18,7 @@ const ServerLogs = () => import('@/views/ServerLogsView.vue')
 const TraeRuntime = () => import('@/views/TraeRuntimeView.vue')
 const QoderRuntime = () => import('@/views/QoderRuntimeView.vue')
 const ModelRules = () => import('@/views/ModelRulesView.vue')
+const Backup = () => import('@/views/BackupView.vue')
 const ChannelPolicy = () => import('@/views/ChannelPolicyView.vue')
 const OpsAlerts = () => import('@/views/OpsAlertsView.vue')
 
@@ -51,6 +52,8 @@ const router = createRouter({
         { path: 'qoder-runtime', component: QoderRuntime, meta: { title: 'Qoder 运行策略', key: 'qoder-runtime', adminOnly: true } },
         // WorkBuddy 模型规则：按账号 deny/allow（批次十三），admin 专属
         { path: 'model-rules', component: ModelRules, meta: { title: '模型规则', key: 'model-rules', adminOnly: true } },
+        // 备份与还原：表驱动分区导出/导入（批次十五），覆盖全部通道、与通道无关，admin 专属
+        { path: 'backup', component: Backup, meta: { title: '备份与还原', key: 'backup', adminOnly: true } },
         // 运维告警：七类规则阈值 + 活跃告警 + 指标端点。viewer 可看（只读），写操作服务端拦
         { path: 'alerts', component: OpsAlerts, meta: { title: '运维告警', key: 'alerts' } },
         // 「任务记录」已并入「积分明细」（见 CLAUDE.md）。这里保留重定向：

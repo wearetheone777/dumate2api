@@ -63,6 +63,12 @@
           <template #icon><SafetyCertificateOutlined /></template>
           <span>通道风控</span>
         </a-menu-item>
+        <!-- 备份与还原（批次十五）：覆盖全部通道的账号/配置，与通道无关，
+             不走 menuKeys 白名单（切换通道后它仍在） -->
+        <a-menu-item v-if="isAdmin" key="backup">
+          <template #icon><DatabaseOutlined /></template>
+          <span>备份与还原</span>
+        </a-menu-item>
         <!-- Qoder 运行策略：超时/排队/冷却热生效 + 自动签到（P0-1/P0-3）。
              只在 Qoder 通道下出现——它是通道级配置，套到别的通道上是误导 -->
         <a-menu-item v-if="isAdmin && channelStore.current === 'qoder'" key="qoder-runtime">
@@ -218,7 +224,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined, BlockOutlined } from '@ant-design/icons-vue'
+import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined, BlockOutlined, DatabaseOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import client from '@/api/client'
 import { auth, isAdmin } from '@/stores/auth'
