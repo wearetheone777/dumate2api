@@ -12,6 +12,7 @@ const WebAccounts = () => import('@/views/WebAccountsView.vue')
 const Usage = () => import('@/views/UsageView.vue')
 const ReqLogs = () => import('@/views/ReqLogsView.vue')
 const ChatLab = () => import('@/views/ChatLabView.vue')
+const BalanceTrend = () => import('@/views/BalanceTrendView.vue')
 const AgentSetup = () => import('@/views/AgentSetupView.vue')
 const Users = () => import('@/views/UsersView.vue')
 const ServerLogs = () => import('@/views/ServerLogsView.vue')
@@ -40,6 +41,9 @@ const router = createRouter({
         { path: 'usage', component: Usage, meta: { title: '用量统计', key: 'usage' } },
         { path: 'reqlogs', component: ReqLogs, meta: { title: '请求日志', key: 'reqlogs' } },
         { path: 'chatlab', component: ChatLab, meta: { title: '聊天测试台', key: 'chatlab' } },
+        // 余额趋势：余额流水的 30 分钟采样折线（批次十九）。全局视图（账本覆盖
+        // 网页账号与各通道池账号），viewer 可看
+        { path: 'balance-trend', component: BalanceTrend, meta: { title: '余额趋势', key: 'balance-trend' } },
         // 接入配置写本机客户端文件，只对 admin 有意义（与账户管理同款限制）
         { path: 'setup', component: AgentSetup, meta: { title: '接入配置', key: 'setup', adminOnly: true } },
         { path: 'users', component: Users, meta: { title: '账户管理', key: 'users', adminOnly: true } },

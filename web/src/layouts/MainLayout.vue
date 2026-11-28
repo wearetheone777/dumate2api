@@ -44,6 +44,12 @@
           <template #icon><WalletOutlined /></template>
           <span>积分明细</span>
         </a-menu-item>
+        <!-- 余额趋势：余额流水的采样折线（批次十九）。账本覆盖网页账号与各通道
+             池账号，全局视图、与通道无关，viewer 可看，不走 menuKeys 白名单 -->
+        <a-menu-item key="balance-trend">
+          <template #icon><LineChartOutlined /></template>
+          <span>余额趋势</span>
+        </a-menu-item>
         <a-menu-item v-if="showMenu('web-accounts')" key="web-accounts">
           <template #icon><TeamOutlined /></template>
           <a-badge :count="accountAlerts" :show-zero="false" :offset="[10, 0]" :number-style="badgeStyle">
@@ -229,7 +235,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined, BlockOutlined, DatabaseOutlined, HddOutlined } from '@ant-design/icons-vue'
+import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined, BlockOutlined, DatabaseOutlined, HddOutlined, LineChartOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import client from '@/api/client'
 import { auth, isAdmin } from '@/stores/auth'

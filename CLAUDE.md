@@ -864,6 +864,7 @@ per-key 限流（低价值场景）。
 | `workbuddy-accounts.json` | WorkBuddy 自持凭证账号池（客户端认证文件导入或手动粘贴 token，含 refresh token；区域字段 cn/global） |
 | `traework-credits.jsonl` | TRAE 逐请求积分归因（按账号的 consumed 游标，见 `traework/credits.js`） |
 | `points-cursor.jsonl` | 搭子的余额游标（每请求一条，相邻差值即该请求成本） |
+| `balance-hist.jsonl` | 各账号余额变动流水（观测式记账：变动即留痕，无变动不记；首见写 delta=null 基线行）。消费方：余额趋势页的采样折线（30 分钟网格 carry-forward，估计段虚线——期间若有消耗，估计值是上界、窗口消耗是下界） |
 | `browser-profile/` | 浏览器登录器用的受控 profile 目录（`DUMATE_BROWSER_PATH` 找不到浏览器时才用） |
 | `logs/run-YYYY-MM-DD.jsonl` | 运行日志每日归档（批次十八）：管理端进程把脱敏后的 console 行按本地日追加一份（`jsonl.append` 单次写），30 天滚动清理挂在日期翻转上。`/api/admin/logs/export?days=N` 打包成 ZIP 下载。**只有管理端进程在写**（网关未 install logbuffer）；存储页只列 data/ 顶层条目，这个目录以一行聚合行出现且不可删 |
 

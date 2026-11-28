@@ -1,3 +1,5 @@
+import client from '@/api/client'
+
 export interface PointsPackage {
   kind: 'subscription' | 'incremental'
   package_type: string
@@ -115,4 +117,30 @@ export interface AllPointsData {
     total: number
     used: number
   }
+}
+
+// ---- 余额趋势（批次十九，后端 src/balance-hist.js + routes/points.js）----
+
+/** 余额流水行：delta=null 是基线行（首见建基线，不算变动）；变动行 delta 带符号双向 */
+export interface BalanceEvent {
+  ts: number
+  account: string
+  channel: string
+  balance: number
+  delta: number | null
+  before: number | null
+  after: number
+  source: string
+}
+
+export const balanceApi = {
+  /** 流水时间线（最新在前）。limit<=0 = 不限（配合 from/to 仍然早停有界） */
+  timeline: (params: { account?: string; from?: number; to?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams()
+    if (params.account) q.set('account', params.account)
+    if (params.from) q.set('from', String(params.from))
+    if (params.to) q.set('to', String(params.to))
+    if (params.limit !== undefined) q.set('limit', String(params.limit))
+    return client.get<{ ok: boolean; rows: BalanceEvent[]; hasMore: boolean }>(`/points/balance-timeline?${q}`)
+  },
 }
