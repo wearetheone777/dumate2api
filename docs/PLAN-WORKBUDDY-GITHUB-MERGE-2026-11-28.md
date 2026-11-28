@@ -206,8 +206,8 @@ yreidev 的 `bizcode.go` 按官方 CLI 枚举归类。对照我们 `constants.js
 | Key 级三维限额 | hub：日 token 限量 / 累计积分额度 / Key 级并发上限（有界排队 `Condition` 唤醒不瞬时 429）。多人分发时触发（M3 同口径） |
 | 随机排程窗口 | hub PR #32：签到/旅行在北京时间 08:00-10:00 抽取时段（只后延）；autocheckin 抖动窗口参数化，小改 |
 | 出口 IP 画像 | hub `wb_ipintel.py`：经代理取出口 IP → ip-api 查 hosting 标志分住宅/机房，失败报 unknown；纯本地 lookup |
-| 管理端 noindex | hub #842：`X-Robots-Tag: noindex,nofollow` + robots 元标签（管理端公网化前置项，P2-21 安全头批次没做这条） |
-| restrictedUntil 持久化对照 | hub v2.1.0 的 11140 永久封禁我们不做（保留自动恢复），但「restrictedUntil 落盘、重启/刷新凭证不放回池、**只有真正成功一次才清**」值得对照我们的冷却持久化查漏 |
+| 管理端 noindex | hub #842 | ✅ **已落地（批次二十四）**：`applySecurityHeaders` 全 kind（html/json/static）都带 `X-Robots-Tag: noindex, nofollow`（响应头覆盖一切路径），入口模板 `web/index.html` 加 robots meta 双保险（覆盖静态托管不经 server.js 的场景）；admin-security-headers.test.js 补接线断言（10 项） |
+| restrictedUntil 持久化对照 | hub v2.1.0 的 11140 永久封禁我们不做（保留自动恢复） | ✅ **已对照（批次二十四，结论：无缺口，无需改码）**：三条纪律逐条核——①**落盘**：pool-state.json 5s 防抖 flusher + 跨进程记录级 LWW（pool.js 头注释与实现）；②**重启/刷新凭证不放回池**：重启恢复冷却直至自然过期（恢复时只清「已过期」态）；凭证 upsert/refresh 路径不触碰池状态（grep 全库：清冷却只有 noteSuccess / 手动 revive（审计留痕）/ 自然过期三条路）；③**只有真正成功才清**：markSuccess 仅在 callWithFailover 的 r.ok 分支调，探针模式（opts.probe）连惩罚都不写、更不清。hub 的 11140 永久封禁不做（保留自动恢复，与现有约定一致） |
 | TLS JA3 一次性核对 | 我们本身就是 Node（官方 chat 也走 Node 主进程），天然接近官方 ClientHello——不用移植 Go uTLS，做一次 MITM 抓本项目 JA3 与官方对比即可 |
 | 订阅类型徽标 | 账号行展示档位（TRAE tier 已有数据），「无数据源的渠道不显示，不编造」 |
 

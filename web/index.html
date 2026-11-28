@@ -5,6 +5,9 @@
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
+    <!-- 管理端公网化前置（P3 noindex）：服务端另有 X-Robots-Tag 头双保险——
+         这条 meta 覆盖「静态托管不经 server.js」的场景 -->
+    <meta name="robots" content="noindex, nofollow" />
     <!-- 与 style.css 的 --lab-bg 同值：地址栏/移动端状态栏配色跟着页面底走。
          stores/theme.ts 在切换时改写这里的 content -->
     <meta name="theme-color" content="#f2f4f8" />

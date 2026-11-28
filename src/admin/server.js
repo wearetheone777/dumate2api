@@ -113,6 +113,9 @@ function applySecurityHeaders(kind) {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
+    // 管理端公网化前置（P3 noindex）：整个面板不许被搜索引擎收录——
+    // 页面里是账号名、余额、密钥形态的运营数据
+    'X-Robots-Tag': 'noindex, nofollow',
   };
   if (kind === 'html') headers['Content-Security-Policy'] = CSP_HTML;
   return headers;
