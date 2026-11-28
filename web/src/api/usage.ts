@@ -84,5 +84,8 @@ export interface UsageOverview {
   by_channel: UsageByChannel[]
   by_key: UsageByKey[]
   points_by_account: UsagePointsAccount[]
+  /** 积分账单缓存元数据（批次二十）：cached=true 时前端必须标「缓存于」；
+   *  cached=false = 刚现算过（后台已重新预热）；非搭子通道为 null */
+  points_cache: { cached: boolean; cached_at?: number } | null
   note: string
 }

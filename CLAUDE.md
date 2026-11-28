@@ -865,6 +865,7 @@ per-key 限流（低价值场景）。
 | `traework-credits.jsonl` | TRAE 逐请求积分归因（按账号的 consumed 游标，见 `traework/credits.js`） |
 | `points-cursor.jsonl` | 搭子的余额游标（每请求一条，相邻差值即该请求成本） |
 | `balance-hist.jsonl` | 各账号余额变动流水（观测式记账：变动即留痕，无变动不记；首见写 delta=null 基线行）。消费方：余额趋势页的采样折线（30 分钟网格 carry-forward，估计段虚线——期间若有消耗，估计值是上界、窗口消耗是下界） |
+| `points-usage-cache.json` | 搭子积分账单的预热缓存（批次二十）：窗口账单与今日实付两部分独立判新鲜（TTL 默认 30 分钟，`DUMATE_POINTS_USAGE_CACHE_TTL_MS` 可覆盖）。keepalive 空闲收尾每日预热；`/usage/overview` 命中即回、陈旧则现算 + 后台预热，**缓存数字必带 `cached_at` 出仓**（前端标注「缓存于」，缓存与实时混看不标时间＝编数据）。删除无损，keepalive/页面加载会重建 |
 | `browser-profile/` | 浏览器登录器用的受控 profile 目录（`DUMATE_BROWSER_PATH` 找不到浏览器时才用） |
 | `logs/run-YYYY-MM-DD.jsonl` | 运行日志每日归档（批次十八）：管理端进程把脱敏后的 console 行按本地日追加一份（`jsonl.append` 单次写），30 天滚动清理挂在日期翻转上。`/api/admin/logs/export?days=N` 打包成 ZIP 下载。**只有管理端进程在写**（网关未 install logbuffer）；存储页只列 data/ 顶层条目，这个目录以一行聚合行出现且不可删 |
 

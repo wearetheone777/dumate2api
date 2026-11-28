@@ -835,6 +835,15 @@ async function runOnce(trigger = 'manual', opts = {}) {
       require('./admin/auth').audit('system', 'keepalive', '',
         `${trigger}: ${units.length} 号，解冻 ${rec.unfrozen.length}${token.aborted ? '（中断）' : ''}`);
     } catch (e) { /* 审计不可用不阻塞结果 */ }
+    // 阶段 4.7（批次二十「统计预热」）：搭子积分账单预热——/overview 的
+    // 逐账号上游查询挪到保活空闲时段，页面命中缓存时不再等上游往返。
+    // fire-and-forget：预热失败只留 stderr，不影响本轮结果（/overview 未
+    // 命中缓存时本来就会现算并自己暖）。
+    if (!token.aborted) {
+      setImmediate(() => {
+        try { require('./points-usage-cache').warm(30); } catch (e) { /* 预热不致命 */ }
+      });
+    }
     // crit 告警推送（2026-11-06 清单项 4）：轮次结束时判一次健康面，crit>0
     // 才推——warn 是「要留意」，推消息会养成狼来了。fire-and-forget：推送
     // 挂了不阻塞本轮返回（notify.sendNotify 内部已兜错，这里再兜一层）。

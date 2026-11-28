@@ -73,6 +73,7 @@ const KNOWN = {
   'langfuse-local.jsonl': { category: 'logs', deletable: true, note: 'Langfuse 投递失败本地日志' },
   // 缓存（deletable，可再生）
   'expiring-snapshot.json': { category: 'cache', deletable: true, note: '临期积分快照（管理端 /credits 刷新重建）' },
+  'points-usage-cache.json': { category: 'cache', deletable: true, note: '积分账单预热缓存（keepalive/页面加载重建）' },
   'dumate-caps.json': { category: 'cache', deletable: true, note: 'max_tokens 上限自学习（撞 400 重建）' },
   'dumate-rate-cache.json': { category: 'cache', deletable: true, note: '实测倍率缓存（计费探针重建）' },
   'qwenwork-daypeak.json': { category: 'cache', deletable: true, note: '历史遗留（2026-11-02 起不再读写，可删）' },
