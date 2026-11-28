@@ -678,3 +678,45 @@ client 400。
 
 **未做**：按会话键**筛选/分组**的前端界面（现在只有详情抽屉里的只读展示）。要按会话聚合
 请求，得在 `reqlogs` 读路径上加过滤参数并写聚合，单独一批更干净。
+
+## 2026-11-29 落地（issue #9：Qoder 活动模型 HungerG，hub v1.10.1 同款设计 + 官方包解包实锤）
+
+**任务**：[dumate2api#9「增加支持HungerG模型」](https://github.com/wearetheone777/dumate2api/issues/9)。
+HungerG = Qoder 2026-11-23 匿名上线的隐身编程模型，免费窗口至 11-30 24:00（UTC+8），
+仅限国际版个人账号、仅官方应用/IDE 入口——标准模型清单（12 个数组逐字节搜过
+4 个账号的原始响应）里没有它。
+
+**key 的取证（本批最有价值的部分）**：hub v1.10.1 的静态表把 key 写成 `"HungerG"`
+（显示名当 key）。本批下载官方 0.5.21 应用 fast-update 包（2026-11-27 构建，360MB）
+手动解包 `app.asar`，在内置文案表 `out/qoder-text/global-prod/bundle.json` 里拿到
+`modelPresentations.models.hmodel.label = "HungerG"`。**同表 `lmodel = QoDuck` 与
+hub 真机验证过的 API key 一致——presentation 键就是 API key 实锤**，HungerG 的
+真实 key 是 `hmodel`。两个拼写都注册成别名，出站统一 `hmodel` 由上游裁决。
+
+**真机对照实验（推翻自己的第一个假设，值得记）**：上游对 `modelKey=hungerg`
+回 10605 真排队信封（p4 / queueCount=1 / serviceAvailable=true），一度以为是
+「key 有效」的证据——随即用乱写的 `no-such-model-xyz` 对照，**得到完全相同的
+p4 信封**：排队发生在模型校验之前，p4 不能证明任何 key 的有效性。当天四个账号
+连 0.1 档 qfmodel 都在同一个账号级 RESOURCE_LIMIT 队列里（免费窗口高峰），端到端
+验证留了长预算命令在通道文档里（窗口内 0 成本）。**任何「上游接受了 X」的判断
+都要有无效对照——单边证据在限流叠加时全是噪声。**
+
+**实现**（`catalog.js` SUPPLEMENTS 静态表 + 三处接线 + 别名表）：
+
+- `/v1/models` 三出口合并补充条目（`qoder/HungerG`、`catalogSource: 'supplement'`）；
+  动态表已列不覆盖、过期自动隐藏（`HUNGERG_FREE_UNTIL_MS = 1796054400000`，与 hub 同值）。
+- `constants.MODEL_ALIASES`：`HungerG`/`hungerg`/`hungerg-free`/`hungerg_free` → `hmodel`。
+- `runOnce` 的 modelMeta 缺席时回落 `supplementMetaOf`（思考档位 + 1M 档位不丢）。
+- `send()` 区域提示：key 未绑区域时按补充表选国际区；**key 显式绑定优先**。
+- 补充行形状与 `fetchModels` 归一化行同形（rate 0 / rateOriginal null /
+  contextTiers [200K,400K,1M] / reasoningEfforts 四档），管理端模型页零改动可用。
+- 快照 `qoder-catalog.snapshot.json` **不收** hmodel——快照是「疑似下线候选」的
+  领地，活动模型走补充表，两套语义不混。
+
+**验证**：`test/unit/qoder-hungerg.test.js` 8 项全绿（key 收敛/行形状/思考档位/
+过期纪律/动态表优先/区域提示/接线自证）；`npm run verify` 56/56、`npm test`
+1935/1935 全绿。两个既有测试（`qoder-model-catalog` 的 disabled 出口、
+`qoder-model-metadata` 的 listModelEntries 字段锁）因名单多了补充条目而失败——
+断言改成 **supplement-aware**（锁「启用者在、禁用者不在」+ 按来源识别补充条目），
+不再锁字面名单——这类「时间敏感的字面名单断言」在窗口类功能里必然过期，
+形状断言才是唯一耐久的写法。

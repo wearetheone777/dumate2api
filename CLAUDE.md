@@ -1055,3 +1055,4 @@ Vue 3 + Vite + ant-design-vue 4 + Tailwind + ECharts（按需引入，不用全�
 | 11-16 P2-10 | 接入配置写入前 diff 预览（预览与写入同一 `buildNext`、预览零写盘、密钥打码） | diff 用行级 LCS（零依赖）；超 1200 行只给统计 |
 | 11-16 P2-12 | 看板自动刷新（一个共享定时器、页面不可见不刷、单飞、回调抛错只记不炸）+ 阅读模式 | 阅读模式只改排版不藏数据；页面侧用 `useAutoRefresh(load)` 自动注销 |
 | 11-16 P2-11 | 会话粘性键含 system（全文不截断、parts 空串拼接、OpenAI/Anthropic 两协议同口径）+ 补批把会话键写进请求日志 | 键只认首条 user（2048）+ system 全文；换键不断在跑会话（粘性绑定只在内存）；`sessionKeyFor` 把键产生与上报绑在同一函数 |
+| 11-29 issue #9 | Qoder 活动模型 HungerG（hub v1.10.1 同款设计 + 官方 0.5.21 包解包实锤）：`catalog.js` SUPPLEMENTS 静态表 + /v1/models 三出口合并 + MODEL_ALIASES + runOnce meta 兜底 + send() 区域提示 | **key 是 `hmodel` 不是 "HungerG"**（presentation 键=API key，`lmodel`=QoDuck 同表互证）；p4 排队信封在模型校验之前、不能当 key 有效性证据（要有无效对照）；过期只隐藏不删条目；快照不收活动模型——细节与验证命令见 `docs/CHANNEL-QODER.md` 活动模型补充节 |

@@ -215,7 +215,14 @@ test('fetchModels：enable=false 保留并带 disabled 状态与原因', async (
     const qoder = require('../../src/qoder/index');
     setAccounts([{ id: 1, region: 'cn', enabled: true }]);
     const entries = await qoder.listModelEntries();
-    assert.deepEqual(entries.map((e) => e.name), ['Live'], '/v1/models 不列 disabled');
+    const names = entries.map((e) => e.name);
+    // 活动模型补充（issue #9）：官方限时活动条目会被追加（catalogSource=supplement），
+    // 名单断言因此只锁「启用者必须在、禁用者不得在」，并顺带核补充条目的状态
+    assert.ok(names.includes('Live'), '启用的模型要列出');
+    assert.ok(!names.includes('Dead'), '/v1/models 不列 disabled');
+    for (const e of entries) {
+      if (e.catalogSource === 'supplement') assert.equal(e.status, 'active', '补充条目必是 active');
+    }
   } finally {
     session.fetchModels = orig;
   }
