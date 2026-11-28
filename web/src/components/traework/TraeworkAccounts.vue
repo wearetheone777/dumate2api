@@ -85,7 +85,7 @@
       <a-skeleton v-if="loading && !rows.length" active :paragraph="{ rows: 4 }" />
 
       <a-row v-else :gutter="[16, 16]">
-        <a-col v-for="a in rows" :key="a.id" :span="8" :xs="24" :md="8">
+        <a-col v-for="a in sortedRows" :key="a.id" :span="8" :xs="24" :md="8">
           <a-card size="small" :bordered="true" class="h-full">
             <div class="flex items-start justify-between">
               <div class="min-w-0 flex items-start gap-2">
@@ -139,6 +139,11 @@
                   />
                 </label>
               </div>
+            </div>
+
+            <!-- 临期角标（批次二十一）：expiring-snapshot 透出，快照陈旧不显示 -->
+            <div v-if="entryOf(a.id)" class="mt-2">
+              <ExpiringTag :entry="entryOf(a.id)" :fresh="expFresh" :preferred="preferredOf(a.id)" :window-days="expWindow" />
             </div>
 
             <a-alert
@@ -350,6 +355,8 @@ import { regionStore, regionParam, isIntlRegion } from '@/stores/region'
 import { traeworkApi } from '@/api/traework'
 import type { TraeworkAccount, TraeworkCreditRow, TraeworkIntlPlan, TraeworkStatus } from '@/api/traework'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
+import ExpiringTag from '@/components/ExpiringTag.vue'
+import { useExpiring } from '@/utils/expiringBadge'
 
 // message 走 App.useApp() 的实例（App.vue 已包 <a-app>），静态 import 拿不到上下文
 const { message } = App.useApp()
@@ -358,6 +365,10 @@ const status = ref<TraeworkStatus | null>(null)
 const credits = ref<{ count: number; rows: TraeworkCreditRow[] } | null>(null)
 const loading = ref(false)
 const rows = computed(() => status.value?.rows ?? [])
+
+// 临期角标（批次二十一）：快照通道之一，窗口 7 天（额度包到期即消失）
+const { entryOf, preferredOf, loadExpiring, reorder, expFresh, expWindow } = useExpiring('traework')
+const sortedRows = computed(() => reorder(rows.value, (x) => x.id))
 
 // TRAE 没有官方手机号接口（GetUserInfo 已 401），只在昵称恰好形如
 // 「用户13800138000」时才能取到。这段文案在取不到时作为 title 提示。
@@ -530,6 +541,7 @@ const errFresh = (a: TraeworkAccount) => lastErrorFresh(a)
 
 async function load() {
   loading.value = true
+  loadExpiring() // 独立数据源（临期快照），不阻塞账号列表
   try {
     const r = regionParam() as 'cn' | 'intl' | undefined
     const [s, c] = await Promise.all([

@@ -84,6 +84,16 @@
                 <div v-if="a.phoneMasked" class="text-xs text-slate-500 mt-1">
                   <span class="font-mono">{{ a.phoneMasked }}</span>
                 </div>
+                <!-- 临期角标（批次二十一）：qoder 不在 expiring-snapshot 里，
+                     从 grants 账本出（credits 行的 expiring* 字段）——有金额
+                     也有最早到期时刻，比快照通道的信息更全 -->
+                <div v-if="expiringOf(a.id)" class="mt-2">
+                  <a-tooltip title="7 天窗口内会作废的批次；金额是推算剩余（余额查不到时回落领取额口径）。明细见积分明细页的 Qoder 批次账本。">
+                    <a-tag :color="expiringOf(a.id)!.urgent ? 'red' : 'orange'">
+                      {{ expiringOf(a.id)!.dateText }} 到期 · 剩 {{ expiringOf(a.id)!.daysLeft }} 天 · ≈{{ expiringOf(a.id)!.amountText }} 积分
+                    </a-tag>
+                  </a-tooltip>
+                </div>
               </div>
               <a-switch
                 size="small"
@@ -323,6 +333,24 @@ const checkedInCount = computed(() => credits.value.filter((c) => c.checkedIn ==
 const subText = computed(() => 'Qoder 多账号池（凭证自持，device flow 取票）')
 
 const creditOf = (id: number) => credits.value.find((c) => c.id === id) || null
+
+// 临期角标（批次二十一）：grants 账本 → credits 行的 expiring* 字段。
+// 有临期批次才出标签（快照通道拿不到金额，qoder 恰好两样都有）。
+function expiringOf(id: number): { urgent: boolean; dateText: string; daysLeft: number; amountText: string } | null {
+  const c = creditOf(id)
+  if (!c?.expiringNearest || !c.expiringCount || !(Number(c.expiringAmount) > 0)) return null
+  const d = new Date(c.expiringNearest)
+  const p = (n: number) => String(n).padStart(2, '0')
+  const daysLeft = Math.max(1, Math.ceil((c.expiringNearest - Date.now()) / 86400000))
+  const amt = Number(c.expiringAmount).toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+  return {
+    urgent: daysLeft <= 3,
+    dateText: `${p(d.getMonth() + 1)}-${p(d.getDate())}`,
+    daysLeft,
+    // 推算剩余口径带 ≈ 前缀；回落领取额口径时如实不带（tooltip 说明）
+    amountText: (c.expiringEstimated ? '≈' : '') + amt,
+  }
+}
 // 该账号**最早到期**的批次。签到积分领取后 30 天作废，所以「最早到期」才是
 // 需要提醒的那个——给全部批次会淹没在列表里。
 // 数据来自本地账本 + 上游总余额的先领先扣推算（/qoder/grants）。

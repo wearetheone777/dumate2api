@@ -63,7 +63,7 @@
       </a-empty>
 
       <a-row v-else :gutter="[16, 16]">
-        <a-col v-for="a in accounts" :key="a.id" :span="8">
+        <a-col v-for="a in sortedAccounts" :key="a.id" :span="8">
           <a-card size="small" :bordered="true" class="h-full">
             <div class="flex items-start justify-between">
               <div>
@@ -90,6 +90,11 @@
               class="mt-2"
               style="padding: 4px 8px"
             />
+
+            <!-- 临期角标（批次二十一）：expiring-snapshot 透出；搭子窗口 30 天 -->
+            <div v-if="entryOf(a.id)" class="mt-2">
+              <ExpiringTag :entry="entryOf(a.id)" :fresh="expFresh" :preferred="preferredOf(a.id)" :window-days="expWindow" />
+            </div>
 
             <div class="mt-3 grid grid-cols-2 gap-2 text-sm">
               <div>
@@ -564,6 +569,8 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { DeleteOutlined } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import ExpiringTag from '@/components/ExpiringTag.vue'
+import { useExpiring } from '@/utils/expiringBadge'
 import { App } from 'ant-design-vue'
 import client from '@/api/client'
 import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
@@ -597,6 +604,11 @@ function onRestored() {
 }
 
 const accounts = ref<WebAccount[]>([])
+
+// 临期角标（批次二十一）：快照通道之一，窗口 30 天（签到积分包天然落在
+// 25~30 天区间，窗口必须 ≥30 天才不会恒空）；按紧迫度把临期账号排前面
+const { entryOf, preferredOf, loadExpiring, reorder, expFresh, expWindow } = useExpiring('dumate')
+const sortedAccounts = computed(() => reorder(accounts.value, (x) => x.id))
 const loginUrl = ref('')
 const loginSteps = ref<string[]>([])
 const addOpen = ref(false)
@@ -702,6 +714,7 @@ function checkinColor(r: string) {
 }
 
 async function load() {
+  loadExpiring() // 独立数据源（临期快照），不阻塞账号列表
   const { data } = await client.get('/web-accounts')
   accounts.value = data.accounts
   loginUrl.value = data.login_url

@@ -858,7 +858,7 @@ per-key 限流（低价值场景）。
 | `qwenwork-accounts.json` | 千问自持凭证账号池（**含 refresh token，等同密码**） |
 | `qoder-accounts.json` | Qoder 自持凭证账号池（device flow 换取，含 refresh token） |
 | `qoder-grants.jsonl` | Qoder 积分批次账本（**签到领取记录**，用于过期提醒；上游无逐批余额接口） |
-| `expiring-snapshot.json` | 四家通道（搭子/TRAE/千问/WorkBuddy）的临期积分快照：管理端 /credits 顺带写、网关选号读（FEFO）。WorkBuddy 的到期来自套餐 `CycleEndTime`（北京时间，2026-11-04 接入）。陈旧即退回普通轮询，进程间靠它通信，不通过 IPC（`src/expiring.js`） |
+| `expiring-snapshot.json` | 四家通道（搭子/TRAE/千问/WorkBuddy）的临期积分快照：管理端 /credits 顺带写、网关选号读（FEFO）。WorkBuddy 的到期来自套餐 `CycleEndTime`（北京时间，2026-11-04 接入）。陈旧即退回普通轮询，进程间靠它通信，不通过 IPC（`src/expiring.js`）。批次二十一补了第三个读方：`/api/admin/expiring` 只读出仓 → 五个账号卡视图的临期角标（`view()` 与 `accountIds()` 同判据；**快照只记时刻不记金额**——qoder 不在快照里，它的角标从 /qoder/credits 行的 expiring* 字段出）；界面在快照陈旧（fresh=false）时隐藏角标 |
 | `dumate-caps.json` | 搭子按模型 max_tokens 上限的自学习记录（7 天 TTL，`src/dumate-caps.js`；静态实测表在代码里） |
 | `traework-accounts.json` | TRAE 自持凭证账号池（OAuth 换取，含轮换的 refreshToken） |
 | `workbuddy-accounts.json` | WorkBuddy 自持凭证账号池（客户端认证文件导入或手动粘贴 token，含 refresh token；区域字段 cn/global） |

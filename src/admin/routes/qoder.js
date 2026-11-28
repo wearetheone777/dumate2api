@@ -236,6 +236,16 @@ const routes = [
         const v = m ? m.get(g.grantId) : null;
         return v != null ? v : 0;
       };
+      // 批次二十一角标：逐账号临期明细挂到 credits 行上（推算口径与 summary
+      // 同源；estOk=false 时整体回落领取额口径，与 summary 的行为一致）。
+      // expiring-snapshot 没有 qoder——账号卡的临期角标从这份账本出。
+      for (const r of rows) {
+        const gList = expiring.filter((g) => g.accountId === r.id);
+        r.expiringCount = gList.length;
+        r.expiringAmount = Number(gList.reduce((s, g) => s + (estOk ? estOf(g) : (g.amount || 0)), 0).toFixed(4));
+        r.expiringNearest = gList.length ? gList[0].expiresAt : null; // expiring 已按 expiresAt 升序
+        r.expiringEstimated = estOk;
+      }
       const grantedSum = expiring.reduce((s, r) => s + (r.amount || 0), 0);
       // 区域视图：临期批次按当前视图内的账号收窄
       const shownIds = new Set(rows.map((r) => r.id));

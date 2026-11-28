@@ -96,6 +96,15 @@ export interface QoderCreditRow {
   checkinNextAt: number | null
   /** 上次签到时刻（本地记录，上游不提供） */
   lastCheckin: number | null
+  // ---- 批次二十一角标：逐账号临期明细（grants 账本，快照没有 qoder）----
+  /** 7 天内到期批次数 */
+  expiringCount?: number
+  /** 推算剩余合计（estOk=false 时回落领取额口径，与 summary 行为一致） */
+  expiringAmount?: number
+  /** 最早到期批次的时刻（无临期批次为 null） */
+  expiringNearest?: number | null
+  /** expiringAmount 是否推算口径（false = 领取额口径） */
+  expiringEstimated?: boolean
 }
 
 /**

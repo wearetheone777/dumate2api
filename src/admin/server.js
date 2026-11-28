@@ -229,6 +229,8 @@ router.mount(PREFIX + '/workbuddy', workbuddyRoutes);
 router.mount(PREFIX + '/backup', require('./routes/backup').routes);
 // 存储管理（批次十七）：data/ 四类视图 + 先预览再确认的清理 + 60s 快照
 router.mount(PREFIX + '/storage', require('./routes/storage').routes);
+// 临期快照只读出仓（批次二十一）：账号卡角标的数据源，快照本身由各 /credits 写方维护
+router.mount(PREFIX + '/expiring', require('./routes/expiring').routes);
 router.mount(PREFIX + '/keys', keysRoutes);
 router.mount(PREFIX + '/cc-switch', ccswitchRoutes);
 router.mount(PREFIX + '/agent-setup', require('./routes/agent-setup').routes);
