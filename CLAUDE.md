@@ -904,6 +904,7 @@ per-key 限流（低价值场景）。
 | `admin/routes/traework.js` | TRAE Work 通道的管理接口：`/status` 通道健康+账号列表（mode=multi，可增删）、`/models` 模型表（只读）、`/credits` 各账号额度与签到状态、`/checkin` 手动签到（幂等）、`/billing-check` 计费自检探针、**`/login/url` + `/login/callback` 两步 OAuth 登录**、`DELETE/PATCH /accounts/:id` |
 | `admin/routes/qwenwork.js` | 千问办公通道的管理接口：`/status` 通道健康、`/credits` 三个池、`/credits/daily` 按天聚合、`/credits/records` 逐笔明细、`/billing-check` 计费自检探针、`/models` 模型表、**`/account` 登录态详情（只读）**、**`/accounts` 账号（`mode='single'` 表示单账号直连，不可增删）** |
 | `admin/routes/accounts.js` | 搭子网页账号的管理接口（签到/抽奖/积分/记录）。**回填与显示名的逻辑都在这里**（`backfillNickname` / `backfillAll`），属于管理端 |
+| `admin/routes/backup.js` | 备份分区表（批次十四，qoder-trae-workbuddy-switch 移植）：`GET /sections` + `/export` `/preview` `/import`。**SECTION_TABLE 是唯一分区清单**（5 账号分区按身份键合并、其余按顶层键合并），新增可备份类型 = 加一行；预览零写盘；导出默认脱敏（sensitive 分区必须显式含凭据+confirm）；**脱敏记录覆盖本地时保留本地凭据字段**。细节见 `docs/PLAN-WORKBUDDY-GITHUB-MERGE-2026-11-28.md` 批次十四行 |
 | `admin/routes/*.js` | 其余管理 API，按 `mount()` 挂载到 `/api/admin/<前缀>` |
 
 **千问登录态只读，管理端绝不写入。** 它存在官方客户端的 `auth-v2.dat` 里（Electron safeStorage：DPAPI 解 `Local State` 的 `encrypted_key` → 32B AES key → AES-256-GCM 解密）。官方客户端和我们各写一次会互相把对方的登录态刷掉，所以换账号必须开客户端操作。**不复制这个文件到 `data/`**——它会过期，复制一份立刻失效。`refresh_token` 过期（`refreshExpired`）要提前告警：access token 到期后无法自动续期。
