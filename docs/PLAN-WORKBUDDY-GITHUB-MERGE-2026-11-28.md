@@ -202,7 +202,7 @@ yreidev 的 `bizcode.go` 按官方 CLI 枚举归类。对照我们 `constants.js
 
 | 项 | 说明 |
 |---|---|
-| 长度截断无缝续写 | misakano `continue.go`（1107 行）：`deepseek-v4.1-flash` 单次输出硬上限 32000，`finish_reason=length` 且纯文本时同账号补发续写、帧接进同一条 SSE、usage 跨段合并；**工具参数截断（半截 JSON）不续**。对 Codex 写长文件场景价值明显，工程量中，单独排批 |
+| 长度截断无缝续写 | misakano `continue.go`（1107 行） | ✅ **已落地（批次二十三）**：新 `src/continue.js` 续写闸门挂进 web-pool 的 `callStreamWithFailover`（搭子网页凭证链路——9084 与 fallback-web 两个入口自动跟随；桌面 8980 直通路径不经 web-pool，不适用）。**机制**：闸门在响应头被接受后才创建（失败尝试的错误体不进闸门）；第一段全部帧**原样透传**（首字延迟零影响），只扣住收尾三件套（finish 帧 / usage 帧 / [DONE]）——扣住是为了让翻译层看到「没结束的流」；`finish_reason=length` 且段内无 tool_calls 且有正文时，同账号补发续写（原消息 + assistant 预填已生成文本 + 一条继续指令），续写段 delta 接进同一条流，循环到自然收尾 / 达段数上限（`DUMATE_CONTINUE_MAX` 默认 3）/ 失败。**usage 跨段合并**：prompt 取末段（续写 prompt 天然含前文，按段相加会双计输入）、completion 按段相加、total 按合并口径重算；合并值**重写**进放出的 usage 帧（客户端与翻译层读的就是流里那条），单段不重写保逐字节保真。**三条硬边界**：①段内出现过 tool_calls 绝不续（半截 JSON 补写只会生成重复/损坏参数）；②续写段的 reasoning_content 纯思考帧丢弃（第一段思考块已在协议上收口，中途无位置再开）、混合帧重建只留正文；③续写请求失败降级——恢复上一段扣住的收尾帧放出（客户端拿到与旧行为一致的「截断但完整收口」），失败段残余字节整段吞掉。开关 `DUMATE_CONTINUE_RETRY=0`。测试踩坑记录：扣住帧之后的空行必须**尾随扣住**（先透传会打乱字节顺序）；token 缓存按账号 id 记忆，接线测试每用例换独立账号 id 才能保证剧本对齐 | `src/continue.js` 新 + web-pool.js 接线 + continue-gate.test.js 12 项（闸门 8 + 接线 4，https.request 劫持） |
 | Key 级三维限额 | hub：日 token 限量 / 累计积分额度 / Key 级并发上限（有界排队 `Condition` 唤醒不瞬时 429）。多人分发时触发（M3 同口径） |
 | 随机排程窗口 | hub PR #32：签到/旅行在北京时间 08:00-10:00 抽取时段（只后延）；autocheckin 抖动窗口参数化，小改 |
 | 出口 IP 画像 | hub `wb_ipintel.py`：经代理取出口 IP → ip-api 查 hosting 标志分住宅/机房，失败报 unknown；纯本地 lookup |

@@ -525,18 +525,49 @@ async function callStreamWithFailover(path, method, body, onChunk, opts = {}) {
     tried.add(item.account.id);
 
     let accepted = false;
-    const r = await callModelStream(item.account, path, method, body, guardedChunk, {
+    // 长度截断无缝续写（批次二十三）：闸门在**响应头被接受之后**才创建——
+    // 失败尝试的错误体不能进闸门（会被解析成帧再透传出去，还污染段状态）。
+    // 闸门扣住每段的收尾三件套（finish/usage/[DONE]），finish_reason=length
+    // 且纯文本时同账号补发续写、帧接进同一条流；细节与边界见 src/continue.js。
+    let gate = null;
+    const r = await callModelStream(item.account, path, method, body, (c) => {
+      if (gate) gate.onChunk(c); else guardedChunk(c);
+    }, {
       ...opts,
       onStatus: (code) => {
-        // 2xx 才接受这次响应；否则标记未接受，让下面走故障转移
         accepted = code >= 200 && code < 300;
+        if (accepted && !gate) {
+          try {
+            const cont = require('./continue');
+            if (cont.enabled() && cont.maxSegments() > 0) {
+              gate = cont.createGate((c) => guardedChunk(c), { body });
+            }
+          } catch (e) { /* 闸门建不起来就按旧行为透传 */ }
+        }
         if (typeof opts.onStatus === 'function') { try { opts.onStatus(code); } catch (e) { /* 忽略 */ } }
       },
     });
 
     if (r.ok && accepted) {
       markSuccess(item.account.id);
-      return { ...r, attempts: i + 1 };
+      let result = { ...r, attempts: i + 1 };
+      if (gate) {
+        // 续写循环：同一账号补发，直到自然收尾 / 达段数上限 / 续写失败。
+        // 失败降级——finalize 放出已完成的最后一段的收尾帧，客户端拿到
+        // 与旧行为一致「截断但完整收口」的回答。
+        let seg = gate.segmentDone();
+        let guard = 0;
+        while (seg && seg.continue && guard < 10) {
+          guard++;
+          const cr = await callModelStream(item.account, path, method, seg.body, (c) => gate.onChunk(c), { ...opts, onStatus: undefined });
+          if (!cr.ok) { gate.restoreFallback(); break; } // 降级：恢复上一段收尾帧并吞掉失败段残余
+          seg = gate.segmentDone();
+        }
+        const fin = gate.finalize();
+        if (fin.usage) result = { ...result, usage: fin.usage };
+        if (fin.segments > 1) result = { ...result, continued: true, segments: fin.segments };
+      }
+      return result;
     }
 
     const status = r.status || 0;
