@@ -7,7 +7,14 @@ const fs = require('fs');
 const path = require('path');
 // 运行日志环形缓冲（调研 P1-9）：必须在任何 require 打第一条日志之前安装，
 // 否则启动横幅、模块加载警告都进不了 /logs 的回放窗口。
-require('./logbuffer').shared.install();
+const logbuffer = require('./logbuffer');
+logbuffer.shared.install();
+// 每日 JSONL 归档（批次十八）：sink 管道不占 SSE 订阅者名额；启动横幅之前的
+// 行不在（attach 在 require 之后就位，与 install 同一时刻），漏的只是安装前
+// 那几行 require 日志。
+try { require('./logarchive').attach(logbuffer.shared); } catch (e) {
+  console.warn('[logarchive] 归档管道挂载失败（不影响日志查看）:', e.message);
+}
 
 const router = require('./router');
 const auth = require('./auth');

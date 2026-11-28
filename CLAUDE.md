@@ -865,6 +865,7 @@ per-key 限流（低价值场景）。
 | `traework-credits.jsonl` | TRAE 逐请求积分归因（按账号的 consumed 游标，见 `traework/credits.js`） |
 | `points-cursor.jsonl` | 搭子的余额游标（每请求一条，相邻差值即该请求成本） |
 | `browser-profile/` | 浏览器登录器用的受控 profile 目录（`DUMATE_BROWSER_PATH` 找不到浏览器时才用） |
+| `logs/run-YYYY-MM-DD.jsonl` | 运行日志每日归档（批次十八）：管理端进程把脱敏后的 console 行按本地日追加一份（`jsonl.append` 单次写），30 天滚动清理挂在日期翻转上。`/api/admin/logs/export?days=N` 打包成 ZIP 下载。**只有管理端进程在写**（网关未 install logbuffer）；存储页只列 data/ 顶层条目，这个目录以一行聚合行出现且不可删 |
 
 **`DUMATE_ADMIN_DATA` 决定数据目录，管理端与网关必须一致**，否则读到的账号/埋点不同。默认都是 `<repo>/data`，正常启动无需设置。容器/自定义部署里如果改了一边没改另一边，症状是「管理端显示空账号、但请求明明成功」——先核对两边的数据目录。
 
@@ -908,6 +909,7 @@ per-key 限流（低价值场景）。
 | `admin/routes/backup.js` | 备份分区表（批次十四，qoder-trae-workbuddy-switch 移植）：`GET /sections` + `/export` `/preview` `/import`。**SECTION_TABLE 是唯一分区清单**（5 账号分区按身份键合并、其余按顶层键合并），新增可备份类型 = 加一行；预览零写盘；导出默认脱敏（sensitive 分区必须显式含凭据+confirm）；**脱敏记录覆盖本地时保留本地凭据字段**。细节见 `docs/PLAN-WORKBUDDY-GITHUB-MERGE-2026-11-28.md` 批次十四行 |
 | `admin/routes/storage.js` | 存储管理（批次十七）：data/ 四类视图 + 先预览再确认的清理 + 60s 快照。**白名单根只收裸文件名**（分隔符/`..` 参数形状上就拒）；**未识别文件一律 other/protected**——分类表（KNOWN）只登记认识的文件名，新增可清理文件 = 在 KNOWN 加一行标 `deletable:true`，绝不给未知文件放行；可删的只有 logs/cache 两类，checkin-ledger/qoder-grants/usage-agg/pool-state/admin-audit 这类「删了有行为后果或不可再生」的刻意归 config 保护。preview 响应不下发 fullPath。新增 data/ 文件后**它默认是保护的**——想让存储页能清理它必须显式登记 |
 | `admin/trash.js` | 账号回收站（批次十六）：五通道共用一套（SPECS 表驱动），**软删除搬移到独立回收站文件**而不是 live 里加标记——消费方零改动。写顺序「新增侧先落」（中途失败是两边都有不是数据丢失）；恢复 fail-closed（未知 key 拒/live 已有同 id 拒/preferred 排他归一）；30 天 + 200 条先到先出；损坏时全部写路径拒绝。`routesFor(channel)` 工厂四路由（GET /trash、POST /trash/clear、POST /trash/:key/restore、DELETE /trash/:key），**必须展开在各通道 routes 数组最前**（字面 /trash 先于 /:id 参数路由被匹配）；purge/clear 服务端强制 confirm。清扫循环挂管理端进程（`startSweep`，boot + 每小时）——网关进程从不写回收站文件，**别把清扫挪进网关 keepalive**（会引入跨进程写竞争） |
+| `admin/logbuffer.js` / `admin/logarchive.js` | 运行日志（调研 P1-9 + 批次十八）：内存环按行首特征分 **chat/task/sys 三频道**（每频道独立 500 行；`[chat]` 等显式标签直接命中、`[keepalive]` 等巡检前缀归 task、其余 sys；剥 ISO 时间戳前缀后再判，未知频道返回空不回落）。**脱敏在入缓冲之前、中文标签也要认**（密码/口令/密钥/秘钥/令牌/凭据 + 显式分隔符——`--reset-admin` 横幅打「密码:  值」，只认 ASCII 键名时整行漏过，2026-11-28 实测）；敏感行整行丢弃、不进环不落盘。归档走 **sink 管道**（`addSink`，不占 SSE 4 路订阅名额）→ `logarchive.js` 每日一份 JSONL + 30 天清理 + 零依赖 ZIP 导出（手拼 CRC32/本地头/EOCD，`unzip -t` 交叉验证过） |
 | `admin/routes/*.js` | 其余管理 API，按 `mount()` 挂载到 `/api/admin/<前缀>` |
 
 **千问登录态只读，管理端绝不写入。** 它存在官方客户端的 `auth-v2.dat` 里（Electron safeStorage：DPAPI 解 `Local State` 的 `encrypted_key` → 32B AES key → AES-256-GCM 解密）。官方客户端和我们各写一次会互相把对方的登录态刷掉，所以换账号必须开客户端操作。**不复制这个文件到 `data/`**——它会过期，复制一份立刻失效。`refresh_token` 过期（`refreshExpired`）要提前告警：access token 到期后无法自动续期。
