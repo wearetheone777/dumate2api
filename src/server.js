@@ -1711,6 +1711,89 @@ async function handleImageSearch(req, res) {
   }
 }
 
+// WorkBuddy agenttool 搜索/抓取 + 嵌入（批次八）。三条都是**只读端点**：
+// 搜索/抓取不消耗模型额度，嵌入走独立注册表；都**不喂池**——检索失败与
+// 对话可用性是两回事（dumate-web-api 只读端点同一纪律）。响应不做 OpenAI
+// chat 包装：结果形状与 chat completion 无关（qwenwork /v1/search/* 同口径）。
+async function handleWorkbuddySearch(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/search/agenttool';
+  req._channel = 'workbuddy';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
+  }
+  const body = pb.value;
+  const search = require('./workbuddy/search');
+  const region = req._apiKeyRegion === 'intl' ? 'global' : (req._apiKeyRegion || 'cn');
+  try {
+    const r = await search.webSearch({
+      query: body.query || body.q,
+      blockedDomains: body.blocked_domains || body.blockedDomains,
+    }, { region });
+    logRequest(req, res, startedAt, { model: 'workbuddy/agenttool-search', stream: false, messages: 0 }, 200, null, { media: 'agenttool_search', results: r.items.length });
+    return sendJSON(res, 200, { object: 'search_result', items: r.items, query: r.query, total_results: r.totalResults, response_time_ms: r.responseTimeMs });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'workbuddy/agenttool-search', stream: false, messages: 0 }, status, null, { media: 'agenttool_search', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleWorkbuddyFetch(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/webfetch';
+  req._channel = 'workbuddy';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
+  }
+  const body = pb.value;
+  const search = require('./workbuddy/search');
+  const region = req._apiKeyRegion === 'intl' ? 'global' : (req._apiKeyRegion || 'cn');
+  try {
+    const r = await search.webFetch({ url: body.url, format: body.format }, { region });
+    logRequest(req, res, startedAt, { model: 'workbuddy/webfetch', stream: false, messages: 0 }, 200, null, { media: 'webfetch', chars: r.content.length });
+    return sendJSON(res, 200, { url: r.url, title: r.title, content: r.content });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'workbuddy/webfetch', stream: false, messages: 0 }, status, null, { media: 'webfetch', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleWorkbuddyEmbeddings(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/embeddings';
+  req._channel = 'workbuddy';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  const pb = parseJsonBody(bodyStr);
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
+  }
+  const body = pb.value;
+  const emb = require('./workbuddy/embeddings');
+  const region = req._apiKeyRegion === 'intl' ? 'global' : (req._apiKeyRegion || 'cn');
+  try {
+    const r = await emb.sendEmbeddings({ input: body.input, model: body.model }, { region });
+    logRequest(req, res, startedAt, { model: `workbuddy/${r.model}`, stream: false, messages: 0 }, 200, null, {
+      media: 'embeddings', items: r.data.length,
+      prompt_tokens: r.usage ? r.usage.prompt_tokens : null,
+    });
+    return sendJSON(res, 200, r);
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: `workbuddy/${body.model || 'bge-m3'}`, stream: false, messages: 0 }, status, null, { media: 'embeddings', error: e.message });
+    const type = status === 400 ? 'invalid_request_error' : (status === 413 ? 'invalid_request_error' : 'api_error');
+    return sendJSON(res, status, { error: { message: e.message, type, ...(e.code ? { code: e.code } : {}) } });
+  }
+}
+
 async function handleFileUpload(req, res) {
   const startedAt = Date.now();
   req._logPath = '/v1/files/upload';
@@ -2911,7 +2994,13 @@ const server = http.createServer(async (req, res) => {
       // 解析不出来（如 GET /v1/models）就不传通道，validate 会跳过这条规则
       // ——不该因为「无法判定通道」把只读请求拒掉。
       let reqChannel = '';
-      if (model) {
+      if (req.method === 'POST' && /^\/(v1\/)?(search\/agenttool|webfetch|embeddings)/.test(url)) {
+        // WorkBuddy agenttool（批次八）路径归通道，**优先于 body.model**：
+        // /v1/embeddings 的 body 带 model:'bge-m3'（嵌入注册表的名字，不是
+        // 对话模型），按它 resolve 会落 dumate 兜底，区域/通道绑定的 key
+        // 就被 403 channel_not_allowed。
+        reqChannel = 'workbuddy';
+      } else if (model) {
         try {
           const r = require('./upstream-router').resolve(model);
           reqChannel = r.channel || '';
@@ -2920,7 +3009,9 @@ const server = http.createServer(async (req, res) => {
         // 无 model 字段的工具端点按路径归通道：搜索/语音润色/文件上传是千问
         // （纯国内），生图/视频/TTS 是搭子。不映射的话，区域绑定的 key 打
         // 这些端点会绕过 validate 的区域判定（channel 未知即跳过）。
-        if (/^\/(v1\/)?(search|voice\/polish|files\/upload)/.test(url)) reqChannel = 'qwenwork';
+        // search 必须写全 web|images：search/agenttool 是 workbuddy 的，
+        // 宽匹配会把它吞进千问。
+        if (/^\/(v1\/)?(search\/(web|images)|voice\/polish|files\/upload)/.test(url)) reqChannel = 'qwenwork';
         else if (/^\/(v1\/)?(images\/generations|videos\/generations|audio\/speech)/.test(url)) reqChannel = 'dumate';
       }
 
@@ -3003,6 +3094,18 @@ const server = http.createServer(async (req, res) => {
     // 调用方不要拿 session_id 当引用（它只是上传会话，不是文件标识）。
     if ((url === '/v1/files/upload' || url === '/files/upload') && req.method === 'POST') {
       return await handleFileUpload(req, res);
+    }
+    // WorkBuddy agenttool（批次八）：搜索/抓取/嵌入。路径不占用 qwenwork 的
+    // /v1/search/web（那是千问联网搜索）与搭子的 /v1/images/*（生图）——
+    // 各家语义独立，通道专属路径互不抢。
+    if ((url === '/v1/search/agenttool' || url === '/search/agenttool') && req.method === 'POST') {
+      return await handleWorkbuddySearch(req, res);
+    }
+    if ((url === '/v1/webfetch' || url === '/webfetch') && req.method === 'POST') {
+      return await handleWorkbuddyFetch(req, res);
+    }
+    if ((url === '/v1/embeddings' || url === '/embeddings') && req.method === 'POST') {
+      return await handleWorkbuddyEmbeddings(req, res);
     }
 
     // Responses API (Codex CLI 0.155+ 只认 wire_api="responses")

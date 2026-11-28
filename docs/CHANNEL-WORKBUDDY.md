@@ -748,3 +748,31 @@ if (!Number.isFinite(c)) return false;
 **RT >10 天强制续期（L0NE-6）——经核对已被既有行为覆盖，不新做**。keepalive 的 workbuddy 刷新腿自 P1-3（misakano #296 早死观测）起就是**每轮必刷**（720h 窗口恒真等价无条件，带 1h 最小间隔 + `lastRefreshAt` 落盘 + 退场跳过）——「距上次刷新 >10 天强制刷」这个条件在每轮必刷面前恒不触发，加上去只会是死代码。L0NE-6 关心的事（离线 30 天 RT 链断）真正的防线是「keepalive 开着」：keepalive 默认关（新排程不悄悄自启纪律），关着期间本来就没有任何续期路径，这是排程开关的显式选择，不是判据缺口；只要开着，RT 链永远 <1 天新鲜。唯一残值场景（keepalive 关 10~30 天后重开）首轮必刷照样救回来——不需要新判据。
 
 **x-device-token 负知识（Zhengyuuuui，写进「别再试」清单）**：**国际版官方客户端不产 `x-device-token`**（三轮抓包 + 二进制验证）；国内版才有，且一设备一账号。给国际版请求补这个头不是「更像官方」而是**更像非官方**——官方根本没有。别再试。
+
+### 11.10 批次八：agenttool 搜索/抓取 + embeddings（2026-11-28，hub + yreidev/misakano 双源 + 真机探针定案）
+
+**三条新上游能力端点全部探针先行**（`test/probe-workbuddy-agenttool.js`，轻量头集真机全 200）：
+
+| 端点 | 请求 | 实测形状 |
+|---|---|---|
+| `POST {chatBase}/agenttool/v1/search` | `{query}` | `{query, type:'text2text', provider:'1', results:[{title,url,snippet,site,favicon}]×5, total_results, response_time_ms}`；**query 原样回显**（我们拼的 `-site:` 也在回显里） |
+| `POST {chatBase}/agenttool/v1/webfetch` | `{url, format:'markdown'}` | `{url, title, content(markdown)}`；**http scheme 也认**，不强制 https |
+| `POST {chatBase}/v2/embeddings` | `{model:'bge-m3', input}` | 标准 OpenAI 信封 `{data:[{embedding:[×1024], object:'embedding'}], model, object:'list', usage:{prompt_tokens,total_tokens}}` |
+
+**纪律（与 dumate-web-api 只读端点同一套）**：不消耗模型额度——这是**千问之外的第二条免费搜索腿**；失败**不喂池不改账号健康**（检索失败与对话可用性是两回事，罚号只会让对话请求被无辜跳过）；禁跟随重定向（3xx→502，Authorization 不能跟着 30x 走，Node https.request 本身不跟随、3xx 原样浮出）；轻量头集（Bearer AT + CLI UA，**不带** X-Stainless-*/b3 链路头——agenttool 是 CLI 的工具子端点，不是对话链路）。
+
+**网关端点与鉴权映射的因果（本批最值的坑）**：`/v1/search/agenttool`、`/v1/webfetch`、`/v1/embeddings` 三条新路由挂 server.js。**`/v1/embeddings` 的 body.model 是嵌入注册表的名字（`bge-m3`），不是对话模型**——若鉴权段先按 `router.resolve(body.model)` 归通道，`bge-m3` 会落 dumate 兜底 → 通道绑定 key 直接 403 `channel_not_allowed`。所以 workbuddy 工具端点的**路径归通道分支必须放在 body.model resolve 之前**；同一提交把 qwenwork 的 `/search/` 匹配收窄到 `search/(web|images)`（原来宽匹配会先吞掉 `/v1/search/agenttool`）。这两处顺序有接线自证测试锁（indexOf 顺序断言 + 转义文本 includes）。
+
+**错误口径**（计划原文 + 探针实测）：
+
+- **11351 坏模型 → 400**。上游对坏嵌入模型报的是 **HTTP 500**（body 里才是 `{code:11351}`）——按状态码透传 = 客户端拿 502 当上游抖动无限重试，必须拆 body 收成 400，message 明示「嵌入与对话是两套注册表，实测可用：bge-m3」。两条收编路径都锁了测试：`e.upstreamCode`（信封解析出的）与 message 里的五位数正则（HTTP 500 的信封走 envelopeError 后 code 仍在 message 里）。
+- **11353 输入过长 → 400 `input_too_large`**，不换号——换号改变不了输入长度。
+- **8MiB 本地预检 → 413 `payload_too_large`**，不发上游（发了才知道更浪费）。
+- **条数不符 → 502 宁可不返回**。嵌入按请求位置配对，上游少回/多回一条就是静默错位，宁可整批失败。
+- **postTool 层**：4xx 状态码透传（信封 `{code,msg,requestId}` 解析进 message 与 `upstreamCode`）、5xx 收 502、2xx 非 JSON → 502（工具端点信封恒为 JSON，裸文本是上游异常）。
+
+**postTool 刻意不进 provider**：三条端点不走 `handleDirectChannel`（无对话、无预算、无翻译层），独立轻量实现（`src/workbuddy/search.js`，embeddings 复用它发请求）。账号选择 = `opts.account`（探针/管理端用）或区域第一个可用账号；`ensureFresh` 失败带旧 token 试——只读端点不值得为它走换票重试链。响应形状：search → `{object:'search_result', items, query, total_results, response_time_ms}`；embeddings 原样透传 OpenAI 信封（data/model/usage）。
+
+**验证**：`test/unit/workbuddy-agenttool.test.js` 17 项（buildQuery `-site:` 幂等 / 信封归一化 / 缺字段不炸 / url·query 校验 / 3xx 禁跟随 / 信封错误 / 非 JSON / normalizeInput 全形状 / 11351 双路径 / 11353 / 413 / 条数不符 / 其它错误透传 / 接线自证）；`npm test` 1792/1792、`npm run verify` 52/52；隔离实例冒烟六项（9085 scratch 实例，不动 9080）全过。**测试基建两个坑**：① stub `module.exports.postTool` 的**恢复必须写在测试体内**——顶层代码文件加载时执行，随后用例会把桩换回去（「Missing expected rejection」的根因）；② 接线自证 grep 正则字面量时源码里 `/` 写作 `\/`，按转义后文本比对。
+
+**待办**：server.js 已改，**9080 重启后三条端点才生效**（当前网关进程还是旧代码）。嵌入注册表暂只有 bge-m3 实测——上游若有新嵌入模型，先探针再放行，别把对话模型名透传进 embeddings（必 11351）。
