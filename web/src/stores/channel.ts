@@ -10,6 +10,10 @@
 // 选择持久化到 localStorage：刷新后保持，否则每次刷新都跳回搭子。
 import { reactive, computed } from 'vue'
 import client from '@/api/client'
+// 通道能力声明的单一来源（批次二十二）：仓库根 channels.def.json，后端
+// src/channels.js require 同一份——同一事实两处各写一份迟早不一致。
+// vite 原生支持 JSON import；改通道清单/能力位只改 JSON 一处。
+import DEF from '@def/channels'
 
 export interface ChannelInfo {
   id: string
@@ -42,45 +46,49 @@ export interface ChannelInfo {
 
 const STORAGE_KEY = 'lab-channel'
 
-// 通道定义。新增通道只需在这里加一条 + 后端 channels 里报出来。
-// menuKeys 是该通道**有意义**的菜单：搭子有账号池/积分/密钥，千问没有——
-// 与其让用户点进去看到一片空，不如直接隐藏。
-export const CHANNELS = [
-  {
-    id: 'dumate',
-    label: '百度搭子',
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
-  },
-  {
-    id: 'qwenwork',
-    label: '千问办公',
-    // 千问办公：单账号直连，没有「任务记录」（无签到/抽奖任务）。
-    // 账号管理先只读展示当前账号，后续接入多账号再开放写入。
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
-  },
-  {
-    id: 'traework',
-    label: 'TRAE Work',
-    // TRAE Work：凭证自持（OAuth 换取），有签到体系，但积分结构与搭子不同
-    // （是 credits 而非额度包），所以不显示搭子的「任务记录」。
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
-  },
-  {
-    id: 'qoder',
-    label: 'Qoder',
-    // Qoder：凭证自持（device flow 自取），与 TRAE 同构——多账号、有签到、
-    // 单一 credits 结构。签名纯本地，不需要任何客户端。
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
-  },
-  {
-    id: 'workbuddy',
-    label: 'WorkBuddy',
-    // WorkBuddy：第五通道（2026-11-03），标准 OpenAI 协议 + 双区域账号
-    // （国内 copilot.tencent.com / 国际 workbuddy.ai）。凭证自持（登录流程
-    // 后置期从客户端认证文件导入），有签到（仅国内版）。
-    menuKeys: ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account', 'points', 'web-accounts', 'alerts'],
-  },
-] as const
+/** 能力位（与 channels.def.json 的 capabilities 字段一一对应） */
+export interface ChannelCaps {
+  checkin: boolean
+  credits: boolean
+  growth: boolean
+  media: boolean
+  search: boolean
+  regions: string[]
+}
+
+export interface ChannelDef {
+  id: string
+  label: string
+  kind: 'http' | 'direct'
+  capabilities: ChannelCaps
+}
+
+// JSON import 的类型是宽泛的 JsonValue，这里收敛成强类型（字段缺失/写错在
+// vue-tsc 处不报——所以后端有 channels-caps 测试锁声明文件的形状）
+export const CHANNEL_DEFS = DEF.channels as unknown as ChannelDef[]
+
+const defOf = (id: string): ChannelDef | null => CHANNEL_DEFS.find((c) => c.id === id) || null
+
+/**
+ * 菜单白名单从能力位派生（批次二十二）：credits → 「积分明细」，其余菜单
+ * 所有通道都有。派生顺序必须与历史 menuKeys 数组逐位一致（dashboard →
+ * chatlab → usage → reqlogs → models → keys → account → points →
+ * web-accounts → alerts），否则侧栏顺序会悄悄变。
+ */
+function menuKeysFor(c: ChannelDef): string[] {
+  const keys = ['dashboard', 'chatlab', 'usage', 'reqlogs', 'models', 'keys', 'account']
+  if (c.capabilities.credits) keys.push('points')
+  keys.push('web-accounts', 'alerts')
+  return keys
+}
+
+// 通道定义。新增通道只在 channels.def.json 加一条，这里与后端 channels.js
+// 自动跟随——不再各自维护一份清单。
+export const CHANNELS = CHANNEL_DEFS.map((c) => ({
+  id: c.id,
+  label: c.label,
+  menuKeys: menuKeysFor(c),
+}))
 
 export function channelLabel(id: string): string {
   const c = CHANNELS.find((x) => x.id === id)
@@ -90,12 +98,20 @@ export function channelLabel(id: string): string {
 /**
  * 当前通道是不是「直连型」（千问办公 / TRAE Work）。
  *
- * 这两个通道与搭子的账单模型完全不同（搭子用上游账单+余额游标，
+ * 直连通道与搭子的账单模型完全不同（搭子用上游账单+余额游标，
  * 直连通道用各自的积分池），所以界面上凡是要区分「看哪套账」的地方，
- * 都用这个判定而不是逐个比对 id——否则加一条通道就要改八个页面。
+ * 都用这个判定而不是逐个比对 id——kind 从 channels.def.json 的声明读
+ * （批次二十二），加通道不再改判定函数。
  */
 export function isDirectChannel(id: string = channelStore.current): boolean {
-  return id === 'qwenwork' || id === 'traework' || id === 'qoder' || id === 'workbuddy'
+  const c = defOf(id)
+  return !!c && c.kind === 'direct'
+}
+
+/** 当前通道是否具备某能力位（批次二十二：能力位是声明不是分支） */
+export function channelCan(cap: keyof ChannelCaps, id: string = channelStore.current): boolean {
+  const c = defOf(id)
+  return !!c && c.capabilities[cap] === true
 }
 
 /**
@@ -126,11 +142,11 @@ export function isWorkBuddy(id: string = channelStore.current): boolean {
 /**
  * 服务端通道筛选参数。usage / reqlogs / keys 三个接口都按它过滤，
  * 默认搭子——不传就返回全通道，卡片与表格会对不上。
+ * 有效性从声明表判（不在清单里的 id 归搭子，与后端 normalize 同语义）。
  */
 export function channelParam(): 'dumate' | 'qwenwork' | 'traework' | 'qoder' | 'workbuddy' {
   const id = channelStore.current
-  if (id === 'qwenwork' || id === 'traework' || id === 'qoder' || id === 'workbuddy') return id
-  return 'dumate'
+  return defOf(id) ? (id as 'dumate' | 'qwenwork' | 'traework' | 'qoder' | 'workbuddy') : 'dumate'
 }
 
 function initial(): string {
