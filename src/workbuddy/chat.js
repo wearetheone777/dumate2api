@@ -254,7 +254,7 @@ function guardEmptyTextParts(messages) {
  * @param {object} account 账号（uid 用于缓存键）
  * @returns {{ body: string, convId: string, traceId: string }} 出站 JSON 串、会话 id（三头与 body 同源）与会话级 TraceId（32-hex）
  */
-function buildChatBody(payload, region, account) {
+function buildChatBody(payload, region, account, opts = {}) {
   let obj = payload;
   if (typeof payload === 'string') {
     try { obj = JSON.parse(payload); } catch (e) { obj = { messages: [] }; }
@@ -393,6 +393,32 @@ function buildChatBody(payload, region, account) {
   }
   thinking.backfillReasoningContent(body);
 
+  // 批次十：会话轮级字段（misakano conv_fields.go，两版真机抓包同构）。官方把
+  // 「这一轮属于哪个 request-id」同时写在**头**（X-Conversation-Request-ID）和
+  // **体**（最后一条 user 的 conversationRequestId）里——网关之前只写头，
+  // 头体不一致本身就是可判别指纹。注入点必须在 thinking 之后（字段不该被
+  // 后续处理触碰）。
+  //
+  // 边界（不伪造，conv_fields.go 原文口径）：
+  //   - 只给「当前轮」的最后一条 user 消息写；历史消息的轮级 ID OpenAI 协议
+  //     无此字段，无从得知，**不编造**（对不上的 ID 比缺失更容易被抓）；
+  //   - assistant 的 messageId/usage/model 由真实调用产出，历史部分同样不补；
+  //   - 客户端已自带 conversationRequestId → 原值优先不覆盖；
+  //   - opts.convReqId 为空（独立调用方没走 postStream）→ 整个跳过，不写空值。
+  if (opts.convReqId && Array.isArray(body.messages) && body.messages.length) {
+    let idx = -1;
+    for (let i = body.messages.length - 1; i >= 0; i--) {
+      const m = body.messages[i];
+      if (m && typeof m === 'object' && String(m.role || '').toLowerCase() === 'user') { idx = i; break; }
+    }
+    if (idx >= 0) {
+      const cur = body.messages[idx];
+      if (!String(cur.conversationRequestId || '').trim()) cur.conversationRequestId = opts.convReqId;
+      if (cur.startsNewUserRequest === undefined) cur.startsNewUserRequest = true;
+      if (!String(cur.agent || '').trim()) cur.agent = 'cli';
+    }
+  }
+
   return { body: JSON.stringify(body), convId, traceId };
 }
 
@@ -500,13 +526,15 @@ function chatUserAgent(region) {
  *   （X-B3-TraceId / traceparent / b3）随会话延续（P2「b3 链路随会话延续」）；
  *   不传或形状不对则每请求生成新 uuidv7（activity.js 等调用方不受影响）。
  */
-function chatHeaders(region, account, bodyLen, convId, traceIdHex) {
+function chatHeaders(region, account, bodyLen, convId, traceIdHex, opts = {}) {
   const spec = c.specOf(region);
   const clientVersion = (process.env.DUMATE_WORKBUDDY_APP_VERSION || '').trim()
     || spec.fallbackAppVersion;
   const product = region === 'global' ? 'workbuddy-ai' : 'WorkBuddy';
   const msgId = uuidv7hex();
-  const convReqId = uuidv7hex();
+  // convReqId 可由调用方传入（postStream：头体必须同源——body 里最后一条 user
+  // 的 conversationRequestId 写的就是同一个值，批次十）；不传则本级生成。
+  const convReqId = String(opts.convReqId || '') || uuidv7hex();
   const traceId = /^[0-9a-f]{32}$/.test(String(traceIdHex || ''))
     ? String(traceIdHex).toLowerCase()
     : uuidv7hex();
@@ -519,7 +547,9 @@ function chatHeaders(region, account, bodyLen, convId, traceIdHex) {
     'X-Product': 'SaaS',
     'X-Agent-Purpose': 'conversation',
     'X-Agent-Intent': 'craft',
-    'X-Agent-Type': 'main',
+    // agentType 可覆写（批次十窗口探针用 auxiliary——panel 口径：内部维护请求
+    // 不是用户主对话，上游看到的仍是一个正常 chat 请求）
+    'X-Agent-Type': String(opts.agentType || '') || 'main',
     'X-Agent-Runtime': 'local-agent',
     'X-Private-Data': 'true',
     'X-Client-Version': clientVersion,
@@ -585,21 +615,30 @@ function chatHeaders(region, account, bodyLen, convId, traceIdHex) {
  * 每请求最多一次。响应体带 `retry_policy.retry === false` 时上游明说别重试——
  * 不 failover 也不记熔断。详见 failover.js。
  */
-function postStream(region, account, payload) {
+function postStream(region, account, payload, opts = {}) {
   return new Promise((resolve) => {
     let agent = null;
     try { agent = require('../proxy-agent').getAgentFor(account); } catch (e) {
       return resolve({ stream: null, status: 0, error: `出站代理配置错误: ${e.message}`, fatal: true });
     }
     const spec = c.specOf(region);
-    const { body, convId, traceId } = buildChatBody(payload, region, account);
+    // 本轮聚合主键先于 body 构造生成：buildChatBody 把它写进最后一条 user 的
+    // conversationRequestId，chatHeaders 把同一个值写进 X-Conversation-Request-ID
+    // （批次十头体同源；failover 重发同一份 body，主键不换）
+    const convReqId = uuidv7hex();
+    const { body, convId, traceId } = buildChatBody(payload, region, account, {
+      convReqId,
+    });
     const chain = failover.chainFor(region, spec.chatBase);
     const maxIdx = Math.min(1, chain.length - 1); // 每请求最多一次 failover
     const attempt = (idx) => {
       const cand = chain[idx];
       const u = new URL(cand.base + c.EP_CHAT);
       const headers = {
-        ...chatHeaders(region, account, Buffer.byteLength(body), convId, traceId),
+        ...chatHeaders(region, account, Buffer.byteLength(body), convId, traceId, {
+          convReqId,
+          agentType: opts.agentType,
+        }),
         'User-Agent': chatUserAgent(region),
       };
       const reqOpts = {

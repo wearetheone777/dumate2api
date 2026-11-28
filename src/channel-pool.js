@@ -556,6 +556,11 @@ function noteError(channel, id, info) {
 function _stickySize() { return sticky.size(); }
 function _stickyClear() { sticky.clear(); }
 
+/** 清掉 (账号, 模型) 的模型级冷却（批次十窗口探针用：探针证明窗口已开才清） */
+function clearModelBlock(channel, id, model) {
+  try { pool.clearModelBlock(uidOf(channel, id), model); } catch (e) { /* 池操作失败不影响探针 */ }
+}
+
 /**
  * 写入账号余额快照（2026-11-08 融合批）。
  *
@@ -650,6 +655,7 @@ function fallbackLowestFloor(channel, candidates, opts = {}) {
 
 module.exports = {
   uidOf, sessionKeyOf, sessionKeyFor, systemTextOf, pickCandidate, availability, release, noteSuccess, noteError,
+  clearModelBlock,
   noteCredits, creditsOf,
   // 策略读取器（离线验证与 /config 端点报当前生效策略用）
   pickStrategyOf, inflightMaxOf, minIntervalMsOf, creditFloorOf, leastInflightOrder, fallbackLowestFloor,

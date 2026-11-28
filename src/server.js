@@ -3449,6 +3449,16 @@ async function start() {
     log('· Qoder 通道已关闭（DUMATE_QODER_AUTOSTART=off）');
   }
 
+  // WorkBuddy 6004 窗口探针循环（批次十）：登记侧在 workbuddy/index.js 的
+  // model_cap 分支，执行侧在这里——冷却与选号状态都在网关进程里，探针循环
+  // 必须跟它们同进程。独立开关 DUMATE_WORKBUDDY_WINDOW_PROBE=0 关闭；
+  // 无登记窗口时只是 30s 一次的空转检查，不产生任何上游请求。
+  try {
+    require('./workbuddy/windowprobe').startLoop();
+  } catch (e) {
+    log(`⚠ WorkBuddy 窗口探针启动失败（不影响对话链路）: ${e.message}`);
+  }
+
 
 
   server.listen(PROXY_PORT, PROXY_HOST, () => {

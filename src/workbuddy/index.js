@@ -949,8 +949,19 @@ async function runConversation(region, auth, payload, onChunk, model, opts = {})
         // 落 undefined 会让池按账号级默认处置，量级不对
         e.modelCap = true;
         const reset = c.parseRateLimitReset(text);
-        if (reset) e.retryAfterMs = Math.max(0, reset * 1000 - Date.now());
-        else e.retryAfterMs = 300000;
+        if (reset) {
+          e.retryAfterMs = Math.max(0, reset * 1000 - Date.now());
+          // 登记侧（批次十窗口探针）：只在重置墙钟已知时登记 (账号,模型) 窗口
+          // ——到点由探针发最小请求钉住新一轮窗口起点，避免「重置了却没人发
+          // 请求 → 窗口不开始 → 额度空转」（windowprobe.go 原文口径）
+          try {
+            require('./windowprobe').registerWindow(auth.id, model, reset * 1000, {
+              region, detail: text.slice(0, 200),
+            });
+          } catch (e2) { /* 登记失败不影响请求 */ }
+        } else {
+          e.retryAfterMs = 300000;
+        }
       }
       if (kind === 'temp_rate') {
         // 14003 临时限流：有重置墙钟就按它，没有兜底 ~30s（yreidev 口径）

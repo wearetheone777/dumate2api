@@ -619,6 +619,49 @@ const routes = [
     },
   },
   {
+    // 6004 额度窗口表（批次十）：登记侧在 index.js model_cap 分支（带重置墙钟
+    // 才登记），执行侧 windowprobe.js 到点发最小探针钉住新一轮窗口起点。
+    method: 'GET',
+    path: '/windows',
+    handler: async ({ res }) => {
+      const wp = require('../../workbuddy/windowprobe');
+      const now = Date.now();
+      const rows = wp.listWindows().map((w) => ({
+        ...w,
+        due: Number(w.resetAt) <= now,
+        in_ms: Math.max(0, Number(w.resetAt) - now),
+      }));
+      return sendJSON(res, 200, {
+        ok: true,
+        enabled: wp.enabled(),
+        next_due_in_ms: wp.nextDue() != null ? Math.max(0, wp.nextDue() - now) : null,
+        windows: rows,
+      });
+    },
+  },
+  {
+    // 立即探针：不等到点，把当前所有已登记窗口（或指定 账号+模型）立刻探一遍。
+    // panel RunModelWindowProbeNow 同款——探针是真实计费对话请求，按钮要慎重。
+    method: 'POST',
+    path: '/windows/run',
+    handler: async ({ res, req, body }) => {
+      const wp = require('../../workbuddy/windowprobe');
+      if (!wp.enabled()) return sendJSON(res, 200, { ok: false, error: '窗口探针已关闭（DUMATE_WORKBUDDY_WINDOW_PROBE=0）' });
+      const accId = Number(body && body.account_id);
+      const mdl = String((body && body.model) || '').trim();
+      let targets = wp.listWindows();
+      if (accId && mdl) targets = targets.filter((w) => w.accountId === accId && w.model === mdl);
+      const due = targets.filter((w) => Number(w.resetAt) <= Date.now());
+      // 未到点的窗口不提前探——提前探会把「还没重置」误记成一次尝试，纯浪费
+      const notDue = targets.length - due.length;
+      if (!due.length) {
+        return sendJSON(res, 200, { ok: true, sent: 0, results: [], not_due: notDue, note: '没有到点的窗口（探针只在到点后才有意义）' });
+      }
+      const r = await wp.runDue();
+      return sendJSON(res, 200, { ok: true, sent: r.sent, results: r.results, skipped_not_due: notDue });
+    },
+  },
+  {
     method: 'GET',
     path: '/tasks/scan',
     handler: async ({ res, req }) => {

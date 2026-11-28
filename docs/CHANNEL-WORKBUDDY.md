@@ -799,3 +799,22 @@ if (!Number.isFinite(c)) return false;
 **冒烟假象教训**：4MB 用例首测 502 空体——是本机 `http_proxy=7897` 在「413 提前断连」场景的产物，`--noproxy '*'` 直连 413 正确。**凡「预期短响应 + 大上传」的冒烟用例都要绕代理**，否则测的是代理不是网关。
 
 **验证**：workbuddy-audio 19 项；npm test 1811/1811、verify 52/52；隔离实例（9085）六项冒烟全过。**9080 重启后生效**。上游语音模型不在 /v1/models 目录（独立端点），/v1/models 不列。
+
+### 11.12 批次十：body 轮级字段（头体同源）+ 6004 窗口探针（2026-11-28，misakano conv_fields.go / windowprobe.go 移植）
+
+**① 头体同源（conv_fields.go，A/B 探针真机定案）**。官方把「这一轮属于哪个 request-id」同时写在**头**（`X-Conversation-Request-ID`）与**体**（最后一条 user 的 `conversationRequestId`）里——网关原来只写头，头体不一致本身就是可判别指纹。现在 `postStream` 生成一份 `convReqId`（uuidv7hex，**failover 重发同一份 body 不换主键**）同时进 `chatHeaders`（第六参 `opts`）与 `buildChatBody`（第四参 `opts.convReqId`）。注入点在 thinking 之后（字段不该被后续处理触碰）。
+
+**不伪造边界**（conv_fields.go 原文口径，探针 A/B 双 PASS 后默认开）：只写**当前轮最后一条 user**，历史消息的轮级 ID 无从得知不编造（对不上的 ID 比缺失更容易被抓）；assistant 的 messageId/usage/model 由真实调用产出不补；客户端已带的值原值优先（显式值是意图）；`startsNewUserRequest` 只补 undefined（显式 false 不覆盖）；`opts.convReqId` 为空（独立调用方没走 postStream，如 audio/activity）整个跳过，不写空值。`X-Agent-Type` 可经 `opts.agentType` 覆写（窗口探针用 `auxiliary`），默认 `main`。
+
+**② 6004 窗口探针（windowprobe.go 移植）**。上游按**首次请求**起算新一轮配额窗口——重置时刻到了没人发请求，额度一直空转；原处理只到「解除冷却」，是被动的。两半：
+
+- **登记侧**（`index.js` model_cap 分支）：6004 带重置墙钟（`parseRateLimitReset` 解析成功）时登记 (账号,模型) 窗口，落 `data/workbuddy-model-windows.json`（原子写，跨重启）。新墙钟无条件覆盖旧值、计数归零——重试期间的每次 429 都可能带来更准的时刻。
+- **执行侧**（`windowprobe.js`，网关进程 `startLoop()` 驱动）：到点发最小请求（`"Hi"` + `max_tokens:16` **必须 stream:true**，`X-Agent-Type: auxiliary`——panel 口径：内部维护请求不是用户主对话）钉住窗口起点。**走 chat.postStream 真实代码路径**（与真实流量同一套 body 构造/头集），只打桩不留旁路。
+
+**四分支处置**（每条路径都删记录或推后时刻，循环不空转）：首个有效帧带 choices → 窗口已开，清 (账号,模型) 模型冷却 + 删记录；仍限流且给了更晚重置点（>现在+30s）→ 换新墙钟计数归零；同时刻（服务端时钟/处理延迟）→ 15s 后重试，连续 20 次（≈5 分钟）后放弃；其它错误（网络/鉴权/5xx/200 流里非限流错误帧）→ 不重试直接删——探针是真实计费请求，不值得反复打。
+
+**闸门与纪律**：探针过同一套选号闸门（账号退场/停用/区域不符 → 不发直接删，记录留着只会每轮被取出）；探针本身**不喂池**（成功不清账号状态、失败不罚号）；批量 8 个、间隔 400ms；无登记窗口时 30s 一次空转检查，不产生任何上游请求。**HTTP 200 里的限流不能只看状态码**——上游常把限流塞进 200 的 SSE 错误帧，`scanProbeStream` 读到第一个有效帧再分类，否则会把「仍在限流」当成打通、清掉冷却钉错起点。6004 信封措辞注意：`quota exceeded` 是 HARD_CREDIT 标记且先于 model_cap 判——测试信封必须用 code 6004 + 中性措辞，措辞撞上会被误分类。
+
+**管理端**：`GET /api/admin/workbuddy/windows`（窗口表 + due 状态 + `next_due_in_ms`）、`POST /api/admin/workbuddy/windows/run`（立即探针，`account_id`+`model` 可点名；**未到点窗口不提前探**——提前探会把「还没重置」误记成一次尝试，纯浪费）。开关 `DUMATE_WORKBUDDY_WINDOW_PROBE=0` 关（关闭时 GET 如实报 enabled:false、run 明确拒绝）。
+
+**验证**：workbuddy-convfields 9 项 + workbuddy-windowprobe 15 项（四分支/闸门/批量截断/接线自证五路）+ verify-workbuddy-window-api.js 7 项（HTTP 层）；npm test 1835/1835、verify 52/52。**9080 重启后生效**（注入即默认开、探针循环随网关起）。
