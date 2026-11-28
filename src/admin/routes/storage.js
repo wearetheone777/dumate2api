@@ -92,7 +92,8 @@ function classify(name, isDir) {
     if (name === 'browser-profile') return { category: 'credentials', note: '浏览器登录器 profile（含登录态）' };
     if (name === 'runs') return { category: 'config', note: '任务原始产物目录' };
     if (name === 'logs') return { category: 'logs', note: '运行日志归档目录（每日一份，30 天滚动清理；ZIP 导出在用，目录本身不删）' };
-    return { category: 'other', note: '未识别目录（保护）' };  }
+    return { category: 'other', note: '未识别目录（保护）' };
+  }
   if (KNOWN[name]) return { ...KNOWN[name] };
   // 回收站文件（批次十六）与轮转产物按规则归类
   if (/-accounts-trash\.json$/.test(name)) return { category: 'credentials', note: '账号回收站（去账号页管理）' };
