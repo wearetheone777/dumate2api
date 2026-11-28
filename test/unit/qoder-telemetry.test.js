@@ -117,7 +117,91 @@ test('qoder/index 真的会喂遥测（接线回归：不能只写模块不接�
   // （WorkBuddy 的 webagent.dailyActivity 代码齐全却从没被调用）。
   const src = require('fs').readFileSync(
     require('path').resolve(__dirname, '../../src/qoder/index.js'), 'utf8');
-  assert.match(src, /telemetry\.note\('ok'\)/, '成功分支要计数');
+  assert.match(src, /telemetry\.note\('ok', scopeOf\(account, model\)\)/, '成功分支要带作用域计数');
   assert.match(src, /telemetry\.note\(telemetry\.kindOf\(/, '失败分支要按分类计数');
   assert.match(src, /classifyForTelemetry\(e, model\)/, '失败分类要复用 upstream-errors');
+});
+
+
+// ---- P1-5 排队观察 ----
+
+test('observationSnapshot：按 (area, account, model) 隔离，reason 恒 unknown', () => {
+  const now = Date.now();
+  telemetry.note('queued', { area: 'cn', accountId: 1, model: 'dfmodel', queueType: 'p7', now });
+  telemetry.note('queued', { area: 'cn', accountId: 2, model: 'dfmodel', queueType: 'p1', now });
+  telemetry.note('queued', { area: 'global', accountId: 1, model: 'dfmodel', queueType: 'p9', now });
+  telemetry.note('queued', { area: 'cn', accountId: 1, model: 'gfmodel', queueType: 'p0', now });
+  const s = telemetry.observationSnapshot(now);
+  assert.strictEqual(s.total, 4);
+  assert.strictEqual(s.windowMs, telemetry.OBSERVE_TTL_MS);
+  const row = s.rows.find((r) => r.account === 1 && r.model === 'dfmodel' && r.area === 'cn');
+  assert.strictEqual(row.queueType, 'p7');
+  assert.strictEqual(row.queued, 1);
+  for (const r of s.rows) assert.strictEqual(r.reason, 'unknown');
+});
+
+test('observationSnapshot：并发记账按作用域累加，queueType 非法归 unknown', () => {
+  const now = Date.now();
+  for (let i = 0; i < 5; i++) {
+    telemetry.note('queued', { area: 'cn', accountId: 3, model: 'gfmodel', queueType: 'p2', now });
+  }
+  for (let i = 0; i < 3; i++) {
+    telemetry.note('throttled', { area: 'cn', accountId: 3, model: 'gfmodel', now });
+  }
+  for (let i = 0; i < 2; i++) {
+    telemetry.note('rejected', { area: 'cn', accountId: 3, model: 'gfmodel', queueType: 'q9', now });
+  }
+  const s = telemetry.observationSnapshot(now);
+  const row = s.rows.find((r) => r.account === 3 && r.model === 'gfmodel');
+  assert.strictEqual(row.queued, 5);
+  assert.strictEqual(row.throttled, 3);
+  assert.strictEqual(row.rejected, 2);
+  assert.strictEqual(row.queueType, 'p2', '最后一个合法排队类型');
+  // 只有非法 queueType 时记 unknown
+  telemetry.note('queued', { area: 'cn', accountId: 9, model: 'x', queueType: 'p10', now });
+  const bad = telemetry.observationSnapshot(now).rows.find((r) => r.account === 9);
+  assert.strictEqual(bad.queueType, 'unknown');
+});
+
+test('observationSnapshot：成功只清匹配作用域，别的账号/模型不受影响', () => {
+  const now = Date.now();
+  telemetry.note('queued', { area: 'cn', accountId: 1, model: 'dfmodel', queueType: 'p3', now });
+  telemetry.note('queued', { area: 'cn', accountId: 2, model: 'dfmodel', queueType: 'p5', now });
+  telemetry.note('ok', { area: 'cn', accountId: 1, model: 'dfmodel', now });
+  const s = telemetry.observationSnapshot(now);
+  const hit = s.rows.find((r) => r.account === 1);
+  const other = s.rows.find((r) => r.account === 2);
+  assert.strictEqual(hit.queued, 0);
+  assert.strictEqual(hit.throttled, 0);
+  assert.strictEqual(hit.queueType, 'unknown');
+  assert.strictEqual(hit.ok, 1);
+  assert.ok(hit.clearedAt > 0);
+  assert.strictEqual(other.queued, 1, '别的账号不受影响');
+  assert.strictEqual(other.queueType, 'p5');
+});
+
+test('observationSnapshot：TTL 过期行不出现在快照里', () => {
+  const now = Date.now();
+  telemetry.note('queued', { area: 'cn', accountId: 1, model: 'dfmodel', queueType: 'p3', now: now - telemetry.OBSERVE_TTL_MS - 1000 });
+  telemetry.note('queued', { area: 'cn', accountId: 2, model: 'dfmodel', queueType: 'p4', now });
+  const s = telemetry.observationSnapshot(now);
+  assert.strictEqual(s.total, 1);
+  assert.strictEqual(s.rows[0].account, 2);
+});
+
+test('observationSnapshot：有界 200 条，超过丢最老', () => {
+  const now = Date.now();
+  for (let i = 0; i < telemetry.OBSERVE_MAX + 25; i++) {
+    telemetry.note('queued', { area: 'cn', accountId: i, model: 'm', queueType: 'p1', now: now + i });
+  }
+  const s = telemetry.observationSnapshot(now + telemetry.OBSERVE_MAX + 25);
+  assert.strictEqual(s.total, telemetry.OBSERVE_MAX);
+  assert.ok(s.rows.every((r) => r.account >= 25));
+});
+
+test('observationSnapshot：note 缺字段不造观察行；ok 没有旧观察也不造行', () => {
+  const now = Date.now();
+  telemetry.note('ok', { now });
+  telemetry.note('queued', { now });
+  assert.strictEqual(telemetry.observationSnapshot(now).total, 0);
 });

@@ -21,12 +21,20 @@
 // 字段（restriction）：见下；字段（guard）：额度护栏（P1-6）
 //   guard.enabled     是否按「套餐剩余低于阈值」把账号从候选里剔除（默认关）
 //   guard.threshold   阈值（积分，默认 1；< 阈值即跳过该账号）
+//   guard.creditFloor pool 层保留积分下限（0 = 关闭）
+// 字段（thinking）：DeepSeek 思考注入开关（2026-11-28 P0-4，thinking.js）
+//   thinking.enabled       默认开（对齐官方客户端：deepseek 系必带 thinking+effort）
+//   thinking.defaultEffort 默认档覆盖（'' = 用模型目录 reasoning.defaultEffort，
+//                          目录也没有时 thinking.js 兜底 'high'）
+// 字段（systemTail）：system 后置救前缀缓存（2026-11-28 P1-1，默认关）
+//   systemTail.enabled  开头连续 system 块挪到消息末尾、头部放恒定短桩——
+//                       前缀缓存键变小且跨会话稳定（仅 cn 区域生效，chat.js）
 const fs = require('fs');
 const path = require('path');
 const filelock = require('../filelock');
 
 const FILE = 'workbuddy-runtime.json';
-const FIELDS = ['restriction', 'guard'];
+const FIELDS = ['restriction', 'guard', 'thinking', 'systemTail'];
 
 function dataDir() {
   return process.env.DUMATE_ADMIN_DATA || path.resolve(__dirname, '..', '..', 'data');
@@ -43,6 +51,23 @@ function envInt(name, dflt, min, max) {
   const n = parseInt(raw, 10);
   if (!Number.isFinite(n) || n < min || n > max) return dflt;
   return n;
+}
+
+/** env 读布尔：缺失/非法回默认；'0'/'false'/'off' 为假，其余非空串为真 */
+function envBool(name, dflt) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === '') return dflt;
+  const s = String(raw).trim().toLowerCase();
+  if (['0', 'false', 'off', 'no'].includes(s)) return false;
+  if (['1', 'true', 'on', 'yes'].includes(s)) return true;
+  return dflt;
+}
+
+/** env 读档位词（白名单外一律回默认——档位词表是 thinking.js 的 EFFORT_RANK） */
+function envEffort(name, dflt) {
+  const raw = String(process.env[name] || '').trim().toLowerCase();
+  if (['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(raw)) return raw;
+  return dflt;
 }
 
 function defaults() {
@@ -69,6 +94,19 @@ function defaults() {
       // 有人希望留余量。默认拦会让「明明还有额度却不用」变成难解释的行为。
       creditFloor: 0,
     },
+    // DeepSeek 思考注入（P0-4）：**默认开**——官方客户端对 deepseek 系必带
+    // thinking:{type:"enabled"} + effort，裸请求上游按不思考应答（misakano
+    // issue #43 实测）。客户端显式 off/none/disabled 永远赢过这个开关；
+    // 运维想全关就在这里（或 env DUMATE_WORKBUDDY_THINKING=0）。
+    thinking: {
+      enabled: envBool('DUMATE_WORKBUDDY_THINKING', true),
+      defaultEffort: envEffort('DUMATE_WORKBUDDY_THINKING_EFFORT', ''),
+    },
+    // system 后置（P1-1）：**默认关**——它改变出站消息顺序，是激进优化；
+    // 开关 + 真机缓存对照（A/B）确认有收益后才在面板打开
+    systemTail: {
+      enabled: envBool('DUMATE_WORKBUDDY_SYSTEM_TAIL', false),
+    },
   };
 }
 
@@ -87,6 +125,8 @@ const RANGES = {
 const SUBFIELDS = {
   restriction: Object.keys(RANGES),
   guard: ['enabled', 'threshold', 'creditFloor'],
+  thinking: ['enabled', 'defaultEffort'],
+  systemTail: ['enabled'],
 };
 
 /** 子键白名单：提交未知子键要 400（否则「填错了」会静默无效） */
@@ -152,6 +192,22 @@ function sanitize(patch, { strict = false } = {}) {
         out.guard.creditFloor = n;
       }
     }
+    if (key === 'thinking') {
+      out.thinking = {};
+      if (v.enabled !== undefined) out.thinking.enabled = v.enabled === true;
+      if (v.defaultEffort !== undefined) {
+        const s = String(v.defaultEffort).trim().toLowerCase();
+        if (!['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(s)) {
+          if (strict) throw new Error('defaultEffort 需为 minimal/low/medium/high/xhigh/max 之一或空串');
+          continue;
+        }
+        out.thinking.defaultEffort = s;
+      }
+    }
+    if (key === 'systemTail') {
+      out.systemTail = {};
+      if (v.enabled !== undefined) out.systemTail.enabled = v.enabled === true;
+    }
   }
   return out;
 }
@@ -184,6 +240,8 @@ function Load() {
   return {
     restriction: { ...cache.snap.restriction },
     guard: { ...cache.snap.guard },
+    thinking: { ...cache.snap.thinking },
+    systemTail: { ...cache.snap.systemTail },
   };
 }
 

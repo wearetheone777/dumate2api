@@ -13,6 +13,17 @@
         <!-- 月度账单 CSV（P2-18）：按当前页面选的月份导出，BOM + 公式注入防护在服务端 -->
         <a-select v-model:value="billMonth" size="small" style="width: 130px" :options="billMonthOptions" />
         <a-button size="small" class="ghost-btn" :loading="exporting" @click="exportMonthly">导出账单</a-button>
+        <!-- 用量聚合表 CSV（批次二十）：客户端生成（BOM + 公式注入防护与月度账单同款） -->
+        <a-dropdown>
+          <a-button size="small" class="ghost-btn">导出 CSV</a-button>
+          <template #overlay>
+            <a-menu @click="exportCsvMenu">
+              <a-menu-item key="daily">按天聚合</a-menu-item>
+              <a-menu-item key="model">按模型</a-menu-item>
+              <a-menu-item key="key">按密钥</a-menu-item>
+            </a-menu>
+          </template>
+        </a-dropdown>
         <a-button size="small" class="ghost-btn" :loading="loading" @click="load">刷新</a-button>
       </template>
     </PageHeader>
@@ -341,6 +352,15 @@
       <div v-else ref="chartEl" style="height: 280px"></div>
     </a-card>
 
+    <!-- 模型 Top 10（批次二十）：窗口内 Token 消耗前十，横向条形——
+         按模型表是全量明细，这张图回答「大头在哪」 -->
+    <a-card title="模型 Top 10" :bordered="false" class="mt-4">
+      <template #extra><span class="text-xs text-slate-400">窗口内 Token 消耗</span></template>
+      <a-spin v-if="loading && !data" size="small" />
+      <a-empty v-else-if="!data || !data.by_model.length" description="暂无数据" />
+      <div v-else ref="topChartEl" style="height: 300px"></div>
+    </a-card>
+
     <!-- 按模型 / 按密钥 -->
     <a-row :gutter="[16, 16]" class="mt-4">
       <a-col :xs="24" :md="12">
@@ -566,6 +586,11 @@
     <a-card v-if="!isQw && !isTw && !isWb" title="按账号积分消耗" :bordered="false" class="mt-4">
       <div class="text-xs text-slate-500 mb-2">
         来自上游计费记录（近 {{ data?.days ?? days }} 天）——本地日志算不出扣费，单价在上游。
+        <!-- 批次二十：命中预热缓存时必须标时间——缓存与实时混着看却不标，
+             读的人无从判断数字新旧（keepalive 空闲时段与页面加载后台预热） -->
+        <template v-if="data?.points_cache?.cached">
+          · 数字缓存于 <span class="num">{{ new Date(data.points_cache.cached_at ?? 0).toLocaleString('zh-CN', { hour12: false }) }}</span>（后台自动预热）
+        </template>
       </div>
       <a-spin v-if="loading && !data" size="small" />
       <a-table
@@ -660,6 +685,40 @@ async function exportMonthly() {
   } finally {
     exporting.value = false
   }
+}
+
+// ---- 用量聚合表 CSV（批次二十，客户端生成）----
+// 公式注入防护与月度账单（monthly-billing.js csvCell）同款：前导单引号把
+// 公式变文本；含逗号/引号/换行的单元格加引号转义
+function csvCellOf(v: unknown): string {
+  let s = String(v == null ? '' : v)
+  if (/^\s*[=+\-@]/.test(s)) s = `'${s}`
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+function exportCsvMenu({ key }: { key: string | number }) {
+  const d = data.value as any
+  if (!d) { message.warning('还没有数据，先刷新一次'); return }
+  let head: string[]
+  let rows: (string | number)[][]
+  if (key === 'daily') {
+    head = ['日期', '请求数', 'Token', '失败数']
+    rows = (d.daily || []).map((r: any) => [r.day, r.requests, r.total_tokens, r.failed])
+  } else if (key === 'model') {
+    head = ['模型', '请求数', '输入 Token', '输出 Token', '总 Token', '失败数', '平均耗时ms']
+    rows = (d.by_model || []).map((r: any) => [r.model, r.requests, r.input_tokens, r.output_tokens, r.total_tokens, r.failed, r.avg_ms])
+  } else {
+    head = ['密钥', '请求数', '输入 Token', '输出 Token', '总 Token', '失败数', '平均耗时ms']
+    rows = (d.by_key || []).map((r: any) => [r.name, r.requests, r.input_tokens, r.output_tokens, r.total_tokens, r.failed, r.avg_ms])
+  }
+  const csv = '\uFEFF' + [head.join(','), ...rows.map((r) => r.map(csvCellOf).join(','))].join('\r\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `dumate2api-usage-${key}-${d.days ?? days.value}d.csv`
+  a.click()
+  URL.revokeObjectURL(url)
 }
 
 // 全价请求洞察（/usage/agg 的 full_price 段）：与 overview 同窗口（days 天）。
@@ -881,6 +940,41 @@ const successRateColor = computed(() => {
 
 const chartEl = ref<HTMLElement | null>(null)
 let chartInst: echarts.ECharts | null = null
+const topChartEl = ref<HTMLElement | null>(null)
+let topChartInst: echarts.ECharts | null = null
+
+// 模型 Top 10（批次二十）：横向条形，窗口内 Token 消耗前十——
+// 按模型表是全量明细，这张图回答「大头在哪」。y 类目轴反转传值使
+// 消耗最大的停在顶部（类目轴自下而上排）。
+function renderTopChart() {
+  if (!topChartEl.value || !data.value) return
+  if (!topChartInst) topChartInst = echarts.init(topChartEl.value)
+  const rows = (data.value.by_model || []).slice(0, 10).slice().reverse()
+  topChartInst.setOption({
+    grid: { left: 8, right: 48, top: 8, bottom: 8, containLabel: true },
+    tooltip: {
+      ...TOOLTIP_BASE,
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (params: any[]) => {
+        const p = params[0]
+        const row = rows[p.dataIndex]
+        if (!row) return ''
+        return `<div style="color:${INK.muted};font-size:11px">${row.model}</div>`
+          + `<div style="margin-top:2px">Token <b>${exactNum(row.total_tokens)}</b></div>`
+          + `<div>请求 <b>${exactNum(row.requests)}</b>${row.failed ? ` · <span style="color:var(--lab-danger)">失败 ${exactNum(row.failed)}</span>` : ''}</div>`
+      },
+    },
+    xAxis: { type: 'value', ...axisStyle({ formatter: (v: number) => compactNum(v) }) },
+    yAxis: {
+      type: 'category',
+      data: rows.map((r) => r.model),
+      ...axisStyle({ showGrid: false }),
+      axisLabel: { width: 150, overflow: 'truncate' },
+    },
+    series: [barSeries({ data: rows.map((r) => r.total_tokens), color: SERIES[1] })],
+  }, { notMerge: true })
+}
 
 function renderChart() {
   if (!chartEl.value || !data.value) return
@@ -950,6 +1044,7 @@ async function load() {
     lastRefresh.value = new Date().toLocaleTimeString('zh-CN')
     await nextTick()
     renderChart()
+    renderTopChart()
   } catch {
     // 失败保留上一份数据（或显示 —），不把错误态伪装成加载态。
     // 千问卡的错误说明由 qw.error 自带；这里静默即可。
@@ -958,14 +1053,20 @@ async function load() {
   }
 }
 
-function onResize() { chartInst?.resize() }
+function onResize() {
+  chartInst?.resize()
+  topChartInst?.resize()
+}
 
 watch(days, load)
 // 切通道要重新拉数据（服务端过滤），不能只改前端显示
 watch(() => channelStore.current, load)
 
 // 主题切换（夜间模式）重绘：canvas 读不到 CSS 变量，按新主题常量重建 option
-function onThemePaint() { renderChart() }
+function onThemePaint() {
+  renderChart()
+  renderTopChart()
+}
 
 
 // 自动刷新（P2-12）：注册后由顶栏的间隔开关驱动，卸载时自动注销
@@ -982,6 +1083,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('lab:theme', onThemePaint)
   chartInst?.dispose()
   chartInst = null
+  topChartInst?.dispose()
+  topChartInst = null
 })
 </script>
 

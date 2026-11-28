@@ -56,7 +56,7 @@
       <a-skeleton v-if="loading && !rows.length" active :paragraph="{ rows: 4 }" />
 
       <a-row v-else :gutter="[16, 16]">
-        <a-col v-for="a in rows" :key="a.id" :span="12" :xs="24" :sm="12">
+        <a-col v-for="a in sortedRows" :key="a.id" :span="12" :xs="24" :sm="12">
           <a-card size="small" :bordered="true" class="h-full">
             <div class="flex items-start justify-between">
               <div class="min-w-0">
@@ -78,6 +78,12 @@
                 :checked="a.enabled"
                 @change="(v: boolean) => toggle(a, v)"
               />
+            </div>
+
+            <!-- 临期角标（批次二十一）：expiring-snapshot 的 FEFO 判据透出。
+                 千问窗口 30 天（上游 expiring_soon 兜底）；陈旧不显示 -->
+            <div v-if="entryOf(a.id)" class="mt-2">
+              <ExpiringTag :entry="entryOf(a.id)" :fresh="expFresh" :preferred="preferredOf(a.id)" :window-days="expWindow" />
             </div>
 
             <a-alert
@@ -253,11 +259,17 @@ import { channelStore, isQwenwork } from '@/stores/channel'
 import { qwenworkApi } from '@/api/qwenwork'
 import type { QwAccount, QwLoginPoll } from '@/api/qwenwork'
 import { lastErrorFresh, errorWhen } from '@/utils/lastError'
+import ExpiringTag from '@/components/ExpiringTag.vue'
+import { useExpiring } from '@/utils/expiringBadge'
 
 // message 走 App.useApp() 的实例（App.vue 已包 <a-app>），静态 import 拿不到上下文
 const { message } = App.useApp()
 
 const rows = ref<QwAccount[]>([])
+
+// 临期角标（批次二十一）：快照通道之一；按紧迫度把临期账号排到列表前面
+const { entryOf, preferredOf, loadExpiring, reorder, expFresh, expWindow } = useExpiring('qwenwork')
+const sortedRows = computed(() => reorder(rows.value, (x) => x.id))
 const err = ref('')
 const loading = ref(false)
 const phoneLoading = ref(false)
@@ -302,6 +314,7 @@ function tokenExpired(a: QwAccount) {
 
 async function load() {
   loading.value = true
+  loadExpiring() // 独立数据源（临期快照），不阻塞账号列表；响应后角标与排序自动更新
   try {
     const { data } = await qwenworkApi.accounts()
     rows.value = data.accounts || []
@@ -368,7 +381,7 @@ async function remove(a: QwAccount) {
   busy[a.id] = true
   try {
     await qwenworkApi.removeAccount(a.id)
-    message.success('已删除')
+    message.success('已移入回收站（30 天内可恢复）')
     await load()
   } catch (e: any) {
     message.error(e?.response?.data?.error || '删除失败')

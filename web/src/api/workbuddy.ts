@@ -128,6 +128,43 @@ export interface WorkBuddyBusy {
  * 逐项记明。界面必须区分「查到了是 0」与「没查到（null）」——这是本项目
  * 反复强调的一条（null ≠ 0）。
  */
+/**
+ * 官方逐请求用量账本（`GET /workbuddy/usage-official`，P1-6）——**只读**。
+ *
+ * R2 两本账：这是**官方账本**（含官方客户端直连的消耗，网关 reqlog 看不到的
+ * 那一半）；与用量页的网关侧账本并列呈现，不是「一个总量的两部分」。
+ * credit 缺失/0 = 「这条记录没带」= 不知道，不是免费——creditsUnknown 如实单列。
+ */
+export interface WorkBuddyUsageOfficial {
+  ok: boolean
+  window_hours: number
+  start: string
+  end: string
+  totals: {
+    requests: number
+    credits: number
+    creditsUnknown: number
+    accounts: number
+    active: number
+    truncated: boolean
+  }
+  by_account: Array<{
+    id: number
+    name: string
+    region: string
+    requests: number
+    creditsKnown: number
+    creditsUnknown: number
+    truncated: boolean
+    error?: string
+  }>
+  by_model: Array<{ model: string; requests: number; credits: number; creditsUnknown: number }>
+  series: Array<{ day: string; requests: number; credits: number }>
+  errors: Array<{ id: number; name: string; error: string }>
+  skipped_enterprise?: number
+  note?: string
+}
+
 export interface WorkBuddyGrowth {
   ok: boolean
   region: 'cn' | 'global'
@@ -334,6 +371,34 @@ export interface WorkBuddyGuard {
   note?: string
 }
 
+/** 模型规则（批次十二/十三）。models 元素可带 cn:/global: 前缀，裸名两域命中 */
+export interface WorkBuddyModelRule {
+  id: string
+  name: string
+  mode: 'deny' | 'allow'
+  models: string[]
+  note?: string
+  updatedAt: string
+}
+
+/** GET /workbuddy/model-rules 的返回（?account_id=&model= 时附 account 诊断视图） */
+export interface WorkBuddyModelRulesView {
+  ok: boolean
+  rules: WorkBuddyModelRule[]
+  /** 规则 id → 挂载账号数 */
+  counts: Record<string, number>
+  /** 账号 id → 挂着的规则 id 全量映射 */
+  assignments: Record<string, string[]>
+  account?: {
+    id: number
+    nickname: string
+    region: 'cn' | 'global'
+    ruleIds: string[]
+    /** 指定 model 时的判定结果（排查用）；未指定 model 时无此字段 */
+    blocked?: boolean
+  } | null
+}
+
 export const workbuddyApi = {
   status: (region?: 'cn' | 'intl') =>
     client.get<WorkBuddyStatus>(`/workbuddy/status${region ? `?region=${region}` : ''}`),
@@ -446,6 +511,13 @@ export const workbuddyApi = {
     const qs = q.length ? '?' + q.join('&') : ''
     return client.get<WorkBuddyGrowth>(`/workbuddy/growth${qs}`)
   },
+  usageOfficial: (opts: { hours?: number; region?: 'cn' | 'intl' } = {}) => {
+    const q: string[] = []
+    if (opts.hours) q.push(`hours=${opts.hours}`)
+    if (opts.region) q.push(`region=${opts.region}`)
+    const qs = q.length ? '?' + q.join('&') : ''
+    return client.get<WorkBuddyUsageOfficial>(`/workbuddy/usage-official${qs}`)
+  },
   credits: (region?: 'cn' | 'intl', uids?: number[]) =>
     client.get<{
       count: number
@@ -497,4 +569,33 @@ export const workbuddyApi = {
   removeAccount: (id: number) => client.delete(`/workbuddy/accounts/${id}`),
   patchAccount: (id: number, fields: { enabled?: boolean; nickname?: string; proxy?: string; group?: string }) =>
     client.patch<{ ok: boolean; proxy?: string | null; account?: WorkBuddyAccount }>(`/workbuddy/accounts/${id}`, fields),
+
+  // ---- 模型规则（批次十二/十三，misakano modelrules.go 移植） ----
+  // 语义：deny 黑名单 / allow 白名单，多规则并集 + deny 优先；模型名可带
+  // cn:/global: 前缀（裸名两域命中）；allow 在账号所属域零命中视作没挂。
+  // 全部候选被拦 → 网关回 400 model_not_allowed（规则不会自愈，不回 503）。
+  modelRules: (opts: { accountId?: number; model?: string } = {}) => {
+    const q: string[] = []
+    if (opts.accountId) q.push(`account_id=${opts.accountId}`)
+    if (opts.model) q.push(`model=${encodeURIComponent(opts.model)}`)
+    const qs = q.length ? '?' + q.join('&') : ''
+    return client.get<WorkBuddyModelRulesView>(`/workbuddy/model-rules${qs}`)
+  },
+  saveModelRule: (rule: { id?: string; name: string; mode: 'deny' | 'allow'; models: string[]; note?: string }) =>
+    client.post<{ ok: boolean; rule?: WorkBuddyModelRule; error?: string }>('/workbuddy/model-rules', { rule }),
+  deleteModelRule: (id: string) =>
+    client.delete<{ ok: boolean; error?: string }>(`/workbuddy/model-rules/${id}`),
+  /** 设置某账号挂的规则集合（**整体替换**，空数组 = 全摘） */
+  assignModelRules: (accountId: number, ids: string[]) =>
+    client.post<{ ok: boolean; ids: string[]; error?: string }>('/workbuddy/model-rules/assign', {
+      account_id: accountId,
+      ids,
+    }),
+  /** 一条规则批量挂/摘到多账号（只增删这一条，其余规则原样保留；幂等） */
+  applyModelRule: (id: string, accountIds: number[], assigned: boolean) =>
+    client.post<{ ok: boolean; changed: number; error?: string }>('/workbuddy/model-rules/apply', {
+      id,
+      account_ids: accountIds,
+      assigned,
+    }),
 }

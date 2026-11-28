@@ -86,28 +86,34 @@ export const traeRuntimeApi = {
     }>('/trae-runtime/usage'),
 }
 
-/** 服务端运行日志（进程内环形缓冲，强制脱敏） */
+/** 服务端运行日志（进程内三频道环形缓冲，强制脱敏） */
+export type ServerLogChannel = 'chat' | 'task' | 'sys'
+
 export interface ServerLogRow {
   ts: number
   level: 'log' | 'warn' | 'error'
   text: string
   seq: number
+  ch: ServerLogChannel
 }
 
 export const logsApi = {
-  list: (params: { level?: string; keyword?: string; limit?: number } = {}) => {
+  list: (params: { level?: string; keyword?: string; channel?: string; limit?: number } = {}) => {
     const q = new URLSearchParams()
     if (params.level) q.set('level', params.level)
     if (params.keyword) q.set('keyword', params.keyword)
+    if (params.channel) q.set('channel', params.channel)
     if (params.limit) q.set('limit', String(params.limit))
-    return client.get<{ rows: ServerLogRow[]; total: number; capacity: number }>(`/logs?${q}`)
+    return client.get<{ rows: ServerLogRow[]; total: number; byChannel: Record<string, number>; capacity: number }>(`/logs?${q}`)
   },
-  streamUrl: (level = '', keyword = '') => {
+  streamUrl: (level = '', keyword = '', channel = '') => {
     const q = new URLSearchParams()
     if (level) q.set('level', level)
     if (keyword) q.set('keyword', keyword)
+    if (channel) q.set('channel', channel)
     return `/api/admin/logs/stream?${q}`   // EventSource 不走 axios 基址
   },
+  exportUrl: (days = 7) => `/api/admin/logs/export?days=${days}`,
 }
 
 /** 月度账单（月 × 通道 × Key，只统计经本网关的请求） */

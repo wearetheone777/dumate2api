@@ -121,6 +121,28 @@ function toolResultText(block) {
   return '';
 }
 
+/** Anthropic image block source → data URL / 原样 URL；空 source 返回空串 */
+function imageBlockUrl(block) {
+  const src = block && block.source;
+  if (!src || typeof src !== 'object') return '';
+  if (src.type === 'url') return typeof src.url === 'string' ? src.url : '';
+  if (src.type === 'base64') return `data:${src.media_type || 'image/png'};base64,${src.data || ''}`;
+  return '';
+}
+
+/** tool_result.content 里的 image 块 → OpenAI image_url parts（复用共享转换器） */
+function toolResultImages(block) {
+  const c = block && block.content;
+  if (!Array.isArray(c)) return [];
+  const parts = [];
+  for (const x of c) {
+    if (!x || x.type !== 'image') continue;
+    const part = toImageUrlPart(imageBlockUrl(x));
+    if (part) parts.push(part);
+  }
+  return parts;
+}
+
 // Convert Anthropic Messages request to OpenAI Chat Completions request
 //
 // opts.nativeTools=true 时转发结构化工具；默认 false = 文本降级（只有 9084 还在用）。
@@ -159,11 +181,7 @@ function anthropicToOpenAI(anthropicReq, opts = {}) {
         } else if (block.type === 'tool_result') {
           parts.push({ type: 'text', text: `[Tool Result]\n${toolResultText(block)}` });
         } else if (block.type === 'image') {
-          const src = block.source || {};
-          const url = src.type === 'url' ? src.url
-            : src.type === 'base64' ? `data:${src.media_type || 'image/png'};base64,${src.data || ''}`
-              : '';
-          const part = toImageUrlPart(url);
+          const part = toImageUrlPart(imageBlockUrl(block));
           if (part) imageParts.push(part);
           else parts.push({ type: 'text', text: '[Image content - unsupported source]' });
         }
@@ -194,11 +212,7 @@ function anthropicToOpenAI(anthropicReq, opts = {}) {
         // 直连通道保真：base64/URL source 统一转 OpenAI image_url part。
         // TRAE llm_utils_chat 实测接受该形状（2026-10-30）；不支持的通道
         // 由各自通道层降级（traework 校验模型能力，千问/Qoder 展开占位文本）。
-        const src = block.source || {};
-        const url = src.type === 'url' ? src.url
-          : src.type === 'base64' ? `data:${src.media_type || 'image/png'};base64,${src.data || ''}`
-            : '';
-        const part = toImageUrlPart(url);
+        const part = toImageUrlPart(imageBlockUrl(block));
         if (part) imageParts.push(part);
         else texts.push('[Image content - unsupported source]');
       }
@@ -226,12 +240,19 @@ function anthropicToOpenAI(anthropicReq, opts = {}) {
     // user：tool_result 必须各自独立成 role:'tool' 消息，且**紧跟在带 tool_calls
     // 的 assistant 消息之后**——中间夹一条 user 文本会让上游报「工具结果没有
     // 对应的调用」。所以先落 tool 消息，再落文本。
+    //
+    // P0-4：tool_result.content 里可能夹 image 块（浏览器截图等工具输出）。
+    // 上游只认 OpenAI image_url part，不认 role:'tool' 消息带 parts 数组；
+    // 因此图片作为**独立 user 消息紧跟对应 tool 消息**发出，tool_call_id 不丢。
     for (const b of toolResults) {
       messages.push({
         role: 'tool',
         tool_call_id: b.tool_use_id || b.id || '',
         content: toolResultText(b),
       });
+      for (const part of toolResultImages(b)) {
+        messages.push({ role: 'user', content: [part] });
+      }
     }
     const text = texts.filter(Boolean).join('\n');
     if (imageParts.length) {

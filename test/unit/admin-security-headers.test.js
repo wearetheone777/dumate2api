@@ -45,6 +45,12 @@ test('三个头的值正确（nosniff / DENY / no-referrer）', () => {
   assert.match(SRC, /'Referrer-Policy': 'no-referrer'/);
 });
 
+test('noindex：X-Robots-Tag 头 + index.html robots meta（P3，公网化前置）', () => {
+  assert.match(SRC, /'X-Robots-Tag': 'noindex, nofollow'/, 'applySecurityHeaders 全 kind 都带 noindex');
+  const html = fs.readFileSync(path.resolve(__dirname, '../../web/index.html'), 'utf8');
+  assert.match(html, /<meta name="robots" content="noindex, nofollow"\s*\/?>/, '入口模板带 robots meta（覆盖静态托管不经 server.js 的场景）');
+});
+
 // ---- 清单其余各项的接线自证（防被当冗余删掉） ----
 
 test('登录失败退避与限流存在（audit P1-5）', () => {

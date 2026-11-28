@@ -35,6 +35,19 @@ async function main() {
 
   const payload = { model: MODEL, messages, tools, max_tokens: 16384 };
   const modelKey = chat.resolveModelKey(MODEL);
+  // 身份句守卫对照（P0-1 真机 A/B）：``--guard`` 走与真实链路**同一段**
+  // `identity-guard.guardBody`（`qoder/index.js` 的挂点），不另写一份逻辑。
+  // 不带该参数 = 原样出站，两组唯一变量就是守卫本身。
+  // 旧版探针只调 chat.buildBody，绕过了挂点，所以 2026-11-28 那轮 A/B 无效。
+  if (process.argv.includes('--guard')) {
+    const g = require('../src/qoder/identity-guard');
+    // guardBody 原地改 body，没有返回值 —— 自己比对 system 文本算命中证据
+    const before = String(payload.messages[0] && payload.messages[0].content || '');
+    g.guardBody(payload);
+    const after = String(payload.messages[0] && payload.messages[0].content || '');
+    const changed = before !== after;
+    console.log(`[guard] enabled=${g.enabled()} 命中=${changed} system=「${after.slice(0, 40)}」`);
+  }
   const bodyJson = chat.buildBody(modelKey, payload);
   const encBody = cosy.encode(Buffer.from(bodyJson));
 

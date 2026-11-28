@@ -62,16 +62,78 @@ async function pickAccount() {
   return ensureFresh(list[0]);
 }
 
+/**
+ * 强制换票（绕过 `needsRefresh` 的 24 小时提前量）。
+ *
+ * 为什么需要：`needsRefresh` 是按 `expiresAt` 推断的，**上游的 401 才是真相**。
+ * 实测（2026-11-28）：三个 intl 账号的 `expiresAt` 都还没到（12-08），
+ * `needsRefresh` 返回 false，于是带着旧 access 发出去被上游 401——而它们的
+ * refresh token 早已失效。等 24 小时窗口等于让这些号白撞一整天。
+ *
+ * 语义与 WorkBuddy 同源（hub #441）：**401 的第一响应是刷新，不是换号**——
+ * 刷新成功说明账号其实健康（只是 access 被提前作废），比换号便宜得多。
+ * 刷新被拒（`refreshRejected`）才判死退场。
+ */
+async function forceRefresh(a) {
+  if (!a || !a.refreshToken) {
+    const e = new Error('traework 缺少 refreshToken，无法刷新');
+    e.refreshRejected = true;
+    throw e;
+  }
+  const r = await authStore.exchange(a);
+  if (!r.ok) {
+    authStore.patch(a.id, { lastError: normalizeError(`刷新失败: ${r.error}`) });
+    const e = new Error(`traework token 刷新失败: ${r.error}`);
+    e.code = 'refresh_failed';
+    e.refreshRejected = isRefreshRejected(r.error);
+    throw e;
+  }
+  // 刷新成功 = 上游刚承认这个号能换票，之前的「凭证退场」标记必须一并清掉，
+  // 否则它会让 needsRefresh 永远返回 false，新 access 用到过期都不会再刷。
+  authStore.patch(a.id, { ...r.patch, lastError: '', refreshRetiredAt: null });
+  return authStore.get(a.id);
+}
+
 /** token 余量不足就先换票（选号成功后的第一步；失败抛错由调用方喂池） */
 async function ensureFresh(a) {
   if (!authStore.needsRefresh(a)) return a;
   const r = await authStore.exchange(a);
   if (!r.ok) {
     authStore.patch(a.id, { lastError: normalizeError(`刷新失败: ${r.error}`) });
-    throw new Error(`traework token 刷新失败: ${r.error}`);
+    const e = new Error(`traework token 刷新失败: ${r.error}`);
+    // 两个标记供调用方决定「换号」还是「等」：
+    //   code           固定 refresh_failed，便于调用方按类型分支
+    //   refreshRejected true = 该号凭证彻底废了（再等也不会好，必须换号）
+    e.code = 'refresh_failed';
+    e.refreshRejected = isRefreshRejected(r.error);
+    throw e;
   }
   authStore.patch(a.id, { ...r.patch, lastError: '' });
   return authStore.get(a.id);
+}
+
+/**
+ * 换票失败是不是「这个账号的凭证彻底废了」（而不是网络抖/上游临时故障）。
+ *
+ * 为什么必须单独判：`refresh token is not matched / invalid` 是**账号级终点**——
+ * 再等也不会好，只能重新登录；而超时/5xx 是瞬时的，下一次可能就成功。
+ * 前者的正确处置是「标记该号退场 + 立刻换下一个」，后者是「等」。
+ *
+ * 实测依据（2026-11-28）：导入的过期账号换票时上游回
+ * `HTTP 400 {"ResponseMetadata":{"Error":{"Code":"10101","Data":{"__Message.error":"refresh token is not matched to the ..."}}}}`。
+ * 注意业务码 **10101 在 `upstream-errors.traeCodeKind` 里被归为 deterministic
+ * （换号无用）——与这里的真实语义相反**：那个分类针对的是**对话请求**里的
+ * 账号/租户问题，而换票失败恰恰是「这个号用不了了，换号正有用」。
+ *
+ * 判据只看上游原文措辞（`exchange` 只回 `{ok,error}`，不带 status/raw）。
+ * **认不出时不猜**，返回 false（按瞬时故障处理）——猜成「永久报废」会把
+ * 能自愈的号永久踢出池，比不换号更糟。
+ */
+function isRefreshRejected(msg) {
+  const s = String(msg || '');
+  if (/refresh\s*token\s*(is\s*)?(invalid|not\s*matched|expired|revoked|not\s*found)/i.test(s)) return true;
+  // 业务码兜底：10101/20101/10102 且同串提到 refresh
+  return /"?(10101|20101|10102)"?/.test(s) && /refresh/i.test(s);
 }
 
 /**
@@ -478,53 +540,28 @@ async function runSendOnce(payload, onChunk, opts = {}) {
     }
     throw e;
   }
-  const sel = channelPool.pickCandidate(CHANNEL, usable, {
-    sessionKey, model,
-    // FEFO：集合非空时候选先限制在临期账号内（快照由管理端 /credits 写）
-    expiring: fefoUidSet(),
-  });
-  if (!sel) {
-    const err = new Error('traework 没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
-    err.statusCode = 503;
-    if (opts.attempts) {
-      try { opts.attempts.add({ outcome: 'skip', reason: 'pool_pick_failed（冷却/禁用/在途满）' }); }
-      catch (e2) { /* 埋点失败不影响请求 */ }
-    }
-    throw err;
-  }
-  const { uid } = sel;
-  let auth;
-  try {
-    auth = await ensureFresh(sel.account);
-  } catch (e) {
-    // 换票失败也进池：网络类按熔断计数，凭证失效类按防误杀计数（classify 判）。
-    // 探针模式（opts.probe）不喂池——观测动作不把健康账号打成冷却。
-    if (!opts.probe) {
-      channelPool.noteError(CHANNEL, sel.account.id, { status: Number(e.statusCode) || 0, message: e.message, model });
-    }
-    channelPool.release(uid);
-    throw e;
-  }
-
-  const accountName = auth.nickname || auth.uid || `账号 ${auth.id}`;
-  // 尝试链（P1-5）：谁被选中、选它时的选号策略（策略本身也是「为什么是它」的一部分）
-  if (opts.attempts) {
-    try {
-      opts.attempts.add({
-        accountId: auth.id, account: accountName, outcome: 'picked',
-        // 这里**不能**引用 remoteEligible / remoteOpts：它们在下面的 try 块里才声明，
-        // 引用会抛 ReferenceError 并被外层 catch 吞掉——第一次实现就是这么把
-        // picked 条目静默丢掉的（链里只剩 error，看起来像"没选号就失败了"）。
-        // 链路归属由 onLink 单独上报，这里只写选号策略。
-        reason: `strategy=${runtime.pickStrategy || 'round-robin'}`,
-      });
-    } catch (e2) { /* 埋点失败不影响请求 */ }
-  }
-  if (opts.onAccount) {
-    // 第二个参数是账号 id：计费自检探针要按 id 回读该账号的 consumed 增量
-    // （名字可能重名）。既有调用方只取第一个参数，不受影响。
-    try { opts.onAccount(accountName, auth.id); } catch (e) { /* 上报失败不影响请求 */ }
-  }
+  // 选号 + 换票 + 请求（2026-11-28 重写：换号与 401 自愈都是这一层的职责）。
+  //
+  // 三次真机事故驱动了这个结构：
+  //   1. 导入的过期账号（access 过期 + refresh 被拒 10101）被池选中后，旧实现
+  //      `ensureFresh` 直接 throw，**整个请求失败**，健康账号就在旁边没被用到
+  //      ——表现为「TRAE 明明有号却全失败」。
+  //   2. 换票失败分两类（判据 `isRefreshRejected`）：
+  //        · 凭证彻底废了（refreshRejected）→ 记 lastError + 标 refreshRetiredAt
+  //          （后续请求不再每次白撞换票端点）+ 换下一个
+  //        · 网络抖/上游临时故障 → 喂池（按 classify 冷却）+ 换下一个
+  //   3. `needsRefresh` 只按 expiresAt 推断，**上游的 401 才是真相**。实测
+  //      intl 三号 expiresAt 都还没到（12-08）但 refresh 早已失效——按窗口等
+  //      等于让它们白撞一整天。401 的第一响应是**刷新同一账号再试一次**
+  //      （WorkBuddy hub #441 同源），刷新被拒才判死换号。
+  //
+  // 最多换 3 个号（整池坏号时不能把上游打成风暴——每次换号都伴随一次换票
+  // 请求），每号至多一次 401 刷新重试。
+  const triedIds = new Set();
+  const refreshedIds = new Set();
+  const listUsable = usable.slice();
+  let lastErr = null;
+  let defaultsApplied = false;
 
   // 默认思考档（P0-4，2026-11-16）：客户端没给档位时按运行态配置套一个默认值。
   // 三条边界都压在这一层，因为这里才同时具备「本次账号」与「本次模型」：
@@ -532,149 +569,288 @@ async function runSendOnce(payload, onChunk, opts = {}) {
   //   · descriptor 没声明支持 → 不套（表没预热时同样不套）；
   //   · 客户端显式给了任何形态的档位 → 一律不动。
   // 套用/未套用都经 onReasoning 上报，网关写 X-Reasoning-Applied 与埋点。
-  let effortRes = null;
-  try {
-    const table = runtime.defaultReasoning;
-    if (model && table && typeof table === 'object' && Object.keys(table).length) {
-      const meta = models.cachedMetaById(model, c.regionOf(auth) === 'intl' ? 'intl' : 'cn', { accountId: auth.id });
-      effortRes = reasoningApply.applyDefault(payload, {
-        table, model, supported: meta ? meta.reasoningEfforts : null,
-      });
-      if (effortRes.applied) payload = effortRes.payload;
-      if (opts.onReasoning) { try { opts.onReasoning(effortRes); } catch (e) { /* 上报失败不影响请求 */ } }
-      // 只在「真的套了」或「配了但没生效」时打日志——配置为空时不该刷屏
-      if (effortRes.applied) {
-        console.log(`[traework] 默认思考档 ${effortRes.effective}（model=${model}${effortRes.note ? `，${effortRes.note}` : ''}）`);
-      } else if (effortRes.requested) {
-        console.log(`[traework] 默认思考档未生效：${effortRes.note}（model=${model}）`);
+  // **只对第一个选中账号执行一次**（与改造前等价）：换号重算会把已替换的
+  // payload 再套一遍，而档位是请求级默认值，不该随账号漂移。
+  const applyDefaultReasoning = (auth) => {
+    if (defaultsApplied) return;
+    defaultsApplied = true;
+    try {
+      const table = runtime.defaultReasoning;
+      if (model && table && typeof table === 'object' && Object.keys(table).length) {
+        const meta = models.cachedMetaById(model, c.regionOf(auth) === 'intl' ? 'intl' : 'cn', { accountId: auth.id });
+        const effortRes = reasoningApply.applyDefault(payload, {
+          table, model, supported: meta ? meta.reasoningEfforts : null,
+        });
+        if (effortRes.applied) payload = effortRes.payload;
+        if (opts.onReasoning) { try { opts.onReasoning(effortRes); } catch (e) { /* 上报失败不影响请求 */ } }
+        // 只在「真的套了」或「配了但没生效」时打日志——配置为空时不该刷屏
+        if (effortRes.applied) {
+          console.log(`[traework] 默认思考档 ${effortRes.effective}（model=${model}${effortRes.note ? `，${effortRes.note}` : ''}）`);
+        } else if (effortRes.requested) {
+          console.log(`[traework] 默认思考档未生效：${effortRes.note}（model=${model}）`);
+        }
+      }
+    } catch (e) { /* 默认档是增强项：出任何问题都不影响请求本身 */ }
+  };
+
+  // 请求主体：用这个账号把这个请求完整发一次（链路分流 + 成功/失败喂池）。
+  // 抽成函数是为了让「同账号 401 刷新后重试」与「换号」共用同一段逻辑——
+  // 旧结构把主体直接写在函数体里，只能换号不能重试。release 在 finally，
+  // 调用方走哪条路都不会漏放 in_flight 名额。
+  const attemptRequest = async (auth, uid, accountName) => {
+    applyDefaultReasoning(auth);
+
+    try {
+      // Remote 链路（2026-11-01，P2-16）：DUMATE_TRAEWORK_REMOTE=1 时，**纯文本的
+      // auto 档请求**走 remote（逐轮账单可查、上游自选模型）。边界刻意收窄：
+      //   · 带 tools 的请求**永不收**——remote 协议没有 tools 槽（Trae2api-cn
+      //     明文 "tools remain owned by the API caller"），把网关的 function
+      //     calling 降级进 query 没有实测证据上游会走原生 tool_calls。
+      //   · 显式模型名（2026-11-05，P2-13.1）：DUMATE_TRAEWORK_REMOTE=2 时经
+      //     **manual 策略**走 remote——Trae2api-cn 实测：manual 请求省略完整
+      //     custom_model 对象会被上游**静默落默认档**，所以必须带模型表的
+      //     上游原始 config（models.normalize 的 customModel 字段）。
+      //     表不可用/模型不在表 = 回落 utils_chat（显式名在 utils_chat 本来
+      //     就能跑，没有静默换模型问题）。
+      // 实际模型由 model_config 事件上报（auto 档上游自选，实测 Doubao 系）。
+      const remoteLevel = process.env.DUMATE_TRAEWORK_REMOTE === '1' ? 1
+        : process.env.DUMATE_TRAEWORK_REMOTE === '2' ? 2 : 0;
+      const hasTools = Array.isArray(payload && payload.tools) && payload.tools.length > 0;
+      // isAuto 在模型名解析处按剥前缀后的原始意图判定（本函数上方）
+      // remote 链路是纯国内的（remoteBaseOf 对 intl 如实拒绝）——国际账号不走
+      // linkOverride（2026-11-06，ChatLab 链路实验）：显式指定链路时压过自动
+      // 分流。'utils' 一律走 utils_chat；'solo' 强制 solo（REMOTE 接管也压过，
+      // tools 请求如实失败——上游 400 已知）；'remote' 要求 REMOTE=2（manual
+      // 策略是它的能力，=1 的 auto 策略接不了显式模型），否则 400 明确报出。
+      const linkOverride = opts.linkOverride === 'utils' || opts.linkOverride === 'solo'
+        || opts.linkOverride === 'remote' ? opts.linkOverride : '';
+      const remoteEligible = linkOverride === 'utils' || linkOverride === 'solo' ? false
+        : linkOverride === 'remote'
+          ? (remoteLevel === 2 && c.regionOf(auth) !== 'intl')
+          : (remoteLevel > 0 && !hasTools && c.regionOf(auth) !== 'intl'
+            && (remoteLevel === 2 || isAuto));
+      if (linkOverride === 'remote' && remoteLevel !== 2) {
+        const e = new Error('remote 链路需要 DUMATE_TRAEWORK_REMOTE=2（manual 策略），当前未开启');
+        e.statusCode = 400;
+        throw e;
+      }
+      // level 2 的显式模型：取模型表原始 config（取不到回落 utils_chat）。
+      // effortPayload：原始请求体——manual 策略下解析思考档位写入 custom_model。
+      // maxMode：单次 trae_max_mode / env 开关（descriptor 硬门在 createSession）
+      let remoteOpts = null;
+      if (remoteEligible && (remoteLevel === 2 || linkOverride === 'remote')) {
+        try {
+          const remoteMod = require('./remote');
+          const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn', accountId: auth.id });
+          const hit = (rows.models || []).find((m) => m.id === model);
+          if (hit && hit.customModel) {
+            remoteOpts = {
+              model, strategy: 'manual', customModelRow: hit, effortPayload: payload,
+              maxMode: remoteMod.maxModeRequested(model, payload, runtime.maxMode),
+            };
+          }
+        } catch (e) { /* 表不可用回落 utils_chat */ }
+      }
+      // SOLO/IDE raw 链路（2026-11-06，#12）：DUMATE_TRAEWORK_SOLO=1 且显式模型
+      // 且模型表条目可用。**第一版只接纯文本**——tools 的原生槽形状待证据
+      // （带 tools 实测上游 400，仍走 utils_chat）；纯文本在 REMOTE 开启时仍
+      // 优先 remote（已验证 + 逐轮账单）。链路互斥：remote > solo(text) > utils_chat。
+      // **纯国内**（与 remote 同边界）：国际 JWT 打国内 raw 端点恒 1001
+      // （真机实测：deepseek-v4.1-flash 两区都有、池把请求派给国际账号时 1001）。
+      let soloTransport = null;
+      const soloEligible = (linkOverride === 'solo' || (process.env.DUMATE_TRAEWORK_SOLO === '1' && linkOverride !== 'utils' && linkOverride !== 'remote'))
+        && !persona && !!model && !remoteOpts && !remoteEligible && c.regionOf(auth) !== 'intl';
+      if (soloEligible) {
+        try {
+          const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn', accountId: auth.id });
+          const hit = (rows.models || []).find((m) => m.id === model);
+          if (hit && hit.customModel) {
+            const solo = require('./solo');
+            const fn = 'solo_agent';
+            soloTransport = {
+              post: (b, a) => solo.postSoloStream(b, a, fn),
+              makeBody: (meta) => solo.buildBody(payload, hit, meta, { model, rawChatFunction: fn }),
+            };
+          }
+        } catch (e) { /* 表不可用回落 utils_chat */ }
+      }
+      // 链路上报（埋点 link 字段的数据源）：与 onAccount 同构——实际走哪条链
+      // 只有 send 知道，回调在分流确定后立即触发（无论成败，失败也是链路事实）
+      if (opts.onLink) {
+        const link = remoteEligible && (remoteLevel === 1 || remoteOpts) ? 'remote'
+          : soloTransport ? 'solo' : 'utils_chat';
+        try { opts.onLink(link, persona ? 'traebao' : 'utils_chat'); } catch (e) { /* 上报失败不影响请求 */ }
+      }
+      const result = remoteEligible && (remoteLevel === 1 || remoteOpts)
+        ? await runRemoteConversation(auth, payload, onChunk, opts, model, remoteOpts)
+        : await runConversation(auth, payload, onChunk, opts, model, soloTransport);
+      if (opts.attempts) {
+        try {
+          opts.attempts.add({
+            accountId: auth.id, account: accountName, outcome: 'ok',
+            ms: Date.now() - startedAtOf(opts),
+          });
+        } catch (e2) { /* 埋点失败不影响请求 */ }
+      }
+      // 成功喂池：清熔断/软退避/防误杀计数（修复重试属于模型行为，不算失败）
+      channelPool.noteSuccess(CHANNEL, auth.id);
+      // lastError 是「最近一次结果」，不是「历史故障」（qwenwork 2026-10-02 同款
+      // 修复，TRAE 当年漏了这条不变量）：成功即清除。不清的话一次瞬时限流会
+      // 永久挂在账号卡上——实测（2026-11-02）：测150 在 09:27 撞一次 3004 限流
+      // 后又有 50 次成功请求，牌子却一直挂着，被读成「当前故障」。
+      // 只在确实有 lastError 时才写盘，避免每次成功都触发一次文件写入。
+      if (auth.lastError) {
+        try { authStore.patch(auth.id, { lastError: '' }); }
+        catch (e) { /* 清标记失败不影响请求结果 */ }
+      }
+      return result;
+    } catch (e) {
+      if (opts.attempts) {
+        try {
+          const cls = upstreamErrors.classify({ status: Number(e.statusCode) || 0, message: e.message, model });
+          opts.attempts.add({
+            accountId: auth.id, account: accountName, outcome: 'error',
+            reason: `${cls.kind || 'unknown'}:${Number(e.statusCode) || 0}`,
+            ms: Date.now() - startedAtOf(opts),
+          });
+        } catch (e2) { /* 埋点失败不影响请求 */ }
+      }
+      // 探针模式（opts.probe）不喂池、不写 lastError：错误照常上抛如实展示
+      if (!opts.probe) {
+        channelPool.noteError(CHANNEL, auth.id, { status: Number(e.statusCode) || 0, message: e.message, model });
+        try { authStore.patch(auth.id, { lastError: normalizeError(e.message) }); } catch (err) { /* 记不下不影响 */ }
+      }
+      throw e;
+    } finally {
+      channelPool.release(uid);
+    }
+  };
+
+  for (let round = 0; round < 3; round++) {
+    const sel = channelPool.pickCandidate(CHANNEL, listUsable, {
+      sessionKey, model,
+      // FEFO：集合非空时候选先限制在临期账号内（快照由管理端 /credits 写）
+      expiring: fefoUidSet(),
+      // 已失败（换票被拒 / 401 刷新被拒）的号不再参与本轮选号
+      // （否则 pickCandidate 会把它再选回来）
+      exclude: triedIds.size ? [...triedIds] : undefined,
+    });
+    if (!sel) break;
+    triedIds.add(sel.account.id);
+    let auth;
+    try {
+      auth = await ensureFresh(sel.account);
+    } catch (e) {
+      lastErr = e;
+      // 换票失败也进池：网络类按熔断计数，凭证失效类按防误杀计数（classify 判）。
+      // 探针模式（opts.probe）不喂池——观测动作不把健康账号打成冷却。
+      if (!opts.probe) {
+        channelPool.noteError(CHANNEL, sel.account.id, { status: Number(e.statusCode) || 0, message: e.message, model });
+      }
+      channelPool.release(sel.uid);
+      // 凭证彻底废了：标记退场，让管理端看见「这个号要重新登录」，
+      // 也让后续请求不必每次都先撞一次换票失败。
+      if (e.refreshRejected) {
+        try {
+          authStore.patch(sel.account.id, {
+            lastError: normalizeError(`凭证失效（需重新登录）: ${e.message}`),
+            refreshRetiredAt: Date.now(),
+          });
+        } catch (e2) { /* 标记失败不影响换号 */ }
+      }
+      if (opts.attempts) {
+        try {
+          opts.attempts.add({
+            accountId: sel.account.id, account: sel.account.nickname || sel.account.uid || '',
+            outcome: 'error',
+            reason: e.refreshRejected ? 'refresh_rejected（凭证失效，换号）' : 'refresh_failed（换号重试）',
+          });
+        } catch (e3) { /* 埋点失败不影响请求 */ }
+      }
+      continue;
+    }
+    const { uid } = sel;
+    const accountName = auth.nickname || auth.uid || `账号 ${auth.id}`;
+    // 尝试链（P1-5）：谁被选中、选它时的选号策略（策略本身也是「为什么是它」的一部分）
+    if (opts.attempts) {
+      try {
+        opts.attempts.add({
+          accountId: auth.id, account: accountName, outcome: 'picked',
+          // 这里**不能**引用 remoteEligible / remoteOpts：它们在 attemptRequest
+          // 里才声明，引用会抛 ReferenceError 并被吞掉——第一次实现就是这么把
+          // picked 条目静默丢掉的（链里只剩 error，看起来像"没选号就失败了"）。
+          // 链路归属由 onLink 单独上报，这里只写选号策略。
+          reason: `strategy=${runtime.pickStrategy || 'round-robin'}`,
+        });
+      } catch (e2) { /* 埋点失败不影响请求 */ }
+    }
+    if (opts.onAccount) {
+      // 第二个参数是账号 id：计费自检探针要按 id 回读该账号的 consumed 增量
+      // （名字可能重名）。既有调用方只取第一个参数，不受影响。
+      try { opts.onAccount(accountName, auth.id); } catch (e) { /* 上报失败不影响结果 */ }
+    }
+    try {
+      return await attemptRequest(auth, uid, accountName);
+    } catch (e) {
+      lastErr = e;
+      // 401 且**尚未吐出任何内容**才允许重试（流式已发内容收不回去，
+      // 重试会让客户端看到两段回答）。`e.sent` 由 runConversation 标记。
+      const is401 = Number(e.statusCode) === 401 && !e.sent;
+      if (!is401 || opts.probe || refreshedIds.has(auth.id)) continue;
+      refreshedIds.add(auth.id);
+      if (opts.attempts) {
+        try {
+          opts.attempts.add({
+            accountId: auth.id, account: accountName, outcome: 'skip',
+            reason: 'refresh_on_401（access 被提前作废，刷新同账号重试）',
+          });
+        } catch (e3) { /* 埋点失败不影响请求 */ }
+      }
+      let freshAuth;
+      try {
+        freshAuth = await forceRefresh(auth);
+      } catch (e2) {
+        lastErr = e2;
+        if (!opts.probe) {
+          channelPool.noteError(CHANNEL, auth.id, { status: Number(e2.statusCode) || 401, message: e2.message, model });
+        }
+        // 刷新被拒 = 这个号彻底废了：标退场（与换票路径同一处置）
+        if (e2.refreshRejected) {
+          try {
+            authStore.patch(auth.id, {
+              lastError: normalizeError(`凭证失效（需重新登录）: ${e2.message}`),
+              refreshRetiredAt: Date.now(),
+            });
+          } catch (e3) { /* 标记失败不影响换号 */ }
+        }
+        if (opts.attempts) {
+          try {
+            opts.attempts.add({
+              accountId: auth.id, account: accountName, outcome: 'error',
+              reason: e2.refreshRejected ? 'refresh_rejected（401 后刷新被拒，换号）' : 'refresh_failed（401 后刷新失败，换号）',
+            });
+          } catch (e3) { /* 埋点失败不影响请求 */ }
+        }
+        continue;
+      }
+      auth = freshAuth;
+      try {
+        return await attemptRequest(auth, uid, accountName);
+      } catch (e2) {
+        lastErr = e2;
+        continue;
       }
     }
-  } catch (e) { /* 默认档是增强项：出任何问题都不影响请求本身 */ }
-
-  try {
-    // Remote 链路（2026-11-01，P2-16）：DUMATE_TRAEWORK_REMOTE=1 时，**纯文本的
-    // auto 档请求**走 remote（逐轮账单可查、上游自选模型）。边界刻意收窄：
-    //   · 带 tools 的请求**永不收**——remote 协议没有 tools 槽（Trae2api-cn
-    //     明文 "tools remain owned by the API caller"），把网关的 function
-    //     calling 降级进 query 没有实测证据上游会走原生 tool_calls。
-    //   · 显式模型名（2026-11-05，P2-13.1）：DUMATE_TRAEWORK_REMOTE=2 时经
-    //     **manual 策略**走 remote——Trae2api-cn 实测：manual 请求省略完整
-    //     custom_model 对象会被上游**静默落默认档**，所以必须带模型表的
-    //     上游原始 config（models.normalize 的 customModel 字段）。
-    //     表不可用/模型不在表 = 回落 utils_chat（显式名在 utils_chat 本来
-    //     就能跑，没有静默换模型问题）。
-    // 实际模型由 model_config 事件上报（auto 档上游自选，实测 Doubao 系）。
-    const remoteLevel = process.env.DUMATE_TRAEWORK_REMOTE === '1' ? 1
-      : process.env.DUMATE_TRAEWORK_REMOTE === '2' ? 2 : 0;
-    const hasTools = Array.isArray(payload && payload.tools) && payload.tools.length > 0;
-    // isAuto 在模型名解析处按剥前缀后的原始意图判定（本函数上方）
-    // remote 链路是纯国内的（remoteBaseOf 对 intl 如实拒绝）——国际账号不走
-    // linkOverride（2026-11-06，ChatLab 链路实验）：显式指定链路时压过自动
-    // 分流。'utils' 一律走 utils_chat；'solo' 强制 solo（REMOTE 接管也压过，
-    // tools 请求如实失败——上游 400 已知）；'remote' 要求 REMOTE=2（manual
-    // 策略是它的能力，=1 的 auto 策略接不了显式模型），否则 400 明确报出。
-    const linkOverride = opts.linkOverride === 'utils' || opts.linkOverride === 'solo'
-      || opts.linkOverride === 'remote' ? opts.linkOverride : '';
-    const remoteEligible = linkOverride === 'utils' || linkOverride === 'solo' ? false
-      : linkOverride === 'remote'
-        ? (remoteLevel === 2 && c.regionOf(auth) !== 'intl')
-        : (remoteLevel > 0 && !hasTools && c.regionOf(auth) !== 'intl'
-          && (remoteLevel === 2 || isAuto));
-    if (linkOverride === 'remote' && remoteLevel !== 2) {
-      const e = new Error('remote 链路需要 DUMATE_TRAEWORK_REMOTE=2（manual 策略），当前未开启');
-      e.statusCode = 400;
-      throw e;
-    }
-    // level 2 的显式模型：取模型表原始 config（取不到回落 utils_chat）。
-    // effortPayload：原始请求体——manual 策略下解析思考档位写入 custom_model。
-    // maxMode：单次 trae_max_mode / env 开关（descriptor 硬门在 createSession）
-    let remoteOpts = null;
-    if (remoteEligible && (remoteLevel === 2 || linkOverride === 'remote')) {
-      try {
-        const remoteMod = require('./remote');
-        const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn', accountId: auth.id });
-        const hit = (rows.models || []).find((m) => m.id === model);
-        if (hit && hit.customModel) {
-          remoteOpts = {
-            model, strategy: 'manual', customModelRow: hit, effortPayload: payload,
-            maxMode: remoteMod.maxModeRequested(model, payload, runtime.maxMode),
-          };
-        }
-      } catch (e) { /* 表不可用回落 utils_chat */ }
-    }
-    // SOLO/IDE raw 链路（2026-11-06，#12）：DUMATE_TRAEWORK_SOLO=1 且显式模型
-    // 且模型表条目可用。**第一版只接纯文本**——tools 的原生槽形状待证据
-    // （带 tools 实测上游 400，仍走 utils_chat）；纯文本在 REMOTE 开启时仍
-    // 优先 remote（已验证 + 逐轮账单）。链路互斥：remote > solo(text) > utils_chat。
-    // **纯国内**（与 remote 同边界）：国际 JWT 打国内 raw 端点恒 1001
-    // （真机实测：deepseek-v4.1-flash 两区都有、池把请求派给国际账号时 1001）。
-    let soloTransport = null;
-    const soloEligible = (linkOverride === 'solo' || (process.env.DUMATE_TRAEWORK_SOLO === '1' && linkOverride !== 'utils' && linkOverride !== 'remote'))
-      && !persona && !!model && !remoteOpts && !remoteEligible && c.regionOf(auth) !== 'intl';
-    if (soloEligible) {
-      try {
-        const rows = await models.fetchModels({ region: c.regionOf(auth) === 'intl' ? 'intl' : 'cn', accountId: auth.id });
-        const hit = (rows.models || []).find((m) => m.id === model);
-        if (hit && hit.customModel) {
-          const solo = require('./solo');
-          const fn = 'solo_agent';
-          soloTransport = {
-            post: (b, a) => solo.postSoloStream(b, a, fn),
-            makeBody: (meta) => solo.buildBody(payload, hit, meta, { model, rawChatFunction: fn }),
-          };
-        }
-      } catch (e) { /* 表不可用回落 utils_chat */ }
-    }
-    // 链路上报（埋点 link 字段的数据源）：与 onAccount 同构——实际走哪条链
-    // 只有 send 知道，回调在分流确定后立即触发（无论成败，失败也是链路事实）
-    if (opts.onLink) {
-      const link = remoteEligible && (remoteLevel === 1 || remoteOpts) ? 'remote'
-        : soloTransport ? 'solo' : 'utils_chat';
-      try { opts.onLink(link, persona ? 'traebao' : 'utils_chat'); } catch (e) { /* 上报失败不影响请求 */ }
-    }
-    const result = remoteEligible && (remoteLevel === 1 || remoteOpts)
-      ? await runRemoteConversation(auth, payload, onChunk, opts, model, remoteOpts)
-      : await runConversation(auth, payload, onChunk, opts, model, soloTransport);
-    if (opts.attempts) {
-      try {
-        opts.attempts.add({
-          accountId: auth.id, account: accountName, outcome: 'ok',
-          ms: Date.now() - startedAtOf(opts),
-        });
-      } catch (e2) { /* 埋点失败不影响请求 */ }
-    }
-    // 成功喂池：清熔断/软退避/防误杀计数（修复重试属于模型行为，不算失败）
-    channelPool.noteSuccess(CHANNEL, auth.id);
-    // lastError 是「最近一次结果」，不是「历史故障」（qwenwork 2026-10-02 同款
-    // 修复，TRAE 当年漏了这条不变量）：成功即清除。不清的话一次瞬时限流会
-    // 永久挂在账号卡上——实测（2026-11-02）：测150 在 09:27 撞一次 3004 限流
-    // 后又有 50 次成功请求，牌子却一直挂着，被读成「当前故障」。
-    // 只在确实有 lastError 时才写盘，避免每次成功都触发一次文件写入。
-    if (auth.lastError) {
-      try { authStore.patch(auth.id, { lastError: '' }); }
-      catch (e) { /* 清标记失败不影响请求结果 */ }
-    }
-    return result;
-  } catch (e) {
-    if (opts.attempts) {
-      try {
-        const cls = upstreamErrors.classify({ status: Number(e.statusCode) || 0, message: e.message, model });
-        opts.attempts.add({
-          accountId: auth.id, account: accountName, outcome: 'error',
-          reason: `${cls.kind || 'unknown'}:${Number(e.statusCode) || 0}`,
-          ms: Date.now() - startedAtOf(opts),
-        });
-      } catch (e2) { /* 埋点失败不影响请求 */ }
-    }
-    // 探针模式（opts.probe）不喂池、不写 lastError：错误照常上抛如实展示
-    if (!opts.probe) {
-      channelPool.noteError(CHANNEL, auth.id, { status: Number(e.statusCode) || 0, message: e.message, model });
-      try { authStore.patch(auth.id, { lastError: normalizeError(e.message) }); } catch (err) { /* 记不下不影响 */ }
-    }
-    throw e;
-  } finally {
-    channelPool.release(uid);
   }
+  // 三种收场：没号可换 / 全部失败 / 池本来就空
+  if (lastErr) throw lastErr;
+  const err = new Error('traework 没有可用账号（全部处于冷却/禁用/在途满，可到管理端账号池复活）');
+  err.statusCode = 503;
+  if (opts.attempts) {
+    try { opts.attempts.add({ outcome: 'skip', reason: 'pool_pick_failed（冷却/禁用/在途满）' }); }
+    catch (e2) { /* 埋点失败不影响请求 */ }
+  }
+  throw err;
 }
 
 /** 档位观测：请求了档位就打一行——生效与被钳制都如实记录（Qoder P1 的
@@ -969,6 +1145,8 @@ module.exports = {
   internals: {
     setSendOnce: (fn) => { if (typeof fn === 'function') sendOnce = fn; },
     resetSendOnce: () => { sendOnce = runSendOnce; },
+    // 换票失败的「凭证是否彻底废了」判据（纯函数，供单测直接打）
+    isRefreshRejected,
   },
   DEFAULT_MODEL: c.DEFAULT_MODEL,
 };

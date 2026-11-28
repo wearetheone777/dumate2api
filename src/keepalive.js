@@ -402,15 +402,54 @@ function builtinAdapters() {
       async refresh(a) {
         const authStore = require('./workbuddy/auth');
         const cur = authStore.get(a.id) || a;
-        if (!authStore.needsRefresh(cur, state.warn_hours * 3600 * 1000)) {
+        // P1-3（misakano #296）：上游会**提前**清 refresh session（生态实测
+        // ~12 天死亡，expiresAt 还远）。等 warn 窗口才刷，等于在 AT 还有几天
+        // 寿命时才第一次换票——失败即退场，观测与抢救都晚了。改**每轮必刷**
+        // （720h 窗口恒真，等价于无条件；warn_hours 是各通道共享配置，对
+        // workbuddy 的换票语义不适用），代价只是 refresh 轮换变频。
+        // 最小间隔 1h：防手动连点 runOnce 把换票端点打成机器特征。
+        if (cur.refreshRetiredAt) {
+          // 已判退场：换票端点对它只会回同一份拒绝，不再白撞。
+          // access 未过期时账号仍可用（判废是双条件，见 channel-pool.credentialDead）
+          return { ok: true, skipped: true, retired: true, expire_at: cur.expiresAt || null };
+        }
+        if (cur.lastRefreshAt && Date.now() - cur.lastRefreshAt < 3600000) {
           return { ok: true, skipped: true, expire_at: cur.expiresAt || null };
         }
         // auth.exchange 内部已有 refreshGuard（跨进程轮换竞态）+ 单飞，
         // 这里不重复实现；成功后必须落盘（新 refreshToken 只此一份）
         const r = await authStore.exchange(cur);
-        if (r.ok && r.patch) { try { authStore.patch(a.id, r.patch); } catch (e) { /* 落盘失败下轮重试 */ } }
+        if (r.ok && r.patch) {
+          try { authStore.patch(a.id, { ...r.patch, lastRefreshAt: Date.now() }); } catch (e) { /* 落盘失败下轮重试 */ }
+        }
         const merged = { ...cur, ...(r.patch || {}) };
-        return { ok: !!r.ok, error: r.error || '', expired: !!r.expired, expire_at: merged.expiresAt || null };
+        const out = { ok: !!r.ok, error: r.error || '', expired: !!r.expired, expire_at: merged.expiresAt || null };
+        // **AT 倒计时**（P1-3）：行里直接带剩余天数（1 位小数），预警与界面
+        // 不必再从 expire_at 换算。取不到（expiresAt 缺失）如实 null。
+        const exp = Number(merged.expiresAt);
+        out.at_days_left = Number.isFinite(exp) && exp > 0 ? Math.round(((exp - Date.now()) / 86400000) * 10) / 10 : null;
+        if (!r.ok) {
+          // **keepalive 路径的判废**（P1-3）：换票被上游**明确拒绝**才标退场
+          // ——send 层的判废只在对话请求路径上跑，账号不接流量就永远标不上。
+          // 判据与 send 层同源（isRefreshRejected），认不出措辞不标。
+          if (authStore.isRefreshRejected(r.error || '')) {
+            try {
+              authStore.patch(a.id, {
+                refreshRetiredAt: Date.now(),
+                lastError: `凭证失效（需重新登录）: ${String(r.error || '').slice(0, 260)}`,
+              });
+            } catch (e) { /* 标记失败不影响本轮结果 */ }
+            out.retired = true;
+            // **早死观测**（misakano #296）：AT 还远没到期（> 7 天）却换不动票
+            // = 上游提前清了 refresh session。error 文案如实带出，预警能看见
+            // 「早死」而不是只看到一句通用失败。
+            if (Number.isFinite(exp) && exp > Date.now() + 7 * 86400000) {
+              out.refresh_died_early = true;
+              out.error = `refresh 早死：AT 还有 ${Math.round((exp - Date.now()) / 86400000)} 天寿命却换不动票（上游提前清 session？）：${r.error}`;
+            }
+          }
+        }
+        return out;
       },
       async balance(a) {
         const billing = require('./workbuddy/billing');
@@ -726,6 +765,11 @@ async function runOnce(trigger = 'manual', opts = {}) {
         channel: u.ad.channel, uid: u.uid, name: u.name,
         ok, skipped: !!(r && r.skipped), error: (r && r.error) || '',
         expire_at: (r && r.expire_at) || null,
+        // AT 倒计时（P1-3）：adapter 算好带来的剩余天数（WorkBuddy 有，其余 null）
+        at_days_left: (r && Number.isFinite(r.at_days_left)) ? r.at_days_left : null,
+        // refresh 早死观测（P1-3）：AT 还远却换不动票（misakano #296）
+        refresh_died_early: !!(r && r.refresh_died_early),
+        retired: !!(r && r.retired),
         // 预警只留给「没续上」的号（见 expireWarn 注释）
         expire_warn: ok ? null : expireWarn(r, cfg.warn_hours),
       });
@@ -791,6 +835,15 @@ async function runOnce(trigger = 'manual', opts = {}) {
       require('./admin/auth').audit('system', 'keepalive', '',
         `${trigger}: ${units.length} 号，解冻 ${rec.unfrozen.length}${token.aborted ? '（中断）' : ''}`);
     } catch (e) { /* 审计不可用不阻塞结果 */ }
+    // 阶段 4.7（批次二十「统计预热」）：搭子积分账单预热——/overview 的
+    // 逐账号上游查询挪到保活空闲时段，页面命中缓存时不再等上游往返。
+    // fire-and-forget：预热失败只留 stderr，不影响本轮结果（/overview 未
+    // 命中缓存时本来就会现算并自己暖）。
+    if (!token.aborted) {
+      setImmediate(() => {
+        try { require('./points-usage-cache').warm(30); } catch (e) { /* 预热不致命 */ }
+      });
+    }
     // crit 告警推送（2026-11-06 清单项 4）：轮次结束时判一次健康面，crit>0
     // 才推——warn 是「要留意」，推消息会养成狼来了。fire-and-forget：推送
     // 挂了不阻塞本轮返回（notify.sendNotify 内部已兜错，这里再兜一层）。

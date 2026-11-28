@@ -120,10 +120,22 @@ async function fetchModels(account, { force = false } = {}) {
   if (r.status !== 200) return { ok: false, error: `HTTP ${r.status} ${String(r.raw).slice(0, 120)}`, models: [] };
   let list;
   try { list = (JSON.parse(r.raw).chat || []); } catch (e) { return { ok: false, error: '响应不是 JSON', models: [] }; }
-  const models = list.filter((m) => m && m.enable !== false).map((m) => ({
+  // P0-2：**禁用模型也解析**（只从 `active` 列表里剔除，不静默丢字段）。
+  // 上游的 `enable:false` + `disabled_reason` 是「官方禁用」的明确声明；
+  // 直接过滤掉会让管理端 `/models` 无法区分「官方禁用」与「我们没拉到」，
+  // 只能看到模型平白消失。状态由 catalogStatus 带给调用方。
+  const models = list.filter((m) => m && typeof m.key === 'string' && m.key.trim()).map((m) => ({
     key: m.key,
     name: m.display_name || m.key,
     prefixed: `qoder/${m.key}`,
+    // 目录状态（P0-2）：active / disabled / retired_candidate
+    status: m.enable === false ? 'disabled' : 'active',
+    disabledReason: m.enable === false ? String(m.disabled_reason || m.disable_reason || '') : '',
+    enabled: m.enable !== false,
+    // 运行时别名注册（P0-2）：上游每次成功拉表都把 display_name → key 注册进
+    // 内存表；chat.resolveModelKey 优先查它（精确 → 归一化，歧义不猜）。
+    // 只在内存里，进程重启即丢，下一次拉表重新学。
+    aliasOf: m.display_name ? String(m.display_name) : '',
     // 倍率是相对值，不是积分绝对值
     rate: typeof m.price_factor === 'number' ? m.price_factor : null,
     // 原价倍率：**错峰/免费模型的 price_factor 会是 0**（实测 qfmodel=0、
@@ -170,7 +182,11 @@ async function fetchModels(account, { force = false } = {}) {
     cheap: typeof m.price_factor === 'number' && m.price_factor <= 0.1,
   }));
   const out = { ok: true, error: '', models };
-  if (models.length) modelsCache.set(ck, { at: Date.now(), data: out });
+  if (models.length) {
+    modelsCache.set(ck, { at: Date.now(), data: out });
+    // 运行时别名注册：失败吞掉，不影响这次拉表
+    try { require('./chat').registerAliases(models); } catch (e) { /* 注册失败不阻断 */ }
+  }
   return out;
 }
 
@@ -284,11 +300,26 @@ async function ensureAccount(authStore, account) {
   const r = await exchange(account);
   if (!r.ok) {
     authStore.patch(account.id, { lastError: `换票失败: ${r.error}` });
+    // 凭证退场标记（2026-11-28，与 TRAE/WorkBuddy 同源）：`exchange` 的失败
+    // 全部带 `expired: true`（换票端点拒绝 / 没回 token / PAT 兜底也失败），
+    // 这是上游**明确判死**——再问也是同一个答案。标了之后 needsRefresh
+    // 返回 false，不再每次请求都白撞一次换票端点。
+    // 网络类失败（`出站代理配置错误` / 缺 refreshToken）不带 expired，不标。
+    if (r.expired) {
+      try {
+        authStore.patch(account.id, {
+          lastError: `凭证失效（需重新登录）: ${String(r.error).slice(0, 260)}`,
+          refreshRetiredAt: Date.now(),
+        });
+      } catch (e) { /* 标记失败不影响本次请求 */ }
+    }
     const err = new Error(`Qoder token 换票失败: ${r.error}`);
     err.statusCode = 401;
     throw err;
   }
-  authStore.patch(account.id, r.patch);
+  // 刷新成功说明上游刚承认这份凭证能换票：退场标记必须一并清掉，
+  // 否则 needsRefresh 会永远返回 false，新 access 用到过期都不会再刷。
+  authStore.patch(account.id, { ...r.patch, refreshRetiredAt: null });
   return authStore.get(account.id) || { ...account, ...r.patch };
 }
 
@@ -669,6 +700,45 @@ async function verifyClaim(token, region, campaignId, opts = {}) {
  *   同时也是出站代理的解析来源（E 包收口补点）：签到全链路与对话同出口，
  *   代理配置非法时以首次网络动作的失败收场，不回退直连。
  */
+/**
+ * 签到结果三态判定（P0-5）。
+ *
+ * `r.ok` 是「上游接口回 200」，不等于「领到了」。三类事实必须分开：
+ *   claimed      — 领取响应成功且**实际到账 > 0**
+ *   already      — 明确已领过（无可领活动 / 上游 409 / BLOCKED 且有已领证据）
+ *   none_available / exhausted / same_person / blocked / error — 没领到，原因不同
+ *
+ * 关键纪律：`gained <= 0` 一律不写 lastCheckin / 账本 claim 行——上游结算延迟时
+ * 读成 0 只是「没测出来」，不是没领；但把它写成成功会永久掩盖真实失败。
+ */
+function checkinOutcome(r) {
+  if (!r || r.ok !== true) return 'error';
+  const claims = Array.isArray(r.claimed) ? r.claimed : [];
+  const hasPositiveGain = Number(r.gained) > 0;
+  const successful = claims.filter((x) => x && x.ok);
+  if (successful.length) {
+    // 没有实测差值时（注入的 claimOf / 上游余额查不到）不把 0/null 当失败，
+    // 但仍以「领取响应成功」为成功证据——这是 autocheckin 既有口径。
+    if (r.gained == null) return 'claimed';
+    if (hasPositiveGain) {
+      const verified = successful.filter((x) => x.verification === 'claimed');
+      if (verified.length && verified.length === successful.length) return 'claimed';
+      // 同人已领：领取接口报成功但归属核验点名「进了另一个号」
+      if (successful.some((x) => x.verification === 'same_person' || x.samePerson)) return 'same_person';
+      return 'claimed';
+    }
+    const verified = successful.filter((x) => x.verification === 'claimed');
+    if (verified.length && verified.length === successful.length) return 'none_available';
+    if (successful.some((x) => x.verification === 'same_person' || x.samePerson)) return 'same_person';
+    return 'none_available';
+  }
+  if (r.alreadyChecked) return 'already';
+  if (claims.some((x) => x && x.samePerson)) return 'same_person';
+  if (claims.some((x) => x && /BLOCKED/i.test(String(x.error || '')))) return 'blocked';
+  if (claims.some((x) => x && /EXHAUST|NO_AVAILABLE/i.test(String(x.error || x.status || '')))) return 'exhausted';
+  return 'none_available';
+}
+
 async function checkin(token, region, opts = {}) {
   let agent = null;
   try { agent = opts.account ? agentOf(opts.account) : null; } catch (e) {
@@ -756,6 +826,6 @@ function cachedModels(account) {
 
 module.exports = {
   request, bearerHeaders, exchange, ensureAccount, fetchUserInfo, fetchPlan, importPat, tokenFamilyOf, jobTokenPost,
-  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchProEligibility, claimProBenefit, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinStatus, verifyClaim, TIMEOUT_MS,
+  fetchQuota, fetchCreditUsage, parseCreditUsage, fetchProEligibility, claimProBenefit, fetchModels, cachedModels, listCampaigns, claimCampaign, checkin, checkinOutcome, checkinStatus, verifyClaim, TIMEOUT_MS,
   parseThinkingConfig,
 };

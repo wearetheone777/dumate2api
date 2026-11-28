@@ -279,6 +279,10 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
   // provider 解析出**实际发给上游的模型 key** 后回调（目前只有 Qoder 报）。
   // `route.model` 只是去掉前缀的调用方写法，显示名有没有解析成功看不出来。
   const onModel = (name) => { if (name) req._mappedModel = String(name); };
+  // 上游真实模型的**指纹**（P1-3，目前只有 Qoder 报）：响应里的 model 恒为
+  // "auto"，只有 system_fingerprint 能区分后端。它是哈希，不是模型名——
+  // 单独一个字段，界面写「指纹」而不是冒充 resolved_model。
+  const onFingerprint = (fp) => { if (fp && !req._upstreamFingerprint) req._upstreamFingerprint = String(fp); };
   // 链路上报（2026-11-06）：traework 的三条链路（utils_chat / remote / solo）
   // 实际走哪条只有通道知道——req 上存一下，logRequest 落 link 字段。
   // 没有「链路」概念的通道不上报，字段留空，前端不显示。
@@ -347,7 +351,7 @@ async function handleDirectChannel(req, res, payload, route, ctx) {
     // TRAE 宝身份标记（2026-11-03）：resolve() 把 `traebao/` 前缀剥掉后才到
     // provider 手里，send() 靠 payload.model 认不出身份——显式经 opts 传。
     if (route.personalAssistant) req._personalAssistant = true;
-    const providerOpts = { reqId, onAccount, onModel, onLink, onDegraded, onFailover, onReasoning, onSessionKey, attempts: attemptLog, startedAt, region: ctx.region || '', personalAssistant: !!route.personalAssistant, key: req._apiKey || null };
+    const providerOpts = { reqId, onAccount, onModel, onFingerprint, onLink, onDegraded, onFailover, onReasoning, onSessionKey, attempts: attemptLog, startedAt, region: ctx.region || '', personalAssistant: !!route.personalAssistant, key: req._apiKey || null };
     if (!wantStream) {
       // traework 的 send 第二参是 onChunk；不传即为非流式聚合
       const result = await provider.send(payload, undefined, providerOpts);
@@ -864,6 +868,45 @@ function readBody(req) {
   return bodyLimit.readBody(req, { maxBytes: MAX_BODY_BYTES });
 }
 
+// Buffer 版请求体读取（批次九）：ASR 的 multipart 是**二进制**，readBody 的
+// utf8 字符串路径会把跨 chunk 的多字节序列打碎（音频字节损坏）。语义复刻
+// body-limit：超限当场 resolve(null) + 后台限时排空，读与写分离。
+function readBodyBuffer(req, maxBytes) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    let drainTimer = null;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      if (drainTimer) clearTimeout(drainTimer);
+      resolve(v);
+    };
+    req.on('data', (c) => {
+      if (settled) return;
+      size += c.length;
+      if (size > maxBytes) {
+        req._bodyTooLarge = true;
+        chunks.length = 0;
+        finish(null);
+        try { req.resume(); } catch (e) { /* 已结束 */ }
+        const drainFor = bodyLimit.drainMs();
+        if (drainFor > 0) {
+          drainTimer = setTimeout(() => { try { req.destroy(); } catch (e) { /* 已销毁 */ } }, drainFor);
+          if (drainTimer.unref) drainTimer.unref();
+        } else {
+          try { req.destroy(); } catch (e) { /* 已销毁 */ }
+        }
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => finish(Buffer.concat(chunks)));
+    req.on('error', () => finish(Buffer.concat(chunks)));
+  });
+}
+
 // 请求体超限的统一出口。各端点正常错误形状不同，但 413 极少触发，
 // 统一 OpenAI 形状即可（客户端只看状态码）。
 // **多带 `Connection: close`**：超限时我们并不保证把上传读完（只排空很短一段），
@@ -872,6 +915,9 @@ function sendBodyTooLarge(res) {
   return sendJSON(res, 413, { error: { message: 'Request body too large', type: 'invalid_request_error' } },
     { Connection: 'close' });
 }
+
+// 入站 JSON 统一解析（P1-2）：实现在 src/inbound-json.js（9080/9084 共用）。
+const { parseJsonBody, invalidJsonMessage } = require('./inbound-json');
 
 // 非流式上游响应的累积上限（审计 P1-1b）：上游半信任，流量不可控，
 // 无限 `data += c` 等于把上游（或中间人）的输出全部吃进内存。
@@ -979,6 +1025,10 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 上游会按请求模型静默改路由（glm-5 预置展示 GLM-5.2），不记这个
     // 就只能靠猜。桌面链路拿不到这个头，如实留空。
     real_model: req._realModel || '',
+    // 上游真实模型的指纹（P1-3，Qoder 的 system_fingerprint）。与 real_model
+    // 是两个来源：后者是 HTTP 头回显（只有搭子云端有），前者是响应帧。
+    // 拿不到如实留空——不拿请求的模型名冒充「上游确认了」。
+    upstream_fingerprint: req._upstreamFingerprint || '',
     stream: !!info.stream,
     messages: info.messages || 0,
     status: status || 0,
@@ -993,6 +1043,11 @@ function logRequest(req, res, startedAt, info, status, usage, extra) {
     // 缓存写入（P2-13）：Anthropic 系的第三段。命中率分母要由它剔掉写入。
     cache_creation_tokens: u.creation || 0,
     cache_creation_reported: !!u.creationReported,
+    // 官方逐请求积分（P1-6，R2 两本账）：上游 usage 帧带了 credit 就记。
+    // **credit_reported=false 或 credit=0 是「这条记录没带」= 不知道，不是免费**——
+    // 官方账本侧只累加有值的行，绝不拿 0 补。
+    credit: u.credit != null ? u.credit : null,
+    credit_reported: !!u.creditReported,
     // 计量口径（2026-11-06）：qwen-acp 的会话帧不带 token 计量（tokens 恒 0），
     // 扣费真实发生（三池差值实证）但逐笔金额网关侧拿不到——差值法每请求要
     // 多 2 次上游调用，不值得。标 wallet-delta 让界面显示「无计量」，
@@ -1431,6 +1486,17 @@ async function handleOpenAIModels(req, res) {
             owned_by: 'qoder',
             name: m.name,
             ...(m.contextWindow ? { contextWindow: m.contextWindow, maxContextWindow: m.maxContextWindow } : {}),
+            // P0-3：能力元数据「一致才返回」由 qoder 出口判定；这里只透传。
+            // 缺失字段不填 false/null——cc-switch / 客户端应当成「未知」。
+            ...(m.supports_reasoning !== undefined ? { supports_reasoning: m.supports_reasoning } : {}),
+            ...(m.reasoning_effort_options ? { reasoning_effort_options: m.reasoning_effort_options } : {}),
+            ...(m.default_reasoning_effort ? { default_reasoning_effort: m.default_reasoning_effort } : {}),
+            ...(m.multimodal !== undefined ? { multimodal: m.multimodal } : {}),
+            ...(m.maxOutputTokens ? { maxOutputTokens: m.maxOutputTokens } : {}),
+            // P0-2：模型表来源（upstream / disk-cache / client-cache / snapshot）。
+            // **不能省**——兜底时条目明显变少，不标来源会被当成网关故障排查。
+            ...(m.catalogSource ? { catalogSource: m.catalogSource } : {}),
+            ...(m.status && m.status !== 'active' ? { status: m.status } : {}),
           });
         }
       }
@@ -1506,9 +1572,11 @@ async function handleImageGenerations(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const model = body.model || media.DEFAULT_IMAGE_MODEL;
   const r = await media.generateImage({
     prompt: body.prompt,
@@ -1539,9 +1607,11 @@ async function handleVideo(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const model = body.model || media.DEFAULT_VIDEO_MODEL;
   const r = await media.generateVideo({
     prompt: body.prompt,
@@ -1565,8 +1635,17 @@ async function handleSpeech(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
+  }
+  body = pb.value;
+  // /v1/audio/speech 双通道分派（批次九）：hunyuan-tts / wb: 前缀 → WorkBuddy
+  // TTS（上游写死模型），其余（tts-1 占位名、搭子模型、空）仍走搭子 media.js。
+  const wbAudio = require('./workbuddy/audio');
+  const ttsDispatch = wbAudio.resolveTTSDispatch(body.model);
+  if (ttsDispatch.workbuddy) {
+    return handleWorkbuddySpeech(req, res, body, startedAt, ttsDispatch.region);
   }
   const model = body.model || media.DEFAULT_TTS_MODEL;
   const r = await media.synthesizeSpeech({
@@ -1590,6 +1669,90 @@ async function handleSpeech(req, res) {
   return res.end(r.buffer);
 }
 
+// WorkBuddy 音频端点（批次九，misakano speech.go 协议 + 真机探针定案）。
+// 错误面与 media 同款：4xx → invalid_request_error，5xx → api_error。
+async function handleWorkbuddySpeech(req, res, body, startedAt, regionOverride) {
+  req._logPath = '/v1/audio/speech';
+  req._channel = 'workbuddy';
+  const region = regionOverride || (req._apiKeyRegion === 'intl' ? 'global' : 'cn');
+  const format = String(body.response_format || 'wav').toLowerCase();
+  if (!(format === '' || format === 'wav' || format === 'pcm')) {
+    return sendJSON(res, 400, {
+      error: { message: `response_format "${body.response_format}" 不支持：上游只产出 PCM，可选 wav / pcm`, type: 'invalid_request_error' },
+    });
+  }
+  try {
+    const r = await require('./workbuddy/audio').speechTTS({ input: body.input, voice: body.voice, region });
+    const out = format === 'pcm' ? r.pcm : r.wav;
+    logRequest(req, res, startedAt, { model: `workbuddy/tts`, stream: false, messages: 0 }, 200, null,
+      { media: 'wb_tts', bytes: out.length, ms: r.ms });
+    res.writeHead(200, {
+      'Content-Type': format === 'pcm' ? 'audio/pcm' : 'audio/wav',
+      'Content-Length': out.length,
+      ...(res._cors || {}),
+    });
+    return res.end(out);
+  } catch (e) {
+    const status = e.statusCode || 502;
+    logRequest(req, res, startedAt, { model: 'workbuddy/tts', stream: false, messages: 0 }, status, null,
+      { media: 'wb_tts', error: e.message });
+    return sendJSON(res, status, {
+      error: { message: e.message, type: status < 500 ? 'invalid_request_error' : 'api_error' },
+    });
+  }
+}
+
+// 语音转文本（OpenAI /v1/audio/transcriptions 形状）。本项目此前完全没有 ASR
+// 能力——这条是第一条。multipart 解析与上游转发都在 workbuddy/audio.js。
+async function handleWorkbuddyTranscriptions(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/audio/transcriptions';
+  req._channel = 'workbuddy';
+  const wbAudio = require('./workbuddy/audio');
+  // 3MB 上限在入口钳（读盘/转发之前）；Buffer 读——multipart 是二进制，
+  // utf8 字符串路径会打碎音频字节
+  const raw = await readBodyBuffer(req, wbAudio.MAX_AUDIO_BYTES + wbAudio.ASR_BODY_SLACK);
+  if (raw == null) {
+    return sendJSON(res, 413, {
+      error: { message: '音频超过 3MB 上游上限（请求体含 multipart 分帧余量 64KiB）', type: 'invalid_request_error', code: 'audio_too_large' },
+    }, { Connection: 'close' });
+  }
+  let part;
+  try {
+    part = wbAudio.parseMultipartAudio(raw, req.headers['content-type']);
+  } catch (e) {
+    return sendJSON(res, e.statusCode || 400, { error: { message: e.message, type: 'invalid_request_error' } });
+  }
+  // OpenAI 的 response_format：json（默认）/ text；srt/vtt/verbose_json 要时间戳，
+  // 上游不返回，明确拒掉而不是静默回 json（panel 同口径）
+  const fmt = String((part.fields && part.fields.response_format) || 'json').toLowerCase();
+  if (!(fmt === '' || fmt === 'json' || fmt === 'text')) {
+    return sendJSON(res, 400, {
+      error: { message: `response_format "${part.fields.response_format}" 不支持：上游不返回时间戳，可选 json / text`, type: 'invalid_request_error' },
+    });
+  }
+  const region = (part.fields && part.fields.realm === 'global') || req._apiKeyRegion === 'intl' ? 'global' : 'cn';
+  try {
+    const r = await wbAudio.transcribe({
+      audio: part.bytes, filename: part.filename, contentType: part.contentType, region,
+    });
+    logRequest(req, res, startedAt, { model: 'workbuddy/asr', stream: false, messages: 0 }, 200, null,
+      { media: 'wb_asr', chars: r.text.length, ms: r.ms });
+    if (fmt === 'text') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', ...(res._cors || {}) });
+      return res.end(r.text);
+    }
+    return sendJSON(res, 200, { text: r.text });
+  } catch (e) {
+    const status = e.statusCode || 502;
+    logRequest(req, res, startedAt, { model: 'workbuddy/asr', stream: false, messages: 0 }, status, null,
+      { media: 'wb_asr', error: e.message });
+    return sendJSON(res, status, {
+      error: { message: e.message, type: status < 500 ? 'invalid_request_error' : 'api_error' },
+    });
+  }
+}
+
 // 千问搜索端点（2026-10-31）。两条都是**只读检索**，不消耗对话额度里的
 // 输出预算，但走的是同一份账号凭证与出站代理。
 //
@@ -1603,9 +1766,11 @@ async function handleWebSearch(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const search = require('./qwenwork/search');
   try {
     const r = await search.webSearch({
@@ -1631,9 +1796,11 @@ async function handleVoicePolish(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const voice = require('./qwenwork/voice');
   try {
     const r = await voice.polishVoiceText(body.text, { accountId: body.account_id });
@@ -1657,9 +1824,11 @@ async function handleImageSearch(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   const search = require('./qwenwork/search');
   try {
     const r = await search.imageSearch({ query: body.query || body.q, count: body.count });
@@ -1672,6 +1841,89 @@ async function handleImageSearch(req, res) {
   }
 }
 
+// WorkBuddy agenttool 搜索/抓取 + 嵌入（批次八）。三条都是**只读端点**：
+// 搜索/抓取不消耗模型额度，嵌入走独立注册表；都**不喂池**——检索失败与
+// 对话可用性是两回事（dumate-web-api 只读端点同一纪律）。响应不做 OpenAI
+// chat 包装：结果形状与 chat completion 无关（qwenwork /v1/search/* 同口径）。
+async function handleWorkbuddySearch(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/search/agenttool';
+  req._channel = 'workbuddy';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
+  }
+  const body = pb.value;
+  const search = require('./workbuddy/search');
+  const region = req._apiKeyRegion === 'intl' ? 'global' : (req._apiKeyRegion || 'cn');
+  try {
+    const r = await search.webSearch({
+      query: body.query || body.q,
+      blockedDomains: body.blocked_domains || body.blockedDomains,
+    }, { region });
+    logRequest(req, res, startedAt, { model: 'workbuddy/agenttool-search', stream: false, messages: 0 }, 200, null, { media: 'agenttool_search', results: r.items.length });
+    return sendJSON(res, 200, { object: 'search_result', items: r.items, query: r.query, total_results: r.totalResults, response_time_ms: r.responseTimeMs });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'workbuddy/agenttool-search', stream: false, messages: 0 }, status, null, { media: 'agenttool_search', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleWorkbuddyFetch(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/webfetch';
+  req._channel = 'workbuddy';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
+  }
+  const body = pb.value;
+  const search = require('./workbuddy/search');
+  const region = req._apiKeyRegion === 'intl' ? 'global' : (req._apiKeyRegion || 'cn');
+  try {
+    const r = await search.webFetch({ url: body.url, format: body.format }, { region });
+    logRequest(req, res, startedAt, { model: 'workbuddy/webfetch', stream: false, messages: 0 }, 200, null, { media: 'webfetch', chars: r.content.length });
+    return sendJSON(res, 200, { url: r.url, title: r.title, content: r.content });
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: 'workbuddy/webfetch', stream: false, messages: 0 }, status, null, { media: 'webfetch', error: e.message });
+    return sendJSON(res, status, { error: { message: e.message, type: 'api_error' } });
+  }
+}
+
+async function handleWorkbuddyEmbeddings(req, res) {
+  const startedAt = Date.now();
+  req._logPath = '/v1/embeddings';
+  req._channel = 'workbuddy';
+  const bodyStr = await readBody(req);
+  if (bodyStr == null) return sendBodyTooLarge(res);
+  const pb = parseJsonBody(bodyStr);
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
+  }
+  const body = pb.value;
+  const emb = require('./workbuddy/embeddings');
+  const region = req._apiKeyRegion === 'intl' ? 'global' : (req._apiKeyRegion || 'cn');
+  try {
+    const r = await emb.sendEmbeddings({ input: body.input, model: body.model }, { region });
+    logRequest(req, res, startedAt, { model: `workbuddy/${r.model}`, stream: false, messages: 0 }, 200, null, {
+      media: 'embeddings', items: r.data.length,
+      prompt_tokens: r.usage ? r.usage.prompt_tokens : null,
+    });
+    return sendJSON(res, 200, r);
+  } catch (e) {
+    const status = Number(e.statusCode) || 502;
+    logRequest(req, res, startedAt, { model: `workbuddy/${body.model || 'bge-m3'}`, stream: false, messages: 0 }, status, null, { media: 'embeddings', error: e.message });
+    const type = status === 400 ? 'invalid_request_error' : (status === 413 ? 'invalid_request_error' : 'api_error');
+    return sendJSON(res, status, { error: { message: e.message, type, ...(e.code ? { code: e.code } : {}) } });
+  }
+}
+
 async function handleFileUpload(req, res) {
   const startedAt = Date.now();
   req._logPath = '/v1/files/upload';
@@ -1679,9 +1931,11 @@ async function handleFileUpload(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try { body = JSON.parse(bodyStr || '{}'); } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pb = parseJsonBody(bodyStr, { allowEmpty: true });
+  if (pb.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pb), type: 'invalid_request_error' } });
   }
+  body = pb.value;
   // 请求体形状：{ name, content_base64, mime_type? }。用 base64 而不是
   // multipart，是因为网关没有 multipart 解析器（零第三方依赖），而文件
   // 上传是低频动作，客户端做一次 base64 编码完全可以接受。
@@ -1768,11 +2022,11 @@ async function handleOpenAIChat(req, res) {
   const startedAt = Date.now();  const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let reqBody;
-  try {
-    reqBody = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const p = parseJsonBody(bodyStr);
+  if (p.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(p), type: 'invalid_request_error' } });
   }
+  reqBody = p.value;
 
   // 客户端 token 字段归一（实机原因见 src/budget.js:normalizeTokenFields）：
   // 上游只认 max_tokens——两个都发会被明文拒绝（400），只发
@@ -1989,11 +2243,11 @@ async function handleAnthropicCountTokens(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let body;
-  try {
-    body = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body' } });
+  const pc = parseJsonBody(bodyStr);
+  if (pc.err) {
+    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: invalidJsonMessage(pc) } });
   }
+  body = pc.value;
   let total = estimateTokens(body.system);
   for (const m of (body.messages || [])) total += estimateTokens(m.content) + 4;
   for (const t of (body.tools || [])) total += estimateTokens(t.description || '') + estimateTokens(JSON.stringify(t.input_schema || {}));
@@ -2019,11 +2273,11 @@ async function handleGoogleGenerateContent(req, res, isStream, pathModel) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let googleReq;
-  try {
-    googleReq = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { error: { code: 400, message: 'Invalid JSON body', status: 'INVALID_ARGUMENT' } });
+  const pg = parseJsonBody(bodyStr);
+  if (pg.err) {
+    return sendJSON(res, 400, { error: { code: 400, message: invalidJsonMessage(pg), status: 'INVALID_ARGUMENT' } });
   }
+  googleReq = pg.value;
 
   googleReq.stream = isStream;
   // Google 的模型名在 URL 路径上，body 里没有，埋点要显式带上
@@ -2158,11 +2412,11 @@ async function handleOpenAIResponses(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let reqBody;
-  try {
-    reqBody = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+  const pr = parseJsonBody(bodyStr);
+  if (pr.err) {
+    return sendJSON(res, 400, { error: { message: invalidJsonMessage(pr), type: 'invalid_request_error' } });
   }
+  reqBody = pr.value;
 
   const isStream = reqBody.stream !== false; // Codex 默认流式
   const info = reqlog.describeRequest(reqBody);
@@ -2270,11 +2524,11 @@ async function handleAnthropicMessages(req, res) {
   const bodyStr = await readBody(req);
   if (bodyStr == null) return sendBodyTooLarge(res);
   let anthropicReq;
-  try {
-    anthropicReq = JSON.parse(bodyStr);
-  } catch (e) {
-    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body' } });
+  const pa = parseJsonBody(bodyStr);
+  if (pa.err) {
+    return sendJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: invalidJsonMessage(pa) } });
   }
+  anthropicReq = pa.value;
 
   const info = reqlog.describeRequest(anthropicReq);
   req._logPath = '/v1/messages';
@@ -2766,12 +3020,15 @@ const server = http.createServer(async (req, res) => {
               const reg = regionParamOf(req);
               const st = require('./qoder').status();
               let telemetry = null;
+              let observations = null;
               try { telemetry = require('./qoder/telemetry').snapshot(); }
               catch (e2) { telemetry = null; }
+              try { observations = require('./qoder/telemetry').observationSnapshot(); }
+              catch (e2) { observations = null; }
               if (!reg) {
                 return {
                   direct: true, ready: st.ready, needsClient: false,
-                  accounts: st.accounts, error: st.error || '', telemetry,
+                  accounts: st.accounts, error: st.error || '', telemetry, observations,
                 };
               }
               const rows = require('./qoder/auth').list()
@@ -2779,7 +3036,7 @@ const server = http.createServer(async (req, res) => {
               const ready = rows.some((a) => a.enabled);
               return {
                 direct: true, ready, needsClient: false,
-                accounts: rows.length, region: reg, telemetry,
+                accounts: rows.length, region: reg, telemetry, observations,
                 error: rows.length ? '' : (reg === 'intl' ? '没有国际版账号' : '没有国内账号'),
               };
             } catch (e) {
@@ -2867,17 +3124,36 @@ const server = http.createServer(async (req, res) => {
       // 解析不出来（如 GET /v1/models）就不传通道，validate 会跳过这条规则
       // ——不该因为「无法判定通道」把只读请求拒掉。
       let reqChannel = '';
-      if (model) {
+      if (req.method === 'POST' && /^\/(v1\/)?(search\/agenttool|webfetch|embeddings)/.test(url)) {
+        // WorkBuddy agenttool（批次八）路径归通道，**优先于 body.model**：
+        // /v1/embeddings 的 body 带 model:'bge-m3'（嵌入注册表的名字，不是
+        // 对话模型），按它 resolve 会落 dumate 兜底，区域/通道绑定的 key
+        // 就被 403 channel_not_allowed。
+        reqChannel = 'workbuddy';
+      } else if (model) {
         try {
           const r = require('./upstream-router').resolve(model);
           reqChannel = r.channel || '';
         } catch (e) { reqChannel = ''; }
+      } else if (req.method === 'POST' && /^\/(v1\/)?audio\/transcriptions/.test(url)) {
+        // WorkBuddy ASR（批次九）：本项目唯一的 ASR 实现，路径归通道即可——
+        // multipart 的 model/realm 字段在鉴权段不可得（form-data 不按 JSON 解析）。
+        reqChannel = 'workbuddy';
+      } else if (req.method === 'POST' && /^\/(v1\/)?audio\/speech/.test(url)) {
+        // TTS 双通道分派（批次九）：hunyuan-tts / wb: 前缀 → workbuddy；其余
+        // （tts-1 占位名、搭子模型、无 model）仍归搭子。与 handleSpeech 的
+        // handler 分派同一判据（resolveTTSDispatch 单一来源）。
+        reqChannel = (model && require('./workbuddy/audio').resolveTTSDispatch(model).workbuddy)
+          ? 'workbuddy' : 'dumate';
       } else if (req.method === 'POST') {
         // 无 model 字段的工具端点按路径归通道：搜索/语音润色/文件上传是千问
-        // （纯国内），生图/视频/TTS 是搭子。不映射的话，区域绑定的 key 打
+        // （纯国内），生图/视频是搭子。不映射的话，区域绑定的 key 打
         // 这些端点会绕过 validate 的区域判定（channel 未知即跳过）。
-        if (/^\/(v1\/)?(search|voice\/polish|files\/upload)/.test(url)) reqChannel = 'qwenwork';
-        else if (/^\/(v1\/)?(images\/generations|videos\/generations|audio\/speech)/.test(url)) reqChannel = 'dumate';
+        // search 必须写全 web|images：search/agenttool 是 workbuddy 的，
+        // 宽匹配会把它吞进千问。audio/speech 与 audio/transcriptions 已在
+        // 上两个分支按模型/实现归通道，不再出现在这张路径表里。
+        if (/^\/(v1\/)?(search\/(web|images)|voice\/polish|files\/upload)/.test(url)) reqChannel = 'qwenwork';
+        else if (/^\/(v1\/)?(images\/generations|videos\/generations)/.test(url)) reqChannel = 'dumate';
       }
 
       const verdict = keysvc.validate(key, reqlog.clientIP(req), model, reqChannel);
@@ -2959,6 +3235,21 @@ const server = http.createServer(async (req, res) => {
     // 调用方不要拿 session_id 当引用（它只是上传会话，不是文件标识）。
     if ((url === '/v1/files/upload' || url === '/files/upload') && req.method === 'POST') {
       return await handleFileUpload(req, res);
+    }
+    // WorkBuddy agenttool（批次八）：搜索/抓取/嵌入。路径不占用 qwenwork 的
+    // /v1/search/web（那是千问联网搜索）与搭子的 /v1/images/*（生图）——
+    // 各家语义独立，通道专属路径互不抢。
+    if ((url === '/v1/search/agenttool' || url === '/search/agenttool') && req.method === 'POST') {
+      return await handleWorkbuddySearch(req, res);
+    }
+    if ((url === '/v1/webfetch' || url === '/webfetch') && req.method === 'POST') {
+      return await handleWorkbuddyFetch(req, res);
+    }
+    if ((url === '/v1/embeddings' || url === '/embeddings') && req.method === 'POST') {
+      return await handleWorkbuddyEmbeddings(req, res);
+    }
+    if ((url === '/v1/audio/transcriptions' || url === '/audio/transcriptions') && req.method === 'POST') {
+      return await handleWorkbuddyTranscriptions(req, res);
     }
 
     // Responses API (Codex CLI 0.155+ 只认 wire_api="responses")
@@ -3156,6 +3447,16 @@ async function start() {
     }
   } else {
     log('· Qoder 通道已关闭（DUMATE_QODER_AUTOSTART=off）');
+  }
+
+  // WorkBuddy 6004 窗口探针循环（批次十）：登记侧在 workbuddy/index.js 的
+  // model_cap 分支，执行侧在这里——冷却与选号状态都在网关进程里，探针循环
+  // 必须跟它们同进程。独立开关 DUMATE_WORKBUDDY_WINDOW_PROBE=0 关闭；
+  // 无登记窗口时只是 30s 一次的空转检查，不产生任何上游请求。
+  try {
+    require('./workbuddy/windowprobe').startLoop();
+  } catch (e) {
+    log(`⚠ WorkBuddy 窗口探针启动失败（不影响对话链路）: ${e.message}`);
   }
 
 

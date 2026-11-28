@@ -184,7 +184,19 @@ check('区域归一化', () => {
   assert.strictEqual(constants.normalizeRegion('us'), 'global');
 });
 check('便宜模型表都是 0.1 档', () => {
-  assert.deepStrictEqual(constants.CHEAP_MODELS, ['qfmodel', 'qmodel', 'q37fmodel', 'dfmodel', 'gfmodel']);
+  // P0-2 起 CHEAP_MODELS 由 catalog 快照派生：只包含**未被标候选下线**的
+  // 0.1 档（qmodel / q37fmodel / gm51model 已于 2026-11-28 真机确证下线，不再自动推荐；
+  // mmodel = MiniMax-M3.1-Flash 是本批真机发现的新 0.1 档）。
+  // 断言形状而不是字面量——快照增删条目时这条不该碎，但「候选混进推荐」必须碎。
+  const CHEAP = ['qfmodel', 'qmodel', 'q37fmodel', 'dfmodel', 'gfmodel', 'mmodel'];
+  assert.ok(Array.isArray(constants.CHEAP_MODELS) && constants.CHEAP_MODELS.length > 0, '便宜表非空');
+  for (const k of constants.CHEAP_MODELS) {
+    assert.ok(CHEAP.includes(k), `${k} 应是已知 0.1 档`);
+    assert.ok(constants.FALLBACK_MODELS.includes(k), `${k} 应在兜底表里`);
+    const st = require('../src/qoder/catalog').statusOf(k);
+    assert.strictEqual(st.retiredCandidate, false, `${k} 是候选下线，不该进自动推荐`);
+  }
+  assert.ok(constants.CHEAP_MODELS.includes('gfmodel'), 'gfmodel（0.1 档主力）必须在');
 });
 
 console.log('');
@@ -344,6 +356,16 @@ check('aggregate 出口带归一化后的 usage', () => {
     '{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"credits":0.01,"prompt_cache_hit_tokens":7}}',
   ], 'gfmodel');
   assert.strictEqual(agg.usage.prompt_tokens_details.cached_tokens, 7);
+});
+check('aggregate 捕获 system_fingerprint（P1-3：上游真实后端指纹）', () => {
+  const agg = chat.aggregate([
+    '{"choices":[{"delta":{"content":"a"}}],"system_fingerprint":"fpv0_abc123"}',
+    '{"choices":[{"delta":{},"finish_reason":"stop"}],"system_fingerprint":"fpv0_abc123"}',
+  ], 'gfmodel');
+  assert.strictEqual(agg.system_fingerprint, 'fpv0_abc123');
+  // 上游没给就不造字段——「不知道」不能写成空串/假值
+  const none = chat.aggregate(['{"choices":[{"delta":{"content":"a"}}]}'], 'gfmodel');
+  assert.strictEqual(none.system_fingerprint, undefined);
 });
 
 console.log('');

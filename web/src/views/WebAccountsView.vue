@@ -1,16 +1,26 @@
 <template>
   <div class="page">
+    <!-- 回收站入口（批次十六）：五通道共用一个抽屉，按当前通道取各自的后端。
+         放在通道分支之上——它是唯一一个所有通道账号页都要有的公共动作。
+         restoredTick：恢复成功后重挂子组件，让账号列表立刻反映结果。 -->
+    <div class="flex justify-end">
+      <a-button size="small" @click="trashOpen = true">
+        <template #icon><DeleteOutlined /></template>
+        回收站
+      </a-button>
+    </div>
+
     <!-- ============ TRAE Work：凭证自持，多账号可增删 ============ -->
-    <TraeworkAccounts v-if="isTw" />
+    <TraeworkAccounts v-if="isTw" :key="`tw-${restoredTick}`" />
 
     <!-- ============ 千问办公：多账号池，凭证自持（可增删、可设主账号） ============ -->
-    <QwenworkAccounts v-else-if="isQw" />
+    <QwenworkAccounts v-else-if="isQw" :key="`qw-${restoredTick}`" />
 
     <!-- ============ Qoder：多账号池，凭证自持（device flow，不需要客户端） ============ -->
-    <QoderAccounts v-else-if="isQd" />
+    <QoderAccounts v-else-if="isQd" :key="`qd-${restoredTick}`" />
 
     <!-- ============ WorkBuddy：第五通道，双区域，登录流程后置期用导入 ============ -->
-    <WorkBuddyAccounts v-else-if="isWb" />
+    <WorkBuddyAccounts v-else-if="isWb" :key="`wb-${restoredTick}`" />
 
     <!-- ============ 百度搭子：原有页面 ============ -->
     <template v-else>
@@ -53,7 +63,7 @@
       </a-empty>
 
       <a-row v-else :gutter="[16, 16]">
-        <a-col v-for="a in accounts" :key="a.id" :span="8">
+        <a-col v-for="a in sortedAccounts" :key="a.id" :span="8">
           <a-card size="small" :bordered="true" class="h-full">
             <div class="flex items-start justify-between">
               <div>
@@ -80,6 +90,11 @@
               class="mt-2"
               style="padding: 4px 8px"
             />
+
+            <!-- 临期角标（批次二十一）：expiring-snapshot 透出；搭子窗口 30 天 -->
+            <div v-if="entryOf(a.id)" class="mt-2">
+              <ExpiringTag :entry="entryOf(a.id)" :fresh="expFresh" :preferred="preferredOf(a.id)" :window-days="expWindow" />
+            </div>
 
             <div class="mt-3 grid grid-cols-2 gap-2 text-sm">
               <div>
@@ -544,12 +559,18 @@
     <SessionBrowser />
 
     </template>
+
+    <!-- 回收站抽屉（批次十六）：五通道共用壳，channel 是唯一取数维度 -->
+    <TrashDrawer v-model:open="trashOpen" :channel="channelStore.current as TrashChannel" @restored="onRestored" />
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { DeleteOutlined } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
+import ExpiringTag from '@/components/ExpiringTag.vue'
+import { useExpiring } from '@/utils/expiringBadge'
 import { App } from 'ant-design-vue'
 import client from '@/api/client'
 import { channelStore, isTraework, isQwenwork, isQoder, isWorkBuddy } from '@/stores/channel'
@@ -559,6 +580,8 @@ import QoderAccounts from '@/components/qoder/QoderAccounts.vue'
 import WorkBuddyAccounts from '@/components/workbuddy/WorkBuddyAccounts.vue'
 import SessionBrowser from '@/components/SessionBrowser.vue'
 import AccountTransferCard from '@/components/AccountTransferCard.vue'
+import TrashDrawer from '@/components/TrashDrawer.vue'
+import type { TrashChannel } from '@/api/trash'
 import type { WebAccount, AccountStatus, PoolData, PoolAccount } from '@/api/webaccounts'
 
 // message 走 App.useApp() 的实例（App.vue 已包 <a-app>），静态 import 拿不到上下文
@@ -571,7 +594,21 @@ const isQw = computed(() => isQwenwork())
 const isQd = computed(() => isQoder())
 const isWb = computed(() => isWorkBuddy())
 
+// 回收站（批次十六）：抽屉开合 + 恢复后的列表刷新信号。
+// 搭子（内联模板）直接调本页的 load()；其余通道重挂子组件（它们自己拉数据）。
+const trashOpen = ref(false)
+const restoredTick = ref(0)
+function onRestored() {
+  if (isTw.value || isQw.value || isQd.value || isWb.value) restoredTick.value++
+  else load()
+}
+
 const accounts = ref<WebAccount[]>([])
+
+// 临期角标（批次二十一）：快照通道之一，窗口 30 天（签到积分包天然落在
+// 25~30 天区间，窗口必须 ≥30 天才不会恒空）；按紧迫度把临期账号排前面
+const { entryOf, preferredOf, loadExpiring, reorder, expFresh, expWindow } = useExpiring('dumate')
+const sortedAccounts = computed(() => reorder(accounts.value, (x) => x.id))
 const loginUrl = ref('')
 const loginSteps = ref<string[]>([])
 const addOpen = ref(false)
@@ -677,6 +714,7 @@ function checkinColor(r: string) {
 }
 
 async function load() {
+  loadExpiring() // 独立数据源（临期快照），不阻塞账号列表
   const { data } = await client.get('/web-accounts')
   accounts.value = data.accounts
   loginUrl.value = data.login_url
@@ -963,7 +1001,7 @@ async function toggle(a: WebAccount, v: boolean) {  await client.patch(`/web-acc
 
 async function remove(a: WebAccount) {
   await client.delete(`/web-accounts/${a.id}`)
-  message.success('已删除')
+  message.success('已移入回收站（30 天内可恢复）')
   await load()
 }
 

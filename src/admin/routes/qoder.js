@@ -30,6 +30,8 @@ async function fresh(raw) {
 }
 
 const routes = [
+  // 回收站四路由（批次十六）：列表/清空/恢复/永久删除。放最前，防被参数路由截胡
+  ...require('../trash').routesFor('qoder'),
   {
     // 通道状态 + 账号列表（脱敏：token 只给尾部 6 位）
     // ?region=（2026-11-03）：cn / global（intl 也认）——国内/国际独立视图
@@ -87,10 +89,10 @@ const routes = [
       }
       if (!pref) return sendJSON(res, 200, { models: [], total: 0, region: region || undefined, error: '没有可用账号', fetchedAt: 0 });
       const fr = await fresh(pref);
-      if (fr.error) return sendJSON(res, 200, { models: [], total: 0, region: region || constants.normalizeRegion(pref.region), error: fr.error, fetchedAt: 0 });
+      if (fr.error) return sendJSON(res, 200, { models: [], total: 0, region: region || constants.normalizeRegion(pref.region), error: fr.error, fetchedAt: 0, catalogSource: 'none' });
       try {
         const raw = await session.fetchModels(fr.account, { force });
-        if (!raw.ok) return sendJSON(res, 200, { models: [], total: 0, region: constants.normalizeRegion(pref.region), error: raw.error || '', fetchedAt: 0 });
+        if (!raw.ok) return sendJSON(res, 200, { models: [], total: 0, region: constants.normalizeRegion(pref.region), error: raw.error || '', fetchedAt: 0, catalogSource: 'none' });
         const reg = constants.normalizeRegion(pref.region);
         // 叠加**主动探测**结论（P2-20）：模型表声称的输出上限普遍虚高，
         // 实测过的才有数字。没测过的 probe=null，界面不标注（没测 ≠ 没钳制）。
@@ -103,6 +105,8 @@ const routes = [
           region: reg,
           error: '',
           fetchedAt: Date.now(),
+          // P0-2：目录来源如实标注（upstream / disk-cache / client-cache / snapshot）
+          catalogSource: 'upstream',
           // 倍率语义写清楚：相对值，不是积分绝对值
           rateNote: '倍率是相对值（上游字段 price_factor），实际扣费 = 倍率 × 用量。0.1 档最省，适合调试。',
           probeNote: 'probe 字段是**实测**输出上限（主动探测落盘）：clamped=被静默钳制（标「32K ⚠ 钳制 4×」）、'
@@ -232,6 +236,16 @@ const routes = [
         const v = m ? m.get(g.grantId) : null;
         return v != null ? v : 0;
       };
+      // 批次二十一角标：逐账号临期明细挂到 credits 行上（推算口径与 summary
+      // 同源；estOk=false 时整体回落领取额口径，与 summary 的行为一致）。
+      // expiring-snapshot 没有 qoder——账号卡的临期角标从这份账本出。
+      for (const r of rows) {
+        const gList = expiring.filter((g) => g.accountId === r.id);
+        r.expiringCount = gList.length;
+        r.expiringAmount = Number(gList.reduce((s, g) => s + (estOk ? estOf(g) : (g.amount || 0)), 0).toFixed(4));
+        r.expiringNearest = gList.length ? gList[0].expiresAt : null; // expiring 已按 expiresAt 升序
+        r.expiringEstimated = estOk;
+      }
       const grantedSum = expiring.reduce((s, r) => s + (r.amount || 0), 0);
       // 区域视图：临期批次按当前视图内的账号收窄
       const shownIds = new Set(rows.map((r) => r.id));
@@ -1136,10 +1150,11 @@ const routes = [
     method: 'DELETE',
     path: '/accounts/:id',
     handler: async ({ res, params }) => {
-      const ok = authStore.remove(params[0]);
-      if (!ok) return sendJSON(res, 404, { error: '账号不存在' });
+      // 批次十六：删除 = 移入回收站（30 天可恢复）；永久删除走 DELETE /trash/:key
+      const r = require('../trash').trashAccount('qoder', params[0]);
+      if (!r.ok) return sendJSON(res, 404, { error: r.error });
       try { require('../auth').audit('admin', 'qoder_account_delete', params[0]); } catch (e) { /* 审计失败不影响结果 */ }
-      return sendJSON(res, 200, { ok: true });
+      return sendJSON(res, 200, { ok: true, trashed: true, name: r.name });
     },
   },
   {

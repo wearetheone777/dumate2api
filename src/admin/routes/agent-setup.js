@@ -27,6 +27,35 @@ const routes = [
     },
   },
   {
+    // P2-2：只读的「接入片段」预览。ChatLab 的 Qoder Tab 用它展示客户端该填什么，
+    // 复用 buildClaudeEnv / codexSnippet / deriveTiers 同一份生成器——
+    // 另写一份模板必然漂移（AgentSetup 写进去的与这里展示的对不上时，
+    // 用户只会觉得网关坏了）。这里不写任何文件、也不回显 token：
+    // token 用占位符，避免明文落到测试台的历史/DOM。
+    method: 'GET',
+    path: '/snippets',
+    handler: async ({ res, req }) => {
+      const u = new URL(req.url || '/', 'http://127.0.0.1');
+      const q = u.searchParams;
+      const channel = channels.normalize(q.get('channel') || 'qoder') || 'qoder';
+      const token = q.get('withToken') === '1' ? '' : '<YOUR_API_KEY>';
+      const base = setup.gatewayBase();
+      try {
+        const { tiers, derived, accountNote } = await setup.deriveTiers(channel, []);
+        const env = require('../../admin/routes/ccswitch').buildClaudeEnv(channel, tiers, derived, token, base);
+        const codex = setup.codexSnippet(channel, tiers, derived, token, base);
+        return sendJSON(res, 200, {
+          ok: true, channel, gateway: base, accountNote,
+          claude: Object.entries(env).map(([k, v]) => `${k}=${v}`).join('\n'),
+          codex: [...codex.topLines, ...codex.providerLines].join('\n'),
+          note: '只读展示，不写文件；token 是占位符。真正写入请到「智能体一键配置」页。',
+        });
+      } catch (e) {
+        return sendJSON(res, 500, { ok: false, error: `生成片段失败：${e.message}` });
+      }
+    },
+  },
+  {
     // 写入前预览（调研 P2-10）：返回**将写入的差异**，不改任何文件。
     // body 与 /apply 完全一致——用户先在这里看清楚，再点写入。
     // 预览与写入共用 buildNext（同一份计算），所以不可能出现

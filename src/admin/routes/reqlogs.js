@@ -183,7 +183,9 @@ const routes = [
         region: region || undefined,
         // 提示数据源滚动：日志超 32MB 会轮转，太老的记录可能已被移到 .1
         rotated_file: `${reqlog.LOG_DIR}\\requests.jsonl.1`,
-        note: '记录由网关逐条落盘，最多保留 32MB，最老的记录可能已轮转删除。',
+        retention: reqlog.retentionOf(),
+        note: `记录由网关逐条落盘，主文件最多 ${Math.round(32 * 1024 * 1024 / 1024 / 1024)}MB；`
+          + '归档 .1 可配置天数/行数上限，老记录可能已被清理。',
       });
     },
   },

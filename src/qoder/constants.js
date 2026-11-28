@@ -108,21 +108,27 @@ function normalizeRegion(raw) {
 }
 
 // ---- 模型 ----
-// 上游下发 14 个（见 listModels）。这里只作兜底——拿不到真实表时用它，
-// 避免客户端看到「没有可用模型」。
+// 兜底清单的**单一来源**是 `qoder-catalog.snapshot.json`（经 ./catalog 读取）。
+// P0-2 纪律：第三方清单不是本项目的真机证据，所以**不删条目**，只标
+// `retiredCandidate`——默认不在 /v1/models 列出，管理端灰显提示，
+// 显式调用仍原样透传由上游裁决。倍率只有上游 price_factor 一个来源，
+// 快照里不写任何第三方数值。
 //
 // **倍率差别很大（0.1 ~ 1.4，差 14 倍）**，所以开发调试一律用 0.1 档的
 // Flash 模型，别用 auto/Kimi 烧额度。
-const FALLBACK_MODELS = [
-  'auto', 'qmodel_38max', 'qfmodel', 'qmodel_latest', 'qmodel', 'q37fmodel',
-  'dmodel', 'dfmodel', 'gmodel', 'gfmodel', 'gm51model', 'kmodel_latest',
-  'kmodel', 'mmodel',
-];
+const catalog = require('./catalog');
+const FALLBACK_MODEL_ROWS = catalog.loadSnapshot();
+const FALLBACK_MODELS = FALLBACK_MODEL_ROWS.map((r) => r.key);
 const DEFAULT_MODEL = 'auto';
-/** 开发调试推荐的最低倍率模型（0.1） */
-const CHEAP_MODELS = ['qfmodel', 'qmodel', 'q37fmodel', 'dfmodel', 'gfmodel'];
-/** 模型别名：客户端可能传这些名字 */
-const MODEL_ALIASES = { 'qwen-max': 'qmodel_latest', 'qwen-plus': 'qmodel', 'qwen-flash': 'qfmodel' };
+/** 开发调试推荐的最低倍率模型（0.1）。候选（疑似下线）不自动推荐 */
+const CHEAP_MODELS = catalog.cheapKeys();
+/**
+ * 模型别名：客户端可能传这些名字。
+ * `qwen-plus` 原指向 `qmodel`——2026-11-28 真机复核该 key 已从上游模型表消失
+ * （cn/global 四账号全无），别名指到下线模型会让「别名调用」稳定失败且原因难查。
+ * 改指 `qmodel_38max`（同为 Qwen 中档，倍率 0.2，仍在上游表里）。
+ */
+const MODEL_ALIASES = { 'qwen-max': 'qmodel_latest', 'qwen-plus': 'qmodel_38max', 'qwen-flash': 'qfmodel' };
 
 module.exports = {
   CHANNEL_ID,
@@ -138,6 +144,7 @@ module.exports = {
   normalizeRegion,
   chatStreamCandidates,
   FALLBACK_MODELS,
+  FALLBACK_MODEL_ROWS,
   DEFAULT_MODEL,
   CHEAP_MODELS,
   MODEL_ALIASES,

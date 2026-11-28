@@ -111,12 +111,18 @@ async function qoderModels(region) {
       models: rows.map((r) => ({ id: r.id, name: r.name || r.id, prefixed: r.prefixed, rate: r.rate })),
     };
   }
-  // 上游拿不到时回落静态表（含 0.1 档的便宜模型），避免下拉框空着
+  // 上游拿不到时回落静态表（含 0.1 档的便宜模型），避免下拉框空着。
+  // P0-2：**候选下线也列**（这是验证台，正好用来复核第三方说的「已下线」），
+  // 但带 status 让前端灰显——默认选中项不能落到可疑条目上。
   return {
     region: reg, error,
-    models: require('../../qoder/constants').FALLBACK_MODELS.map((k) => ({
-      id: k, name: k, prefixed: `qoder/${k}`, rate: null,
-    })),
+    models: require('../../qoder/constants').FALLBACK_MODELS.map((k) => {
+      const st = require('../../qoder/catalog').statusOf(k);
+      return {
+        id: k, name: k, prefixed: `qoder/${k}`, rate: null,
+        status: st.status, retiredCandidate: st.retiredCandidate, reason: st.reason || '',
+      };
+    }),
   };
 }
 

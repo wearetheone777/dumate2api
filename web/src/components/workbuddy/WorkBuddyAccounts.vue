@@ -147,6 +147,8 @@
                 <div class="num">{{ creditOf(a.id)?.total ?? '—' }}</div>
                 <!-- 临期包：不用点开详情就该看见的风险（已用完的包不算） -->
                 <div v-if="soonPackText(a)" class="text-xs text-orange-700">{{ soonPackText(a) }}</div>
+                <!-- 建议优先使用（批次二十一）：快照里全频道最早到期的那张卡 -->
+                <a-tag v-if="preferredOf(a.id)" color="purple" class="mt-1">建议优先使用</a-tag>
               </div>
               <div>
                 <div class="text-xs text-slate-400">今日签到</div>
@@ -172,7 +174,7 @@
             <div class="mt-3 flex flex-wrap gap-1">
               <a-button v-if="!isIntl" size="small" :loading="busy[a.id]" @click="checkin(a)">签到</a-button>
               <a-button size="small" @click="openDetail(a)">详情</a-button>
-              <a-popconfirm title="确定删除这个账号？" @confirm="remove(a)">
+              <a-popconfirm title="删除并移入回收站（30 天内可恢复）？" @confirm="remove(a)">
                 <a-button size="small" danger>删除</a-button>
               </a-popconfirm>
             </div>
@@ -729,6 +731,7 @@ import type {
   WorkBuddyBusy, WorkBuddyGrowth,
 } from '@/api/workbuddy'
 import { lastErrorFresh, errorWhen, relTime, isStale } from '@/utils/lastError'
+import { useExpiring } from '@/utils/expiringBadge'
 import {
   DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS, clampPage, pageCount, pageSlice, sameSig, sortRows,
 } from '@/utils/paging'
@@ -740,6 +743,11 @@ const status = ref<WorkBuddyStatus | null>(null)
 const credits = ref<{ count: number; rows: WorkBuddyCreditRow[] } | null>(null)
 const loading = ref(false)
 const rows = computed(() => status.value?.rows ?? [])
+
+// 临期角标（批次二十一）：workbuddy 卡片本就显示临期包金额（soonPackText），
+// 这里只补两样——「建议优先使用」标记（快照首个临期账号）与装载；排序已有
+// 「最快到期」模式（paging.ts 的 expiring），不重复造
+const { preferredOf, loadExpiring } = useExpiring('workbuddy')
 // 分组筛选（M2.4）：空 = 全部。列表、计数、一键签到范围都跟着收窄
 const groupFilter = ref<string>('')
 const filteredRows = computed(() =>
@@ -1228,6 +1236,7 @@ let loadSeq = 0
  */
 async function load(opts: { silent?: boolean; credits?: boolean } = {}) {
   const withCredits = opts.credits !== false
+  loadExpiring() // 独立数据源（临期快照），不阻塞账号列表
   // 只有**轮询**允许被在途请求挡掉：操作后的回落必须真的重新读，
   // 否则删了账号界面还挂着它（用户会以为删除失败）
   if (inFlight && opts.silent) return
@@ -1275,7 +1284,7 @@ async function toggle(a: WorkBuddyAccount, v: boolean) {
 
 async function remove(a: WorkBuddyAccount) {
   await workbuddyApi.removeAccount(a.id)
-  message.success('已删除')
+  message.success('已移入回收站（30 天内可恢复）')
   await load()
 }
 

@@ -12,11 +12,15 @@ const WebAccounts = () => import('@/views/WebAccountsView.vue')
 const Usage = () => import('@/views/UsageView.vue')
 const ReqLogs = () => import('@/views/ReqLogsView.vue')
 const ChatLab = () => import('@/views/ChatLabView.vue')
+const BalanceTrend = () => import('@/views/BalanceTrendView.vue')
 const AgentSetup = () => import('@/views/AgentSetupView.vue')
 const Users = () => import('@/views/UsersView.vue')
 const ServerLogs = () => import('@/views/ServerLogsView.vue')
 const TraeRuntime = () => import('@/views/TraeRuntimeView.vue')
 const QoderRuntime = () => import('@/views/QoderRuntimeView.vue')
+const ModelRules = () => import('@/views/ModelRulesView.vue')
+const Backup = () => import('@/views/BackupView.vue')
+const Storage = () => import('@/views/StorageView.vue')
 const ChannelPolicy = () => import('@/views/ChannelPolicyView.vue')
 const OpsAlerts = () => import('@/views/OpsAlertsView.vue')
 
@@ -37,6 +41,9 @@ const router = createRouter({
         { path: 'usage', component: Usage, meta: { title: '用量统计', key: 'usage' } },
         { path: 'reqlogs', component: ReqLogs, meta: { title: '请求日志', key: 'reqlogs' } },
         { path: 'chatlab', component: ChatLab, meta: { title: '聊天测试台', key: 'chatlab' } },
+        // 余额趋势：余额流水的 30 分钟采样折线（批次十九）。全局视图（账本覆盖
+        // 网页账号与各通道池账号），viewer 可看
+        { path: 'balance-trend', component: BalanceTrend, meta: { title: '余额趋势', key: 'balance-trend' } },
         // 接入配置写本机客户端文件，只对 admin 有意义（与账户管理同款限制）
         { path: 'setup', component: AgentSetup, meta: { title: '接入配置', key: 'setup', adminOnly: true } },
         { path: 'users', component: Users, meta: { title: '账户管理', key: 'users', adminOnly: true } },
@@ -48,6 +55,12 @@ const router = createRouter({
         { path: 'channel-policy', component: ChannelPolicy, meta: { title: '通道风控', key: 'channel-policy', adminOnly: true } },
         // Qoder 运行策略：超时/排队/冷却热生效 + 自动签到排程（P0-1/P0-3），admin 专属
         { path: 'qoder-runtime', component: QoderRuntime, meta: { title: 'Qoder 运行策略', key: 'qoder-runtime', adminOnly: true } },
+        // WorkBuddy 模型规则：按账号 deny/allow（批次十三），admin 专属
+        { path: 'model-rules', component: ModelRules, meta: { title: '模型规则', key: 'model-rules', adminOnly: true } },
+        // 备份与还原：表驱动分区导出/导入（批次十五），覆盖全部通道、与通道无关，admin 专属
+        { path: 'backup', component: Backup, meta: { title: '备份与还原', key: 'backup', adminOnly: true } },
+        // 存储管理：data/ 四类视图 + 先预览再确认的清理（批次十七），与通道无关，admin 专属
+        { path: 'storage', component: Storage, meta: { title: '存储管理', key: 'storage', adminOnly: true } },
         // 运维告警：七类规则阈值 + 活跃告警 + 指标端点。viewer 可看（只读），写操作服务端拦
         { path: 'alerts', component: OpsAlerts, meta: { title: '运维告警', key: 'alerts' } },
         // 「任务记录」已并入「积分明细」（见 CLAUDE.md）。这里保留重定向：

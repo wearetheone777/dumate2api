@@ -214,6 +214,12 @@ function thrownFrameErr(fe, sent) {
   if (t.policy) err.policy = true;
   if (t.dupRequest) err.dupRequest = true;
   if (t.opaqueCode) err.opaqueCode = t.opaqueCode;
+  // P1-3：上游业务码与请求 ID 单独带出来，不塞进 message 让人从文本里抠。
+  // 取不到就是空串——0/null 会被读成「上游明确报了 0 号错误」。
+  if (fe.requestId != null) err.upstreamRequestId = String(fe.requestId).slice(0, 120);
+  else if (fe.request_id != null) err.upstreamRequestId = String(fe.request_id).slice(0, 120);
+  const upstreamCode = t.opaqueCode || t.code || fe.code;
+  if (upstreamCode != null && String(upstreamCode).trim()) err.upstreamCode = String(upstreamCode).slice(0, 40);
   if (sent !== undefined) err.sent = sent;
   return err;
 }
@@ -760,6 +766,11 @@ async function runOnce(account, payload, onChunk, opts, meter) {
               return;
             }
             noteCredits(parsed);
+            // 上游真实模型的指纹（P1-3）：响应 model 恒为 auto，只有它认得出后端。
+            // 只上报第一个非空值（逐帧重复，取首个即可），异常吞掉。
+            if (parsed.system_fingerprint && opts && typeof opts.onFingerprint === 'function') {
+              try { opts.onFingerprint(String(parsed.system_fingerprint).slice(0, 120)); } catch (e2) { /* 上报失败不影响请求 */ }
+            }
             // 累积本轮正文/思维链，供下一轮 DeepSeek reasoning 回填
             const ch0 = parsed.choices && parsed.choices[0];
             const d0 = ch0 && ch0.delta;
@@ -971,6 +982,13 @@ async function runOnce(account, payload, onChunk, opts, meter) {
       toolNames: repair.toolNamesOf(payload),
       echoMode: repair.toolEchoMode(),
     });
+    // P1-3：上游真实模型的指纹（与流式同一口径）
+    if (out && out.system_fingerprint && opts && typeof opts.onFingerprint === 'function') {
+      try { opts.onFingerprint(String(out.system_fingerprint).slice(0, 120)); } catch (e2) { /* 上报失败不影响请求 */ }
+    }
+    // system_fingerprint 是给**排障**的（埋点），不是协议字段：Aggregate 的
+    // 返回值会原样回给客户端，保留它无害（OpenAI 本就有这个字段），
+    // 但上游没给时绝不造。
     // 非流式同样记下本轮 reasoning，供下一轮 DeepSeek 回填。**只在确认收尾时记**
     // ——修复轮会整轮丢弃，提前记会把被丢弃的那轮思维链留给下一句对话。
     const rememberOut = () => {
@@ -1155,13 +1173,28 @@ function classifyForTelemetry(e, model) {
   return { ...cls, throttled: ue.isThrottle(e.message), policy: e.policy === true || ue.isContentPolicy(e.message) };
 }
 
+/** 遥测作用域：区域 + 账号 id + 模型（P1-5，不记任何正文/凭证） */
+function scopeOf(account, model) {
+  return {
+    area: account && account.region ? constants.normalizeRegion(account.region) : '',
+    accountId: account ? account.id : null,
+    model: model || '',
+  };
+}
+
 async function send(payload, onChunk, opts = {}) {
   const tried = new Set();
   const errors = [];
+  // 会话粘性 + 池选号（冷却/熔断/禁用/暂停/在途满跳过），见 channel-pool.js
+  // 注意顺序：会话键在守卫**之前**取——键反映客户端原文（逐轮稳定），守卫只改
+  // 出站字节，不因开关切换把粘性绑定抖到新键（升级时不会丢前缀缓存）。
+  const sessionKey = channelPool.sessionKeyFor(payload, opts);
+  // 出站身份句守卫（P0-1）：在 buildBody 之前中和第三方 Agent 的身份句
+  // （You are Codex, 等）。默认关闭；开启时只插一个空格，不改语义。
+  // 放在 provider 入口而不是 server.js：只影响 Qoder，不碰其它通道。
+  try { require('./identity-guard').guardBody(payload); } catch (e) { /* 守卫失败不影响请求 */ }
   const model = payload && payload.model ? String(payload.model).replace(/^qoder\//, '') : '';
   const startedAt = Date.now();
-  // 会话粘性 + 池选号（冷却/熔断/禁用/暂停/在途满跳过），见 channel-pool.js
-  const sessionKey = channelPool.sessionKeyFor(payload, opts);
   // 区域约束（API Key 的 region，2026-11-01）：'cn' → 只用国内账号，'intl' →
   // 只用国际（global）账号，'' = 不限。请求的模型名不编码区域，区域约束只能
   // 落在账号池选择上——不加过滤的话，intl key 的请求会被 FEFO/轮询派给国内
@@ -1221,7 +1254,7 @@ async function send(payload, onChunk, opts = {}) {
       channelPool.noteSuccess(CHANNEL, account.id);
       // 风控遥测（P1-11）：只记计数，不参与任何判定。探针模式也记——
       // 探针读的是上游真实反应，正是最干净的风控样本。
-      try { telemetry.note('ok'); } catch (e2) { /* 埋点失败不影响请求 */ }
+      try { telemetry.note('ok', scopeOf(account, model)); } catch (e2) { /* 埋点失败不影响请求 */ }
       // 成功即清除上次的失败标记（与千问同一约定：一次瞬时失败不该永远挂着）
       if (account.lastError) {
         try { authStore.patch(account.id, { lastError: '' }); }
@@ -1236,7 +1269,7 @@ async function send(payload, onChunk, opts = {}) {
       // upstream-errors 的分类**（不另写一套正则，两套必然漂移）。
       try {
         const cls = classifyForTelemetry(e, model);
-        telemetry.note(telemetry.kindOf(cls), { queueType: queueTypeOf(e.message) });
+        telemetry.note(telemetry.kindOf(cls), { ...scopeOf(account, model), queueType: queueTypeOf(e.message) });
       } catch (e2) { /* 埋点失败绝不影响响应 */ }
       // 失败喂池：105（Login expired）按 401 进防误杀计数；额度类业务码
       // （112/110/114/430）按 poolInfoOf 的专门处置（固定冷却/不惩罚），
@@ -1255,7 +1288,35 @@ async function send(payload, onChunk, opts = {}) {
         if (isAuthErr) clock.measureSkew(account.region).catch(() => { /* 排障信息，失败不管 */ });
         markFailure(account, `${e.message}${clockHint}`);
       }
-      errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled, quotaKind: e.quotaKind || '' });
+      // P1-3：诊断字段进尝试链，不进 message（也不记正文/凭证）。
+      // upstreamRequestId 取不到留空，不拿本地 requestSetId 冒充——它不是上游回的。
+      const diagName = account.nickname || account.uid || `账号 ${account.id}`;
+      // 失败阶段（P1-3）：**我们**判定的「错在哪一步」，与上游给的码分开。
+      //   auth     401/403/105（凭证或权限）
+      //   throttle 429 或限流文案（上游让我们等）
+      //   quota    额度类业务码（quotaKind 有值）
+      //   network  statusCode 0（连接层失败/计时器掐断）
+      //   model    模型级拒绝（404 Model not found / 403 + 模型文案）
+      //   http     其它上游 HTTP 错误
+      // 模型级拒绝的判据复用 classify（不另写正则）——它已经把 1005 /
+      // 「订阅专享」/ Model not found 归成 kind:'model'。
+      let clsKind = '';
+      try { clsKind = classifyForTelemetry(e, model).kind || ''; } catch (e2) { clsKind = ''; }
+      const stage = code === 401 || code === 403 ? 'auth'
+        : throttled ? 'throttle'
+          : e.quotaKind ? 'quota'
+            : !code ? 'network'
+              : clsKind === 'model' ? 'model'
+                : 'http';
+      const diag = {
+        accountId: account.id, account: diagName, outcome: 'error', stage,
+        reason: `upstream:${e.upstreamCode || code || 'network'}\n${String(e.message || '').slice(0, 60)}`.trim(),
+      };
+      if (e.upstreamCode) diag.upstreamCode = e.upstreamCode;
+      if (e.upstreamRequestId) diag.upstreamRequestId = e.upstreamRequestId;
+      const reqAttemptLog = opts.attempts || null;
+      if (reqAttemptLog) reqAttemptLog.add(diag);
+      errors.push({ account: account.nickname || account.uid || account.id, status: code || '网络错误', error: e.message, throttled, quotaKind: e.quotaKind || '', upstreamCode: e.upstreamCode || '', upstreamRequestId: e.upstreamRequestId || '' });
       if (e.sent) throw e; // 流式已吐帧，不能再换号
       if (!retryable(code, e.message, e.quotaKind)) throw e;
       sel = channelPool.pickCandidate(CHANNEL, usable, { exclude: tried, sessionKey, model, expiring });
@@ -1373,6 +1434,62 @@ async function listModels() {
 }
 
 /**
+ * `/v1/models` 的能力元数据：只给**所有声明过的账号都明确且一致**的值。
+ *
+ * 数据源是 session.fetchModels 的归一化字段：isReasoning / reasoningEfforts /
+ * reasoningDefault / multimodal。maxOutputTokens 两个来源：上游模型表声称值
+ * （m.maxOutputTokens / m.max_tokens，当前上游通常不给），以及撞过 400 后
+ * max-output.js 的自学习值（按区域 + 模型 key）。
+ *
+ * **为什么按 key 聚合而不是按展示名**：同一展示名在不同账号/区域可能映射不同
+ * key；把「同名不同能力」合并成一个条目等于编造。所以外层按 key 建组，
+ * 任一键在某账号缺失或声明不同，就把该字段整项省略（不填 false/null）。
+ * 这与 AI-Toolkit credits-proxy 的口径一致——「不知道」不能写成「没有」。
+ *
+ * `accountCount` 是声明过该模型的账号数（不含没有该模型的账号）。
+ * 只有显式声明的数量与它相等，且所有声明一致，才输出字段。
+ */
+function buildModelCapability(modelsByAccount, { region, key, accountCount = 1 } = {}) {
+  const cap = { present: 0 };
+  const put = (field, value, equal) => {
+    if (value === undefined || value === null) return;
+    cap.present++;
+    if (cap[field] === undefined) { cap[field] = { value, equal: true }; return; }
+    cap[field].equal = cap[field].equal && equal(value, cap[field].value);
+  };
+  const samePrimitive = (a, b) => a === b;
+  const sameArray = (a, b) => Array.isArray(a) && Array.isArray(b)
+    && a.length === b.length && a.every((x, i) => x === b[i]);
+
+  for (const models of modelsByAccount || []) {
+    const m = (models || []).find((x) => x && String(x.key || x.name || '') === String(key || ''));
+    if (!m) continue; // 这个账号没该模型：不参与一致性判定
+    cap.present++;
+    put('supportsReasoning', m.isReasoning === true ? true : (m.isReasoning === false ? false : undefined), samePrimitive);
+    put('multimodal', m.multimodal === true ? true : (m.multimodal === false ? false : undefined), samePrimitive);
+    put('reasoningEfforts', Array.isArray(m.reasoningEfforts) ? [...m.reasoningEfforts] : undefined, sameArray);
+    put('reasoningDefault', typeof m.reasoningDefault === 'string' && m.reasoningDefault ? m.reasoningDefault : undefined, samePrimitive);
+    const claimed = Number(m.maxOutputTokens || m.max_tokens);
+    put('maxOutputTokens', Number.isFinite(claimed) && claimed > 0 ? claimed : undefined, samePrimitive);
+  }
+  const learned = Number(maxOutput.get(region, key));
+  if (Number.isFinite(learned) && learned > 0) {
+    cap.present++;
+    put('maxOutputTokens', learned, samePrimitive);
+  }
+  const out = {};
+  const take = (field, target) => {
+    if (cap[field] && cap[field].equal && cap.present >= accountCount) out[target] = cap[field].value;
+  };
+  take('supportsReasoning', 'supports_reasoning');
+  take('reasoningEfforts', 'reasoning_effort_options');
+  take('reasoningDefault', 'default_reasoning_effort');
+  take('multimodal', 'multimodal');
+  take('maxOutputTokens', 'maxOutputTokens');
+  return out;
+}
+
+/**
  * 模型条目：**带真实显示名与上下文**。
  *
  * 为什么单独一个方法：`/v1/models` 要的不只是 id 列表——cc-switch 解析模型
@@ -1383,31 +1500,88 @@ async function listModels() {
  * 上下文也带上：cc-switch 会读它；声明虚高会让客户端到接近上限才压缩历史，
  * 而 Qoder 多数模型只有 180K。
  */
-async function listModelEntries() {
+async function listModelEntries({ includeRetired = false } = {}) {
   try {
-    const account = authStore.preferred();
-    if (account) {
-      const r = await session.fetchModels(account);
-      if (r.ok && r.models.length) {
+    const accounts = authStore.findUsable();
+    const pref = authStore.preferred();
+    if (pref) {
+      const primary = await session.fetchModels(pref);
+      if (primary.ok && primary.models.length) {
         // 顺手告诉 model-info 上游下发的完整表（带倍率），界面据此标「上游下发」
-        try { require('../model-info').setQoderModels(r.models); } catch (e) { /* 不影响返回 */ }
-        return r.models.map((m) => ({
-          // **id 用真实模型名**（GLM-5.3-Flash），不用内部代号（gfmodel）：
-          // cc-switch 里填的是这个字段，代号根本分不清是哪个模型。
-          // 两种写法都能被 resolveModelKey 解析，旧配置不受影响。
-          id: `qoder/${m.name || m.key}`,
-          name: m.name || m.key,
-          // cc-switch 用这个值决定何时压缩历史。给**最大档**而不是默认档：
-          // 上游多数模型挂着 1M 档，声明 180K 会让长会话提前压缩。
-          contextWindow: m.maxInputTokens || m.contextWindow || null,
-          maxContextWindow: m.maxInputTokens || m.contextWindow || null,
-        }));
+        try { require('../model-info').setQoderModels(primary.models); } catch (e) { /* 不影响返回 */ }
+        // P0-3：能力字段跨账号「一致才返回」。只有主账号拉成功不够——第二个账号
+        // 声明不同时，出口必须省略该字段而不是替它猜。没有该模型的账号不参与判定。
+        // 逐账号读 5 分钟缓存（warmupModels 已预热），不是每请求打上游。
+        // 两个账号列表形状不同：缓存命中对象有 data.models，fetch 结果是裸 models。
+        const byAccount = [primary.models];
+        const declaring = new Set();
+        const markDeclaring = (models) => {
+          for (const m of models || []) if (m && String(m.key || m.name || '') !== '') declaring.add(String(m.key || m.name));
+        };
+        markDeclaring(primary.models);
+        for (const a of accounts) {
+          if (a === pref || a.id === pref.id || a.uid === pref.uid) continue;
+          const cached = session.cachedModels(a);
+          const models = cached && cached.length ? cached : (cached && Array.isArray(cached.models) ? cached.models : null);
+          if (models && models.length) { byAccount.push(models); markDeclaring(models); }
+        }
+        const region = constants.normalizeRegion(pref.region);
+        return primary.models
+          // P0-2：上游 enable=false 的模型**不列进 /v1/models**（官方已禁用），
+          // 但管理端仍可见（admin /qoder/models 与 model-info.qoderRows）。
+          // 候选下线（retiredCandidate）是快照条目，不在这个分支（动态表里没有它们）。
+          .filter((m) => m.enabled !== false)
+          .map((m) => {
+            const key = m.key || m.name;
+            return {
+              // **id 用真实模型名**（GLM-5.3-Flash），不用内部代号（gfmodel）：
+              // cc-switch 里填的是这个字段，代号根本分不清是哪个模型。
+              // 两种写法都能被 resolveModelKey 解析，旧配置不受影响。
+              id: `qoder/${m.name || m.key}`,
+              name: m.name || m.key,
+              // cc-switch 用这个值决定何时压缩历史。给**最大档**而不是默认档：
+              // 上游多数模型挂着 1M 档，声明 180K 会让长会话提前压缩。
+              contextWindow: m.maxInputTokens || m.contextWindow || null,
+              maxContextWindow: m.maxInputTokens || m.contextWindow || null,
+              status: 'active',
+              catalogSource: 'upstream',
+              ...buildModelCapability(byAccount, { region, key, accountCount: declaring.size }),
+            };
+          });
       }
     }
   } catch (e) { /* 拿不到就用兜底 */ }
-  return constants.FALLBACK_MODELS.map((k) => ({
-    id: `qoder/${k}`, name: k, contextWindow: null, maxContextWindow: null,
-  }));
+  // P0-2：兜底走四级降级（磁盘缓存 → 客户端缓存 → 仓库快照）。
+  // `includeRetired=false`（/v1/models 默认）不列疑似下线条目；
+  // 管理端走 admin /qoder/models 或 model-info.qoderRows 拿全量 + 状态 + 原因。
+  try {
+    const cat = require('./catalog');
+    const r = await cat.resolveCatalog({
+      fetchUpstream: () => session.fetchModels(authStore.preferred() || { region: 'cn' }),
+      allowSnapshot: true,
+    });
+    if (r.ok && r.models.length) {
+      return r.models
+        .filter((m) => includeRetired || !m.retiredCandidate)
+        .map((m) => ({
+          id: `qoder/${m.name || m.key}`,
+          name: m.name || m.key,
+          contextWindow: m.maxInputTokens || m.contextWindow || null,
+          maxContextWindow: m.maxInputTokens || m.contextWindow || null,
+          status: m.status || 'active',
+          disabledReason: m.disabledReason || '',
+          retiredCandidate: !!m.retiredCandidate,
+          catalogSource: r.catalogSource,
+        }));
+    }
+  } catch (e) { /* 继续用 constants 兜底 */ }
+  return constants.FALLBACK_MODELS.map((k) => {
+    const st = require('./catalog').statusOf(k);
+    return {
+      id: `qoder/${k}`, name: k, contextWindow: null, maxContextWindow: null,
+      status: st.status, retiredCandidate: st.retiredCandidate, catalogSource: 'snapshot',
+    };
+  });
 }
 
 /** 账号的额度与签到（管理端用） */
@@ -1445,20 +1619,23 @@ async function checkinAndSave(account) {
   } catch (e) {
     return { ok: false, error: e.message, claimed: [] };
   }
-  const got = (r.claimed || []).some((x) => x.ok);
+  // P0-5：判定要「领取响应成功 + 实际到账 > 0」双证据。gained<=0 不写
+  // lastCheckin，也不写 claim 行；已领过只写 already（不代表这次发放了积分）。
+  const outcome = session.checkinOutcome(r);
+  const got = outcome === 'claimed';
   try {
     const auth = require('./auth');
     if (got) auth.patch(a.id, { lastCheckin: Date.now() });
   } catch (e) { /* 落盘失败不影响本次签到结果 */ }
   // 签到账本：某天某账号签到了（按月/按年的签到详情用它）。
   // 今天已领过（一个活动都不可领）也算「这天签过」，如实记 already。
-  if (got || r.alreadyChecked) {
+  if (got || outcome === 'already') {
     ledger.append({
       channel: 'qoder', account_id: a.id, account: a.nickname || a.uid || '',
       at: Date.now(), credits: got ? r.gained : null, source: got ? 'claim' : 'already',
     });
   }
-  return r;
+  return { ...r, outcome, gained: got ? r.gained : null, measuredGained: r.gained == null ? null : r.gained };
 }
 
 function quota(account) {
@@ -1480,4 +1657,6 @@ module.exports = {
   fefoUidSet,
   // 客户端渲染错误码（2026-11-01）：鉴权映射 / 无语义码 / statusCode 钳制
   httpStatusOf, frameThrown, thrownFrameErr, bizFrameError, bizFromBody, accountsForRegion,
+  // /v1/models 能力元数据（P0-3）：单测直接打纯函数，不发网络
+  internals: { buildModelCapability },
 };

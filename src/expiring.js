@@ -180,4 +180,30 @@ function info(channel, now = Date.now()) {
   };
 }
 
-module.exports = { update, accountIds, info, filePath, windowDays, maxAgeMs };
+/**
+ * 前端角标读方（批次二十一）：逐账号临期明细。与 accountIds 同一套判据
+ * （窗口 / TTL / 未过期才进门），只是把 Set 展开成带时刻的明细——两处
+ * 不得漂移。fresh=false 时条目照常返回，由调用方决定是否展示（过期数据
+ * 比没有数据更害人，界面必须把陈旧隐藏而不是照常标红）。
+ */
+function view(channel, now = Date.now()) {
+  const days = windowDays(channel);
+  if (!days) return { at: null, fresh: false, windowDays: 0, accounts: [] };
+  const snap = loadSnap();
+  const ch = snap && snap.channels && snap.channels[channel];
+  if (!ch) return { at: null, fresh: false, windowDays: days, accounts: [] };
+  const fresh = typeof ch.at === 'number' && now - ch.at <= maxAgeMs();
+  const acc = (ch.accounts && typeof ch.accounts === 'object') ? ch.accounts : {};
+  const horizon = now + days * 86400000;
+  const accounts = [];
+  for (const [id, nearest] of Object.entries(acc)) {
+    const t = Number(nearest);
+    // 与 accountIds 同判据：还没到期、且在窗口内的才算临期
+    if (!Number.isFinite(t) || !(t > now) || t > horizon) continue;
+    accounts.push({ id, nearest: t, daysLeft: Math.max(1, Math.ceil((t - now) / 86400000)) });
+  }
+  accounts.sort((a, b) => a.nearest - b.nearest);
+  return { at: ch.at || null, fresh, windowDays: days, accounts };
+}
+
+module.exports = { update, accountIds, info, view, filePath, windowDays, maxAgeMs };

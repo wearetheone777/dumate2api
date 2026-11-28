@@ -48,8 +48,47 @@ function rotateIfNeeded(file) {
   } catch (e) { /* 文件还不存在 */ }
 }
 
+/**
+ * P2-3：日志保留策略。只在**归档文件**上动手——主文件正在被多进程追加，
+ * 裁剪它等于和写者抢同一个 inode，丢行且可能把半行留给读侧。
+ * days / maxLines 都按「面板 > env > 不限」解析；0 一律表示不限。
+ * 失败吞掉：清理绝不能影响埋点主路径。
+ */
+function retentionOf() {
+  let days = parseInt(process.env.DUMATE_REQLOG_RETENTION_DAYS || '0', 10) || 0;
+  let maxLines = parseInt(process.env.DUMATE_REQLOG_MAX_LINES || '0', 10) || 0;
+  try {
+    const cfg = require('./livecfg').Load().reqlogRetention || {};
+    if (Number.isFinite(Number(cfg.days)) && Number(cfg.days) >= 0) days = Math.round(Number(cfg.days));
+    if (Number.isFinite(Number(cfg.maxLines)) && Number(cfg.maxLines) >= 0) maxLines = Math.round(Number(cfg.maxLines));
+  } catch (e) { /* 配置读不到按 env */ }
+  return { days, maxLines };
+}
+
+function pruneArchive(now = Date.now()) {
+  const { days, maxLines } = retentionOf();
+  if (!days && !maxLines) return;
+  const archive = path.join(LOG_DIR, `${FILE}.1`);
+  try {
+    const st = fs.statSync(archive);
+    const stale = days > 0 && (now - st.mtimeMs) > days * 86400000;
+    if (stale) { fs.unlinkSync(archive); return; }
+    if (maxLines > 0 && st.size > 0) {
+      const lines = fs.readFileSync(archive, 'utf8').split('\n').filter(Boolean);
+      if (lines.length > maxLines) {
+        const tmp = `${archive}.tmp`;
+        fs.writeFileSync(tmp, `${lines.slice(-maxLines).join('\n')}\n`, 'utf8');
+        filelock.renameAtomic(tmp, archive);
+      }
+    }
+  } catch (e) { /* 归档不存在或清理失败都不影响主路径 */ }
+}
+
 function record(entry) {
   if (disabled) return;
+  // 保留策略挂在轮转后的下一次记录：高频路径上只在归档存在时多一次 stat，
+  // 而且清理失败被吞，不影响正在转发的响应。
+  try { pruneArchive(); } catch (e) { /* 忽略 */ }
   if (!aggHook && !aggHookBroken) {
     try { aggHook = require('./reqlog-hook'); } catch (e) { aggHookBroken = true; }
   }
@@ -119,7 +158,7 @@ function newReqId() {
 // 是两回事：前者是「确认零缓存」（全价请求），后者是「未知」（不能当 0 算）。
 function pickUsage(u) {
   if (!u || typeof u !== 'object') {
-    return { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false };
+    return { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false, credit: null, creditReported: false };
   }
   const input = Number(u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0) || 0;
   const output = Number(u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0) || 0;
@@ -140,16 +179,21 @@ function pickUsage(u) {
   // 后者不能当 0 写入去算分母（会虚高命中率）。
   const creationCands = [num(u.cache_creation_input_tokens)].filter((v) => v != null);
   const creation = creationCands.length ? Math.max(...creationCands) : 0;
+  // 官方逐请求积分（P1-6，R2 两本账口径）：上游 usage 帧带了 credit 就记。
+  // **credit 缺失/0 = 「这条记录没带」= 不知道，不是免费**——聚合侧只累加
+  // 有值的行，绝不拿 0 补。
+  const credit = num(u.credit);
   return {
     input, output, total, cached, cachedReported: cands.length > 0,
     creation, creationReported: creationCands.length > 0,
+    credit, creditReported: credit != null,
   };
 }
 
 // 从 SSE 文本里扫出 usage。流式响应没有单一的 usage 字段，
 // 必须逐行解析 data: 负载，取最后一个带 usage 的块。
 function usageFromSSE(text) {
-  let best = { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false };
+  let best = { input: 0, output: 0, total: 0, cached: 0, cachedReported: false, creation: 0, creationReported: false, credit: null, creditReported: false };
   for (const line of text.split('\n')) {
     if (!line.startsWith('data:')) continue;
     const payload = line.slice(5).trim();
@@ -225,5 +269,5 @@ function markFirstToken(res) {
 
 module.exports = {
   record, read, pickUsage, usageFromSSE, describeRequest, clientIP, newReqId,
-  markFirstToken, LOG_DIR,
+  markFirstToken, retentionOf, pruneArchive, LOG_DIR,
 };

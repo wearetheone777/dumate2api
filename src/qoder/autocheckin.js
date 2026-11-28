@@ -208,6 +208,55 @@ function stop() {
  *   failedAtOf    (accountId) => 上次失败时刻（默认读 state.failures）
  *   now           注入当前时刻（退避判据可测）
  */
+/**
+ * P1-4：同人拒绝的 6h 窗口（从**最后一次明确被拒**算，不是自然日）。
+ * 判据只认账本里 `verification==='same_person'` 的行；`unverified` 不猜。
+ * 返回值：null = 没有明确同人拒绝；数字 = 最近一次被拒时刻。
+ */
+function lastSamePersonRejected(accountId, rows = null) {
+  const list = rows || require('./grants').readAll();
+  let last = null;
+  for (const r of list) {
+    if (!r || r.accountId !== accountId) continue;
+    if (r.verification !== 'same_person' && r.samePerson !== true) continue;
+    const t = Number(r.ts || r.grantedAt || 0);
+    if (!Number.isFinite(t) || t <= 0) continue;
+    if (last == null || t > last) last = t;
+  }
+  return last;
+}
+
+/** 排序键：最近一次真正领到 ∈ [0, now]，越早越优先；未核实保持中间位不猜。 */
+function lastClaimedAt(accountId, rows) {
+  let last = 0;
+  for (const r of rows) {
+    if (!r || r.accountId !== accountId) continue;
+    if (r.verification !== 'claimed') continue;
+    const t = Number(r.ts || r.grantedAt || 0);
+    if (Number.isFinite(t) && t > last) last = t;
+  }
+  return last;
+}
+
+/**
+ * 账号轮转排序：6h 内被判同人拒绝的排到队尾（本轮跳过）；
+ * 其余按「最久没真正领到」优先。未核实的不被当成已领——保留中间位。
+ * @returns {{list:Array, skipped:Array}} skipped 是被窗口跳过的账号
+ */
+function orderCheckinCandidates(list, { now = Date.now(), rows = null, windowMs = 6 * 3600 * 1000 } = {}) {
+  const all = rows || require('./grants').readAll();
+  const skipped = [];
+  const active = [];
+  for (const a of list || []) {
+    const rejectedAt = lastSamePersonRejected(a.id, all);
+    if (rejectedAt != null && now - rejectedAt < windowMs) { skipped.push(a); continue; }
+    active.push({ account: a, claimed: lastClaimedAt(a.id, all) });
+  }
+  // 没真正领到（0）的排最前；其它按领到时刻升序。
+  active.sort((x, y) => x.claimed - y.claimed);
+  return { list: active.map((x) => x.account), skipped };
+}
+
 async function runOnce(trigger = 'manual', opts = {}) {
   if (state.running) return { skipped: 'already_running' };
   state.running = true;
@@ -229,7 +278,17 @@ async function runOnce(trigger = 'manual', opts = {}) {
       // 国际版默认不进队列：campaigns 端点只在 cn 有活动
       list = list.filter((a) => c.normalizeRegion(a.region) === 'cn');
     }
-    const results = [];
+    // P1-4：同人拒绝 6h 窗口内不重复打；其余按「最久没真正领到」轮转。
+    // 核验失败(unverified)不改变结论，只保留原位不猜。
+    const ordered = orderCheckinCandidates(list, { now, rows: opts.rows || null });
+    list = ordered.list;
+    const skippedRows = ordered.skipped.map((a) => ({
+      id: a.id, name: a.nickname || a.uid || `账号 ${a.id}`,
+      region: c.normalizeRegion(a.region), ok: true, action: 'skipped', already: false,
+      error: '', note: '同人拒绝 6 小时窗口内，本轮跳过',
+    }));
+
+    const results = [...skippedRows];
     for (let i = 0; i < list.length; i++) {
       if (abortFlag) break;
       if (i > 0) await sleep(delayMs);
@@ -281,7 +340,11 @@ async function runOnce(trigger = 'manual', opts = {}) {
       }
       let r;
       try { r = await claimOf(a); } catch (e) { r = { ok: false, error: e.message, claimed: [] }; }
-      const got = !!(r && r.ok && ((r.claimed || []).some((x) => x.ok) || r.gained > 0));
+      // P0-5：领取成功 ≠ 积分到账。只有 outcome=claimed（领取响应成功且
+      // gained>0）或实测差值>0 才算签成；gained<=0 一律留 failed 并报结果。
+      const outcome = r && r.outcome ? r.outcome : session.checkinOutcome(r);
+      const received = outcome === 'claimed' || (r && Number(r.gained) > 0);
+      const got = !!(r && r.ok && received);
       if (got) {
         delete state.failures[raw.id];
         // 统一签到账本：index.checkinAndSave 已写（channel='qoder'）。
@@ -310,7 +373,9 @@ async function runOnce(trigger = 'manual', opts = {}) {
         ok: got,
         action: 'claim',
         already: false,
+        outcome,
         gained: r && r.gained != null ? r.gained : null,
+        measuredGained: r && r.measuredGained != null ? r.measuredGained : null,
         claimed: (r && r.claimed ? r.claimed.filter((x) => x.ok).length : 0),
         error: got ? '' : String((r && r.error) || '签到失败'),
       });
@@ -409,5 +474,6 @@ function configure(patch = {}) {
 module.exports = {
   CONFIG_FILE, DEFAULTS,
   computeNextRunAt, shouldCatchup, decideCheckin, withinBackoff,
+  lastSamePersonRejected, lastClaimedAt, orderCheckinCandidates,
   schedule, stop, runOnce, snapshot, configure, state,
 };

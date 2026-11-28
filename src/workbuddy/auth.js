@@ -103,13 +103,17 @@ function upsert(acc) {
     const data = load();
     const wantRegion = c.normalizeRegion(acc.region);
     const i = data.accounts.findIndex((a) => a.region === wantRegion && acc.uid && a.uid === acc.uid);
+    // 重新导入/登录（带新 refreshToken）必须清掉「凭证已退场」标记，否则
+    // needsRefresh 一直返回 false，新凭证被判成不用刷新——表现为
+    // 「重新导入客户端凭证了还是用不了」，且没有任何报错（TRAE 同款坑）。
+    const fresh = acc.refreshToken ? { ...acc, refreshRetiredAt: null } : acc;
     if (i >= 0) {
-      data.accounts[i] = { ...data.accounts[i], ...acc, region: wantRegion };
+      data.accounts[i] = { ...data.accounts[i], ...fresh, region: wantRegion };
       save(data);
       return data.accounts[i];
     }
     const id = data.accounts.reduce((m, a) => Math.max(m, Number(a.id) || 0), 0) + 1;
-    const rec = { id, enabled: true, createdAt: Date.now(), region: wantRegion, ...acc };
+    const rec = { id, enabled: true, createdAt: Date.now(), region: wantRegion, ...fresh };
     data.accounts.push(rec);
     save(data);
     return rec;
@@ -147,7 +151,35 @@ function remove(id) {
 /** token 是否在 skewMs 内过期。无 expiresAt 视为需要刷新 */
 function needsRefresh(a, skewMs = 3600000) {
   if (!a || !a.expiresAt) return true;
+  // 凭证退场标记（2026-11-28，与 TRAE 同源）：换票被上游**明确拒绝**过，
+  // 再问也是同一个答案。返回 false 表示「不刷新」，账号仍可能因 access
+  // 未过期而可用；access 也过期了则由 index.js 的选号层直接判废。
+  if (a.refreshRetiredAt) return false;
   return Date.now() + skewMs >= a.expiresAt;
+}
+
+/**
+ * 换票失败是不是「这份凭证彻底废了」（而不是网络抖/上游临时故障）。
+ *
+ * 与 TRAE 的 `isRefreshRejected` 同一判据思路：只认上游原文措辞，认不出**不猜**
+ * ——把瞬时故障当凭证失效会让健康账号被误标退场（要人工重新登录才能解），
+ * 代价远大于多撞一次换票端点。
+ *
+ * WorkBuddy 的原文形状（`exchangeOnce` 组装）：`刷新失败 HTTP <status>: <msg>`，
+ * msg 取自信封 `msg`/`message`。实测/文档记录的终态措辞：
+ *   · `12153`（sessionDead 标记，见 constants.SESSION_DEAD_MARKERS）
+ *   · `Offline user session not found`
+ *   · `invalid_grant`（refreshToken 轮换竞态——但 `exchange` 的 guard 2 已先
+ *     重读采纳别人的新值，走到这里说明存储里也没有可用新值，确属终态）
+ *   · `refresh token ... invalid/expired/not found`
+ */
+function isRefreshRejected(msg) {
+  const s = String(msg || '');
+  if (!s) return false;
+  if (/12153/.test(s)) return true;
+  if (/Offline user session not found/i.test(s)) return true;
+  if (/invalid_grant/i.test(s)) return true;
+  return /refresh[\s_-]*token[^.]{0,40}(invalid|expired|not\s+found|revoked|not\s+matched)/i.test(s);
 }
 
 // 刷新单飞表：同一账号并发的 ExchangeToken 只打一次上游（TRAE 同款——
@@ -317,8 +349,24 @@ async function exchange(a) {
 async function ensureFresh(a) {
   if (!needsRefresh(a)) return a;
   const r = await exchange(a);
-  if (!r.ok) return a;   // 刷新失败带旧 token 试一次，错误如实上报
-  return patch(a.id, r.patch) || { ...a, ...r.patch };
+  if (!r.ok) {
+    // 上游**明确拒绝**换票（12153 / invalid_grant / refresh token invalid）
+    // 才标退场（2026-11-28，与 TRAE 同源）：后续请求不再每次白撞换票端点，
+    // 也让 index.js 的选号层能在 access 也过期时直接判废。
+    // 认不出措辞就不标——网络抖/5xx 下次可能就好，误标要重新登录才能解。
+    if (isRefreshRejected(r.error)) {
+      try {
+        patch(a.id, {
+          lastError: `凭证失效（需重新登录）: ${String(r.error).slice(0, 260)}`,
+          refreshRetiredAt: Date.now(),
+        });
+      } catch (e) { /* 标记失败不影响本次请求 */ }
+    }
+    return a;   // 刷新失败带旧 token 试一次，错误如实上报
+  }
+  // 刷新成功说明上游刚承认这份凭证能换票：退场标记必须一并清掉，
+  // 否则 needsRefresh 会永远返回 false，新 access 用到过期都不会再刷。
+  return patch(a.id, { ...r.patch, refreshRetiredAt: null }) || { ...a, ...r.patch };
 }
 
 /**
@@ -406,7 +454,7 @@ function importManual(opts) {
 
 module.exports = {
   FILE, dataDir, filePath, load, save, list, get, findUsable, upsert, patch, remove,
-  needsRefresh, exchange, ensureFresh, importFromClient, importManual,
+  needsRefresh, isRefreshRejected, exchange, ensureFresh, importFromClient, importManual,
   // 测试接缝：exchange() 经 exports.exchangeOnce 调上游，测试可替换成假实现
   // （真实现直接打 refresh 端点，离线测不了）。生产代码路径不受影响。
   exchangeOnce,

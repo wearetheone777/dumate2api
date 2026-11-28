@@ -58,6 +58,10 @@ function recordRate(model, region, billed, opts = {}) {
   const r = normRegion(region);
   const x = Number(billed);
   if (!m || !Number.isFinite(x) || x < 0) return null;
+  // 目录必须先于锁文件存在：withLock 要在数据目录里 open .lock 文件，
+  // 全新数据目录（首次探针/首次测试）没有它就是 ENOENT——saveLedger 里的
+  // mkdir 在锁之后才跑，救不了第一笔
+  fs.mkdirSync(dataDir(), { recursive: true });
   const filelock = require('../filelock');
   return filelock.withLock(filePath(), () => {
     const doc = loadLedger();

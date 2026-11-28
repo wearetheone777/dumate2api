@@ -1,0 +1,35 @@
+{
+  "_comment": "通道能力声明的单一来源（批次二十二）。src/channels.js 与 web/src/stores/channel.ts 都从这份文件构建——同一事实写两份迟早不一致，JSON 是两边都能直接消费的最小公共形态。改通道清单/能力位只改这里：加通道 = 加一条；能力位是声明不是分支，消费方读 can(id, cap) / regionsOf(id)。",
+  "channels": [
+    {
+      "id": "dumate",
+      "label": "百度搭子",
+      "kind": "http",
+      "capabilities": { "checkin": true, "credits": true, "growth": false, "media": true, "search": false, "regions": [] }
+    },
+    {
+      "id": "qwenwork",
+      "label": "千问办公",
+      "kind": "direct",
+      "capabilities": { "checkin": false, "credits": true, "growth": false, "media": false, "search": true, "regions": [] }
+    },
+    {
+      "id": "traework",
+      "label": "TRAE Work",
+      "kind": "direct",
+      "capabilities": { "checkin": true, "credits": true, "growth": false, "media": false, "search": false, "regions": ["cn", "intl"] }
+    },
+    {
+      "id": "qoder",
+      "label": "Qoder",
+      "kind": "direct",
+      "capabilities": { "checkin": true, "credits": true, "growth": false, "media": false, "search": false, "regions": ["cn", "intl"] }
+    },
+    {
+      "id": "workbuddy",
+      "label": "WorkBuddy",
+      "kind": "direct",
+      "capabilities": { "checkin": true, "credits": true, "growth": true, "media": false, "search": false, "regions": ["cn", "intl"] }
+    }
+  ]
+}

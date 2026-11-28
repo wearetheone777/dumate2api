@@ -169,6 +169,16 @@
           />
           <div class="text-xs text-slate-400 mt-1">只是不对外列出，客户端显式传这些名字仍然可用</div>
         </div>
+        <div>
+          <div>请求日志保留策略（只清归档 .1）</div>
+          <div class="flex items-center gap-2 mt-1">
+            <a-input-number v-model:value="liveForm.reqlogRetention.days" :min="0" :disabled="!isAdmin" style="width: 140px" />
+            <span class="text-xs text-slate-400">天（0 = 不限）</span>
+            <a-input-number v-model:value="liveForm.reqlogRetention.maxLines" :min="0" :disabled="!isAdmin" style="width: 140px" />
+            <span class="text-xs text-slate-400">行（0 = 不限）</span>
+          </div>
+          <div class="text-xs text-slate-400 mt-1">正在写的 requests.jsonl 永不裁剪；仅超 32MB 轮转后的归档会被清理</div>
+        </div>
         <div class="flex items-center justify-between">
           <div>
             <div>软冷却基数（毫秒）</div>
@@ -372,7 +382,10 @@ async function loadAudit() {
 
 // ── 热配置开关（livecfg）──
 const liveSaving = ref(false)
-const liveForm = reactive({ recordClientInfo: true, hiddenModels: [] as string[], softCooldownMs: 0 })
+const liveForm = reactive({
+  recordClientInfo: true, hiddenModels: [] as string[], softCooldownMs: 0,
+  reqlogRetention: { days: 0, maxLines: 0 },
+})
 
 async function loadLive() {
   try {

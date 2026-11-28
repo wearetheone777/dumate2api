@@ -7,7 +7,14 @@ const fs = require('fs');
 const path = require('path');
 // 运行日志环形缓冲（调研 P1-9）：必须在任何 require 打第一条日志之前安装，
 // 否则启动横幅、模块加载警告都进不了 /logs 的回放窗口。
-require('./logbuffer').shared.install();
+const logbuffer = require('./logbuffer');
+logbuffer.shared.install();
+// 每日 JSONL 归档（批次十八）：sink 管道不占 SSE 订阅者名额；启动横幅之前的
+// 行不在（attach 在 require 之后就位，与 install 同一时刻），漏的只是安装前
+// 那几行 require 日志。
+try { require('./logarchive').attach(logbuffer.shared); } catch (e) {
+  console.warn('[logarchive] 归档管道挂载失败（不影响日志查看）:', e.message);
+}
 
 const router = require('./router');
 const auth = require('./auth');
@@ -106,6 +113,9 @@ function applySecurityHeaders(kind) {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
+    // 管理端公网化前置（P3 noindex）：整个面板不许被搜索引擎收录——
+    // 页面里是账号名、余额、密钥形态的运营数据
+    'X-Robots-Tag': 'noindex, nofollow',
   };
   if (kind === 'html') headers['Content-Security-Policy'] = CSP_HTML;
   return headers;
@@ -218,6 +228,12 @@ router.mount(PREFIX + '/qoder', qoderRoutes);
 // Qoder 运行期配置 + 自动签到排程（P0-3 / P0-1，docs/QODER-GATEWAY-FEATURE-MERGE.md）
 router.mount(PREFIX + '/qoder-runtime', require('./routes/qoder-runtime').routes);
 router.mount(PREFIX + '/workbuddy', workbuddyRoutes);
+// 备份分区表（批次十四）：导出勾选 / 导入合并读同一张 SECTION_TABLE，预览零写盘
+router.mount(PREFIX + '/backup', require('./routes/backup').routes);
+// 存储管理（批次十七）：data/ 四类视图 + 先预览再确认的清理 + 60s 快照
+router.mount(PREFIX + '/storage', require('./routes/storage').routes);
+// 临期快照只读出仓（批次二十一）：账号卡角标的数据源，快照本身由各 /credits 写方维护
+router.mount(PREFIX + '/expiring', require('./routes/expiring').routes);
 router.mount(PREFIX + '/keys', keysRoutes);
 router.mount(PREFIX + '/cc-switch', ccswitchRoutes);
 router.mount(PREFIX + '/agent-setup', require('./routes/agent-setup').routes);
@@ -309,6 +325,9 @@ function start() {
   try { require('../balance-refresh').schedule(); } catch (e) { log(`⚠ 余额刷新排程异常（不阻断启动）: ${e.message}`); }
   // 运维告警规则评估（2026-11-08 调研 P1-6）：默认关闭，环境变量显式开启
   try { require('./routes/alerts').schedule(); } catch (e) { log(`⚠ 告警排程异常（不阻断启动）: ${e.message}`); }
+  // 账号回收站留存清扫（批次十六）：boot 一轮 + 每小时。删除/恢复/清空全部只发生在
+  // 管理端进程，网关进程从不写回收站文件——单进程写就单进程清，不引入跨进程写竞争
+  try { require('./trash').startSweep(); } catch (e) { log(`⚠ 回收站清扫异常（不阻断启动）: ${e.message}`); }
   // 运行时模块接线（池恢复 / livecfg / 计量探活），失败不阻断管理端启动
   try { boot.init({ log }); } catch (e) { log(`⚠ 启动接线异常（不阻断启动）: ${e.message}`); }
   // 优雅停止：保活排程与进行中的一轮、池状态、计量分桶落盘后再退

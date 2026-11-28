@@ -794,6 +794,68 @@
         </a-col>
       </a-row>
 
+      <!-- 官方逐请求用量账本（P1-6）：R2 两本账的官方那本——含官方客户端直连的
+           消耗（reqlog 看不到的一半）。与下面的套餐包台账并列，不是相加关系。
+           credit 缺失/0 = 「这条记录没带」= 不知道，不是免费。 -->
+      <a-card :bordered="false" class="mb-4">
+        <template #title>
+          <span class="section-title">官方账本（逐请求）</span>
+          <a-button size="small" class="ml-2" :loading="wbUsageOfficialLoading" @click="loadWbUsageOfficial">
+            拉取
+          </a-button>
+          <a-radio-group
+            v-model:value="wbUsageOfficialHours"
+            size="small"
+            class="ml-2"
+            :options="[
+              { label: '72h', value: 72 },
+              { label: '7d', value: 168 },
+              { label: '30d', value: 720 },
+            ]"
+          />
+        </template>
+        <template #extra>
+          <span class="text-xs text-slate-400">含官方客户端直连的消耗 · 只读</span>
+        </template>
+        <div v-if="!wbUsageOfficial" class="text-xs text-slate-400">尚未拉取（窗口可选 72h / 7d / 30d）</div>
+        <div v-else-if="!wbUsageOfficial.ok" class="text-xs text-red-600">拉取失败</div>
+        <div v-else class="text-xs space-y-2">
+          <div class="flex flex-wrap gap-x-6 gap-y-1">
+            <span>请求 <span class="num">{{ wbUsageOfficial.totals.requests }}</span></span>
+            <span>
+              积分 <span class="num">{{ wbUsageOfficial.totals.credits.toFixed(2) }}</span>
+              <span
+                v-if="wbUsageOfficial.totals.creditsUnknown"
+                class="text-orange-700 ml-1"
+              >（另有 {{ wbUsageOfficial.totals.creditsUnknown }} 条未带金额，未计入）</span>
+            </span>
+            <span>有消耗账号 <span class="num">{{ wbUsageOfficial.totals.active }}/{{ wbUsageOfficial.totals.accounts }}</span></span>
+            <span v-if="wbUsageOfficial.totals.truncated" class="text-orange-700">数据被截断（窗口过大），数字偏小</span>
+            <span v-if="wbUsageOfficial.skipped_enterprise" class="text-slate-400">
+              跳过 {{ wbUsageOfficial.skipped_enterprise }} 个企业号
+            </span>
+          </div>
+          <div v-if="wbUsageOfficial.by_model.length">
+            <span class="text-slate-400 mr-2">按模型</span>
+            <span v-for="m in wbUsageOfficial.by_model.slice(0, 8)" :key="m.model" class="mr-3">
+              {{ m.model || '未知' }} <span class="num">{{ m.credits.toFixed(2) }}</span>
+              <span class="text-slate-400">（{{ m.requests }} 次）</span>
+            </span>
+          </div>
+          <div v-if="wbUsageOfficial.series.length">
+            <span class="text-slate-400 mr-2">按日</span>
+            <span v-for="d in wbUsageOfficial.series.slice(-7)" :key="d.day" class="mr-3">
+              {{ d.day }} <span class="num">{{ d.credits.toFixed(2) }}</span>
+              <span class="text-slate-400">（{{ d.requests }}）</span>
+            </span>
+          </div>
+          <div v-if="wbUsageOfficial.errors.length" class="text-orange-700">
+            {{ wbUsageOfficial.errors.length }} 个账号拉取失败：{{ wbUsageOfficial.errors.slice(0, 3).map((e) => `${e.name}: ${e.error}`).join('；') }}
+          </div>
+          <div class="text-slate-400">窗口 {{ wbUsageOfficial.window_hours }}h（{{ wbUsageOfficial.start }} ~ {{ wbUsageOfficial.end }}）。覆盖官方客户端直连；经本网关的请求在用量页。</div>
+        </div>
+      </a-card>
+
       <a-empty
         v-if="!wbRows.length"
         :description="wbError || `还没有${isIntlRegion() ? '国际' : '国内'}版账号`"
@@ -1389,7 +1451,7 @@ import type { QwCredits, QwCreditRecord } from '@/api/qwenwork'
 import { qoderApi } from '@/api/qoder'
 import type { QoderCreditRow, QoderCreditRecord } from '@/api/qoder'
 import { workbuddyApi } from '@/api/workbuddy'
-import type { WorkBuddyCreditRow, WorkBuddyBusy, WorkBuddyGrowth } from '@/api/workbuddy'
+import type { WorkBuddyCreditRow, WorkBuddyBusy, WorkBuddyGrowth, WorkBuddyUsageOfficial } from '@/api/workbuddy'
 import type { PointsData, PointsPackage, AllPointsData, AccountPoints } from '@/api/points'
 import type { RecordsData } from '@/api/records'
 import { SERIES, INK, TOOLTIP_BASE, axisStyle, compactNum, exactNum, barSeries } from '@/utils/chartTheme'
@@ -1764,6 +1826,30 @@ const wbGrowth = ref<WorkBuddyGrowth | null>(null)
 const wbGrowthLoading = ref(false)
 const wbBusy = ref<WorkBuddyBusy | null>(null)
 const wbBusyLoading = ref(false)
+// 官方逐请求用量账本（P1-6）：与网关侧账本并列的官方那本（含客户端直连消耗）
+const wbUsageOfficial = ref<WorkBuddyUsageOfficial | null>(null)
+const wbUsageOfficialLoading = ref(false)
+const wbUsageOfficialHours = ref(72)
+
+async function loadWbUsageOfficial() {
+  wbUsageOfficialLoading.value = true
+  try {
+    const r = regionParam() as 'cn' | 'intl' | undefined
+    const { data } = await workbuddyApi.usageOfficial({ hours: wbUsageOfficialHours.value, region: r })
+    wbUsageOfficial.value = data
+  } catch (e: any) {
+    wbUsageOfficial.value = {
+      ok: false,
+      window_hours: wbUsageOfficialHours.value,
+      start: '', end: '',
+      totals: { requests: 0, credits: 0, creditsUnknown: 0, accounts: 0, active: 0, truncated: false },
+      by_account: [], by_model: [], series: [],
+      errors: [{ id: 0, name: '', error: e?.response?.data?.error || e?.message || '拉取失败' }],
+    }
+  } finally {
+    wbUsageOfficialLoading.value = false
+  }
+}
 
 async function loadWbGrowth() {
   wbGrowthLoading.value = true

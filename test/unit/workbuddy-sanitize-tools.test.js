@@ -143,3 +143,83 @@ test('buildChatBody 会把清洗应用到顶层 tools（端到端串起来）', 
   assert.match(body.tools[0].function.description, /helpful AI assistant/i,
     '端到端必须真的清到——只写模块不接进 buildChatBody 等于没做');
 });
+
+// —— 批次五：CN Kimi $ref 内联展开（panel kimi_tools.go 移植）——
+
+test('kimiInlineTools：顶层/嵌套 $ref 展开、$defs 剥除、循环与缺目标兜底', () => {
+  // 顶层 $ref：整份参数 schema 指向 $defs（实测上游 400 11129）→ 展开成内联定义
+  const tools = [{
+    type: 'function',
+    function: {
+      name: 'f',
+      parameters: { $ref: '#/$defs/Args', $defs: { Args: { type: 'object', properties: { q: { type: 'string' } } } } },
+    },
+  }];
+  const out = s.kimiInlineTools(tools);
+  assert.strictEqual(out[0].function.parameters.$defs, undefined, '$defs 必须剥除');
+  assert.strictEqual(out[0].function.parameters.properties.q.type, 'string');
+
+  // 嵌套 $ref + 循环引用：循环处落空 schema 兜底（不可内联）
+  const cyc = {
+    type: 'object',
+    properties: { a: { $ref: '#/$defs/A' } },
+    $defs: { A: { type: 'object', properties: { self: { $ref: '#/$defs/A' } } } },
+  };
+  const p2 = s.kimiInlineTools([{ type: 'function', function: { name: 'g', parameters: cyc } }])[0].function.parameters;
+  assert.strictEqual(p2.$defs, undefined);
+  assert.strictEqual(Object.keys(p2.properties.a.properties.self).length, 0, '循环引用落空 schema');
+
+  // 缺目标 → {type:'object'}（参考同口径：至少退化成无参工具而不是必 400）
+  const miss = [{ type: 'function', function: { name: 'h', parameters: { $ref: '#/$defs/Nope' } } }];
+  assert.deepStrictEqual(s.kimiInlineTools(miss)[0].function.parameters, { type: 'object' });
+
+  // JSON Pointer 转义还原（~1 → /、~0 → ~）
+  const esc = [{ type: 'function', function: { name: 'i', parameters: { $ref: '#/$defs/a~1b', $defs: { 'a/b': { type: 'string' } } } } }];
+  assert.deepStrictEqual(s.kimiInlineTools(esc)[0].function.parameters, { type: 'string' });
+});
+
+test('kimiInlineTools：无 $ref 无 $defs 原引用返回；非 function 工具保形；深度保护', () => {
+  const clean = [{ type: 'function', function: { name: 'j', parameters: { type: 'object', properties: { x: { type: 'string' } } } } }];
+  assert.strictEqual(s.kimiInlineTools(clean), clean, '零改动路径返回原数组（普通 kimi 请求零影响）');
+
+  const mixed = [
+    { type: 'custom', x: 1 },
+    { type: 'function', function: { name: 'k', parameters: { $ref: '#/$defs/A', $defs: { A: { type: 'string' } } } } },
+  ];
+  const om = s.kimiInlineTools(mixed);
+  assert.strictEqual(om[0], mixed[0], '非 function 工具原样保留');
+  assert.deepStrictEqual(om[1].function.parameters, { type: 'string' });
+
+  // >64 层嵌套：栈保护落 {}，不炸调用栈
+  let deep = { type: 'object' };
+  for (let i = 0; i < 80; i++) deep = { type: 'object', properties: { n: deep } };
+  const od = s.kimiInlineTools([{ type: 'function', function: { name: 'l', parameters: { type: 'object', properties: { root: deep } } } }]);
+  assert.ok(od[0].function.parameters.properties.root.properties.n, '正常前段保留');
+});
+
+test('buildChatBody 门控：只有 cn + kimi 前缀的请求才展开（非 kimi 零改动）', () => {
+  const chat = require('../../src/workbuddy/chat');
+  process.env.DUMATE_ADMIN_DATA = process.env.DUMATE_ADMIN_DATA || tmpDir('wb-sanitize-tools');
+  const acct = { id: 1, uid: 'u1', accessToken: 't' };
+  const kimiTools = [{
+    type: 'function',
+    function: {
+      name: 'f',
+      parameters: { $ref: '#/$defs/Args', $defs: { Args: { type: 'object', properties: { q: { type: 'string' } } } } },
+    },
+  }];
+  // cn + kimi → 展开（$defs 消失）
+  const b1 = chat.buildChatBody({ model: 'kimi-k31', messages: [{ role: 'user', content: 'hi' }], tools: kimiTools }, 'cn', acct);
+  const out1 = JSON.parse(b1.body);
+  assert.strictEqual(out1.tools[0].function.parameters.$defs, undefined, 'kimi 请求应展开 $ref');
+  // cn + 非 kimi → 原样（$defs 还在）
+  const kimiTools2 = JSON.parse(JSON.stringify(kimiTools));
+  const b2 = chat.buildChatBody({ model: 'glm-5.3', messages: [{ role: 'user', content: 'hi' }], tools: kimiTools2 }, 'cn', acct);
+  const out2 = JSON.parse(b2.body);
+  assert.ok(out2.tools[0].function.parameters.$defs, '非 kimi 请求不动 $defs');
+  // cn: 前缀剥掉再判
+  const kimiTools3 = JSON.parse(JSON.stringify(kimiTools));
+  const b3 = chat.buildChatBody({ model: 'cn:kimi-k31', messages: [{ role: 'user', content: 'hi' }], tools: kimiTools3 }, 'cn', acct);
+  const out3 = JSON.parse(b3.body);
+  assert.strictEqual(out3.tools[0].function.parameters.$defs, undefined, 'cn: 前缀剥掉后仍命中 kimi 门控');
+});

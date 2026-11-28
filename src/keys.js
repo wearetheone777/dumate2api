@@ -123,7 +123,7 @@ function normalizeList(items) {
 // 不按 key 分流）。设成具体通道后，这把 key 只能调该通道的模型。
 // 五条通道：dumate（本地转发）、qwenwork（直连）、traework（直连，凭证自持）、
 // qoder（直连，纯本地签名）、workbuddy（直连，双区域）
-const { CHANNELS, normalize } = require('./channels');
+const { CHANNELS, normalize, regionsOf } = require('./channels');
 function normalizeChannel(v) {
   return normalize(v);
 }
@@ -132,13 +132,15 @@ function normalizeChannel(v) {
 // 只对有国际版的通道有意义——qoder（global 端点）、traework（2026-11-03 国际版
 // 已接入）、workbuddy（双区域）；dumate 与 qwenwork 是纯国内产品（上游连国际
 // 端点都没有），intl key 打它们在 validate 就拒，不进运行时。
+// 「哪些通道是纯国内」从 channels.def.json 的 regions 声明读（批次二十二）：
+// regionsOf(ch) 不含 'intl' 即纯国内——能力位是声明不是分支。
 const KEY_REGIONS = ['', 'cn', 'intl'];
 function normalizeRegionKey(v) {
   const s = String(v || '').trim().toLowerCase();
   return KEY_REGIONS.includes(s) ? s : '';
 }
-/** 没有国际版的通道（区域恒为国内） */
-const CN_ONLY_CHANNELS = new Set(['dumate', 'qwenwork']);
+/** 没有国际版的通道（区域恒为国内）。由 regions 声明派生，不再手写清单 */
+const CN_ONLY_CHANNELS = new Set(CHANNELS.filter((ch) => !regionsOf(ch).includes('intl')));
 
 // ---- 校验 ----
 // 返回 { ok } 或 { ok:false, reason }。reason 直接面向使用者，

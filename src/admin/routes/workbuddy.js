@@ -40,7 +40,31 @@ function uidsOf(url) {
   return ids.size ? ids : null;
 }
 
+/** 成长任务写路径（/tasks/* 三个端点共用）的账号选择：body.id 单号、body.group
+ *  分组、缺省全量可用；企业号在这里统一闸掉（判据单一出处 tasks.enterpriseBlocked）。 */
+function taskAccountsOf(body) {
+  const tasks = require('../../workbuddy/tasks');
+  const id = body && body.id;
+  const group = body && body.group ? String(body.group).trim() : '';
+  let list;
+  if (id) {
+    list = [authStore.get(id)].filter(Boolean);
+    if (!list.length) return { err: `账号 ${id} 不存在` };
+  } else if (group) {
+    list = authStore.findUsable().filter((a) => (a.group || '') === group);
+    if (!list.length) return { err: `分组「${group}」下没有可用账号` };
+  } else {
+    list = authStore.findUsable();
+  }
+  if (!list.length) return { err: '没有可用账号' };
+  const blocked = list.filter((a) => tasks.enterpriseBlocked(a));
+  if (blocked.length === list.length) return { err: '选中的全是企业号——组织账号不做成长写腿' };
+  return { list: list.filter((a) => !tasks.enterpriseBlocked(a)), skippedEnterprise: blocked.length };
+}
+
 const routes = [
+  // 回收站四路由（批次十六）：列表/清空/恢复/永久删除。放最前，防被参数路由截胡
+  ...require('../trash').routesFor('workbuddy'),
   {
     // 通道状态 + 账号列表（脱敏）。?region= 区域视图
     method: 'GET',
@@ -98,9 +122,11 @@ const routes = [
       return sendJSON(res, 200, {
         ok: true,
         config: config.restriction,
+        thinking: config.thinking,
         envDefaults: runtime.defaults().restriction,
+        thinkingDefaults: runtime.defaults().thinking,
         file: runtime.FILE,
-        note: 'holdSeconds=0 彻底关闭连坐暂停（仍记「哪些号被限制」供观测）；改短时长会立即截断现有倒计时。',
+        note: 'holdSeconds=0 彻底关闭连坐暂停（仍记「哪些号被限制」供观测）；改短时长会立即截断现有倒计时。thinking.defaultEffort 留空 = 用模型目录的 defaultEffort。',
       });
     },
   },
@@ -111,7 +137,15 @@ const routes = [
       const runtime = require('../../workbuddy/runtime');
       let out;
       try {
-        out = runtime.Store({ restriction: body || {} });
+        // 兼容两种提交形状：{restriction:{...}, thinking:{...}}（新面板一次提交两组）
+        // 与裸 restriction 字段对象（旧面板）。thinking 不在 body 里时不下发
+        // （patch 语义：不传 = 不改动）。
+        const hasThinking = body && body.thinking && typeof body.thinking === 'object'
+          && !Array.isArray(body.thinking);
+        const patch = hasThinking
+          ? { restriction: body.restriction || {}, thinking: body.thinking }
+          : { restriction: body || {} };
+        out = runtime.Store(patch);
       } catch (e) {
         return sendJSON(res, 400, { ok: false, error: e.message });
       }
@@ -128,7 +162,9 @@ const routes = [
       return sendJSON(res, 200, {
         ok: true,
         config: out.config.restriction,
+        thinking: out.config.thinking,
         changed: out.changed.restriction || {},
+        thinkingChanged: out.changed.thinking || {},
         state: wb.restrictionState(),
       });
     },
@@ -503,6 +539,234 @@ const routes = [
       const okCount = out.filter((r) => r.ok).length;
       try { require('../auth').audit('admin', 'workbuddy_checkin', id || (group ? `group:${group}` : 'all'), `${okCount}/${out.length}`); } catch (e) { /* 审计失败不影响结果 */ }
       return sendJSON(res, 200, { ok: true, results: out });
+    },
+  },
+  {
+    // ── 成长任务写路径（P0-6，2026-11-28 融合批；手动触发，端点本身就是独立开关）──
+    //
+    // 三个动作各自幂等/低风险（探针定案见 docs/CHANNEL-WORKBUDDY.md 11.x）：
+    //   sweep  补领清扫：accept（幂等报名）+ claim（完成未领）+ 回读确认
+    //   redeem 连登兑换：只兑 unlocked 档，403/409 是业务态如实报
+    //   makeup 断登补签：每轮 ≤1 张补签卡，最近断点优先，无卡早退
+    // 企业号（enterpriseId 非空）一律跳过——组织账号的行为自动化不碰。
+    // 自动化入口在 autocheckin 第四腿，受 DUMATE_WORKBUDDY_TASKS_SWEEP（默认关）管；
+    // 这里是手动按钮，操作人点了就是明确授权。
+    method: 'POST',
+    path: '/tasks/sweep',
+    handler: async ({ res, body }) => {
+      const tasks = require('../../workbuddy/tasks');
+      const { list, err, skippedEnterprise } = taskAccountsOf(body);
+      if (err) return sendJSON(res, 200, { ok: false, error: err });
+      // 账号间并发、账号内互斥（runExclusive；同账号重复点击报 busy）
+      const results = await Promise.all(list.map((a) => tasks.runExclusive(a, async () => ({
+        id: a.id, nickname: a.nickname || a.uid || '', region: constants.normalizeRegion(a.region),
+        ...(await tasks.sweepTasks(constants.normalizeRegion(a.region), a)),
+      }))));
+      try { require('../auth').audit('admin', 'workbuddy_tasks_sweep', (body && body.id) || 'all', results.map((r) => `#${r.id} 领${(r.claimed || []).length}/未验${(r.unverified || []).length}`).join(' ')); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: results.some((r) => r.ok), skippedEnterprise: skippedEnterprise || 0, results });
+    },
+  },
+  {
+    method: 'POST',
+    path: '/tasks/redeem',
+    handler: async ({ res, body }) => {
+      const tasks = require('../../workbuddy/tasks');
+      const { list, err, skippedEnterprise } = taskAccountsOf(body);
+      if (err) return sendJSON(res, 200, { ok: false, error: err });
+      const results = await Promise.all(list.map((a) => tasks.runExclusive(a, async () => ({
+        id: a.id, nickname: a.nickname || a.uid || '', region: constants.normalizeRegion(a.region),
+        ...(await tasks.redeemUnlocked(constants.normalizeRegion(a.region), a)),
+      }))));
+      try { require('../auth').audit('admin', 'workbuddy_tasks_redeem', (body && body.id) || 'all', results.map((r) => `#${r.id} 兑${(r.redeemed || []).length}`).join(' ')); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: results.some((r) => r.ok), skippedEnterprise: skippedEnterprise || 0, results });
+    },
+  },
+  {
+    method: 'POST',
+    path: '/tasks/makeup',
+    handler: async ({ res, body }) => {
+      const tasks = require('../../workbuddy/tasks');
+      const { list, err, skippedEnterprise } = taskAccountsOf(body);
+      if (err) return sendJSON(res, 200, { ok: false, error: err });
+      const results = await Promise.all(list.map((a) => tasks.runExclusive(a, async () => ({
+        id: a.id, nickname: a.nickname || a.uid || '', region: constants.normalizeRegion(a.region),
+        ...(await tasks.makeupBrokenDay(constants.normalizeRegion(a.region), a)),
+      }))));
+      try { require('../auth').audit('admin', 'workbuddy_tasks_makeup', (body && body.id) || 'all', results.map((r) => `#${r.id} ${r.used || '未用卡'}`).join(' ')); } catch (e) { /* 审计失败不影响结果 */ }
+      return sendJSON(res, 200, { ok: results.some((r) => r.ok), skippedEnterprise: skippedEnterprise || 0, results });
+    },
+  },
+  {
+    // ── 官方逐请求用量账本（P1-6，只读）──
+    //
+    // R2 两本账：这里是**官方账本**（含官方客户端直连的消耗，reqlog 看不到的那
+    // 一半）；网关侧账本在用量页。两者不是「一个总量的两部分」——覆盖范围不同，
+    // 前端并排呈现时各自标来源。企业号跳过（成长/账本域对组织号 403，问了也是白问）。
+    method: 'GET',
+    path: '/usage-official',
+    handler: async ({ res, req }) => {
+      const usageMod = require('../../workbuddy/usage');
+      const hoursRaw = Number(((req.url.match(/[?&]hours=(\d+)/) || [])[1]) || 0) || undefined;
+      const regionQ = regionOf(req.url || '');
+      const all = authStore.findUsable();
+      const skipped = all.filter((a) => require('../../workbuddy/tasks').enterpriseBlocked(a)).length;
+      let targets = all
+        .filter((a) => !require('../../workbuddy/tasks').enterpriseBlocked(a))
+        .map((a) => ({ account: a, region: constants.normalizeRegion(a.region), name: a.nickname || a.uid || `账号 ${a.id}`, id: a.id }));
+      if (regionQ) targets = targets.filter((t) => t.region === regionQ);
+      if (!targets.length) return sendJSON(res, 200, { ok: false, error: '没有可拉取账号' });
+      const data = await usageMod.fetchOfficialUsage(targets, { hours: hoursRaw });
+      data.skipped_enterprise = skipped;
+      return sendJSON(res, 200, data);
+    },
+  },
+  {
+    // 模型规则（批次十二，misakano modelrules.go 移植）：命名模型组 + deny/allow
+    // 挂账号。规则与「账号 → 规则 id」都进 workbuddy-model-rules.json（mtime 热
+    // 读，网关零重启生效）。deny 并集 / allow 并集 / deny 优先，见 rules.js。
+    method: 'GET',
+    path: '/model-rules',
+    handler: async ({ res, req }) => {
+      const rules = require('../../workbuddy/rules');
+      // ?account_id= 附加单账号视图：挂的规则 + 对指定模型的判定结果（排查用）
+      const accId = Number(((req.url.match(/[?&]account_id=(\d+)/) || [])[1]) || 0);
+      const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1]) || '').trim();
+      const out = {
+        ok: true,
+        rules: rules.listRules(),
+        counts: rules.ruleAccountCounts(),
+        assignments: rules.ruleAssignments(),
+      };
+      if (accId) {
+        const authStore = require('../../workbuddy/auth');
+        const acc = authStore.get(accId);
+        out.account = acc ? {
+          id: acc.id, nickname: acc.nickname || acc.uid || `账号 ${acc.id}`,
+          region: acc.region || 'cn', ruleIds: rules.ruleIdsOf(accId),
+        } : null;
+        if (model && out.account) {
+          out.account.blocked = rules.blockedByRules(accId, out.account.region, model);
+        }
+      }
+      return sendJSON(res, 200, out);
+    },
+  },
+  {
+    method: 'POST',
+    path: '/model-rules',
+    handler: async ({ res, body, user }) => {
+      const rules = require('../../workbuddy/rules');
+      try {
+        const rule = rules.upsertRule((body && body.rule) || body || {});
+        try { require('../auth').audit(user && user.username, 'workbuddy_rule_upsert', rule.id, `${rule.mode} ${rule.name}`); } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, rule });
+      } catch (e) {
+        return sendJSON(res, e.statusCode || 400, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
+    method: 'DELETE',
+    path: '/model-rules/:id',
+    handler: async ({ res, params, user }) => {
+      const rules = require('../../workbuddy/rules');
+      const ok = rules.deleteRule(params[0]);
+      if (ok) { try { require('../auth').audit(user && user.username, 'workbuddy_rule_delete', params[0]); } catch (e) { /* 审计失败不影响结果 */ } }
+      return sendJSON(res, ok ? 200 : 404, { ok, error: ok ? '' : `规则不存在: ${params[0]}` });
+    },
+  },
+  {
+    // 整体替换某账号挂的规则集合（编辑弹窗用）
+    method: 'POST',
+    path: '/model-rules/assign',
+    handler: async ({ res, body, user }) => {
+      const rules = require('../../workbuddy/rules');
+      try {
+        const ids = rules.assignRules(Number((body && body.account_id) || 0), (body && body.ids) || []);
+        try { require('../auth').audit(user && user.username, 'workbuddy_rule_assign', String((body && body.account_id) || ''), ids.join(',')); } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, ids });
+      } catch (e) {
+        return sendJSON(res, e.statusCode || 400, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
+    // 把一条规则批量挂/摘（规则卡片「应用」用：账号多的池子里逐个配置太慢）
+    method: 'POST',
+    path: '/model-rules/apply',
+    handler: async ({ res, body, user }) => {
+      const rules = require('../../workbuddy/rules');
+      try {
+        const changed = rules.applyRule((body && body.id) || '', (body && body.account_ids) || [], !!(body && body.assigned));
+        try { require('../auth').audit(user && user.username, 'workbuddy_rule_apply', String((body && body.id) || ''), `${(body && body.assigned) ? '挂' : '摘'} ${changed}`); } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, changed });
+      } catch (e) {
+        return sendJSON(res, e.statusCode || 400, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
+    // 6004 额度窗口表（批次十）：登记侧在 index.js model_cap 分支（带重置墙钟
+    // 才登记），执行侧 windowprobe.js 到点发最小探针钉住新一轮窗口起点。
+    method: 'GET',
+    path: '/windows',
+    handler: async ({ res }) => {
+      const wp = require('../../workbuddy/windowprobe');
+      const now = Date.now();
+      const rows = wp.listWindows().map((w) => ({
+        ...w,
+        due: Number(w.resetAt) <= now,
+        in_ms: Math.max(0, Number(w.resetAt) - now),
+      }));
+      return sendJSON(res, 200, {
+        ok: true,
+        enabled: wp.enabled(),
+        next_due_in_ms: wp.nextDue() != null ? Math.max(0, wp.nextDue() - now) : null,
+        windows: rows,
+      });
+    },
+  },
+  {
+    // 立即探针：不等到点，把当前所有已登记窗口（或指定 账号+模型）立刻探一遍。
+    // panel RunModelWindowProbeNow 同款——探针是真实计费对话请求，按钮要慎重。
+    method: 'POST',
+    path: '/windows/run',
+    handler: async ({ res, req, body }) => {
+      const wp = require('../../workbuddy/windowprobe');
+      if (!wp.enabled()) return sendJSON(res, 200, { ok: false, error: '窗口探针已关闭（DUMATE_WORKBUDDY_WINDOW_PROBE=0）' });
+      const accId = Number(body && body.account_id);
+      const mdl = String((body && body.model) || '').trim();
+      let targets = wp.listWindows();
+      if (accId && mdl) targets = targets.filter((w) => w.accountId === accId && w.model === mdl);
+      const due = targets.filter((w) => Number(w.resetAt) <= Date.now());
+      // 未到点的窗口不提前探——提前探会把「还没重置」误记成一次尝试，纯浪费
+      const notDue = targets.length - due.length;
+      if (!due.length) {
+        return sendJSON(res, 200, { ok: true, sent: 0, results: [], not_due: notDue, note: '没有到点的窗口（探针只在到点后才有意义）' });
+      }
+      const r = await wp.runDue();
+      return sendJSON(res, 200, { ok: true, sent: r.sent, results: r.results, skipped_not_due: notDue });
+    },
+  },
+  {
+    method: 'GET',
+    path: '/tasks/scan',
+    handler: async ({ res, req }) => {
+      const growth = require('../../workbuddy/growth');
+      const tasks = require('../../workbuddy/tasks');
+      const regionQ = regionOf(req.url || '');
+      const idQ = Number(((req.url.match(/[?&]id=(\d+)/) || [])[1]) || 0);
+      let list = idQ ? [authStore.get(idQ)].filter(Boolean) : authStore.findUsable();
+      if (regionQ) list = list.filter((a) => constants.normalizeRegion(a.region) === regionQ);
+      if (!list.length) return sendJSON(res, 200, { ok: false, error: '没有可扫描账号' });
+      const executionEnabled = tasks.sweepEnabled();
+      // 扫描是只读的，账号间并发（每账号 1 个 GET，低频手动触发）
+      const results = await Promise.all(list.map((a) => growth.scanGrowthTasks(constants.normalizeRegion(a.region), a, { execution_enabled: executionEnabled })));
+      return sendJSON(res, 200, {
+        ok: results.some((r) => r.scan_state === 'ok' || r.scan_state === 'empty'),
+        execution_enabled: executionEnabled,
+        results: results.map((r, i) => ({ id: list[i].id, nickname: list[i].nickname || list[i].uid || '', region: constants.normalizeRegion(list[i].region), ...r })),
+      });
     },
   },
   {
@@ -886,10 +1150,11 @@ const routes = [
     method: 'DELETE',
     path: '/accounts/:id',
     handler: async ({ res, params }) => {
-      const ok = authStore.remove(params[0]);
-      if (!ok) return sendJSON(res, 404, { error: '账号不存在' });
+      // 批次十六：删除 = 移入回收站（30 天可恢复）；永久删除走 DELETE /trash/:key
+      const r = require('../trash').trashAccount('workbuddy', params[0]);
+      if (!r.ok) return sendJSON(res, 404, { error: r.error });
       try { require('../auth').audit('admin', 'workbuddy_account_delete', params[0]); } catch (e) { /* 审计失败不影响结果 */ }
-      return sendJSON(res, 200, { ok: true });
+      return sendJSON(res, 200, { ok: true, trashed: true, name: r.name });
     },
   },
   {

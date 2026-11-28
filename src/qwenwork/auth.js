@@ -146,14 +146,18 @@ function upsert(acc) {
     if (acc && acc.preferred === true) {
       for (const x of data.accounts) x.preferred = false;
     }
+    // 重新登录（带新 refreshToken）必须清掉「凭证已退场」标记，否则
+    // needsRefresh 一直返回 false，新凭证被判成不用刷新——表现为
+    // 「重新登录了还是用不了」，且没有任何报错（TRAE/WorkBuddy/Qoder 同款坑）。
+    const fresh = acc.refreshToken ? { ...acc, refreshRetiredAt: null } : acc;
     if (i >= 0) {
-      data.accounts[i] = { ...data.accounts[i], ...acc };
+      data.accounts[i] = { ...data.accounts[i], ...fresh };
       save(data);
       return data.accounts[i];
     }
     const id = data.accounts.reduce((m, a) => Math.max(m, Number(a.id) || 0), 0) + 1;
     // 池里第一个账号自动成为主账号，否则一个账号时也要额外配一次
-    const rec = { id, enabled: true, createdAt: Date.now(), ...acc };
+    const rec = { id, enabled: true, createdAt: Date.now(), ...fresh };
     if (rec.preferred === undefined) rec.preferred = data.accounts.length === 0;
     data.accounts.push(rec);
     save(data);
@@ -233,7 +237,30 @@ function patch(id, fields) {
  */
 function needsRefresh(a, skewMs = 24 * 3600 * 1000) {
   if (!a || !a.expiresAt) return true;
+  // 凭证退场标记（2026-11-28，与 TRAE/WorkBuddy/Qoder 同源）：换票被上游
+  // 明确判死过，再问也是同一个答案。返回 false 表示「不刷新」，账号仍可能
+  // 因 access 未过期而可用。
+  if (a.refreshRetiredAt) return false;
   return Date.now() + skewMs >= a.expiresAt;
+}
+
+/**
+ * 换票结果是不是「这份凭证彻底废了」（而不是网络抖/上游临时故障）。
+ *
+ * **与 `exchange()` 里收编官方客户端那条判据同源**（那个 `rejected` 变量），
+ * 抽成函数是为了让 `chat.ensureAccount` 的退场标记用同一个口径——两套正则
+ * 必然会漂移（本项目反复踩过：同一事实写两份，迟早不一致）。
+ *
+ * 只认上游原文措辞，认不出**不猜**：瞬时故障误标退场要人工重新登录才能解，
+ * 代价远大于多撞一次换票端点。
+ *
+ * 原文形状（2026-11-28 实测/文档记录）：`401 INVALID_REFRESH_TOKEN`、
+ * `invalid_grant:令牌未激活或缺少用户ID`。
+ */
+function isRefreshRejected(r) {
+  if (!r || r.ok) return false;
+  if (r.status === 401 || r.status === 403) return true;
+  return /INVALID_REFRESH_TOKEN|invalid_grant/i.test(r.error || '');
 }
 
 /** 从 JWT 里取 exp（秒 → 毫秒） */
@@ -399,8 +426,9 @@ async function exchange(a, opts = {}) {
     r.error += `；访问令牌仍可用到 ${new Date(exp).toLocaleTimeString('zh-CN', { hour12: false })}，网关请求暂不受影响`;
   }
 
-  const rejected = r.status === 401 || r.status === 403
-    || /INVALID_REFRESH_TOKEN|invalid_grant/i.test(r.error || '');
+  // 判据走 isRefreshRejected（单一来源）：chat.ensureAccount 的退场标记
+  // 用同一口径，两处写两套正则会漂移。
+  const rejected = isRefreshRejected(r);
   if (rejected) {
     try {
       const adopted = await adoptOfficialAndRefresh(a, { ...deps, exchangeOnce: once });
@@ -512,7 +540,7 @@ function maskPhone(p) {
 
 module.exports = {
   FILE, filePath, dataDir, load, save, list, get, findUsable, preferred,
-  upsert, remove, patch, needsRefresh, exchange, exchangeOnce,
+  upsert, remove, patch, needsRefresh, isRefreshRejected, exchange, exchangeOnce,
   adoptOfficialAndRefresh, jwtExp, fetchUserInfo,
   fetchPhone, maskPhone, genMachineId,
 };

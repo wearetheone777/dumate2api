@@ -69,6 +69,14 @@ function systemTextOf(payload) {
  * 「继续」就共用一个粘性账号，前一秒还在 A 项目上下文里，后一秒被塞进 B 项目
  * 的前缀缓存，命中率与上下文恢复成本双双恶化。
  *
+ * **为什么还要含首条 assistant（P1-8，hub v2.0.7 #839）**：只看 system+首条
+ * user 时，**同一开场白的多个并发会话**（同一个 harness 反复开新会话，开场
+ * 消息逐字节相同）从第 2 轮起仍撞同一个键——它们会被钉死在同一个账号上，
+ * 前缀缓存互相踩踏。加入首条 assistant 后，分叉发生在第 2 轮：各会话拿到
+ * 各自的键、各走各号。第 1 轮（还没有 assistant）的键与旧口径**逐字节一致**
+ * ——旧键的既有绑定不受影响；第 2 轮的键变更由 `sessionKeyFor` 的 prebind
+ * 迁移兜住（把第 1 轮绑定的账号迁给第 2 轮的新键，会话不换号）。
+ *
  * 三个已确认的前提（不成立时这条改动就该回退）：
  *   1. 两个协议都把 system **每轮重发**（Claude Code 顶层 `system`；Codex/OpenAI
  *      在 messages 里）——所以同一会话的 system 在轮次之间是稳定的，键也稳定；
@@ -76,28 +84,46 @@ function systemTextOf(payload) {
  *   3. 键只在本地用（选号 + 粘性表），不进上游、不进日志原文。
  *
  * system 用**全文**哈希而不截断：system 的差异常在尾部（追加的项目约定），
- * 截断会把「改过的 system」认成同一个；user 侧仍截 2048（那是既有的稳定锚点）。
+ * 截断会把「改过的 system」认成同一个；user 与 assistant 侧仍截 2048
+ * （assistant 是本轮新增的锚点，沿用同一条稳定口径，不引入第二套数字）。
  */
-function sessionKeyOf(payload, opts) {
+
+/**
+ * 键的完整推导（sessionKeyOf 的实现体，sessionKeyFor 需要 prevKey 做迁移）。
+ * @returns {{key:string, prevKey:string|null}} prevKey = 还没有 assistant 时
+ *   的旧键（P1-8 迁移用）；本请求没有 assistant 时为 null（key 就是旧键）。
+ */
+function sessionKeyPartsOf(payload, opts) {
   if (opts && opts.sessionKey != null && String(opts.sessionKey).trim()) {
-    return `k:${String(opts.sessionKey).trim()}`;
+    // 显式键由调用方全权管理（自带迁移语义），这里不掺和
+    return { key: `k:${String(opts.sessionKey).trim()}`, prevKey: null };
   }
   try {
     const msgs = payload && Array.isArray(payload.messages) ? payload.messages : [];
     const first = msgs.find((m) => m && m.role === 'user');
     const text = first ? textOf(first.content) : '';
-    if (!text.trim()) return '';
+    if (!text.trim()) return { key: '', prevKey: null };
     const sys = systemTextOf(payload);
-    const digest = crypto.createHash('sha1')
+    const digestOf = (asst) => crypto.createHash('sha1')
       .update(sys)
       .update('\u0000')                       // 分隔符：防「system 尾部 + user 头部」拼出同一串
       .update(text.slice(0, 2048))
+      .update(asst ? '\u0000' : '')           // assistant 分隔符：有才加（旧键形状不变）
+      .update(asst ? String(asst).slice(0, 2048) : '')
       .digest('hex')
       .slice(0, 20);
-    return `m:${digest}`;
+    const asstMsg = msgs.find((m) => m && m.role === 'assistant');
+    const asstText = asstMsg ? textOf(asstMsg.content) : '';
+    const hasAssistant = !!String(asstText || '').trim();
+    const key = `m:${digestOf(hasAssistant ? asstText : '')}`;
+    return { key, prevKey: hasAssistant ? `m:${digestOf('')}` : null };
   } catch (e) {
-    return '';
+    return { key: '', prevKey: null };
   }
+}
+
+function sessionKeyOf(payload, opts) {
+  return sessionKeyPartsOf(payload, opts).key;
 }
 
 // 粘性命中也要过与 pool.pick 同一套判据：模型负缓存与保底不在
@@ -189,6 +215,15 @@ function inflightMaxOf(channel) {
   return v == null ? 0 : v;
 }
 
+/** 通道级积分保底线（面板 > env > 0）。Qoder 专属；0 = 用池默认/关。 */
+function creditFloorOf(channel) {
+  if (channel !== 'qoder') return 0;
+  const rt = qoderRuntime();
+  const v = rt ? rt.pick('concurrency.creditFloor', null) : null;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 /**
  * 通道级选号策略（'' = 用池默认）。
  * `DUMATE_QODER_PICK_STRATEGY=least-inflight` 或面板 concurrency.pickStrategy
@@ -235,11 +270,42 @@ function withinInterval(uid, minMs, now) {
  * 回调失败一律吞掉：埋点绝不能影响选号。
  */
 function sessionKeyFor(payload, opts) {
-  const key = sessionKeyOf(payload, opts);
-  if (key && opts && typeof opts.onSessionKey === 'function') {
-    try { opts.onSessionKey(key); } catch (e) { /* 埋点失败不影响请求 */ }
+  const parts = sessionKeyPartsOf(payload, opts);
+  // P1-8 prebind（hub v2.0.7 #839）：带 assistant 的新键从第 2 轮才出现，
+  // 此时还没有自己的绑定；第 1 轮的旧键（不含 assistant）已经绑定了账号。
+  // 把旧键的绑定迁给新键——会话跨键变更不换号，前缀缓存不断（否则第 2 轮
+  // 粘性丢失，整段前缀重付）。幂等：新键已绑定时不动。
+  if (parts.prevKey && parts.key) {
+    const bound = sticky.lookup(parts.prevKey);
+    if (bound && !sticky.lookup(parts.key)) {
+      try { sticky.bind(parts.key, bound); } catch (e) { /* 迁移失败不影响选号 */ }
+    }
   }
-  return key;
+  if (parts.key && opts && typeof opts.onSessionKey === 'function') {
+    try { opts.onSessionKey(parts.key); } catch (e) { /* 埋点失败不影响请求 */ }
+  }
+  return parts.key;
+}
+
+/**
+ * 凭证已彻底不可用：换票被上游明确拒绝过（`refreshRetiredAt`）**且** access
+ * 也已过期。这种号带出去只会吃一个注定失败的 401（TRAE 实测：`needsRefresh`
+ * 因退场标记返回 false，于是带着过期 token 出网，每次白撞一个上游请求）。
+ *
+ * **只在这个双条件下判废**：退场标记单独存在时账号仍可能可用（access 未过期，
+ * 实测存在），`findUsable` 也刻意不排除它们（签到等辅助路径需要）。
+ *
+ * 放在 `pickCandidate` 而不是各通道的选号循环里：四个通道的选号逻辑各异，
+ * 而这是**与通道无关**的凭证事实——写四遍必然漂移（TRAE 与 WorkBuddy 已经
+ * 各自实现过一次，Qoder/千问再抄就是第三、第四份）。
+ */
+function credentialDead(a) {
+  if (!a || !a.refreshRetiredAt) return false;
+  const exp = Number(a.expiresAt);
+  // 没有 expiresAt 时不敢判死：那说明这个通道不跟踪到期时间，
+  // 我们无法证明 access 已经失效（宁可放它试一次，错误如实上报）。
+  if (!Number.isFinite(exp) || exp <= 0) return false;
+  return Date.now() >= exp;
 }
 
 /**
@@ -255,7 +321,7 @@ function sessionKeyFor(payload, opts) {
  * @returns {{account:object, uid:string, sessionKey:string}|null} null = 没有可用账号
  */
 function pickCandidate(channel, candidates, opts = {}) {
-  const list = (candidates || []).filter((a) => a && a.id !== undefined);
+  const list = (candidates || []).filter((a) => a && a.id !== undefined && !credentialDead(a));
   if (!list.length) return null;
   const byUid = new Map(list.map((a) => [uidOf(channel, a.id), a]));
   const uids = [...byUid.keys()];
@@ -264,6 +330,7 @@ function pickCandidate(channel, candidates, opts = {}) {
   const busy = new Set();
   const minMs = minIntervalMsOf(channel);
   const inFlightMax = inflightMaxOf(channel);
+  const creditFloor = creditFloorOf(channel);
   const now = Date.now();
 
   for (;;) {
@@ -307,7 +374,10 @@ function pickCandidate(channel, candidates, opts = {}) {
       uid = pool.pick(ordered, {
         exclude: [...exclude, ...busy],
         model: opts.model,
-        paid: opts.paid,
+        paid: opts.paid !== false, // 默认按真实收费请求处理（false 仅供只读探针豁免）
+        // Qoder 通道级积分保底（面板 > env > 0）。池创建时的 creditFloor 是
+        // 全通道共享、要重启才生效；这里按次覆盖，面板热改下一次选号即生效。
+        ...(creditFloor ? { creditFloor } : {}),
         // FEFO（最早到期优先）：调用方算好的「有临期积分批次」uid 集合，
         // 非空时池把候选限制在集合内（pool.pick 的 expiring 语义），把临期
         // 额度先烧掉。集合为空/null 时无感。
@@ -318,7 +388,23 @@ function pickCandidate(channel, candidates, opts = {}) {
         // （'first'），而不是在排好的队列上再抽签/轮询——那样顺序就白排了。
         ...(ordered !== uids ? { pickMode: 'first' } : {}),
       });
-      if (uid == null) return null;
+      if (uid == null) {
+        // P1-2 第三条不变量：**全部余额低于保底**时如实按余额最高者继续，
+        // 不报「没有账号」。`fallbackLowestFloor` 只在「保底是唯一拦截原因」
+        // 时返回账号，并自带 WARN——冷却/熔断/在途满一律返回 null，
+        // 那时 null 仍然是正确答案（客户端 429/503 后重试）。
+        const rest = uids.map((u) => byUid.get(u)).filter((a) => a && !exclude.has(uidOf(channel, a.id)));
+        const fb = fallbackLowestFloor(channel, rest, { model: opts.model, inFlightMax });
+        if (fb) {
+          const fbUid = uidOf(channel, fb.id);
+          if (pool.acquire(fbUid, inFlightMax ? { inFlightMax } : undefined)) {
+            markPicked(fbUid, now);
+            if (sessionKey) sticky.bind(sessionKey, fbUid);
+            return { account: fb, uid: fbUid, sessionKey };
+          }
+        }
+        return null;
+      }
       // 闸门放在池选择之后（池还不知道间隔这回事）：选中的账号若在最小
       // 间隔内，本轮跳过它继续找——不是账号的错，与 busy 同语义
       if (withinInterval(uid, minMs, now)) {
@@ -470,6 +556,11 @@ function noteError(channel, id, info) {
 function _stickySize() { return sticky.size(); }
 function _stickyClear() { sticky.clear(); }
 
+/** 清掉 (账号, 模型) 的模型级冷却（批次十窗口探针用：探针证明窗口已开才清） */
+function clearModelBlock(channel, id, model) {
+  try { pool.clearModelBlock(uidOf(channel, id), model); } catch (e) { /* 池操作失败不影响探针 */ }
+}
+
 /**
  * 写入账号余额快照（2026-11-08 融合批）。
  *
@@ -524,10 +615,49 @@ function creditsOf(channel, id) {
   }
 }
 
+/**
+ * 全部候选都低于积分保底时，返回余额最高的那个并打 WARN；否则返回 null。
+ *
+ * **只在「保底是唯一拦截原因」时兜底**（P1-2 第三条不变量）：
+ *   - 有冷却/熔断/禁用/暂停/模型冷却/在途满 → 返回 null（等一等就好，
+ *     拿一个余额低还排着队的号去撞上游只会更糟）
+ *   - 还有余额 ≥ 保底的健康号 → 返回 null（那说明不是「全部低」，
+ *     池选不到它是别的原因，兜底会掩盖真问题）
+ *   - 余额未知（null）不参与比较，也不阻止兜底（null ≠ 0）
+ */
+function fallbackLowestFloor(channel, candidates, opts = {}) {
+  const floor = creditFloorOf(channel);
+  if (!(floor > 0)) return null;
+  const list = (candidates || []).filter((a) => a && a.id !== undefined);
+  const maxInFlight = Number(opts.inFlightMax) > 0 ? Number(opts.inFlightMax)
+    : (inflightMaxOf(channel) || DEFAULTS.inFlightMax);
+  let best = null;
+  let bestCredits = -Infinity;
+  let sawBelow = false;
+  for (const a of list) {
+    const st = pool.status(uidOf(channel, a.id));
+    if (!st) continue;
+    if (st.cooling || st.state === 'disabled' || st.state === 'paused') return null;
+    if (opts.model && (st.model_cooldowns || []).some((m) => m && m.model === opts.model)) return null;
+    if ((st.in_flight || 0) >= maxInFlight) return null;
+    // pool.status 的 floor_blocked 是池创建时的全局阈值；这里必须按**通道级**
+    // 面板值现算，否则面板改了阈值、兜底却还按旧值判。
+    const c = Number(st.credits);
+    if (!Number.isFinite(c)) continue;                // 余额未知：不参与、不阻止
+    if (c >= floor) return null;                      // 还有没被拦的号：不该兜底
+    sawBelow = true;
+    if (c > bestCredits) { bestCredits = c; best = a; }
+  }
+  if (!sawBelow || !best) return null;
+  console.warn(`[${channel}] 所有账号积分都低于保底线 ${floor}，按余额最高者 ${best.nickname || best.uid || best.id}（${bestCredits}）继续派发；这不是「没有账号」。`);
+  return best;
+}
+
 module.exports = {
   uidOf, sessionKeyOf, sessionKeyFor, systemTextOf, pickCandidate, availability, release, noteSuccess, noteError,
+  clearModelBlock,
   noteCredits, creditsOf,
   // 策略读取器（离线验证与 /config 端点报当前生效策略用）
-  pickStrategyOf, inflightMaxOf, minIntervalMsOf, leastInflightOrder,
+  pickStrategyOf, inflightMaxOf, minIntervalMsOf, creditFloorOf, leastInflightOrder, fallbackLowestFloor,
   _stickySize, _stickyClear,
 };

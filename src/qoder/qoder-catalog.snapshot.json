@@ -1,0 +1,27 @@
+{
+  "_comment": "Qoder 兜底模型快照（仓库内静态种子）。只记 key 与状态，不写任何第三方倍率/显示名——倍率唯一来源是上游 price_factor。retiredCandidate=true 表示「上游模型表里已不再出现」。2026-11-28 真机复核：cn 与 global 各两账号，四个账号的模型表都不含 qmodel / q37fmodel / gm51model，确证下线，因此条目标 retiredCandidate 并保留（不删——显式调用仍透传给上游裁决，上游若恢复可直接复活）。同批真机补齐了当时漏登记的 7 个上游 key。",
+  "version": 2,
+  "models": [
+    { "key": "auto", "retiredCandidate": false },
+    { "key": "ultimate", "retiredCandidate": false },
+    { "key": "fast", "retiredCandidate": false },
+    { "key": "efficient", "retiredCandidate": false },
+    { "key": "smodel", "retiredCandidate": false },
+    { "key": "cmodel", "retiredCandidate": false },
+    { "key": "qmodel_latest", "retiredCandidate": false },
+    { "key": "qmodel_38max", "retiredCandidate": false },
+    { "key": "qfmodel", "retiredCandidate": false },
+    { "key": "kmodel_latest", "retiredCandidate": false },
+    { "key": "kmodel", "retiredCandidate": false },
+    { "key": "gmodel_latest", "retiredCandidate": false },
+    { "key": "gmodel", "retiredCandidate": false },
+    { "key": "gfmodel", "retiredCandidate": false },
+    { "key": "dmodel", "retiredCandidate": false },
+    { "key": "dfmodel", "retiredCandidate": false },
+    { "key": "mmodel", "retiredCandidate": false },
+    { "key": "jmodel", "retiredCandidate": false },
+    { "key": "qmodel", "retiredCandidate": true, "reason": "2026-11-28 真机复核：cn/global 四账号模型表均无此 key（原第三方 11-19 清单称下线）" },
+    { "key": "q37fmodel", "retiredCandidate": true, "reason": "2026-11-28 真机复核：cn/global 四账号模型表均无此 key" },
+    { "key": "gm51model", "retiredCandidate": true, "reason": "2026-11-28 真机复核：cn/global 四账号模型表均无此 key（GLM 系已由 gmodel_latest / gmodel 承接）" }
+  ]
+}

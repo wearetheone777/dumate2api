@@ -8,6 +8,7 @@
 //     soft_rate→429 / 其余按状态码
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const c = require('./constants');
 const chat = require('./chat');
 const authStore = require('./auth');
@@ -241,6 +242,57 @@ function _restrictionReset(now = Date.now()) {
   try { if (fs.existsSync(restrictionClearPath())) fs.unlinkSync(restrictionClearPath()); } catch (e) { /* 忽略 */ }
 }
 
+// ---------------------------------------------------------------------------
+// WAF / 网关层拦截的快速失败（P1-5，2026-11-28）
+//
+// WAF（403 + 无业务信封，判据在 constants.looksLikeWafBody）拦的是**出口 IP**，
+// 不是账号：窗口内 ≥2 个**不同**账号都吃到它，说明再换号也没用（换的是身份
+// 不是出口），60 秒内整区快速失败。单号命中不算——那可能是该号自身的问题，
+// 换下一个号确认（第二个号也中才升级），这正是滑窗的判定方式。
+//
+// 与连坐暂停的三点差异，都是刻意为之：
+//   - **不持久化**：60s 级瞬态，进程重启即清零（连坐是 30 分钟级，要落快照）；
+//   - **不罚号**：feed='none'，账号本身没犯错，喂池冷却只会白伤健康号；
+//   - **不设运行期配置**：阈值与窗口写死（2 号 / 60s）——它只是止损闸门，
+//     不是调参对象；真要关，上游侧解除即可。
+const WAF_WINDOW_MS = 60000;
+const WAF_MIN_UIDS = 2;
+const wafHits = new Map(); // region -> Map(uid -> lastHitAt)
+
+/** 记一次 WAF 命中（uid 用账号 id；区域未知不记——循环内都会带 regionKey） */
+function noteWafHit(region, uid, now = Date.now()) {
+  if (!region) return;
+  let m = wafHits.get(region);
+  if (!m) { m = new Map(); wafHits.set(region, m); }
+  for (const [k, at] of [...m]) {
+    if (now - at > WAF_WINDOW_MS) m.delete(k);
+  }
+  m.set(String(uid === undefined || uid === null ? '-' : uid), now);
+}
+
+/**
+ * WAF 快速失败剩余毫秒（0 = 不拦）。窗口内 ≥2 个不同 uid 中招才拦，
+ * 拦到「最后一次命中 + 窗口」为止（滑窗语义：不再有新命中就自动解除）。
+ */
+function wafBlockedRemaining(region, now = Date.now()) {
+  const m = wafHits.get(region);
+  if (!m) return 0;
+  const uids = new Set();
+  let last = 0;
+  for (const [k, at] of [...m]) {
+    if (now - at > WAF_WINDOW_MS) { m.delete(k); continue; }
+    uids.add(k);
+    if (at > last) last = at;
+  }
+  if (uids.size < WAF_MIN_UIDS) return 0;
+  return Math.max(0, last + WAF_WINDOW_MS - now);
+}
+
+/** 测试：清空 WAF 滑窗 */
+function _wafReset() {
+  wafHits.clear();
+}
+
 /**
  * 重刷观测快照（管理端改完连坐参数后调用）：把内存态按**当前配置**重新
  * 夹一遍写回文件，界面不必等下一个请求就能看到「改短已生效」。
@@ -311,8 +363,25 @@ function restrictionState(now = Date.now()) {
  * 不是理论洁癖**：一个账号连续被几个不支持 reasoning 的模型请求打中，10 分钟内
  * 所有模型都会被池标记不可用。
  */
+/**
+ * 零输出守卫（批次六，hub sse.go HeadVetoError 移植）：上游 200 + 流正常收尾
+ * （finish_reason=length）但正文/思考/工具全空——客户端只会拿到一个空回答。
+ * 判定点都安排在「客户端尚未收到任何可见输出」的首帧否决窗口内（见
+ * runConversation 三处判定点注释），抛给 send() 换号重发。不罚账号：
+ * 空输出与账号健康无关（多半是上游侧临时故障），喂池只会让健康号背锅。
+ */
+function zeroOutputError(model) {
+  const e = new Error(`WorkBuddy 上游返回空输出（200 + finish_reason=length，正文/思考/工具全空），正在换号重发`);
+  e.zeroOutput = true;
+  e.statusCode = 502;
+  e.code = 'zero_output_length';
+  e.model = model;
+  return e;
+}
+
 function errorActionOf(e) {
   if (e && e.paramError) return { feed: 'none', action: 'throw' };
+  if (e && e.zeroOutput) return { feed: 'none', action: 'rotate' };
   if (e && e.modelCap) return { feed: 'model', action: 'rotate' };
   if (e && e.restricted) return { feed: 'account', action: 'restrict' };
   const kind = e && (e.kind || '');
@@ -326,6 +395,12 @@ function errorActionOf(e) {
   if (kind === 'queue') return { feed: 'none', action: 'throw', queue: true };
   if (kind === 'reasoning_unsupported') return { feed: 'none', action: 'throw', reasoning: true };
   if (kind === 'tool_pair_mismatch') return { feed: 'none', action: 'throw', toolPair: true };
+  // ---- P0-5 四类（2026-11-28，yreidev bizcode 全表）----
+  if (kind === 'context_overflow') return { feed: 'none', action: 'throw' };     // 11115 原文返回
+  if (kind === 'channel_check') return { feed: 'none', action: 'throw' };        // 11128 补头即过
+  if (kind === 'temp_rate') return { feed: 'model', action: 'rotate' };          // 14003 当场换号
+  if (kind === 'session_limit') return { feed: 'account', action: 'rotate' };    // 10105 短冷却换号
+  if (kind === 'waf') return { feed: 'none', action: 'throw' };                  // P1-5 IP 级——send 层滑窗处置，这里兜底不罚号
   if (kind === 'client' || kind === 'not_found') return { feed: 'none', action: 'throw' };
   return { feed: 'account', action: 'throw' };
 }
@@ -407,6 +482,12 @@ function statusOf(kind, httpStatus) {
   // 而不是靠兜底分支掰出 429/400。
   if (kind === 'queue') return 429;
   if (kind === 'soft_rate') return 429;
+  // P0-5 四类：11115/11128 请求级 400；14003/10105 语义是「稍后再来」429
+  if (kind === 'context_overflow') return 400;
+  if (kind === 'channel_check') return 400;
+  if (kind === 'temp_rate') return 429;
+  if (kind === 'session_limit') return 429;
+  if (kind === 'waf') return 503;   // P1-5：出口级拦截，语义是「稍后再来」
   if (kind === 'not_found') return 502;
   if (kind === 'server') return httpStatus >= 500 ? httpStatus : 502;
   return httpStatus >= 400 ? httpStatus : 400;
@@ -453,6 +534,51 @@ function lowCreditIdSet(now = Date.now()) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 单发请求分片亲和（P1-8，hub v2.0.7 #842；DUMATE_WB_MSGSTAT_SHARDS 选通，默认关）
+//
+// 单发请求（messages 里没有 assistant 回复）与多轮会话不同：粘滞键虽然也会
+// 绑定，但绑定表只在内存——**进程重启后同一请求会被随机分给任何账号**，
+// 而上游 prompt 缓存按账号存放，换号 = 整段前缀重付。分片把「同一内容指纹」
+// 的单发请求钉到固定 ≤N 个账号上（哈希来自请求内容 + 日盐，跨重启稳定）；
+// 亲和集全忙/冷却时自然落回全量轮询（可用性永远优先于亲和）。
+// 日盐（UTC+8，额度按北京时间日重置）每天轮换一次映射，让单发流量的消耗
+// 在账号间摊匀。
+// 多轮请求不受影响：它们有粘滞键兜着，isSingleShot 直接放行。
+// ---------------------------------------------------------------------------
+
+/** 日盐：北京时间日期串 YYYYMMDD */
+function msgstatDaySalt(now = Date.now()) {
+  const d = new Date(now + 8 * 3600000);
+  return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+/** 单发判定：messages 里没有任何 assistant 回复（[system,user] 型及其变体） */
+function isSingleShot(payload) {
+  const msgs = payload && Array.isArray(payload.messages) ? payload.messages : [];
+  return !msgs.some((m) => m && m.role === 'assistant');
+}
+
+/**
+ * 分片亲和账号 id 集合。非单发 / 未开启 / 候选 ≤1 个时返回 null（不分片）。
+ * 哈希输入 = (会话键, 模型, tools) + 日盐——会话键本身已含 system 全文与
+ * 首条 user（P2-11 口径），所以「+user 哈希」不需要再单独拼一遍。
+ * 返回 Set（裸 id 字符串）；空 Set 不会出现（take ≥ 1）。
+ */
+function msgstatShardIds(usable, { sessionKey, model, payload } = {}) {
+  const n = parseInt(process.env.DUMATE_WB_MSGSTAT_SHARDS || '0', 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (!Array.isArray(usable) || usable.length <= 1) return null;
+  if (!payload || !isSingleShot(payload)) return null;
+  let toolsJson = '';
+  try { toolsJson = JSON.stringify(payload.tools || []); } catch (e) { toolsJson = ''; }
+  const basis = `${sessionKey || ''}|${model || ''}|${toolsJson}|${msgstatDaySalt()}`;
+  const start = crypto.createHash('sha1').update(basis).digest().readUInt32BE(0) % usable.length;
+  const take = Math.min(Math.max(1, n), usable.length);
+  const rotated = usable.slice(start).concat(usable.slice(0, start));
+  return new Set(rotated.slice(0, take).map((a) => String(a.id)));
+}
+
 /** 模型名前置校验（缓存就绪且完全不在表中 → 400 + 可用列表；没就绪放行） */
 function assertModelKnown(payload, model, region) {  const hit = models.cachedModelIds(region);
   const ready = hit && hit.length && hit[0] !== 'glm-5.3';
@@ -482,6 +608,14 @@ async function send(payload, onChunk, opts = {}) {
     if (holdMs > 0) {
       const e = new Error(`WorkBuddy ${region === 'global' ? '国际' : '国内'}区域风控连坐暂停中，${Math.ceil(holdMs / 1000)}s 后自动恢复（窗口内多个账号被限制，防设备指纹连坐）`);
       e.statusCode = 503;
+      throw e;
+    }
+    // WAF 快速失败（P1-5）：出口 IP 级拦截，换号无效，到点自动解除
+    const wafMs = wafBlockedRemaining(region);
+    if (wafMs > 0) {
+      const e = new Error(`WorkBuddy ${region === 'global' ? '国际' : '国内'}区域 WAF 快速失败中：窗口内多个账号被网关层拦截（出口 IP 级风控，换号无效），${Math.ceil(wafMs / 1000)}s 后自动恢复`);
+      e.statusCode = 503;
+      e.wafFailFast = true;
       throw e;
     }
   }
@@ -527,26 +661,69 @@ async function send(payload, onChunk, opts = {}) {
     }
     scopeBlocked = allUsable.length - scoped.length;
   }
+  // 免费模型豁免（批次五，hub v2.2.2）：确认免费的模型不消耗套餐余额，低余额
+  // 账号打免费模型既不失败也不花钱——护栏两层（guard.threshold 快照过滤 +
+  // pool creditFloor）对它放行，被拦纯属误伤。判据 models.isFreeModel：
+  // 实测账本 EMA=0 → 目录 free；判不出来不豁免（保守，等同今日行为）。
+  // 'auto' 档位永远不豁免（实际模型由账号决定，免费性不可知）。
+  let freeModel = false;
+  try {
+    freeModel = require('./models').isFreeModel(
+      modelRegion || opts.region || 'cn', model,
+    );
+  } catch (e) { freeModel = false; }
   // 额度护栏（P1-6）：低于阈值的账号从候选里剔除。**全被剔除时退回全量**
   // ——「全拦掉」等于把通道弄停，而护栏只是省一次注定失败的上游请求，
-  // 不该比上游本身更严。探针（opts.probe）不过滤：它就是要发请求测扣费。
-  const lowIds = opts.probe ? null : lowCreditIdSet();
+  // 不该比上游本身更严。探针（opts.probe）与免费模型（freeModel）不过滤：
+  // 探针就是要发请求测扣费；免费请求不被低余额误拦。
+  const lowIds = (opts.probe || freeModel) ? null : lowCreditIdSet();
   let usable = scoped;
   let guardSkipped = 0;
   if (lowIds && lowIds.size) {
     const kept = scoped.filter((a) => !lowIds.has(String(a.id)));
     if (kept.length) { usable = kept; guardSkipped = scoped.length - kept.length; }
   }
+  // 模型规则（批次十二，misakano modelrules.go 移植）：按账号 deny/allow 过滤候选。
+  // **全部被拦 → 400 model_not_allowed**——503 会被客户端当上游抖动重试，而规则
+  // 不会自愈，重试只是白打（参考实现 RulesBlockedForRealm 的判据注释）。部分被拦
+  // 照常跑（被拦的账号不进候选）。'auto' 档位不做模型级判断（实际模型由账号决定，
+  // 规则无从比对）。规则挂在账号上，冷却/白名单/护栏各管各的，叠加判定。
+  {
+    const ruleView = require('./rules').filterAccounts(usable, region || modelRegion || '', model);
+    if (ruleView.blockedCount && !ruleView.kept.length) {
+      const e = new Error(`WorkBuddy 模型规则拦截：${model} 在全部候选账号上都被 deny/白名单外规则拦下（规则不会自愈，请到管理端调整模型规则）`);
+      e.statusCode = 400;
+      e.modelNotAllowed = true;
+      throw e;
+    }
+    if (ruleView.blockedCount) usable = ruleView.kept;
+  }
   const tried = new Set();
   const refreshTried = new Set();
   let rotated = 0;
+  // 零输出守卫（批次六）：换号重发的发生次数，全池耗尽时把「试了几个号」讲清
+  let zeroOutCount = 0;
   // FEFO：集合非空时候选先限制在临期账号内（快照由管理端 /credits 写）
   const fefo = fefoUidSet();
   let lastErr = null;
+  // 分片亲和集（P1-8）：单发 + 开关开启时非空。整个 send 过程算一次
+  //（候选集在本轮内不变——tried 只从 usable 里划掉）
+  const shardSet = msgstatShardIds(usable, { sessionKey, model, payload });
+  let shardFallback = false;
   for (let attempt = 0; attempt < usable.length; attempt++) {
     const pool = usable.filter((a) => !tried.has(a.id));
     if (!pool.length) break;
-    const sel = channelPool.pickCandidate(CHANNEL, pool, { sessionKey, model, expiring: fefo });
+    // 先在分片集内选（亲和）；分片集全忙/冷却（pickCandidate null）→ 本轮
+    // 退全量。分片集是可用列表的子集，不会选出可用性之外的东西。
+    let sel = null;
+    if (shardSet && !shardFallback) {
+      const sub = pool.filter((a) => shardSet.has(String(a.id)));
+      if (sub.length && sub.length < pool.length) {
+        sel = channelPool.pickCandidate(CHANNEL, sub, { sessionKey, model, expiring: fefo, paid: !freeModel });
+        if (!sel) shardFallback = true;
+      }
+    }
+    if (!sel) sel = channelPool.pickCandidate(CHANNEL, pool, { sessionKey, model, expiring: fefo, paid: !freeModel });
     if (!sel) break;
     tried.add(sel.account.id);
     const { uid } = sel;
@@ -570,6 +747,21 @@ async function send(payload, onChunk, opts = {}) {
       lastErr = lastErr || (() => { const e = new Error(`WorkBuddy ${regionKey === 'global' ? '国际' : '国内'}区域风控连坐暂停中，${Math.ceil(holdMs / 1000)}s 后自动恢复`); e.statusCode = 503; return e; })();
       continue;
     }
+    {
+      const wafMs = wafBlockedRemaining(regionKey);
+      if (wafMs > 0) {
+        // 该区域已进入 WAF 快速失败：不再向上游发任何请求（region 空时
+        // 另一区的账号照常接）。region 明确且全拦时由循环末尾的 lastErr 兜底
+        channelPool.release(uid);
+        lastErr = lastErr || (() => {
+          const e = new Error(`WorkBuddy ${regionKey === 'global' ? '国际' : '国内'}区域 WAF 快速失败中（出口 IP 级风控），${Math.ceil(wafMs / 1000)}s 后自动恢复`);
+          e.statusCode = 503;
+          e.wafFailFast = true;
+          return e;
+        })();
+        continue;
+      }
+    }
 
     const accountName = auth.nickname || auth.uid || `账号 ${auth.id}`;
     if (opts.onAccount) {
@@ -584,7 +776,25 @@ async function send(payload, onChunk, opts = {}) {
       }
       return result;
     } catch (e) {
+      // WAF（P1-5）：先记滑窗再谈处置。第二个不同账号也中 → 整区快速失败
+      // 当场生效（入口/循环检查都会拦）；单号命中 → 不罚号，换下一个确认。
+      // 必须插在 errorActionOf 之前——waf 不该走任何 feed/rotate 语义。
+      if (e && e.kind === 'waf') {
+        noteWafHit(regionKey, auth.uid || auth.id);
+        const wafMs = wafBlockedRemaining(regionKey);
+        if (wafMs > 0) {
+          const stop = new Error(`WorkBuddy ${regionKey === 'global' ? '国际' : '国内'}区域触发 WAF 快速失败：窗口内多个账号被网关层拦截（出口 IP 级风控，换号无效），${Math.ceil(wafMs / 1000)}s 后自动恢复`);
+          stop.statusCode = 503;
+          stop.wafFailFast = true;
+          throw stop;
+        }
+        lastErr = lastErr || e;
+        continue;
+      }
       const act = errorActionOf(e);
+      // 零输出守卫（批次六）：feed='none' + rotate——不罚账号，只换号重发。
+      // 计数只为耗尽时的报错文案服务。
+      if (e && e.zeroOutput) zeroOutCount++;
       if (!opts.probe) {
         if (act.feed === 'model') {
           // 模型级失败：6004 冷却（scope:model + retryAfterMs）与
@@ -636,6 +846,18 @@ async function send(payload, onChunk, opts = {}) {
             channelPool.noteError(CHANNEL, auth.id, { status: 401, message: e.message, model });
             try { authStore.patch(auth.id, { lastError: e.message }); } catch (err) { /* 记不下不影响 */ }
           }
+          // 上游**明确拒绝**换票（12153 / invalid_grant / refresh token invalid）
+          // 才标退场：后续请求不再每次白撞换票端点。认不出措辞就不标
+          // （网络抖/5xx 下次可能就好了，误标要人工重新登录才能解）。
+          const refreshErr = rr && rr.error ? String(rr.error) : '';
+          if (authStore.isRefreshRejected(refreshErr)) {
+            try {
+              authStore.patch(auth.id, {
+                lastError: `凭证失效（需重新登录）: ${refreshErr}`.slice(0, 300),
+                refreshRetiredAt: Date.now(),
+              });
+            } catch (err) { /* 标记失败不影响换号 */ }
+          }
           continue;
         }
         throw e;
@@ -655,6 +877,12 @@ async function send(payload, onChunk, opts = {}) {
   if (notes.length) {
     const note = `（另有 ${notes.join('；')}）`;
     if (lastErr && lastErr.message) lastErr.message = `${lastErr.message}${note}`;
+  }
+  // 零输出守卫（批次六）：全池耗尽且死因是空输出时，把「试了几个号 + 怎么办」
+  // 讲清——不然客户端只看到一句 502，无从判断是网络还是账号问题。
+  // statusCode 502 / code zero_output_length 已在 zeroOutputError 里带上。
+  if (lastErr && lastErr.zeroOutput) {
+    lastErr.message = `WorkBuddy 上游空输出（finish_reason=length，正文/思考/工具全空）已连续出现 ${Math.max(zeroOutCount, 1)} 次（含换号重发，全部账号都这样）——通常是上游侧临时故障或该模型当前异常：可稍后重试、换一个模型，或到管理端通道页看上游健康`;
   }
   throw lastErr || noRegionAccountError(opts.region);
 }
@@ -730,11 +958,30 @@ async function runConversation(region, auth, payload, onChunk, model, opts = {})
       // 受限标记：send 的处置循环靠它判定
       if (kind === 'restricted') e.restricted = true;
       if (kind === 'model_cap') {
-        // 6004 模型窗口额度用满：模型级冷却 + 重置墙钟（上游写的恢复时刻，
-        // 只在 6004 里出现）。send 层据 retryAfterMs 喂池（scope:model）并换号
+        // 600x 族模型窗口额度用满：模型级冷却 + 重置墙钟（上游写的恢复时刻）。
+        // send 层据 retryAfterMs 喂池（scope:model）并换号。解析不出墙钟时
+        // 默认 5 分钟：6004 是模型窗口用满（不是瞬时抖动、也不是次日重置），
+        // 落 undefined 会让池按账号级默认处置，量级不对
         e.modelCap = true;
         const reset = c.parseRateLimitReset(text);
-        if (reset) e.retryAfterMs = Math.max(0, reset * 1000 - Date.now());
+        if (reset) {
+          e.retryAfterMs = Math.max(0, reset * 1000 - Date.now());
+          // 登记侧（批次十窗口探针）：只在重置墙钟已知时登记 (账号,模型) 窗口
+          // ——到点由探针发最小请求钉住新一轮窗口起点，避免「重置了却没人发
+          // 请求 → 窗口不开始 → 额度空转」（windowprobe.go 原文口径）
+          try {
+            require('./windowprobe').registerWindow(auth.id, model, reset * 1000, {
+              region, detail: text.slice(0, 200),
+            });
+          } catch (e2) { /* 登记失败不影响请求 */ }
+        } else {
+          e.retryAfterMs = 300000;
+        }
+      }
+      if (kind === 'temp_rate') {
+        // 14003 临时限流：有重置墙钟就按它，没有兜底 ~30s（yreidev 口径）
+        const reset = c.parseRateLimitReset(text);
+        e.retryAfterMs = reset ? Math.max(0, reset * 1000 - Date.now()) : 30000;
       }
       // 排队：把位次翻成人话挂到 error 上，下游（与界面）能说清「为什么慢」。
       // **message 也要换成人话**：客户端看到的是 message，不是 queueInfo 字段。
@@ -796,6 +1043,15 @@ async function runConversation(region, auth, payload, onChunk, model, opts = {})
       });
       const msg = (agg.choices && agg.choices[0] && agg.choices[0].message) || {};
       const hasCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      // 零输出守卫判定点①（非流式）：聚合全部完成后客户端还什么都没收到，
+      // 否决窗口天然完整——直接抛给 send() 换号。放在修复判定之前：
+      // 空正文对 looksUnfinished 是「收尾正常」，不走守卫就会原样回空回答。
+      {
+        const fin0 = (agg.choices && agg.choices[0] && agg.choices[0].finish_reason) || '';
+        if (fin0 === 'length' && !hasCalls && !msg.content && !msg.reasoning_content) {
+          throw zeroOutputError(model);
+        }
+      }
       if (hasCalls || !repairable || attempt >= caps.REPAIR_MAX
         || !repair.looksUnfinished(msg.content, caps.HOLD_CAP)) return agg;
       attempt++;
@@ -822,11 +1078,36 @@ async function runConversation(region, auth, payload, onChunk, model, opts = {})
       echoMode: repair.toolEchoMode(),
     }) : null;
     const deliver = gate ? (inner) => gate.onInner(inner) : down;
+    // 零输出守卫（批次六）的无门跟踪：正文/思考/工具是否出现过、上游给了什么
+    // finish_reason。只在无门路径用——有门时这些状态 gate.result() 全带。
+    // tail 暂扣 finish/usage 帧：否决时整批丢弃，非否决轮在 [DONE] 前按原序补发
+    //（与门的 hold 语义一致；readStream 会吞回调里的异常，所以用标记不抛）。
+    let sawOut = false;
+    let lastFinish = null;
+    let vetoHit = false;
+    const tail = [];
     try {
       await chat.readStream(r.stream, (chunk) => {
+        if (vetoHit) return;   // 已判定否决：丢弃残帧（含迟到的数据帧）
         // 哨兵裸值交给下游桥（server.js 统一补 `data: ` 前缀并收尾）；
         // 带门时交门暂扣，finish() 在收尾补发以保证顺序在 usage/finish 之后。
-        if (chunk === null) { deliver('[DONE]'); return; }
+        if (chunk === null) {
+          if (!gate && !sawOut && lastFinish === 'length') { vetoHit = true; return; }   // [DONE] 不写出
+          if (!gate) { for (const f of tail) deliver(f); tail.length = 0; }
+          deliver('[DONE]'); return;
+        }
+        if (!gate) {
+          const ch0 = (chunk.choices || [])[0];
+          const d = ch0 ? (ch0.delta || ch0.message || {}) : {};
+          if ((d.content && String(d.content).length)
+            || (d.reasoning_content && String(d.reasoning_content).length)
+            || (Array.isArray(d.tool_calls) && d.tool_calls.length)) sawOut = true;
+          if ((ch0 && ch0.finish_reason) || chunk.usage) {
+            if (ch0 && ch0.finish_reason) lastFinish = ch0.finish_reason;
+            tail.push(JSON.stringify(chunk));   // finish/usage 暂扣到 [DONE] 前
+            return;
+          }
+        }
         deliver(JSON.stringify(chunk));
       });
     } catch (e) {
@@ -835,8 +1116,25 @@ async function runConversation(region, auth, payload, onChunk, model, opts = {})
       if (!e.statusCode) e.sent = sent || !!(gate && gate.result().emitted > 0);
       throw e;
     }
-    if (!gate) return { streamed: true };
+    // 零输出守卫判定点②（流式无门，纯对话/修复关闭）：此刻 [DONE] 与
+    // finish/usage 都没写出，角色帧/空 delta 虽已透传但四个翻译器对它们
+    // 零可见事件（Anthropic 只记 lastFinishReason，Responses/Google 同为
+    // 缓存字段）——换号重发对客户端无痕。裸关闭（上游没发 [DONE]）同判。
+    if (!gate && !sawOut && lastFinish === 'length') vetoHit = true;
+    if (vetoHit) throw zeroOutputError(model);
+    if (!gate) {
+      // 裸关闭也要把暂扣的 finish/usage 补出去，别让尾部帧凭空消失
+      for (const f of tail) deliver(f);
+      tail.length = 0;
+      return { streamed: true };
+    }
     const g = gate.result();
+    // 零输出守卫判定点③（流式带门）：finish/usage/[DONE] 全部还在门里，
+    // 一轮缓冲整批丢弃即可，连透传帧都不用补。reasoningSeen 挡住「思考已
+    // 直发」的半空轮——那不是零输出，客户端已经看见思考内容了。
+    if (g.finishReason === 'length' && !g.text && !g.toolCalls && !g.reasoningSeen) {
+      throw zeroOutputError(model);
+    }
     // 已转直发（正文超长 / 出现过工具调用）→ 正常一轮，收尾
     if (g.live || g.toolCalls > 0) break;
     if (!repair.looksUnfinished(g.text, caps.HOLD_CAP)) break;
@@ -888,6 +1186,10 @@ module.exports = {
   lowCreditIdSet,
   // 风控连坐 + 失败处置（可离线测的纯函数）
   noteAccountRestriction, restrictionHoldRemaining, _restrictionReset, errorActionOf,
+  // WAF 快速失败（P1-5）：滑窗记数与判定 + 测试复位
+  noteWafHit, wafBlockedRemaining, _wafReset,
+  // 单发分片（P1-8）：纯推导导出，离线锁「哈希稳定 / 日盐轮换 / 非单发不分片」
+  msgstatShardIds, isSingleShot, msgstatDaySalt,
   // 跨进程观测（管理端 9083 读快照、写解除信号；网关侧消费信号）
   restrictionSnapshot, requestClearRestriction, consumeClearSignal,
   restrictionState, repersistRestriction, restrictionCfg,

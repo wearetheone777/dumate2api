@@ -192,7 +192,7 @@ const routes = [
           })();
           const out = {
             dumate: {
-              id: 'dumate', label: '百度搭子', kind: 'http',
+              ...require('../../channels').publicOf('dumate'),
               port: upstreamPort, ready: !!upstreamPort, managed: upstreamManaged,
               ...dumateExtra,
             },
@@ -225,7 +225,7 @@ const routes = [
               }
             } catch (e) { /* 账号池读不到就只报通道状态 */ }
             out.qwenwork = {
-              id: 'qwenwork', label: '千问办公', kind: 'direct',
+              ...require('../../channels').publicOf('qwenwork'),
               ready: st.ready, wasm: st.wasm ? st.wasm.version : null,
               loggedIn: !!st.loggedIn, error: st.error || '',
               // ACP 链路上游实定档位（最近一次建会话的 extra_data.mode）
@@ -233,7 +233,7 @@ const routes = [
               ...acct,
             };
           } catch (e) {
-            out.qwenwork = { id: 'qwenwork', label: '千问办公', kind: 'direct', ready: false, error: e.message };
+            out.qwenwork = { ...require('../../channels').publicOf('qwenwork'), ready: false, error: e.message };
           }
           try {
             const tw = require('../../traework');
@@ -255,7 +255,7 @@ const routes = [
               return t < m ? t : m;
             }, Infinity);
             out.traework = {
-              id: 'traework', label: 'TRAE Work', kind: 'direct',
+              ...require('../../channels').publicOf('traework'),
               // 区域视图下 ready 按该区域重算：该区没账号就是不可用
               ready: reg ? usable.length > 0 : st.ready,
               loggedIn: reg ? usable.length > 0 : !!st.loggedIn,
@@ -268,7 +268,7 @@ const routes = [
               error: reg && !usable.length ? (reg === 'intl' ? '没有国际版账号' : '没有国内账号') : (st.error || ''),
             };
           } catch (e) {
-            out.traework = { id: 'traework', label: 'TRAE Work', kind: 'direct', ready: false, error: e.message };
+            out.traework = { ...require('../../channels').publicOf('traework'), ready: false, error: e.message };
           }
           // Qoder：与 TRAE 同构（多账号自持凭证），但没有 wasm 依赖——
           // 签名纯本地，所以顶栏徽标不该显示「wasm 未知」。
@@ -289,7 +289,7 @@ const routes = [
               return t < m ? t : m;
             }, Infinity);
             out.qoder = {
-              id: 'qoder', label: 'Qoder', kind: 'direct',
+              ...require('../../channels').publicOf('qoder'),
               ready: reg ? usable.length > 0 : st.ready,
               loggedIn: usable.length > 0,
               accounts: reg ? usable.length : (st.accounts || 0),
@@ -303,7 +303,7 @@ const routes = [
               error: reg && !usable.length ? (reg === 'intl' ? '没有国际版账号' : '没有国内账号') : (st.error || ''),
             };
           } catch (e) {
-            out.qoder = { id: 'qoder', label: 'Qoder', kind: 'direct', ready: false, needsClient: false, error: e.message };
+            out.qoder = { ...require('../../channels').publicOf('qoder'), ready: false, needsClient: false, error: e.message };
           }
           // WorkBuddy：第五通道（双区域）
           try {
@@ -314,7 +314,7 @@ const routes = [
             const reg = regionOf(req.url || '');
             const usable = reg ? usableAll.filter((a) => (String(a.region || '').toLowerCase() === 'global' ? 'intl' : 'cn') === reg) : usableAll;
             out.workbuddy = {
-              id: 'workbuddy', label: 'WorkBuddy', kind: 'direct',
+              ...require('../../channels').publicOf('workbuddy'),
               ready: reg ? usable.length > 0 : st.ready,
               loggedIn: usable.length > 0,
               accounts: reg ? usable.length : (st.accounts || 0),
@@ -324,7 +324,7 @@ const routes = [
               error: reg && !usable.length ? (reg === 'intl' ? '没有国际版账号' : '没有国内账号') : (st.error || ''),
             };
           } catch (e) {
-            out.workbuddy = { id: 'workbuddy', label: 'WorkBuddy', kind: 'direct', ready: false, needsClient: false, error: e.message };
+            out.workbuddy = { ...require('../../channels').publicOf('workbuddy'), ready: false, needsClient: false, error: e.message };
           }
           return out;
         })(),

@@ -7,65 +7,24 @@
 // 为什么扣费必须问上游：本地只知道「发了多少 token」，不知道
 // 「扣了多少积分」——计费规则在上游，模型不同单价不同。日志里算不出来。
 const reqlog = require('../../reqlog');
-const accounts = require('../../accounts');
-const web = require('../../dumate-web');
 const usageAgg = require('../../usage-agg');
+const pointsCache = require('../../points-usage-cache');
 const { normalize, belongs, effChannel, LABELS } = require('../../channels');
 const { sendJSON } = require('../router');
 
 // 积分记录按账号查，且需要 startAt/endAt（实测缺参数会报
 // "参数错误:StartAt"）。结果按账号合并，并附上每个账号的明细。
+// **实现只有一份**（points-usage-cache.js，批次二十）：这里委托到共享实现，
+// keepalive 的空闲预热与 /overview 的现算走同一段代码——第二份实现必然漂移。
 async function pointsUsage(days) {
-  const now = Math.floor(Date.now() / 1000);
-  const start = now - days * 86400;
-  const list = accounts.load().accounts.filter((a) => a.enabled);
-  const perAccount = [];
-  let total = 0;
-  let count = 0;
-
-  for (const a of list) {
-    // limit=1 就够：只取 totalCount 与 consumedPoints 这两个汇总字段，
-    // 明细列表这个页面用不上，取全量只是白白多传数据。
-    // 出站代理（E 包收口补点）：配置非法该账号出错误行，不回退直连。
-    let agent;
-    try { agent = web.agentFor(a); } catch (e) {
-      perAccount.push({ id: a.id, name: accounts.displayName(a), ok: false, error: e.message });
-      continue;
-    }
-    const r = await web.api.usageRecords(a.cookie, { startAt: start, endAt: now, page: 1, limit: 1, agent });
-    if (!r.ok) {
-      perAccount.push({ id: a.id, name: accounts.displayName(a), ok: false, error: r.error });
-      continue;
-    }
-    const consumed = Number(r.consumed_points || 0);
-    const cnt = Number(r.total_count || 0);
-    total += consumed;
-    count += cnt;
-    perAccount.push({ id: a.id, name: accounts.displayName(a), ok: true, consumed_points: consumed, count: cnt });
-  }
-
-  return { total_consumed: Math.round(total * 100) / 100, total_records: count, accounts: perAccount };
+  const m = await pointsCache.computeWindow(days);
+  return { total_consumed: m.total_consumed, total_records: m.total_records, accounts: m.accounts };
 }
 
-// 今日消耗单独取（窗口不同，不能从上面的结果推算）
+// 今日消耗单独取（窗口不同，不能从窗口账单推算）
 async function pointsTodayUsage() {
-  const now = Math.floor(Date.now() / 1000);
-  const start = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
-  const list = accounts.load().accounts.filter((a) => a.enabled);
-  let total = 0;
-  let count = 0;
-
-  for (const a of list) {
-    // 出站代理（E 包收口补点）：配置非法跳过该账号（按查不到计），不直连
-    let agent = null;
-    try { agent = web.agentFor(a); } catch (e) { continue; }
-    const r = await web.api.usageRecords(a.cookie, { startAt: start, endAt: now, page: 1, limit: 1, agent });
-    if (r.ok) {
-      total += Number(r.consumed_points || 0);
-      count += Number(r.total_count || 0);
-    }
-  }
-  return { consumed: Math.round(total * 100) / 100, records: count };
+  const t = await pointsCache.computeToday();
+  return { consumed: t.consumed, records: t.records };
 }
 
 function dayKey(ts) {
@@ -177,10 +136,28 @@ const routes = [
       // 积分消耗问上游（本地算不出扣费）。**只有搭子有上游积分账单**——
       // 千问办公的账在自己的池子里（/qwenwork/credits），不查搭子账号池，
       // 否则切到千问会看到搭子的账号消费挂在页面上。
+      // 批次二十「统计预热」：命中新鲜缓存直接回（keepalive 空闲时段或上次
+      // 页面加载已在后台暖好）；陈旧则现算，同时**后台预热**——先回账再暖，
+      // 下一次刷新不再等上游往返。缓存必带时间出仓，前端标注「缓存于」。
       const showPoints = !ch || ch === 'dumate';
-      const [pointsAll, todayPoints] = showPoints
-        ? await Promise.all([pointsUsage(days), pointsTodayUsage()])
-        : [{ total_consumed: 0, total_records: 0, accounts: [] }, { consumed: 0, records: 0 }];
+      let pointsAll;
+      let todayPoints;
+      let pointsCacheMeta = null;
+      if (showPoints) {
+        const v = pointsCache.view(days);
+        if (v.window && v.window.fresh && v.today && v.today.fresh) {
+          pointsAll = { total_consumed: v.window.total_consumed, total_records: v.window.total_records, accounts: v.window.accounts };
+          todayPoints = { consumed: v.today.consumed, records: v.today.records };
+          pointsCacheMeta = { cached: true, cached_at: Math.max(v.window.at, v.today.at) };
+        } else {
+          [pointsAll, todayPoints] = await Promise.all([pointsUsage(days), pointsTodayUsage()]);
+          pointsCacheMeta = { cached: false };
+          pointsCache.warm(days); // fire-and-forget，失败只留 stderr
+        }
+      } else {
+        pointsAll = { total_consumed: 0, total_records: 0, accounts: [] };
+        todayPoints = { consumed: 0, records: 0 };
+      }
 
       // 今日单独算一套更细的指标：顶部卡片要回答「今天跑得怎么样」，
       // 只有请求数与 token 不够——还得知道成功率、快慢、哪些模型在用。
@@ -285,6 +262,9 @@ const routes = [
           // 主力模型 = 窗口内 token 消耗最多的那个
           top_model: byModel.length ? byModel[0].model : null,
         },
+        // 积分账单的缓存元数据：cached=true 时前端标「缓存于 HH:mm」，
+        // cached=false 表示刚现算过（后台已重新预热）。非搭子通道为 null
+        points_cache: showPoints ? pointsCacheMeta : null,
         daily,
         by_model: byModel,
         by_key: byKey,

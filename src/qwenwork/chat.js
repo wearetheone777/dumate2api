@@ -53,11 +53,25 @@ async function ensureAccount(authStore, account) {
   const r = await authStore.exchange(account);
   if (!r.ok) {
     authStore.patch(account.id, { lastError: `换票失败: ${r.error}` });
+    // 凭证退场标记（2026-11-28，与 TRAE/WorkBuddy/Qoder 同源）：上游**明确
+    // 判死**（`INVALID_REFRESH_TOKEN` / `invalid_grant` / 401 / 403）才标，
+    // 标了之后 `needsRefresh` 返回 false，不再每次请求都白撞换票端点。
+    // 判据复用 auth.js 的 `isRefreshRejected`（与收编官方客户端那条路径同源，
+    // 不另写一套正则——两套必然漂移）。
+    if (authStore.isRefreshRejected(r)) {
+      try {
+        authStore.patch(account.id, {
+          lastError: `凭证失效（需重新登录）: ${String(r.error).slice(0, 260)}`,
+          refreshRetiredAt: Date.now(),
+        });
+      } catch (e) { /* 标记失败不影响本次请求 */ }
+    }
     const err = new Error(`千问办公 token 换票失败: ${r.error}`);
     err.statusCode = 401;
     throw err;
   }
-  authStore.patch(account.id, r.patch);
+  // 刷新成功说明上游刚承认这份凭证能换票：退场标记必须一并清掉。
+  authStore.patch(account.id, { ...r.patch, refreshRetiredAt: null });
   return authStore.get(account.id) || { ...account, ...r.patch };
 }
 

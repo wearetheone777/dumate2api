@@ -459,6 +459,45 @@ N 次禁用账号，那是另一种误伤；
 降级编排（`degrade.js`）显式排除凭证被拒：同一份凭证换模型/换区都是白试一次，
 会把「请重新登录」拖成两倍耗时。离线验证：`test/unit/trae-auth-reject.test.js`。
 
+**换票失败必须换号，401 的第一响应是刷新同账号（2026-11-28 真机驱动，两段合成一条链路）**。
+
+两件事同源，都在 `runSendOnce` 的选号层：
+
+1. **换票失败 → 换号，不是整个请求失败。** 旧实现 `ensureFresh` 失败直接 `throw e`，
+   导入的过期账号（access 过期 + refresh 被拒）一被池选中就打挂整个请求，
+   健康号在旁边没被用到。现在分两类处置（判据 `isRefreshRejected`，只认上游原文措辞
+   `refresh token is not matched / invalid` 与业务码 10101/20101 配 refresh 字样，认不出不猜）：
+   `refreshRejected` → 记 `lastError` + 标 `refreshRetiredAt` + 换下一个；
+   网络抖/5xx → 喂池按 classify 冷却 + 换下一个。最多换 3 个号（每次换号都伴随一次
+   换票请求，整池坏号不能打成上游风暴）。
+   **注意业务码 10101 在 `upstream-errors.traeCodeKind` 里是 `deterministic`（换号无用）
+   ——与换票语境的语义相反**：那个分类针对对话请求的账号/租户问题，换票失败恰恰是
+   「这个号用不了了，换号正有用」。
+2. **401 的第一响应是刷新同一账号再试一次**（WorkBuddy `hub #441` 同源）。
+   `needsRefresh` 只按 `expiresAt` 推断，**上游的 401 才是真相**：实测 intl 三号
+   `expiresAt` 都还有 11 天、`needsRefresh` 返回 false，但 refresh token 早已失效
+   （上行 20101 `refresh token is invalid`）。401 且**尚未吐出任何内容**（`e.sent`）
+   时调 `forceRefresh` 绕过提前量，成功则同账号重试一次；刷新被拒才标退场换号。
+   已吐内容后的 401 **不重试**——重试会让客户端看到两段回答。
+
+**`refreshRetiredAt` 的语义边界**：它表示「换不了票」，**不是**「这个号不能用」——
+access 若还没过期照样能跑（实测坏号 `expiresIn=0d` 时仍能成功出网一次）。
+但 access 一旦过期，它就必须在选号阶段直接判废（`ensureFresh` 开头），否则每次轮到它
+都白撞一个上游 401 再走刷新路径——那条路径的答案是已知的「拒绝」。
+
+真机尝试链证据（三个 intl 号，修复后）：
+
+```
+picked:wearetheone777 → error:session_dead:401 → skip:refresh_on_401
+→ error:refresh_rejected（401 后刷新被拒，换号）→ picked:githubfan452 → …（三个号各一轮）
+```
+
+修复前同一场景：第一个号 401 即整个请求失败，且不标退场，下次再来一遍。
+离线验证：`test/unit/trae-refresh-failover.test.js`（6 项，含退场+过期直接判废）
+与 `test/unit/trae-401-refresh-retry.test.js`（3 项，含「已吐内容不重试」）。
+两个文件都自带 `DUMATE_POOL_STATE` 临时池，且 `seed()` 走 `pool.revive` 清账号级状态
+——账号 id 每次从 1 重编，不清会让上一个用例的冷却被下一个用例的 id=1 继承。
+
 **单账号人工恢复 `POST /api/admin/traework/accounts/:id/recover`（2026-11-16）**。
 清冷却 / 熔断 / 401 防误杀计数 / 禁用标记，并清掉账号上的 `lastError` 牌子；
 响应回 `before`（恢复前的可用性快照）与 `clearedLastError`，让「到底解掉了什么」可核对。

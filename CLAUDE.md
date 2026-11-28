@@ -93,6 +93,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 7. **搭子思考档位只对同后端白名单生效**（`src/dumate-reasoning.js`）：只认 `none/low/high/max`，
    只对 `deepseek-v41-flash` / `model-text` / `dm-auto-model/{text,mm}.L0` 等同一后端生效；
    `minimal`/`medium`（翻译层五档词表里的）刻意不映射。改之前先读该文件头三个边界。
+8. **四通道共用「凭证退场」口径，判废只有一处**（2026-11-28）：换票被上游**明确拒绝**
+   才标 `refreshRetiredAt`（判据各通道一份：TRAE/WorkBuddy 认原文措辞、Qoder 认
+   `exchange` 的 `expired:true`、千问认 401/403 或 `INVALID_REFRESH_TOKEN`/`invalid_grant`；
+   **认不出不猜**——网络抖误标要人工重新登录才能解）。标记的语义是「换不了票」**不是**
+   「号不能用」：access 未过期时照样能跑，所以判废是**双条件**（标记 + access 已过期）
+   且只在 `channel-pool.pickCandidate` 入口做一次（`credentialDead()`）。别在通道里各写
+   一遍——TRAE 与 WorkBuddy 曾各自实现，第三第四份必然漂移。`upsert` 带新 refreshToken
+   时必须清标记，否则重新登录了也用不了。
 
 ## 命令
 
@@ -653,6 +661,26 @@ ETag 用内容哈希而不是 `statSync` 的 mtime：后者在异步回调里阻
 <a-switch/></label>`），并给关闭态一个不同颜色的标签。同理：改完前端别只看接口
 返回，要用真实浏览器截图核对可见性（本次两处问题都是接口 200、界面无感）。
 
+**`tools/ui-shot.js` 在 WSL 里要经 Windows node 跑（2026-11-28 实测）。** 本机
+WSL 没有 Linux 浏览器，工具默认起的是 Windows Edge——而 WSL node 会把
+`os.tmpdir()`（`/tmp/...`）当 `--user-data-dir` 传给 Edge，**Windows 程序读不了
+Linux 路径，Edge 起不来、devtools 端口永远无响应**（WSL networkMode=mirrored
+不是问题，路径才是）。正确姿势：
+
+```bash
+"/mnt/c/Users/zhou/AppData/Local/Author Software/nvm/.nodejs/node.exe" \
+  '\\wsl.localhost\Ubuntu-24.04\home\zhou\code\claude\demo\dumate2api\tools\ui-shot.js' \
+  --url "http://127.0.0.1:9085/#/页面" --user admin --pass "$PW" \
+  --channel workbuddy --out 'C:\Users\zhou\AppData\Local\Temp\x.png' ...
+```
+
+脚本经 UNC 访问、profile/输出全落 Windows 侧，Windows→WSL 的 localhost 在
+mirrored 模式下可达。要截图的页面若需要登录，用**隔离数据目录** +
+`DUMATE_ADMIN_PORT=9085 ... node src/admin/server.js --reset-admin` 起临时管理端，
+别在真 9081 上试密码。另：`--click` 匹配按钮 innerText，**AntD 两字按钮自动插
+空格**（渲染成「编 辑」「配 置」），--click 传带空格的形态；断言文本避开会自动
+换行的长句（innerText 换行会断开 includes 匹配）。
+
 **新增运行态配置字段要改三处，不是一处（2026-11-16 踩过）。**
 `src/trae-runtime.js` 里 `defaults()`、`FIELDS`、以及 **`Load()` 的返回体**是三份
 独立的字段清单——只加前两个，`Store()` 写盘成功、接口读出来却恒 `undefined`
@@ -727,6 +755,11 @@ per-key 限流（低价值场景）。
 | `DUMATE_QWENWORK_REPAIR_RETRY` / `DUMATE_QODER_REPAIR_RETRY` | `1` | 同上，千问与 Qoder 各一套（`src/repair.js` 的 `envCaps`）。互不影响。**可被管理端「通道风控」面板覆盖** |
 | `DUMATE_QWENWORK_HOLD_CAP` / `DUMATE_QODER_HOLD_CAP` | `600` | 同上，千问与 Qoder 各一套 |
 | `DUMATE_WORKBUDDY_REPAIR_RETRY` / `_HOLD_CAP` | `1` / `600` | 同上，WorkBuddy 一套（2026-11-04 接入共享修复） |
+| `DUMATE_WORKBUDDY_TASKS_SWEEP` | 未设（关闭） | 成长任务补领清扫的**自动化**开关（autocheckin 第四腿：accept 幂等报名 + claim 完成未领 + 连登兑换）。默认关——写操作独立开关纪律；管理端 `/tasks/*` 手动按钮不受它管。端点定案与安全形状见 `docs/CHANNEL-WORKBUDDY.md` 11.5 |
+| `DUMATE_WORKBUDDY_WINDOW_PROBE` | 未设（开启） | 设 `0` 关闭 6004 模型额度窗口探针（批次十，`src/workbuddy/windowprobe.js`）：登记侧在 model_cap 分支（带重置墙钟才登记），执行侧网关进程内 30s 巡检、到点发最小请求（auxiliary，真实计费）钉住窗口起点；探针过选号闸门、不喂池。管理端 `/api/admin/workbuddy/windows[/run]` 可查表/立即探针。见 `docs/CHANNEL-WORKBUDDY.md` 11.12 |
+| `DUMATE_WORKBUDDY_DAILY_MODELS` | 未设（自动） | 网页打卡候选模型序列（批次十一，逗号/分号/换行分隔）。显式序列**整体优先且不重排**；未设 = 自动模式：实时目录免费模型在先（探针实证 `hy4flash-free` 被沙箱接受，rate 0）+ `deepseek-v4.1-flash` 收尾保连登；目录拉不到 → [flash] 兜底。额度/限流失败自动换候选，11140/401 立即停。见 `docs/CHANNEL-WORKBUDDY.md` 11.13 |
+| `DUMATE_WORKBUDDY_WEB_BUDGET_MS` | `600000` | 单账号网页打卡总预算（ms），0 不限：每轮等待与退避都从它里扣，剩余 <30s 不再开新轮，用尽回 phase=budget 明确结论 |
+| `DUMATE_WORKBUDDY_WEB_RETRY_BACKOFF` / `_MAX` | `5` / `30` | 打卡候选轮次间退避基数/封顶（**秒**，指数 ×2^n）；只补 create/session 阶段（turn 已等满 waitMs）。0 = 关退避 |
 | `DUMATE_WORKBUDDY_MIN_MAX_TOKENS` | `16384` | WorkBuddy 输出预算下限（`budget.js` 的 `WB_FLOOR`，reasoning 与正文抢预算） |
 | `DUMATE_WORKBUDDY_MODELS_CACHE_MS` | `600000` | WorkBuddy 模型表缓存时长（10 分钟，按区域分缓存） |
 | `DUMATE_WORKBUDDY_APP_VERSION` | 未设（按区域兜底 5.5.6 / 5.5.2） | 覆盖客户端版本号（进 `X-IDE-Version` 与 chat UA） |
@@ -740,6 +773,8 @@ per-key 限流（低价值场景）。
 | `DUMATE_QODER_QUEUE_PATIENCE_MS` | `6000` | 排队重试的**总预算**（ms）。实测推翻了「按上游时长耐心等」的旧结论：排队是请求级随机，等 30 秒也不保证放行，所以改为快速轮询几轮（信封本身 150~1000ms 就到）仍失败就如实回 429。`0` = 拿到限流立刻回 429 |
 | `DUMATE_QODER_QUEUE_STEP_MS` | `1500` | 排队轮询间隔（ms）。过长恰恰是用户感知的「慢」（原 3000ms × 5 轮 = 15 秒纯等待） |
 | `DUMATE_QODER_READ_IDLE_MS` | `120000` | Qoder 上游**读空闲**超时（ms），每块数据重置，挡「先响应后沉默」的限流排队（见 `docs/CHANNEL-QODER.md`）。**必须大于首字节超时**，否则两计时器抢跑。`0` 关闭 |
+| `DUMATE_CONTINUE_RETRY` | 未设（开启） | 设 `0` 关闭搭子的**长度截断无缝续写**（批次二十三，`src/continue.js`）：网页凭证链路上 `finish_reason=length` 且纯文本时同账号补发续写、帧接进同一条 SSE；工具参数截断不续；续写失败降级放出已扣收尾帧（截断但完整收口） |
+| `DUMATE_CONTINUE_MAX` | `3` | 续写的最大追加段数（每段都是完整的一轮上游调用，撞各自的单次输出上限）。`0` = 关闭续写 |
 | `DUMATE_THROTTLE_MAX_MS` | `600000` | 排队/限流冷却的**上限**（ms，千问与 Qoder 共用）。上游按自己的队列长度给 `waitTime`（实测 7015 秒），照单全收会把账号锁近两小时；封顶后最多等这么久再探一次。**管理端「通道风控」页可热改覆盖**（面板 > env > 默认，解析单一实现 `src/throttle.js`），改完不需要重启任何进程 |
 | `DUMATE_IMAGE_MAX_MB` | 未设（不限） | **单张内联图片**上限（MB）。超限回 413 并指认「第几张、多大、上限多少」，默认不限（没有实测依据的阈值只会挡住能用的场景）。管理端「通道风控」页可覆盖（面板按字节存，优先级 面板 > env > 不限），解析在 `src/image-budget.js` |
 | `DUMATE_IMAGE_MAX_TOTAL_MB` | 未设（不限） | **单请求内联图片合计**上限（MB）。与单张上限是两回事：多张小图加起来照样能把请求体撑到 32MB 的 `DUMATE_MAX_BODY_MB` 线上 |
@@ -816,6 +851,7 @@ per-key 限流（低价值场景）。
 | `admin-audit.jsonl` | 管理操作审计 |
 | `requests.jsonl` | 网关埋点，超 32MB 轮转一次留 `.1` |
 | `web-accounts.json` | 网页账号，**cookie 明文存**（上游要求原样重放，与 keys 的只存哈希是两种策略） |
+| `*-trash.json` | 五个账号回收站（批次十六，`web-accounts-trash.json` / `qwenwork-` / `traework-` / `qoder-` / `workbuddy-accounts-trash.json`）：软删除的记录整体搬到这里（**凭据原样保留**，30 天可恢复），live 账号文件根本不含回收站成员——pool/keepalive/FEFO 等消费方零改动。不在备份分区表里（trash 是暂存区不是配置）；解析失败时全部写路径拒绝（宁可不写） |
 | `activity.jsonl` | 统一操作记录（签到/任务/抽奖），按时间排序 |
 | `task-runs.jsonl` / `task-scheduler.json` | 任务执行历史 / 轮询配置 |
 | `auto-checkin.json` | 自动签到配置 |
@@ -824,13 +860,16 @@ per-key 限流（低价值场景）。
 | `qwenwork-accounts.json` | 千问自持凭证账号池（**含 refresh token，等同密码**） |
 | `qoder-accounts.json` | Qoder 自持凭证账号池（device flow 换取，含 refresh token） |
 | `qoder-grants.jsonl` | Qoder 积分批次账本（**签到领取记录**，用于过期提醒；上游无逐批余额接口） |
-| `expiring-snapshot.json` | 四家通道（搭子/TRAE/千问/WorkBuddy）的临期积分快照：管理端 /credits 顺带写、网关选号读（FEFO）。WorkBuddy 的到期来自套餐 `CycleEndTime`（北京时间，2026-11-04 接入）。陈旧即退回普通轮询，进程间靠它通信，不通过 IPC（`src/expiring.js`） |
+| `expiring-snapshot.json` | 四家通道（搭子/TRAE/千问/WorkBuddy）的临期积分快照：管理端 /credits 顺带写、网关选号读（FEFO）。WorkBuddy 的到期来自套餐 `CycleEndTime`（北京时间，2026-11-04 接入）。陈旧即退回普通轮询，进程间靠它通信，不通过 IPC（`src/expiring.js`）。批次二十一补了第三个读方：`/api/admin/expiring` 只读出仓 → 五个账号卡视图的临期角标（`view()` 与 `accountIds()` 同判据；**快照只记时刻不记金额**——qoder 不在快照里，它的角标从 /qoder/credits 行的 expiring* 字段出）；界面在快照陈旧（fresh=false）时隐藏角标 |
 | `dumate-caps.json` | 搭子按模型 max_tokens 上限的自学习记录（7 天 TTL，`src/dumate-caps.js`；静态实测表在代码里） |
 | `traework-accounts.json` | TRAE 自持凭证账号池（OAuth 换取，含轮换的 refreshToken） |
 | `workbuddy-accounts.json` | WorkBuddy 自持凭证账号池（客户端认证文件导入或手动粘贴 token，含 refresh token；区域字段 cn/global） |
 | `traework-credits.jsonl` | TRAE 逐请求积分归因（按账号的 consumed 游标，见 `traework/credits.js`） |
 | `points-cursor.jsonl` | 搭子的余额游标（每请求一条，相邻差值即该请求成本） |
+| `balance-hist.jsonl` | 各账号余额变动流水（观测式记账：变动即留痕，无变动不记；首见写 delta=null 基线行）。消费方：余额趋势页的采样折线（30 分钟网格 carry-forward，估计段虚线——期间若有消耗，估计值是上界、窗口消耗是下界） |
+| `points-usage-cache.json` | 搭子积分账单的预热缓存（批次二十）：窗口账单与今日实付两部分独立判新鲜（TTL 默认 30 分钟，`DUMATE_POINTS_USAGE_CACHE_TTL_MS` 可覆盖）。keepalive 空闲收尾每日预热；`/usage/overview` 命中即回、陈旧则现算 + 后台预热，**缓存数字必带 `cached_at` 出仓**（前端标注「缓存于」，缓存与实时混看不标时间＝编数据）。删除无损，keepalive/页面加载会重建 |
 | `browser-profile/` | 浏览器登录器用的受控 profile 目录（`DUMATE_BROWSER_PATH` 找不到浏览器时才用） |
+| `logs/run-YYYY-MM-DD.jsonl` | 运行日志每日归档（批次十八）：管理端进程把脱敏后的 console 行按本地日追加一份（`jsonl.append` 单次写），30 天滚动清理挂在日期翻转上。`/api/admin/logs/export?days=N` 打包成 ZIP 下载。**只有管理端进程在写**（网关未 install logbuffer）；存储页只列 data/ 顶层条目，这个目录以一行聚合行出现且不可删 |
 
 **`DUMATE_ADMIN_DATA` 决定数据目录，管理端与网关必须一致**，否则读到的账号/埋点不同。默认都是 `<repo>/data`，正常启动无需设置。容器/自定义部署里如果改了一边没改另一边，症状是「管理端显示空账号、但请求明明成功」——先核对两边的数据目录。
 
@@ -871,6 +910,10 @@ per-key 限流（低价值场景）。
 | `admin/routes/traework.js` | TRAE Work 通道的管理接口：`/status` 通道健康+账号列表（mode=multi，可增删）、`/models` 模型表（只读）、`/credits` 各账号额度与签到状态、`/checkin` 手动签到（幂等）、`/billing-check` 计费自检探针、**`/login/url` + `/login/callback` 两步 OAuth 登录**、`DELETE/PATCH /accounts/:id` |
 | `admin/routes/qwenwork.js` | 千问办公通道的管理接口：`/status` 通道健康、`/credits` 三个池、`/credits/daily` 按天聚合、`/credits/records` 逐笔明细、`/billing-check` 计费自检探针、`/models` 模型表、**`/account` 登录态详情（只读）**、**`/accounts` 账号（`mode='single'` 表示单账号直连，不可增删）** |
 | `admin/routes/accounts.js` | 搭子网页账号的管理接口（签到/抽奖/积分/记录）。**回填与显示名的逻辑都在这里**（`backfillNickname` / `backfillAll`），属于管理端 |
+| `admin/routes/backup.js` | 备份分区表（批次十四，qoder-trae-workbuddy-switch 移植）：`GET /sections` + `/export` `/preview` `/import`。**SECTION_TABLE 是唯一分区清单**（5 账号分区按身份键合并、其余按顶层键合并），新增可备份类型 = 加一行；预览零写盘；导出默认脱敏（sensitive 分区必须显式含凭据+confirm）；**脱敏记录覆盖本地时保留本地凭据字段**。细节见 `docs/PLAN-WORKBUDDY-GITHUB-MERGE-2026-11-28.md` 批次十四行 |
+| `admin/routes/storage.js` | 存储管理（批次十七）：data/ 四类视图 + 先预览再确认的清理 + 60s 快照。**白名单根只收裸文件名**（分隔符/`..` 参数形状上就拒）；**未识别文件一律 other/protected**——分类表（KNOWN）只登记认识的文件名，新增可清理文件 = 在 KNOWN 加一行标 `deletable:true`，绝不给未知文件放行；可删的只有 logs/cache 两类，checkin-ledger/qoder-grants/usage-agg/pool-state/admin-audit 这类「删了有行为后果或不可再生」的刻意归 config 保护。preview 响应不下发 fullPath。新增 data/ 文件后**它默认是保护的**——想让存储页能清理它必须显式登记 |
+| `admin/trash.js` | 账号回收站（批次十六）：五通道共用一套（SPECS 表驱动），**软删除搬移到独立回收站文件**而不是 live 里加标记——消费方零改动。写顺序「新增侧先落」（中途失败是两边都有不是数据丢失）；恢复 fail-closed（未知 key 拒/live 已有同 id 拒/preferred 排他归一）；30 天 + 200 条先到先出；损坏时全部写路径拒绝。`routesFor(channel)` 工厂四路由（GET /trash、POST /trash/clear、POST /trash/:key/restore、DELETE /trash/:key），**必须展开在各通道 routes 数组最前**（字面 /trash 先于 /:id 参数路由被匹配）；purge/clear 服务端强制 confirm。清扫循环挂管理端进程（`startSweep`，boot + 每小时）——网关进程从不写回收站文件，**别把清扫挪进网关 keepalive**（会引入跨进程写竞争） |
+| `admin/logbuffer.js` / `admin/logarchive.js` | 运行日志（调研 P1-9 + 批次十八）：内存环按行首特征分 **chat/task/sys 三频道**（每频道独立 500 行；`[chat]` 等显式标签直接命中、`[keepalive]` 等巡检前缀归 task、其余 sys；剥 ISO 时间戳前缀后再判，未知频道返回空不回落）。**脱敏在入缓冲之前、中文标签也要认**（密码/口令/密钥/秘钥/令牌/凭据 + 显式分隔符——`--reset-admin` 横幅打「密码:  值」，只认 ASCII 键名时整行漏过，2026-11-28 实测）；敏感行整行丢弃、不进环不落盘。归档走 **sink 管道**（`addSink`，不占 SSE 4 路订阅名额）→ `logarchive.js` 每日一份 JSONL + 30 天清理 + 零依赖 ZIP 导出（手拼 CRC32/本地头/EOCD，`unzip -t` 交叉验证过） |
 | `admin/routes/*.js` | 其余管理 API，按 `mount()` 挂载到 `/api/admin/<前缀>` |
 
 **千问登录态只读，管理端绝不写入。** 它存在官方客户端的 `auth-v2.dat` 里（Electron safeStorage：DPAPI 解 `Local State` 的 `encrypted_key` → 32B AES key → AES-256-GCM 解密）。官方客户端和我们各写一次会互相把对方的登录态刷掉，所以换账号必须开客户端操作。**不复制这个文件到 `data/`**——它会过期，复制一份立刻失效。`refresh_token` 过期（`refreshExpired`）要提前告警：access token 到期后无法自动续期。

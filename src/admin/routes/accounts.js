@@ -376,6 +376,9 @@ function aggregateExpiring(packages, accountId, days = 30) {
 }
 
 const routes = [
+  // 回收站四路由（批次十六）：列表/清空/恢复/永久删除。放最前——
+  // 字面 /trash 必须先于下方 PATCH/DELETE '/:id' 这类参数路由被匹配到
+  ...require('../trash').routesFor('dumate'),
   {
     // 桌面端登录态直读导入（2026-11-07 清单项 6 尾巴）：解密本机
     // auth.json（AES-256-GCM，排布实测见 src/auth-import.js 头注释），
@@ -552,10 +555,11 @@ const routes = [
     method: 'DELETE',
     path: '/:id',
     handler: ({ res, params }) => {
-      const ok = accounts.remove(params[0]);
-      if (!ok) return sendJSON(res, 404, { error: '账号不存在' });
+      // 批次十六：删除 = 移入回收站（30 天可恢复）；永久删除走 DELETE /trash/:key
+      const r = require('../trash').trashAccount('dumate', params[0]);
+      if (!r.ok) return sendJSON(res, 404, { error: r.error });
       require('../../admin/auth').audit('admin', 'web_account_delete', params[0]);
-      return sendJSON(res, 200, { ok: true });
+      return sendJSON(res, 200, { ok: true, trashed: true, name: r.name });
     },
   },
   {

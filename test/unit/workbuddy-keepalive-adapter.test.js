@@ -7,9 +7,12 @@
 //
 // 锁住：
 //   1. 四个 adapter 之外多了 workbuddy，uid 键位是 `workbuddy:<id>`（与池一致）
-//   2. refresh：未到期 → skipped（不打上游）；到期 → 走 auth.exchange 并落盘
-//   3. balance：国际版如实 null（不报 0）；精确余额优先；失败如实 error
-//   4. **没有 checkin 方法**（签到只有一个排程）
+//   2. refresh：**每轮必刷**（P1-3，misakano #296 上游提前清 session）+ 1h 最小间隔；
+//      已判退场（refreshRetiredAt）→ skipped 不白撞
+//   3. refresh 被明确拒绝 → keepalive 路径也判废（refreshRetiredAt）；
+//      AT 还有 >7 天寿命却换不动票 → 早死观测（refresh_died_early）
+//   4. balance：国际版如实 null（不报 0）；精确余额优先；失败如实 error
+//   5. **没有 checkin 方法**（签到只有一个排程）
 //
 // 运行：node --test test/unit/workbuddy-keepalive-adapter.test.js
 const test = require('node:test');
@@ -59,7 +62,18 @@ test('keepalive 的 builtinAdapters 含 workbuddy（uid 键位 workbuddy:<id>）
 
     const refresh = (r.results || []).filter((x) => x.channel === 'workbuddy');
     assert.strictEqual(refresh.length, 1);
-    assert.strictEqual(refresh[0].skipped, true, 'token 还有 10 天，不该打刷新端点');
+    // P1-3 每轮必刷：AT 还有 10 天寿命也刷（上游提前清 session，等窗口就晚了）
+    assert.strictEqual(refresh[0].skipped, false, '每轮必刷：10 天寿命也要续（misakano #296）');
+    assert.strictEqual(refresh[0].ok, true);
+    assert.strictEqual(refresh[0].at_days_left, 20, 'AT 倒计时按 patch 后的 expiresAt 算（20 天）');
+
+    // 第二轮（1h 内）：最小间隔生效，不再打换票端点
+    const r2 = await keepalive.runOnce('manual', {
+      per_account_delay_ms: 0, sem_cap: 1, checkin: false, pool: null,
+    });
+    const refresh2 = (r2.results || []).filter((x) => x.channel === 'workbuddy');
+    assert.strictEqual(refresh2.length, 1);
+    assert.strictEqual(refresh2[0].skipped, true, '1h 最小间隔：刚刷过不再撞换票端点');
   } finally {
     wbAuth.exchange = origExchange;
     wbBilling.fetchCredits = origCredits;
@@ -99,5 +113,98 @@ test('workbuddy adapter 没有 checkin 方法（签到只有一个排程）', as
     assert.deepStrictEqual(wbCheckins, [], 'keepalive 不该签 WorkBuddy（归 autocheckin）');
   } finally {
     wbBilling.fetchCredits = origCredits;
+  }
+});
+
+test('P1-3：refresh 被明确拒绝 → keepalive 路径也判废（refreshRetiredAt）', async () => {
+  resetAccounts();
+  wbAuth.upsert({
+    uid: 'ka-retire', region: 'cn', accessToken: 'at', refreshToken: 'rt',
+    expiresAt: Date.now() + 10 * 86400000, enabled: true,
+  });
+  const origExchange = wbAuth.exchange;
+  wbAuth.exchange = async () => ({ ok: false, error: '刷新失败 HTTP 400: Offline user session not found' });
+  try {
+    const r = await keepalive.runOnce('manual', {
+      per_account_delay_ms: 0, sem_cap: 1, checkin: false, pool: null,
+    });
+    const refresh = (r.results || []).filter((x) => x.channel === 'workbuddy');
+    assert.strictEqual(refresh.length, 1);
+    assert.strictEqual(refresh[0].ok, false);
+    assert.strictEqual(refresh[0].retired, true, '明确拒绝 → 判废标号');
+    const cur = wbAuth.get(wbAuth.findUsable()[0].id);
+    assert.ok(cur.refreshRetiredAt, 'refreshRetiredAt 必须落盘（send 层之外的第二条判废路径）');
+  } finally {
+    wbAuth.exchange = origExchange;
+  }
+});
+
+test('P1-3：AT 还远（>7 天）却换不动票 → 早死观测（refresh_died_early）', async () => {
+  resetAccounts();
+  wbAuth.upsert({
+    uid: 'ka-early', region: 'cn', accessToken: 'at', refreshToken: 'rt',
+    expiresAt: Date.now() + 10 * 86400000, enabled: true,
+  });
+  const origExchange = wbAuth.exchange;
+  wbAuth.exchange = async () => ({ ok: false, error: '刷新失败 HTTP 400: invalid_grant' });
+  try {
+    const r = await keepalive.runOnce('manual', {
+      per_account_delay_ms: 0, sem_cap: 1, checkin: false, pool: null,
+    });
+    const refresh = (r.results || []).filter((x) => x.channel === 'workbuddy');
+    assert.strictEqual(refresh[0].refresh_died_early, true, 'misakano #296：AT 有 10 天寿命却换不动票');
+    assert.ok(/早死/.test(refresh[0].error), `error 文案要点破早死：${refresh[0].error}`);
+    assert.ok(/10 天/.test(refresh[0].error), '文案带 AT 剩余天数');
+  } finally {
+    wbAuth.exchange = origExchange;
+  }
+});
+
+test('P1-3：已判退场（refreshRetiredAt）→ skipped 不再白撞换票端点', async () => {
+  resetAccounts();
+  wbAuth.upsert({
+    uid: 'ka-dead', region: 'cn', accessToken: 'at', refreshToken: 'rt',
+    expiresAt: Date.now() + 10 * 86400000, enabled: true,
+  });
+  // upsert 带 refreshToken 会清退场标记（重新登录解废的既有规则）——
+  // 这里模拟「已退场」必须用 patch
+  wbAuth.patch(wbAuth.findUsable()[0].id, { refreshRetiredAt: Date.now() });
+  let called = 0;
+  const origExchange = wbAuth.exchange;
+  wbAuth.exchange = async () => { called++; return { ok: false, error: 'x' }; };
+  const origCredits = wbBilling.fetchCredits;
+  wbBilling.fetchCredits = async () => ({ ok: true, total: 5, totalPrecise: 5 });
+  try {
+    const r = await keepalive.runOnce('manual', {
+      per_account_delay_ms: 0, sem_cap: 1, checkin: false, pool: null,
+    });
+    const refresh = (r.results || []).filter((x) => x.channel === 'workbuddy');
+    assert.strictEqual(refresh[0].skipped, true, '退场号不白撞换票端点');
+    assert.strictEqual(refresh[0].retired, true);
+    assert.strictEqual(called, 0, 'exchange 一次都不该被调');
+  } finally {
+    wbAuth.exchange = origExchange;
+    wbBilling.fetchCredits = origCredits;
+  }
+});
+
+test('P1-3：认不出措辞的换票失败不判废（网络抖不误标）', async () => {
+  resetAccounts();
+  wbAuth.upsert({
+    uid: 'ka-noise', region: 'cn', accessToken: 'at', refreshToken: 'rt',
+    expiresAt: Date.now() + 10 * 86400000, enabled: true,
+  });
+  const origExchange = wbAuth.exchange;
+  wbAuth.exchange = async () => ({ ok: false, error: '刷新失败 HTTP 502: upstream error' });
+  try {
+    const r = await keepalive.runOnce('manual', {
+      per_account_delay_ms: 0, sem_cap: 1, checkin: false, pool: null,
+    });
+    const refresh = (r.results || []).filter((x) => x.channel === 'workbuddy');
+    assert.strictEqual(refresh[0].retired, false, '认不出拒绝措辞 → 不标退场（行字段归一成 boolean）');
+    const cur = wbAuth.get(wbAuth.findUsable()[0].id);
+    assert.ok(!cur.refreshRetiredAt, '5xx/网络抖绝不标退场');
+  } finally {
+    wbAuth.exchange = origExchange;
   }
 });

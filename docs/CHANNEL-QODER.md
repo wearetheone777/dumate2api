@@ -49,9 +49,28 @@
 而且**响应里的 `model` 字段恒为 `"auto"`**（上游如此），不能据此判断实际模型——
 真正的判据是 `system_fingerprint`（实测 `dmodel` → `a307abda…`、`kmodel_latest` → `fpv0_3f6baf1…`）。
 
-**倍率差 14 倍，开发调试一律用 0.1 档**：`qfmodel`/`qmodel`/`q37fmodel`/`dfmodel`/`gfmodel`。
+**倍率差 14 倍，开发调试一律用 0.1 档**：`qfmodel`/`dfmodel`/`gfmodel`/`mmodel`（2026-11-28 真机复核）。
+`qmodel` / `q37fmodel` 已于同日确证下线（见下段），兜底快照里仍保留但标 `retiredCandidate`。
 实测 5 个 0.1 档请求合计不到 0.01 credits，而 `kmodel_latest`(Kimi-K3) 是 1.4 档。
 倍率从模型表接口的 `price_factor` 读，**不硬编码**。
+
+**模型表真机复核（2026-11-28，cn 两账号 + global 两账号）**：cn 14 条 / global 17 条
+（global 多 `ultimate`/`efficient`/`smodel`/`cmodel` 四个）。三条结论：
+
+1. **`qmodel` / `q37fmodel` / `gm51model` 确证下线**——四个账号的模型表里都没有。
+   按 P0-2 纪律**不删条目**，只把快照里的 `retiredCandidate` 连同真机依据一起落定
+   （第三方清单从「声称」升级为「已复核」）。显式调用仍然透传给上游裁决，
+   上游若恢复模型可直接复活。
+2. **快照原先漏登记 7 个上游真实存在的 key**：`ultimate` / `efficient` / `smodel` /
+   `cmodel`（仅 global）/ `gmodel_latest` / `jmodel` / `mmodel`。已补齐。
+   `mmodel`（MiniMax-M3.1-Flash，0.1 档）进了便宜档推荐。
+3. **`qwen-plus` 别名原指向 `qmodel`——已下线 key**，改指 `qmodel_38max`（0.2 档，
+   仍在表里）。这类「别名指到下线模型」不会报错，只会在调用时稳定失败，
+   单测 `qoder-model-catalog.test.js` 新增两条把这两个结论钉死。
+
+global 区另有两个高倍率模型：`smodel`（Sonus，8 档）、`cmodel`（Cantus，4 档）；
+`ultimate` 是 2 档。国内账号调不到这四个，`listModelEntries` 按 preferred 账号的
+region 出表，所以 /v1/models 的可见集合随主账号区域变化。
 
 **Qoder 的 usage 直接返回 credits 消耗**（三条直连通道里唯一如此）：
 `usage.credits = price_factor × tokens/1000`，比千问（读余额差）和 TRAE（读 usage_summary）都干净。
@@ -131,6 +150,27 @@ qoder2api-hub 记载的 71s 上限（hub 根本没有这一层判定：最短掐
   两个账号各挂一次就必然失败。
 
 两条底线没变：**下游拿 429**（客户端自动退避重试），**绝不把限流记成熔断**。
+
+**排队有两种形态，字段能分开（2026-11-28 真机实测）——分开判很重要，因为处置相反。**
+
+| | 真排队 | 伪装成排队的硬拒绝 |
+|---|---|---|
+| `queueType` | `p4` | `p1` |
+| `queueCount` | `≥1`（实测 1） | `0` |
+| `serviceAvailable` | `true` | `false` |
+| 含义 | 服务在，只是拥堵 | 身份被拒（`identity-guard.js` 记的那类） |
+| 处置 | 等着 / 走官方排队轮询，会放行 | **等永远不会放行**，必须中和 system 身份句 |
+
+两者都是 **HTTP 403 + `code 10605` + `subCode RESOURCE_LIMIT` + `isQueued:true`**，
+只看错误码分不开——必须解到最内层信封看这四个字段（信封通常嵌三层：
+`data:{headers,body}` → `{code,message}` → `{code,message}` → 最内层）。
+判别在 `model-locks.js` 的 `queueKindOf()`（返回 `real` / `hard` / `''` 不猜），
+锁池视图（`#/qoder-runtime`）据此打「真排队」/「硬拒绝」标签。
+
+这次实测还确认了一件反直觉的事：**四个账号（cn×2 + global×2）、跨 3 个模型同时都是
+`p4` 真排队，而额度全部健康**（1574 / 1697 / 299 / 0 credits）——所以 `p4` 不是
+额度耗尽导致的降级，是上游此刻的真实负载。判断「是不是额度问题」不该看排队，
+要看 `fetchQuota`（注意签名是 `fetchQuota(accessToken, region)`，传 account 对象会 401）。
 
 **限流是「稍后再来」，不是「服务坏了」——按 429 处置，绝不能进熔断（2026-10-27 修，可用性级）。**
 `upstream-errors.classify` 原来只认 HTTP 429 为 `soft`，而 Qoder 的限流是
@@ -887,3 +927,29 @@ svg 图标）；`script-src 'self'` 够用（Vite chunk 全是同源文件，无
 （「登录退避是防爆破的唯一防线」这类依赖是隐性的）。
 
 至此管理端公网化前置清单**全部就绪**：公网化只剩改监听地址一件事。
+
+## 凭证退场标记（2026-11-28，四通道统一口径）
+
+Qoder 的 `session.ensureAccount` 换票失败时原本只有「抛 401 + 换号」，没有
+「这份凭证已经废了」的记忆：同一个死号每次被池选中都白撞一次换票端点。
+
+现在与 TRAE / WorkBuddy / 千问共用一套口径（判据各有形状，纪律相同）：
+
+| 环节 | Qoder 的实现 |
+|---|---|
+| 判据 | `exchange()` 的 `expired: true`——比字符串可靠，上游明确判死才带 |
+| 写标记 | `session.ensureAccount` 失败分支写 `refreshRetiredAt` + `lastError='凭证失效（需重新登录）…'` |
+| 生效 | `auth.needsRefresh` 见标记返回 false，不再反复打换票端点 |
+| 判废 | **`channel-pool` 的 `credentialDead()`**（四通道共用）：标记 + access 已过期 → 不进候选 |
+| 清除 | 刷新成功分支 + `auth.upsert` 带新 refreshToken 时 |
+
+**判废为什么上移到池层**：四个通道的选号循环各异，而「标记 + access 已过期」
+是**与通道无关**的凭证事实。TRAE 与 WorkBuddy 曾各自实现过一次，Qoder/千问
+再抄就是第三、第四份——必然漂移。现在 `pickCandidate` 入口统一过滤。
+
+**语义边界（别改）**：`refreshRetiredAt` 只表示「换不了票」，**不是**「号不能
+用」——access 未过期时照样能跑（TRAE 实测 `expiresIn=0d` 仍成功出网一次），
+所以 `findUsable` 与 `pickCandidate` 都只在**双条件**下判废；没有 `expiresAt`
+的账号不敢判死（无法证明 access 已失效）。
+
+离线验证：`test/unit/credential-retired.test.js`（8 项：池层三条边界 + 四通道判据）。

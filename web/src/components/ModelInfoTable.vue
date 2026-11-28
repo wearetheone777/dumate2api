@@ -83,6 +83,15 @@
             <a-tag v-if="record.isNew" color="green" class="ml-1">新</a-tag>
             <a-tag v-if="record.isBeta" color="orange" class="ml-1">Beta</a-tag>
             <a-tag v-if="record.visible === false" color="default" class="ml-1">隐藏</a-tag>
+            <!-- P0-2：上游 enable=false 的模型（管理端仍列出，客户端 /v1/models 不给） -->
+            <a-tooltip v-if="record.status === 'disabled'" :title="record.disabledReason || '上游模型表声明 enable=false'">
+              <a-tag color="default" class="ml-1">上游禁用</a-tag>
+            </a-tooltip>
+            <!-- P0-2：第三方清单称已下线、本项目未真机复核。**不删条目**，
+                 灰显提示；显式调用仍会透传给上游自己判 -->
+            <a-tooltip v-else-if="record.retiredCandidate" title="第三方清单称已下线，本项目尚未真机复核；显式调用仍会透传，可用聊天测试台验证">
+              <a-tag color="orange" class="ml-1">疑似下线</a-tag>
+            </a-tooltip>
             <!-- 套餐门槛（P2-11）：只在上游 descriptor 显式声明时显示，
                  不按隐藏状态/模型名猜，也不伪装成风控错误 -->
             <a-tooltip v-if="record.upgradeRequired === true" title="上游模型目录明确标注需要升级套餐">
