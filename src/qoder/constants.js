@@ -128,7 +128,12 @@ const CHEAP_MODELS = catalog.cheapKeys();
  * （cn/global 四账号全无），别名指到下线模型会让「别名调用」稳定失败且原因难查。
  * 改指 `qmodel_38max`（同为 Qwen 中档，倍率 0.2，仍在上游表里）。
  */
-const MODEL_ALIASES = { 'qwen-max': 'qmodel_latest', 'qwen-plus': 'qmodel_38max', 'qwen-flash': 'qfmodel' };
+// HungerG（活动模型，真实 key 是 `hmodel`——依据见 catalog.js 的「活动模型补充」
+// 节）：显示名两个拼写 + OpenCode 目录名 `hungerg-free` 都认，出站统一 hmodel。
+const MODEL_ALIASES = {
+  'qwen-max': 'qmodel_latest', 'qwen-plus': 'qmodel_38max', 'qwen-flash': 'qfmodel',
+  HungerG: 'hmodel', hungerg: 'hmodel', 'hungerg-free': 'hmodel', hungerg_free: 'hmodel',
+};
 
 module.exports = {
   CHANNEL_ID,

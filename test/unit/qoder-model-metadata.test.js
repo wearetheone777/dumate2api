@@ -92,13 +92,22 @@ test('listModelEntries：旧字段不变，新字段追加', async () => {
   session.fetchModels = async () => ({ ok: true, models: MODELS });
   session.cachedModels = () => null;
   const entries = await qoder.listModelEntries();
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].id, 'qoder/G-Model');
-  assert.equal(entries[0].name, 'G-Model');
-  assert.equal(entries[0].contextWindow, 1000000);
-  assert.equal(entries[0].maxContextWindow, 1000000);
-  assert.equal(entries[0].supports_reasoning, true);
-  assert.deepEqual(entries[0].reasoning_effort_options, ['low', 'high']);
+  // 活动模型补充（issue #9）会追加官方限时活动条目（catalogSource=supplement），
+  // 动态表条目按来源过滤后再锁字段——窗口结束后过滤结果不变，断言不会过期
+  const dyn = entries.filter((e) => e.catalogSource !== 'supplement');
+  assert.equal(dyn.length, 1);
+  assert.equal(dyn[0].id, 'qoder/G-Model');
+  assert.equal(dyn[0].name, 'G-Model');
+  assert.equal(dyn[0].contextWindow, 1000000);
+  assert.equal(dyn[0].maxContextWindow, 1000000);
+  assert.equal(dyn[0].supports_reasoning, true);
+  assert.deepEqual(dyn[0].reasoning_effort_options, ['low', 'high']);
+  for (const e of entries) {
+    if (e.catalogSource === 'supplement') {
+      assert.equal(e.status, 'active', '补充条目必是 active');
+      assert.ok(e.key && e.id === `qoder/${e.name}`, '补充条目带 key 与显示名 id');
+    }
+  }
 });
 
 test('listModelEntries：无账号时兜底表不带能力字段', async () => {

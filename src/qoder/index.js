@@ -535,7 +535,10 @@ async function runOnce(account, payload, onChunk, opts, meter) {
   if (opts && typeof opts.onModel === 'function') {
     try { opts.onModel(modelKey); } catch (e) { /* 上报失败不影响请求 */ }
   }
-  const modelMeta = cachedModels.find((m) => m.key === modelKey);
+  const modelMeta = cachedModels.find((m) => m.key === modelKey)
+    // 活动模型补充（issue #9）：HungerG（hmodel）不在动态模型清单里，meta 从
+    // catalog.js 的补充表出——思考档位归一化与上下文档位（1M）才不会丢失。
+    || require('./catalog').supplementMetaOf(modelKey);
   const ctxMax = process.env.DUMATE_QODER_CONTEXT === 'default' ? null : (modelMeta && modelMeta.maxInputTokens);
 
   // **VL 前置校验（P2-24）**：非视觉模型传图在本地 400，不放行到上游。
@@ -1199,8 +1202,13 @@ async function send(payload, onChunk, opts = {}) {
   // 只用国际（global）账号，'' = 不限。请求的模型名不编码区域，区域约束只能
   // 落在账号池选择上——不加过滤的话，intl key 的请求会被 FEFO/轮询派给国内
   // 账号，约束形同虚设。
-  const usable = accountsForRegion(authStore.findUsable(), opts.region);
-  if (!usable.length) throw noRegionAccountError(opts.region);
+  // 活动模型提示（issue #9）：HungerG 是国际版个人账号活动模型（官方活动页
+  // 口径，hub v1.10.1 同款处置）——key 未绑区域时按国际区选号，省得被派给
+  // 国内账号白撞一次；key 显式绑了区域时以 key 为准（绑 cn 的调用照常放行，
+  // 由上游裁决）。
+  const regionWant = opts.region || require('./catalog').supplementRegionOf(model);
+  const usable = accountsForRegion(authStore.findUsable(), regionWant);
+  if (!usable.length) throw noRegionAccountError(regionWant);
   // 排队等待预算 + 共享 request_set_id（官方轮询协议，2026-10-30）。
   // 预算是**整次请求**的（所有账号共享）——runOnce 内的排队等待受它约束，
   // 耗尽后 throttle 错误按旧路交回（换号/429）。request_set_id 在多次尝试间
@@ -1526,7 +1534,9 @@ async function listModelEntries({ includeRetired = false } = {}) {
           if (models && models.length) { byAccount.push(models); markDeclaring(models); }
         }
         const region = constants.normalizeRegion(pref.region);
-        return primary.models
+        // 活动模型补充（issue #9）：动态表不含官方限时活动模型（HungerG），
+        // 追加以 key 去重——官方哪天把它放进动态表，动态条目优先。
+        return require('./catalog').mergeSupplementEntries(primary.models
           // P0-2：上游 enable=false 的模型**不列进 /v1/models**（官方已禁用），
           // 但管理端仍可见（admin /qoder/models 与 model-info.qoderRows）。
           // 候选下线（retiredCandidate）是快照条目，不在这个分支（动态表里没有它们）。
@@ -1547,7 +1557,7 @@ async function listModelEntries({ includeRetired = false } = {}) {
               catalogSource: 'upstream',
               ...buildModelCapability(byAccount, { region, key, accountCount: declaring.size }),
             };
-          });
+          }));
       }
     }
   } catch (e) { /* 拿不到就用兜底 */ }
@@ -1561,7 +1571,7 @@ async function listModelEntries({ includeRetired = false } = {}) {
       allowSnapshot: true,
     });
     if (r.ok && r.models.length) {
-      return r.models
+      return cat.mergeSupplementEntries(r.models
         .filter((m) => includeRetired || !m.retiredCandidate)
         .map((m) => ({
           id: `qoder/${m.name || m.key}`,
@@ -1572,16 +1582,16 @@ async function listModelEntries({ includeRetired = false } = {}) {
           disabledReason: m.disabledReason || '',
           retiredCandidate: !!m.retiredCandidate,
           catalogSource: r.catalogSource,
-        }));
+        })));
     }
   } catch (e) { /* 继续用 constants 兜底 */ }
-  return constants.FALLBACK_MODELS.map((k) => {
+  return require('./catalog').mergeSupplementEntries(constants.FALLBACK_MODELS.map((k) => {
     const st = require('./catalog').statusOf(k);
     return {
       id: `qoder/${k}`, name: k, contextWindow: null, maxContextWindow: null,
       status: st.status, retiredCandidate: st.retiredCandidate, catalogSource: 'snapshot',
     };
-  });
+  }));
 }
 
 /** 账号的额度与签到（管理端用） */

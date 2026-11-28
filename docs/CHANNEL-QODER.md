@@ -953,3 +953,62 @@ Qoder 的 `session.ensureAccount` 换票失败时原本只有「抛 401 + 换号
 的账号不敢判死（无法证明 access 已失效）。
 
 离线验证：`test/unit/credential-retired.test.js`（8 项：池层三条边界 + 四通道判据）。
+
+## 活动模型补充：HungerG（2026-11-29，issue #9；hub v1.10.1 同款设计）
+
+官方限时活动模型**不在动态模型清单里**（12 个数组都没有 `hunger` 字样——4 个
+账号 cn/global 原始响应逐字节搜过），只进官方应用/IDE 的选择器，但上游可直接按
+key 调用。hub 对 QoDuck 验证过同款链路（v1.9.2「discover QoDuck app-only
+model」，key `lmodel` 仅出现在 `app` 数组）。
+
+**key 是 `hmodel`，不是 "HungerG"**（这是本仓库比 hub 静态表更进一步的证据）：
+
+- 官方 0.5.21 应用（2026-11-27 构建，fast-update 包 360MB）内置文案表
+  `out/qoder-text/global-prod/bundle.json`：`modelPresentations.models.hmodel.label
+  = "HungerG"`（detail 就是五个 🔥）。
+- 同表 `lmodel = QoDuck`，与 hub 真机验证过的 API key 一致——**presentation 键
+  就是 API key**。hub 把显示名当 key（它自己的活动日志只见过 10605 排队，无成功
+  调用记录）；两个拼写都注册成别名，出站统一 `hmodel`，上游裁决。
+
+**免费窗口**：2026-11-23 24:00 ~ 11-30 24:00（UTC+8，官方活动页
+docs.qoder.com/zh/events/hungerg-free）。国际版个人账号（Free~Ultra）免费、不消耗
+Credits（Max 思考档也按 0.0× 计费）；Team/Enterprise 不显示。每账号有每日公平
+使用上限。四个思考档 low/medium/high/max；多模态；上下文 1M（默认档 200K）。
+
+**实现**（`catalog.js` 的「活动模型补充」节 + 三处接线）：
+
+| 环节 | 做法 |
+|---|---|
+| 条目来源 | `catalog.js` 的 `SUPPLEMENTS` 静态表（形状与 fetchModels 归一化行同形） |
+| /v1/models | `mergeSupplementEntries` 追加到三个出口（upstream / 兜底 / snapshot）——`qoder/HungerG`，`catalogSource: 'supplement'`；**动态表已列不覆盖**（官方哪天放进清单以官方为准），**过期自动隐藏** |
+| 别名 | `constants.MODEL_ALIASES`：`HungerG`/`hungerg`/`hungerg-free`/`hungerg_free` → `hmodel`（静态表先行，运行时别名不抢） |
+| runOnce meta | `modelMeta` 缺席时回落 `supplementMetaOf`——思考档位归一化与 1M 档位不丢失 |
+| 区域提示 | `send()`：key 未绑区域时按 `supplementRegionOf` 提示区选号（HungerG → intl）；**key 显式绑定的区域优先**，绑 cn 的调用照常放行由上游裁决 |
+| 过期语义 | `HUNGERG_FREE_UNTIL_MS = 1796054400000`（2026-11-30 24:00 UTC+8，hub 同值）；过期只是**不自动列出**，显式调用照常透传 |
+
+**倍率纪律**：活动期 `rate: 0`（官方口径）；窗口结束后的倍率官方未公布——
+`rateOriginal: null` 不编。快照（`qoder-catalog.snapshot.json`）**不收** hmodel：
+快照是「第三方清单疑似下线」的领地，活动模型走补充表，两套语义不混。
+
+**验证状态（如实）**：2026-11-29 真机探测时四个账号**全部模型**（含 0.1 档
+qfmodel 与乱写的 no-such-model-xyz）统一回 p4 排队（queueCount=1 / retryAfter 60s /
+serviceAvailable=true，账号级 RESOURCE_LIMIT）——免费窗口高峰的账号级排队，
+**在模型校验之前**，所以 p4 信封不能证明也不能证伪 `hmodel` 的有效性；对照实验
+（hub 文档）表明无效 key 在放行后会得到明确的 `Cannot find model`。**600s 长预算
+探针（两个国际账号轮转）同样全程未放行**（2026-11-29 午后）——端到端验证待队列
+缓解（错峰时段 22:00-08:00 是自然的重试窗口；免费窗口内探测 0 成本）：
+
+```bash
+DUMATE_QODER_QUEUE_POLL_BUDGET_MS=600000 node -e "
+const qoder = require('./src/qoder');
+qoder.send({ model: 'qoder/HungerG',
+  messages: [{ role: 'user', content: 'reply with exactly: pong' }], max_tokens: 64 },
+  null, { reqId: 'hunger_e2e', probe: true }).then(
+  (o) => console.log('OK', JSON.stringify(o).slice(0, 400)),
+  (e) => console.log('ERR', e.message));"
+```
+
+离线验证：`node --test test/unit/qoder-hungerg.test.js`（8 项：key 收敛 / 行形状 /
+思考档位 / 过期纪律 / 动态表优先 / 区域提示 / 接线自证）；
+`qoder-model-catalog` 与 `qoder-model-metadata` 的名单断言已改为
+supplement-aware（锁「启用者在、禁用者不在」，不再锁字面名单——窗口结束后照样成立）。
