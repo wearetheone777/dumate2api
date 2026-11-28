@@ -818,3 +818,26 @@ if (!Number.isFinite(c)) return false;
 **管理端**：`GET /api/admin/workbuddy/windows`（窗口表 + due 状态 + `next_due_in_ms`）、`POST /api/admin/workbuddy/windows/run`（立即探针，`account_id`+`model` 可点名；**未到点窗口不提前探**——提前探会把「还没重置」误记成一次尝试，纯浪费）。开关 `DUMATE_WORKBUDDY_WINDOW_PROBE=0` 关（关闭时 GET 如实报 enabled:false、run 明确拒绝）。
 
 **验证**：workbuddy-convfields 9 项 + workbuddy-windowprobe 15 项（四分支/闸门/批量截断/接线自证五路）+ verify-workbuddy-window-api.js 7 项（HTTP 层）；npm test 1835/1835、verify 52/52。**9080 重启后生效**（注入即默认开、探针循环随网关起）。
+
+### 11.13 批次十一：打卡候选模型序列（免费优先）+ 预算 + 退避（2026-11-28，hub v2.1.1 移植 + 真机探针定案）
+
+**免费优先有实证**：探针 `test/probe-workbuddy-webmodel.js` 双账号实测——目录免费榜 `hy4flash-free`（rate 0）被网页沙箱 `session/set_model` **接受**且会话跑到 completed（约 3.5s）；而 `deepseek-v4.1-flash` 在实时目录**双区域都是 x0.11 付费**（hub 的 `prefer_flash` 默认把 flash 放最前，在它的 intl 语境下 flash 免费，在我们的实时目录下不成立）。**探针零计费设计**：set_model 在 prompt 之前，失败即删会话绝不 prompt——按用户新纪律（付费模型使用前必须经同意），免费模型探不通过就不产生任何计费。
+
+**候选序列**（`dailyChatCandidates(region)`，hub daily_chat_candidates 同构）：
+
+1. env `DUMATE_WORKBUDDY_DAILY_MODELS`（逗号/分号/换行分隔）显式序列**整体优先且不重排**——操作者的优先级不是建议；
+2. 自动模式 = 实时目录免费模型（catalog `free` 字段，即 rate===0，`models.fetchModels` 10 分钟缓存）+ flash 收尾（保住打卡连登）；
+3. 目录拉不到（无账号/网络失败）→ `[flash]` 兜底——打卡不因目录抖动停摆（旧行为）。
+
+**候选循环**（`dailyActivity` 重构为编排器 + `dailyActivityOnce` 单轮，hub _daily_chat_web_upstream 同构）：
+
+- 轮数 = max(2, 候选数)：第二轮留给「会话只是慢」，每个候选一轮；不再有「最多尝试次数」这个与候选数量互相覆盖的旋钮；
+- **换候选判据**：create 业务拒绝 code∈{14018,6004,6005} 或额度/限流/模型类文案；create HTTP 408/429/5xx；session 阶段一律可换；turn 失败可换。**11140/401 立即停**（风控避让持久化不变）；证书类 TLS 失败对任何候选都一样 → 终止（可降级 /v2/report，开关不变）；
+- **set_model 失败判本轮失败**（偏离 hub 的「本轮仍跑」）：免费优先序列下 set_model 被拒意味着这一轮静默按网页 Auto（付费）计费——比换下一个候选更贵、且更难看见。失败轮的会话当场 delete，换候选重来；
+- **单账号预算**：`DUMATE_WORKBUDDY_WEB_BUDGET_MS` 默认 600000ms（0 不限）——每轮等待、退避都从它里扣，剩余 <30s 不再开新轮；预算用尽回 `phase:'budget'` 明确结论，不再有「跑几小时没动静」；
+- **退避**：5s×2^n 封顶 30s（`DUMATE_WORKBUDDY_WEB_RETRY_BACKOFF`/`_MAX` 秒），**只补 create/session 阶段**——turn 阶段已等满 waitMs，再睡是双重惩罚（hub _web_retry_pause 口径）；
+- 结果带 `attempts` / `models_tried` / `model`，一眼看清落到哪个候选。
+
+**「桌面腿与网页腿共用候选序列」未做**：hub 的桌面腿是桌面身份 chat/completions 对话；本项目每日活跃是 activity 上报 + 网页 ACP 双通道，没有桌面对话腿，共用无从谈起——真要做时按 `dailyChatCandidates` 直接取用即可，函数已按 region 参数化。
+
+**验证**：workbuddy-webmodel 12 项（序列三层/退避/换候选判据/端到端回退/11140 终止/预算结论/接线自证）；npm test 1847/1847、verify 53/53；真机端到端 `dailyActivity` hy4flash-free 一次过（attempts 1，零回退，3.5s）。**只挂管理端进程**（autocheckin + admin 路由），网关 9080 不受本批影响，重启范围仅 9081。
