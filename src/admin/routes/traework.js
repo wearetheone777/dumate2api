@@ -62,6 +62,8 @@ function regionFilter(rows, url) {
 }
 
 const routes = [
+  // 回收站四路由（批次十六）：列表/清空/恢复/永久删除。放最前，防被参数路由截胡
+  ...require('../trash').routesFor('traework'),
   {
     // 链路状态（2026-11-06）：TRAE 对话请求现在有三条链路（utils_chat / Remote /
     // SOLO raw），开关全部由环境变量控制——前端模型卡要显示「请求实际走哪条
@@ -947,10 +949,11 @@ const routes = [
     method: 'DELETE',
     path: '/accounts/:id',
     handler: async ({ res, params }) => {
-      const ok = authStore.remove(params[0]);
-      if (!ok) return sendJSON(res, 404, { error: '账号不存在' });
+      // 批次十六：删除 = 移入回收站（30 天可恢复）；永久删除走 DELETE /trash/:key
+      const r = require('../trash').trashAccount('traework', params[0]);
+      if (!r.ok) return sendJSON(res, 404, { error: r.error });
       try { require('../auth').audit('admin', 'traework_account_delete', params[0]); } catch (e) { /* 审计失败不影响结果 */ }
-      return sendJSON(res, 200, { ok: true });
+      return sendJSON(res, 200, { ok: true, trashed: true, name: r.name });
     },
   },
   {

@@ -1,16 +1,26 @@
 <template>
   <div class="page">
+    <!-- 回收站入口（批次十六）：五通道共用一个抽屉，按当前通道取各自的后端。
+         放在通道分支之上——它是唯一一个所有通道账号页都要有的公共动作。
+         restoredTick：恢复成功后重挂子组件，让账号列表立刻反映结果。 -->
+    <div class="flex justify-end">
+      <a-button size="small" @click="trashOpen = true">
+        <template #icon><DeleteOutlined /></template>
+        回收站
+      </a-button>
+    </div>
+
     <!-- ============ TRAE Work：凭证自持，多账号可增删 ============ -->
-    <TraeworkAccounts v-if="isTw" />
+    <TraeworkAccounts v-if="isTw" :key="`tw-${restoredTick}`" />
 
     <!-- ============ 千问办公：多账号池，凭证自持（可增删、可设主账号） ============ -->
-    <QwenworkAccounts v-else-if="isQw" />
+    <QwenworkAccounts v-else-if="isQw" :key="`qw-${restoredTick}`" />
 
     <!-- ============ Qoder：多账号池，凭证自持（device flow，不需要客户端） ============ -->
-    <QoderAccounts v-else-if="isQd" />
+    <QoderAccounts v-else-if="isQd" :key="`qd-${restoredTick}`" />
 
     <!-- ============ WorkBuddy：第五通道，双区域，登录流程后置期用导入 ============ -->
-    <WorkBuddyAccounts v-else-if="isWb" />
+    <WorkBuddyAccounts v-else-if="isWb" :key="`wb-${restoredTick}`" />
 
     <!-- ============ 百度搭子：原有页面 ============ -->
     <template v-else>
@@ -544,11 +554,15 @@
     <SessionBrowser />
 
     </template>
+
+    <!-- 回收站抽屉（批次十六）：五通道共用壳，channel 是唯一取数维度 -->
+    <TrashDrawer v-model:open="trashOpen" :channel="channelStore.current as TrashChannel" @restored="onRestored" />
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { DeleteOutlined } from '@ant-design/icons-vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { App } from 'ant-design-vue'
 import client from '@/api/client'
@@ -559,6 +573,8 @@ import QoderAccounts from '@/components/qoder/QoderAccounts.vue'
 import WorkBuddyAccounts from '@/components/workbuddy/WorkBuddyAccounts.vue'
 import SessionBrowser from '@/components/SessionBrowser.vue'
 import AccountTransferCard from '@/components/AccountTransferCard.vue'
+import TrashDrawer from '@/components/TrashDrawer.vue'
+import type { TrashChannel } from '@/api/trash'
 import type { WebAccount, AccountStatus, PoolData, PoolAccount } from '@/api/webaccounts'
 
 // message 走 App.useApp() 的实例（App.vue 已包 <a-app>），静态 import 拿不到上下文
@@ -570,6 +586,15 @@ const isTw = computed(() => isTraework())
 const isQw = computed(() => isQwenwork())
 const isQd = computed(() => isQoder())
 const isWb = computed(() => isWorkBuddy())
+
+// 回收站（批次十六）：抽屉开合 + 恢复后的列表刷新信号。
+// 搭子（内联模板）直接调本页的 load()；其余通道重挂子组件（它们自己拉数据）。
+const trashOpen = ref(false)
+const restoredTick = ref(0)
+function onRestored() {
+  if (isTw.value || isQw.value || isQd.value || isWb.value) restoredTick.value++
+  else load()
+}
 
 const accounts = ref<WebAccount[]>([])
 const loginUrl = ref('')
@@ -963,7 +988,7 @@ async function toggle(a: WebAccount, v: boolean) {  await client.patch(`/web-acc
 
 async function remove(a: WebAccount) {
   await client.delete(`/web-accounts/${a.id}`)
-  message.success('已删除')
+  message.success('已移入回收站（30 天内可恢复）')
   await load()
 }
 

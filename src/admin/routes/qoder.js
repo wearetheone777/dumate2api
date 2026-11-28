@@ -30,6 +30,8 @@ async function fresh(raw) {
 }
 
 const routes = [
+  // 回收站四路由（批次十六）：列表/清空/恢复/永久删除。放最前，防被参数路由截胡
+  ...require('../trash').routesFor('qoder'),
   {
     // 通道状态 + 账号列表（脱敏：token 只给尾部 6 位）
     // ?region=（2026-11-03）：cn / global（intl 也认）——国内/国际独立视图
@@ -1138,10 +1140,11 @@ const routes = [
     method: 'DELETE',
     path: '/accounts/:id',
     handler: async ({ res, params }) => {
-      const ok = authStore.remove(params[0]);
-      if (!ok) return sendJSON(res, 404, { error: '账号不存在' });
+      // 批次十六：删除 = 移入回收站（30 天可恢复）；永久删除走 DELETE /trash/:key
+      const r = require('../trash').trashAccount('qoder', params[0]);
+      if (!r.ok) return sendJSON(res, 404, { error: r.error });
       try { require('../auth').audit('admin', 'qoder_account_delete', params[0]); } catch (e) { /* 审计失败不影响结果 */ }
-      return sendJSON(res, 200, { ok: true });
+      return sendJSON(res, 200, { ok: true, trashed: true, name: r.name });
     },
   },
   {

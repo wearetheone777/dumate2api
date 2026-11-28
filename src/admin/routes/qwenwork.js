@@ -342,6 +342,8 @@ function creditRecords(limit) {
 }
 
 const routes = [
+  // 回收站四路由（批次十六）：列表/清空/恢复/永久删除。放最前，防被参数路由截胡
+  ...require('../trash').routesFor('qwenwork'),
   {
     method: 'GET',
     path: '/account',
@@ -735,13 +737,14 @@ const routes = [
     path: '/accounts/:id',
     handler: async ({ res, params }) => {
       const a = authStore.get(params[0]);
-      const ok = authStore.remove(params[0]);
-      if (!ok) return sendJSON(res, 404, { error: '账号不存在' });
+      // 批次十六：删除 = 移入回收站（30 天可恢复）；永久删除走 DELETE /trash/:key
+      const r = require('../trash').trashAccount('qwenwork', params[0]);
+      if (!r.ok) return sendJSON(res, 404, { error: r.error });
       // 基准/队列/缓存都按账号存着，删号后清掉，否则 Map 会一直涨
       try { require('../../qwenwork/credits').forget(a); } catch (e) { /* 清理失败不影响 */ }
       cache.data.delete(String(params[0]));
       try { require('../auth').audit('admin', 'qwenwork_account_delete', params[0]); } catch (e) { /* 审计失败不影响结果 */ }
-      return sendJSON(res, 200, { ok: true });    },
+      return sendJSON(res, 200, { ok: true, trashed: true, name: r.name });    },
   },
   {
     // 停用/启用 + 指定主账号。preferred 是排他的（authStore.patch 内部会清掉其他）

@@ -201,7 +201,7 @@
               <!-- 人工恢复（P0-3）：冷却/熔断/凭证拒绝的号，这条是唯一出口。
                    与上面的「恢复」批量按钮不同——它总是清，不保留上游冷却 -->
               <a-button size="small" :loading="busy[a.id]" @click="recover(a)">恢复</a-button>
-              <a-popconfirm title="确定删除这个账号？" @confirm="remove(a)">
+              <a-popconfirm title="删除并移入回收站（30 天内可恢复）？" @confirm="remove(a)">
                 <a-button size="small" danger>删除</a-button>
               </a-popconfirm>
             </div>
@@ -570,7 +570,7 @@ async function recover(a: TraeworkAccount) {
 
 async function remove(a: TraeworkAccount) {
   await traeworkApi.removeAccount(a.id)
-  message.success('已删除')
+  message.success('已移入回收站（30 天内可恢复）')
   await load()
 }
 

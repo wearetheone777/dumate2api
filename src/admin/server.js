@@ -311,6 +311,9 @@ function start() {
   try { require('../balance-refresh').schedule(); } catch (e) { log(`⚠ 余额刷新排程异常（不阻断启动）: ${e.message}`); }
   // 运维告警规则评估（2026-11-08 调研 P1-6）：默认关闭，环境变量显式开启
   try { require('./routes/alerts').schedule(); } catch (e) { log(`⚠ 告警排程异常（不阻断启动）: ${e.message}`); }
+  // 账号回收站留存清扫（批次十六）：boot 一轮 + 每小时。删除/恢复/清空全部只发生在
+  // 管理端进程，网关进程从不写回收站文件——单进程写就单进程清，不引入跨进程写竞争
+  try { require('./trash').startSweep(); } catch (e) { log(`⚠ 回收站清扫异常（不阻断启动）: ${e.message}`); }
   // 运行时模块接线（池恢复 / livecfg / 计量探活），失败不阻断管理端启动
   try { boot.init({ log }); } catch (e) { log(`⚠ 启动接线异常（不阻断启动）: ${e.message}`); }
   // 优雅停止：保活排程与进行中的一轮、池状态、计量分桶落盘后再退

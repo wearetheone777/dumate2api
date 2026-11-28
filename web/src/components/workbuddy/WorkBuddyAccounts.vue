@@ -172,7 +172,7 @@
             <div class="mt-3 flex flex-wrap gap-1">
               <a-button v-if="!isIntl" size="small" :loading="busy[a.id]" @click="checkin(a)">签到</a-button>
               <a-button size="small" @click="openDetail(a)">详情</a-button>
-              <a-popconfirm title="确定删除这个账号？" @confirm="remove(a)">
+              <a-popconfirm title="删除并移入回收站（30 天内可恢复）？" @confirm="remove(a)">
                 <a-button size="small" danger>删除</a-button>
               </a-popconfirm>
             </div>
@@ -1275,7 +1275,7 @@ async function toggle(a: WorkBuddyAccount, v: boolean) {
 
 async function remove(a: WorkBuddyAccount) {
   await workbuddyApi.removeAccount(a.id)
-  message.success('已删除')
+  message.success('已移入回收站（30 天内可恢复）')
   await load()
 }
 

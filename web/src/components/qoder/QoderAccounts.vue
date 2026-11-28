@@ -220,7 +220,7 @@
                   <a-button size="small" :loading="proBusy[a.id]">领 Pro 福利包</a-button>
                 </a-popconfirm>
                 <a-button size="small" v-if="!a.preferred" @click="setMain(a)">设为主账号</a-button>
-                <a-popconfirm title="确定删除这个账号？" @confirm="remove(a)">
+                <a-popconfirm title="删除并移入回收站（30 天内可恢复）？" @confirm="remove(a)">
                   <a-button size="small" danger>删除</a-button>
                 </a-popconfirm>
               </div>
@@ -526,7 +526,7 @@ async function setMain(a: QoderAccount) {
 }
 
 async function remove(a: QoderAccount) {
-  try { await qoderApi.removeAccount(a.id); await load() }
+  try { await qoderApi.removeAccount(a.id); await load(); message.success('已移入回收站（30 天内可恢复）') }
   catch (e: any) { message.error(e?.response?.data?.error || '删除失败') }
 }
 

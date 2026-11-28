@@ -368,7 +368,7 @@ async function remove(a: QwAccount) {
   busy[a.id] = true
   try {
     await qwenworkApi.removeAccount(a.id)
-    message.success('已删除')
+    message.success('已移入回收站（30 天内可恢复）')
     await load()
   } catch (e: any) {
     message.error(e?.response?.data?.error || '删除失败')

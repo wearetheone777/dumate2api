@@ -849,6 +849,7 @@ per-key 限流（低价值场景）。
 | `admin-audit.jsonl` | 管理操作审计 |
 | `requests.jsonl` | 网关埋点，超 32MB 轮转一次留 `.1` |
 | `web-accounts.json` | 网页账号，**cookie 明文存**（上游要求原样重放，与 keys 的只存哈希是两种策略） |
+| `*-trash.json` | 五个账号回收站（批次十六，`web-accounts-trash.json` / `qwenwork-` / `traework-` / `qoder-` / `workbuddy-accounts-trash.json`）：软删除的记录整体搬到这里（**凭据原样保留**，30 天可恢复），live 账号文件根本不含回收站成员——pool/keepalive/FEFO 等消费方零改动。不在备份分区表里（trash 是暂存区不是配置）；解析失败时全部写路径拒绝（宁可不写） |
 | `activity.jsonl` | 统一操作记录（签到/任务/抽奖），按时间排序 |
 | `task-runs.jsonl` / `task-scheduler.json` | 任务执行历史 / 轮询配置 |
 | `auto-checkin.json` | 自动签到配置 |
@@ -905,6 +906,7 @@ per-key 限流（低价值场景）。
 | `admin/routes/qwenwork.js` | 千问办公通道的管理接口：`/status` 通道健康、`/credits` 三个池、`/credits/daily` 按天聚合、`/credits/records` 逐笔明细、`/billing-check` 计费自检探针、`/models` 模型表、**`/account` 登录态详情（只读）**、**`/accounts` 账号（`mode='single'` 表示单账号直连，不可增删）** |
 | `admin/routes/accounts.js` | 搭子网页账号的管理接口（签到/抽奖/积分/记录）。**回填与显示名的逻辑都在这里**（`backfillNickname` / `backfillAll`），属于管理端 |
 | `admin/routes/backup.js` | 备份分区表（批次十四，qoder-trae-workbuddy-switch 移植）：`GET /sections` + `/export` `/preview` `/import`。**SECTION_TABLE 是唯一分区清单**（5 账号分区按身份键合并、其余按顶层键合并），新增可备份类型 = 加一行；预览零写盘；导出默认脱敏（sensitive 分区必须显式含凭据+confirm）；**脱敏记录覆盖本地时保留本地凭据字段**。细节见 `docs/PLAN-WORKBUDDY-GITHUB-MERGE-2026-11-28.md` 批次十四行 |
+| `admin/trash.js` | 账号回收站（批次十六）：五通道共用一套（SPECS 表驱动），**软删除搬移到独立回收站文件**而不是 live 里加标记——消费方零改动。写顺序「新增侧先落」（中途失败是两边都有不是数据丢失）；恢复 fail-closed（未知 key 拒/live 已有同 id 拒/preferred 排他归一）；30 天 + 200 条先到先出；损坏时全部写路径拒绝。`routesFor(channel)` 工厂四路由（GET /trash、POST /trash/clear、POST /trash/:key/restore、DELETE /trash/:key），**必须展开在各通道 routes 数组最前**（字面 /trash 先于 /:id 参数路由被匹配）；purge/clear 服务端强制 confirm。清扫循环挂管理端进程（`startSweep`，boot + 每小时）——网关进程从不写回收站文件，**别把清扫挪进网关 keepalive**（会引入跨进程写竞争） |
 | `admin/routes/*.js` | 其余管理 API，按 `mount()` 挂载到 `/api/admin/<前缀>` |
 
 **千问登录态只读，管理端绝不写入。** 它存在官方客户端的 `auth-v2.dat` 里（Electron safeStorage：DPAPI 解 `Local State` 的 `encrypted_key` → 32B AES key → AES-256-GCM 解密）。官方客户端和我们各写一次会互相把对方的登录态刷掉，所以换账号必须开客户端操作。**不复制这个文件到 `data/`**——它会过期，复制一份立刻失效。`refresh_token` 过期（`refreshExpired`）要提前告警：access token 到期后无法自动续期。
