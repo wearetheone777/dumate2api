@@ -220,6 +220,8 @@ router.mount(PREFIX + '/qoder-runtime', require('./routes/qoder-runtime').routes
 router.mount(PREFIX + '/workbuddy', workbuddyRoutes);
 // 备份分区表（批次十四）：导出勾选 / 导入合并读同一张 SECTION_TABLE，预览零写盘
 router.mount(PREFIX + '/backup', require('./routes/backup').routes);
+// 存储管理（批次十七）：data/ 四类视图 + 先预览再确认的清理 + 60s 快照
+router.mount(PREFIX + '/storage', require('./routes/storage').routes);
 router.mount(PREFIX + '/keys', keysRoutes);
 router.mount(PREFIX + '/cc-switch', ccswitchRoutes);
 router.mount(PREFIX + '/agent-setup', require('./routes/agent-setup').routes);

@@ -69,6 +69,11 @@
           <template #icon><DatabaseOutlined /></template>
           <span>备份与还原</span>
         </a-menu-item>
+        <!-- 存储管理（批次十七）：data/ 体量视图与清理，同样与通道无关 -->
+        <a-menu-item v-if="isAdmin" key="storage">
+          <template #icon><HddOutlined /></template>
+          <span>存储管理</span>
+        </a-menu-item>
         <!-- Qoder 运行策略：超时/排队/冷却热生效 + 自动签到（P0-1/P0-3）。
              只在 Qoder 通道下出现——它是通道级配置，套到别的通道上是误导 -->
         <a-menu-item v-if="isAdmin && channelStore.current === 'qoder'" key="qoder-runtime">
@@ -224,7 +229,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined, BlockOutlined, DatabaseOutlined } from '@ant-design/icons-vue'
+import { DashboardOutlined, DeploymentUnitOutlined, KeyOutlined, UserOutlined, WalletOutlined, TeamOutlined, BarChartOutlined, FileTextOutlined, CommentOutlined, UsergroupAddOutlined, ApiOutlined, ControlOutlined, CodeOutlined, AlertOutlined, SafetyCertificateOutlined, BlockOutlined, DatabaseOutlined, HddOutlined } from '@ant-design/icons-vue'
 import AppLogo from '@/components/AppLogo.vue'
 import client from '@/api/client'
 import { auth, isAdmin } from '@/stores/auth'
