@@ -619,6 +619,91 @@ const routes = [
     },
   },
   {
+    // 模型规则（批次十二，misakano modelrules.go 移植）：命名模型组 + deny/allow
+    // 挂账号。规则与「账号 → 规则 id」都进 workbuddy-model-rules.json（mtime 热
+    // 读，网关零重启生效）。deny 并集 / allow 并集 / deny 优先，见 rules.js。
+    method: 'GET',
+    path: '/model-rules',
+    handler: async ({ res, req }) => {
+      const rules = require('../../workbuddy/rules');
+      // ?account_id= 附加单账号视图：挂的规则 + 对指定模型的判定结果（排查用）
+      const accId = Number(((req.url.match(/[?&]account_id=(\d+)/) || [])[1]) || 0);
+      const model = decodeURIComponent(((req.url.match(/[?&]model=([^&]*)/) || [])[1]) || '').trim();
+      const out = {
+        ok: true,
+        rules: rules.listRules(),
+        counts: rules.ruleAccountCounts(),
+        assignments: rules.ruleAssignments(),
+      };
+      if (accId) {
+        const authStore = require('../../workbuddy/auth');
+        const acc = authStore.get(accId);
+        out.account = acc ? {
+          id: acc.id, nickname: acc.nickname || acc.uid || `账号 ${acc.id}`,
+          region: acc.region || 'cn', ruleIds: rules.ruleIdsOf(accId),
+        } : null;
+        if (model && out.account) {
+          out.account.blocked = rules.blockedByRules(accId, out.account.region, model);
+        }
+      }
+      return sendJSON(res, 200, out);
+    },
+  },
+  {
+    method: 'POST',
+    path: '/model-rules',
+    handler: async ({ res, body, user }) => {
+      const rules = require('../../workbuddy/rules');
+      try {
+        const rule = rules.upsertRule((body && body.rule) || body || {});
+        try { require('../auth').audit(user && user.username, 'workbuddy_rule_upsert', rule.id, `${rule.mode} ${rule.name}`); } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, rule });
+      } catch (e) {
+        return sendJSON(res, e.statusCode || 400, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
+    method: 'DELETE',
+    path: '/model-rules/:id',
+    handler: async ({ res, params, user }) => {
+      const rules = require('../../workbuddy/rules');
+      const ok = rules.deleteRule(params[0]);
+      if (ok) { try { require('../auth').audit(user && user.username, 'workbuddy_rule_delete', params[0]); } catch (e) { /* 审计失败不影响结果 */ } }
+      return sendJSON(res, ok ? 200 : 404, { ok, error: ok ? '' : `规则不存在: ${params[0]}` });
+    },
+  },
+  {
+    // 整体替换某账号挂的规则集合（编辑弹窗用）
+    method: 'POST',
+    path: '/model-rules/assign',
+    handler: async ({ res, body, user }) => {
+      const rules = require('../../workbuddy/rules');
+      try {
+        const ids = rules.assignRules(Number((body && body.account_id) || 0), (body && body.ids) || []);
+        try { require('../auth').audit(user && user.username, 'workbuddy_rule_assign', String((body && body.account_id) || ''), ids.join(',')); } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, ids });
+      } catch (e) {
+        return sendJSON(res, e.statusCode || 400, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
+    // 把一条规则批量挂/摘（规则卡片「应用」用：账号多的池子里逐个配置太慢）
+    method: 'POST',
+    path: '/model-rules/apply',
+    handler: async ({ res, body, user }) => {
+      const rules = require('../../workbuddy/rules');
+      try {
+        const changed = rules.applyRule((body && body.id) || '', (body && body.account_ids) || [], !!(body && body.assigned));
+        try { require('../auth').audit(user && user.username, 'workbuddy_rule_apply', String((body && body.id) || ''), `${(body && body.assigned) ? '挂' : '摘'} ${changed}`); } catch (e) { /* 审计失败不影响结果 */ }
+        return sendJSON(res, 200, { ok: true, changed });
+      } catch (e) {
+        return sendJSON(res, e.statusCode || 400, { ok: false, error: e.message });
+      }
+    },
+  },
+  {
     // 6004 额度窗口表（批次十）：登记侧在 index.js model_cap 分支（带重置墙钟
     // 才登记），执行侧 windowprobe.js 到点发最小探针钉住新一轮窗口起点。
     method: 'GET',

@@ -683,6 +683,21 @@ async function send(payload, onChunk, opts = {}) {
     const kept = scoped.filter((a) => !lowIds.has(String(a.id)));
     if (kept.length) { usable = kept; guardSkipped = scoped.length - kept.length; }
   }
+  // 模型规则（批次十二，misakano modelrules.go 移植）：按账号 deny/allow 过滤候选。
+  // **全部被拦 → 400 model_not_allowed**——503 会被客户端当上游抖动重试，而规则
+  // 不会自愈，重试只是白打（参考实现 RulesBlockedForRealm 的判据注释）。部分被拦
+  // 照常跑（被拦的账号不进候选）。'auto' 档位不做模型级判断（实际模型由账号决定，
+  // 规则无从比对）。规则挂在账号上，冷却/白名单/护栏各管各的，叠加判定。
+  {
+    const ruleView = require('./rules').filterAccounts(usable, region || modelRegion || '', model);
+    if (ruleView.blockedCount && !ruleView.kept.length) {
+      const e = new Error(`WorkBuddy 模型规则拦截：${model} 在全部候选账号上都被 deny/白名单外规则拦下（规则不会自愈，请到管理端调整模型规则）`);
+      e.statusCode = 400;
+      e.modelNotAllowed = true;
+      throw e;
+    }
+    if (ruleView.blockedCount) usable = ruleView.kept;
+  }
   const tried = new Set();
   const refreshTried = new Set();
   let rotated = 0;
